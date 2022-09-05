@@ -24,7 +24,7 @@ from py_expression_eval import Parser
 
 #from discord.ext import commands
 
-
+#add slash command functionality
 #    add the api integration with the dudebot account for danbooru
 #    add search by order:random
 #    polish role editing system
@@ -37,8 +37,6 @@ from py_expression_eval import Parser
     
 #class discordbot(commands.Bot):
 
-whitelist_roles = ["Kinography","Potato Farmer","Kong","\"Girl\"",">\"she\"","Faggot","@vassago"]
-whitelist_roles = [i.lower() for i in whitelist_roles]
 
 
 reddit = {}
@@ -67,18 +65,13 @@ nitro_shills=[351783699853082625,
 
 good_pills = ['kongpilled',
          'basepilled',
-         '4chanpilled',
          'redpilled',
          'blackpilled',
          'norrispilled'
          ]
-bad_pills = ['kaeluspilled',
-	'neckbeardpilled',
-	'bluepilled',
-        'redditpilled'
-	]
+
 headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/50.0.2661.102 Safari/537.36'}
-api = VesyncApi("longcheeseconey@gmail.com",base64.b64decode(b'c2FkbW9ua2V5').decode('ascii'))
+api = VesyncApi()
 
 parser = Parser()
 
