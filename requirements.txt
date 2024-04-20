@@ -1,4 +1,3 @@
-vesync
 discord
 nltk
 inflect
