@@ -1,8 +1,0 @@
-discord
-nltk
-inflect
-bs4
-html5lib
-pandas
-fuzzywuzzy
-py_expression_eval
