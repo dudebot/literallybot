@@ -1,3 +1,4 @@
 discord.py
 phue
 dotenv
+youtube_dl
