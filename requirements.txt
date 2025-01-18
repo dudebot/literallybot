@@ -2,3 +2,5 @@ discord.py
 phue
 dotenv
 youtube_dl
+pytest
+pytest-cov
