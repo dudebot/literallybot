@@ -25,7 +25,7 @@ import discord
 from os import listdir
 from dotenv import load_dotenv
 import os
-
+from config import Config
 
 def get_prefix(bot, message):
 	"""This function returns a Prefix for our bot's commands.
@@ -124,6 +124,22 @@ async def reload_cog(ctx, *, cog: str):
     else:
         await message.edit(content=f'{cog} has been reloaded.', delete_after=20)
 
+
+# Command to set server admins as bot operators
+@bot.command(name='setbotoperator', hidden=True)
+@commands.has_permissions(administrator=True)
+async def set_bot_operator(ctx, user: discord.Member):
+    """This command sets the specified user as a bot operator if the command invoker has administrator permissions.
+    
+    Args:
+        user (discord.Member): The user to set as a bot operator.
+    Note:
+        This command can be used only by server administrators.
+        This command is hidden from the help menu.
+    """
+    config = Config(ctx.guild.id)
+    config.add_bot_operator(user.id)
+    await ctx.send(f'{user.mention} has been set as a bot operator.')
 
 #Grab token from the token.txt file
 load_dotenv()
