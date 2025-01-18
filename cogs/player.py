@@ -1,12 +1,14 @@
 import os
 from discord.ext import commands
 import discord
+import random
 
-class Player(commands.cog):
+class MusicPlayer(commands.Cog):
     """This is a cog with commands to play music via local mp3 files or audio stream. 
     """
     def __init__(self, bot):
         self.bot = bot
+        self.queue = []  # P418f
 
     @commands.command(name='play', aliases=['p'], description='Plays a local mp3 file or a audio stream.')
     async def play(self, ctx, *, url: str):
@@ -27,9 +29,12 @@ class Player(commands.cog):
         else:
             await ctx.guild.voice_client.move_to(ctx.author.voice.channel)
         
-
-        ctx.guild.voice_client.play(discord.FFmpegPCMAudio(url))
-        await ctx.send(f'Now playing: {url}')
+        self.queue.append(url)  # P418f
+        if not ctx.guild.voice_client.is_playing():
+            ctx.guild.voice_client.play(discord.FFmpegPCMAudio(url))
+            await ctx.send(f'Now playing: {url}')
+        else:
+            await ctx.send(f'Added to queue: {url}')
 
     @commands.command(name='stop', description='Stops the audio stream.')
     async def stop(self, ctx):
@@ -93,8 +98,12 @@ class Player(commands.cog):
             return await ctx.send('I am not connected to a voice channel.')
         else:
             ctx.guild.voice_client.stop()
-
-            
+            if self.queue:
+                next_url = self.queue.pop(0)
+                ctx.guild.voice_client.play(discord.FFmpegPCMAudio(next_url))
+                await ctx.send(f'Now playing: {next_url}')
+            else:
+                await ctx.send('Queue is empty.')
 
     @commands.command(name='queue', description='Shows the current audio stream queue.')
     async def queue(self, ctx):
@@ -104,13 +113,11 @@ class Player(commands.cog):
             self
             ctx
         """
-        # Check if the bot is in a voice channel
-        if ctx.guild.voice_client is None:
-            return await ctx.send('I am not connected to a voice channel.')
+        if not self.queue:
+            await ctx.send('The queue is empty.')
         else:
-            #add url to queue
-            queue.append(url)
-
+            queue_list = '\n'.join(self.queue)
+            await ctx.send(f'Current queue:\n{queue_list}')
 
     @commands.command(name='volume', description='Sets the volume of the audio stream.')
     async def volume(self, ctx, volume: int):
@@ -121,7 +128,10 @@ class Player(commands.cog):
             ctx
             volume (int): The volume level.
         """
-        pass
+        if ctx.guild.voice_client is None:
+            return await ctx.send('I am not connected to a voice channel.')
+        ctx.guild.voice_client.source.volume = volume / 100
+        await ctx.send(f'Volume set to {volume}%')
 
     @commands.command(name='loop', description='Loops the current audio stream.')
     async def loop(self, ctx):
@@ -131,7 +141,10 @@ class Player(commands.cog):
             self
             ctx
         """
-        pass
+        if ctx.guild.voice_client is None:
+            return await ctx.send('I am not connected to a voice channel.')
+        ctx.guild.voice_client.loop = not ctx.guild.voice_client.loop
+        await ctx.send(f'Looping is now {"enabled" if ctx.guild.voice_client.loop else "disabled"}.')
 
     @commands.command(name='shuffle', description='Shuffles the current audio stream queue.')
     async def shuffle(self, ctx):
@@ -141,4 +154,12 @@ class Player(commands.cog):
             self
             ctx
         """
-        pass
+        if not self.queue:
+            await ctx.send('The queue is empty.')
+        else:
+            random.shuffle(self.queue)
+            await ctx.send('Queue shuffled.')
+
+async def setup(bot):
+    """Every cog needs a setup function like this."""
+    await bot.add_cog(MusicPlayer(bot))
