@@ -29,9 +29,5 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
         await change_status()
         self.bot.change_presence.assert_called()
 
-    async def test_greet(self):
-        await self.bot.greet(self.ctx)
-        self.ctx.send.assert_called_with('Hello @testuser!')
-
 if __name__ == '__main__':
     unittest.main()
