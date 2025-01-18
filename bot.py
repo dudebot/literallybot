@@ -101,15 +101,28 @@ async def change_status():
 	"""
 	await bot.change_presence(activity=discord.Game(next(statuslist)))
 
-@bot.command()
-#This is the decorator for commands (outside of cogs).
-async def greet(ctx):
-	"""This coroutine sends a greeting message when called by the command.
-	Note:
-		All commands must be preceded by the bot prefix.
-	"""
-	await ctx.send(f'Hello {ctx.message.author.mention}!')
-	#The bot send a message on the channel that is being invoked in and mention the invoker.
+
+# Command to dynamically reload cogs
+@bot.command(name='reload', hidden=True)
+@commands.is_owner()
+async def reload_cog(ctx, *, cog: str):
+    """This command reloads the selected cog, as long as that cog is in the `./cogs` folder.
+    
+    Args:
+        cog (str): The name of the cog to reload.
+    Note:
+        This command can be used only by the bot owner.
+        This command is hidden from the help menu.
+        This command deletes its messages after 20 seconds.
+    """
+    message = await ctx.send('Reloading...')
+    await ctx.message.delete()
+    try:
+        bot.reload_extension(f'cogs.{cog}')
+    except Exception as exc:
+        await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
+    else:
+        await message.edit(content=f'{cog} has been reloaded.', delete_after=20)
 
 
 #Grab token from the token.txt file
