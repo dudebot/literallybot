@@ -2,6 +2,7 @@ from discord.ext import commands
 import discord
 from sys import version_info as sysv
 from os import listdir
+from config import Config
 
 class Dev(commands.Cog):
 	"""This is a cog with owner-only commands.
@@ -41,7 +42,9 @@ class Dev(commands.Cog):
 		try:
 			for cog in listdir('./cogs'):
 				if cog.endswith('.py') == True:
-					self.bot.reload_extension(f'cogs.{cog[:-3]}')
+					config = Config(ctx.guild.id)
+					if cog[:-3] in config.config["cogs"]:
+						self.bot.reload_extension(f'cogs.{cog[:-3]}')
 		except Exception as exc:
 			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 		else:
@@ -129,6 +132,20 @@ class Dev(commands.Cog):
 		else:
 			await message.edit(content=f'{self.check_cog(cog)} has been reloaded.', delete_after=20)
 
+	@commands.command(name='setbotoperator', hidden=True)
+	@commands.has_permissions(administrator=True)
+	async def set_bot_operator(self, ctx, user: discord.Member):
+		"""This command sets the specified user as a bot operator if the command invoker has administrator permissions.
+		
+		Args:
+			user (discord.Member): The user to set as a bot operator.
+		Note:
+			This command can be used only by server administrators.
+			This command is hidden from the help menu.
+		"""
+		config = Config(ctx.guild.id)
+		config.add_bot_operator(user.id)
+		await ctx.send(f'{user.mention} has been set as a bot operator.')
 
 async def setup(bot):
 	"""Every cog needs a setup function like this."""

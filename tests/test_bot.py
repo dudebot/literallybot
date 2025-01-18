@@ -4,6 +4,7 @@ from discord.ext import commands, tasks
 import discord
 import os
 from bot import bot, get_prefix, change_status
+from config import Config
 
 class TestBot(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -32,6 +33,14 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
     async def test_greet(self):
         await self.bot.greet(self.ctx)
         self.ctx.send.assert_called_with('Hello @testuser!')
+
+    async def test_set_bot_operator(self):
+        config = Config(self.ctx.guild.id)
+        config.add_bot_operator = AsyncMock()
+        with patch('bot.Config', return_value=config):
+            await self.bot.set_bot_operator(self.ctx, user=self.ctx.message.author)
+            config.add_bot_operator.assert_called_with(self.ctx.message.author.id)
+            self.ctx.send.assert_called_with(f'{self.ctx.message.author.mention} has been set as a bot operator.')
 
 if __name__ == '__main__':
     unittest.main()
