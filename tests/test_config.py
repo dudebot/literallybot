@@ -11,6 +11,8 @@ class TestConfig(unittest.TestCase):
         self.server_id = 123456789
         self.config = Config(self.server_id)
         self.config_path = f"configs/{self.server_id}.json"
+        if not os.path.exists("configs"):
+            os.makedirs("configs")
 
     def tearDown(self):
         if os.path.exists(self.config_path):

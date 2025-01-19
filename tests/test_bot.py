@@ -9,7 +9,10 @@ from config import Config
 
 class TestBot(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.bot = bot
+        intents = discord.Intents.default()
+        intents.typing = False
+        intents.presences = False
+        self.bot = commands.Bot(command_prefix=get_prefix, description='A simple example of bot made with Discord.py', intents=intents)
         self.bot.load_extension = AsyncMock()
         self.bot.change_presence = AsyncMock()
         self.bot.send = AsyncMock()
