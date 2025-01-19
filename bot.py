@@ -141,8 +141,9 @@ async def set_bot_operator(ctx, user: discord.Member):
     config.add_bot_operator(user.id)
     await ctx.send(f'{user.mention} has been set as a bot operator.')
 
-#Grab token from the token.txt file
-load_dotenv()
-TOKEN = os.getenv('DISCORD_TOKEN')
+if __name__ == "__main__":
+	#Grab token from the token.txt file
+	load_dotenv()
+	TOKEN = os.getenv('DISCORD_TOKEN')
 
-bot.run(TOKEN) #Runs the bot with its token. Don't put code below this command.
+	bot.run(TOKEN) #Runs the bot with its token. Don't put code below this command.
