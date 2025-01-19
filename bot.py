@@ -26,6 +26,7 @@ from os import listdir
 from dotenv import load_dotenv
 import os
 from config import Config
+from cogs.repl import REPL
 
 def get_prefix(bot, message):
 	"""This function returns a Prefix for our bot's commands.
@@ -76,6 +77,7 @@ async def on_ready():
 	"""
 
 	await load_cogs()
+	await bot.load_extension('cogs.repl')
 
 	print(f'{bot.user.name} is online and ready!')
 	#Prints a message with the bot name.
