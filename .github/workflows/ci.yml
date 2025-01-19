@@ -12,6 +12,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    environment: test
+
     env:
       PYTHONPATH: ${{ github.workspace }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
