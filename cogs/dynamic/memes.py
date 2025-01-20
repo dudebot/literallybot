@@ -29,23 +29,25 @@ class Meme(commands.Cog):
     async def yahallo(self, ctx):
         await ctx.send(file=File("media/yahallo.mp4"))
         
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        if (message.guild 
-            and (message.guild.id == 191762537438511104 or message.guild.id == 1046929409455693905) # todo use configuration
-            and message.content.startswith('"') 
-            and message.content.endswith('"')):
-
+    # @commands.Cog.listener()
+    # async def on_message(self, message):
+    #     if (message.guild 
+    #         and (message.guild.id == 191762537438511104 or message.guild.id == 1046929409455693905) # todo use configuration
+    #         and message.content.startswith('"') 
+    #         and message.content.endswith('"')):
+    
+    @commands.command(name='quoteme', description='Mock your enemies.')
+    async def quoteme(self, ctx, *, message):
             toggled = []
-            for i, c in enumerate(message.content[1:-1].replace(' ', '  ')):
+            for i, c in enumerate(message.replace(' ', '  ')): # temporarily double spaces so they make the letters alternate correclty
                 toggled.append(c.upper() if i % 2 else c.lower())
 
             display_text = "".join(toggled).replace('  ', ' ')
-            nickname = message.author.nick or message.author.name
+            nickname = ctx.author.nick or ctx.author.name
             title = random.choice(["Someone Important","Chief Furry","Alcoholic",
                                    "Literally Who","Basically Hitler","Mayor of Foofgens",
                                    "Peta","Some random weeb"])
-            await message.channel.send(f"> {display_text}\n{nickname}\n{title}, {datetime.today().year}")
+            await ctx.send(f"> {display_text}\n{nickname}\n{title}, {datetime.today().year}")
 
 async def setup(bot):
     """Every cog needs a setup function like this."""
