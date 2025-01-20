@@ -26,7 +26,6 @@ from os import listdir
 from dotenv import load_dotenv
 import os
 from config import Config
-from cogs.repl import REPL
 
 def get_prefix(bot, message):
 	"""This function returns a Prefix for our bot's commands.
@@ -54,11 +53,19 @@ def get_prefix(bot, message):
 
 bot = commands.Bot(command_prefix=get_prefix, description='A simple example of bot made with Discord.py', intents=discord.Intents.all())
 
-# Function to load all cogs in the './cogs' directory
+# Function to load all cogs in the './cogs_static' and './cogs_dynamic' directories
 async def load_cogs():
-    for filename in listdir('./cogs'):
+    for filename in listdir('./cogs/static'):
         if filename.endswith('.py'):
-            cog_name = f'cogs.{filename[:-3]}'
+            cog_name = f'cogs.static.{filename[:-3]}'
+            try:
+                await bot.load_extension(cog_name)
+                print(f'Successfully loaded {cog_name}')
+            except Exception as e:
+                print(f'Failed to load {cog_name}: {e}')
+    for filename in listdir('./cogs/dynamic'):
+        if filename.endswith('.py'):
+            cog_name = f'cogs.dynamic.{filename[:-3]}'
             try:
                 await bot.load_extension(cog_name)
                 print(f'Successfully loaded {cog_name}')
@@ -77,8 +84,7 @@ async def on_ready():
 	"""
 
 	await load_cogs()
-	await bot.load_extension('cogs.repl')
-
+	
 	print(f'{bot.user.name} is online and ready!')
 	#Prints a message with the bot name.
 
@@ -103,45 +109,6 @@ async def change_status():
 	"""
 	await bot.change_presence(activity=discord.Game(next(statuslist)))
 
-
-# Command to dynamically reload cogs
-@bot.command(name='reload', hidden=True)
-@commands.is_owner()
-async def reload_cog(ctx, *, cog: str):
-    """This command reloads the selected cog, as long as that cog is in the `./cogs` folder.
-    
-    Args:
-        cog (str): The name of the cog to reload.
-    Note:
-        This command can be used only by the bot owner.
-        This command is hidden from the help menu.
-        This command deletes its messages after 20 seconds.
-    """
-    message = await ctx.send('Reloading...')
-    await ctx.message.delete()
-    try:
-        bot.reload_extension(f'cogs.{cog}')
-    except Exception as exc:
-        await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
-    else:
-        await message.edit(content=f'{cog} has been reloaded.', delete_after=20)
-
-
-# Command to set server admins as bot operators
-@bot.command(name='setbotoperator', hidden=True)
-@commands.has_permissions(administrator=True)
-async def set_bot_operator(ctx, user: discord.Member):
-    """This command sets the specified user as a bot operator if the command invoker has administrator permissions.
-    
-    Args:
-        user (discord.Member): The user to set as a bot operator.
-    Note:
-        This command can be used only by server administrators.
-        This command is hidden from the help menu.
-    """
-    config = Config(ctx.guild.id)
-    config.add_bot_operator(user.id)
-    await ctx.send(f'{user.mention} has been set as a bot operator.')
 
 if __name__ == "__main__":
 	#Grab token from the token.txt file
