@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import unittest
 from unittest.mock import AsyncMock, MagicMock
 from discord.ext import commands
-from cogs.tools import Tools
+from cogs.dynamic.tools import Tools
 
 class TestTools(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
