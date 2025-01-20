@@ -25,31 +25,36 @@ class Dev(commands.Cog):
 		#Prints on the shell the version of Python and Discord.py installed in our computer.
 
 
-	@commands.command(name='reloadall', hidden=True)#This command is hidden from the help menu.
+	@commands.command(name='reload', hidden=True)#This command is hidden from the help menu.
 	#This is the decorator for commands (inside of cogs).
 	@commands.is_owner()
 	#Only the owner (or owners) can use the commands decorated with this.
-	async def reload_all(self, ctx):
+	async def reload(self, ctx, cog=None):
 		"""This commands reloads all the cogs in the `./cogs` folder.
 		
 		Note:
 			This command can be used only from the bot owner.
 			This command is hidden from the help menu.
 			This command deletes its messages after 20 seconds."""
+   
+		if cog is not None:
+			cogs = [cog+".py"]
+		else:
+			cogs = listdir('./cogs/dynamic')
 
 		message = await ctx.send('Reloading...')
 		await ctx.message.delete()
 		try:
-			for cog in listdir('./cogs'):
+			for cog in cogs:
 				if cog.endswith('.py') == True:
 					config = Config(ctx.guild.id)
 					if cog[:-3] in config.config["cogs"]:
-						self.bot.reload_extension(f'cogs.{cog[:-3]}')
+						self.bot.reload_extension(f'cogs.dynamic.{cog[:-3]}')
+			ctx.send('All cogs have been reloaded.', delete_after=20)
 		except Exception as exc:
 			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 		else:
 			await message.edit(content='All cogs have been reloaded.', delete_after=20)
-
 
 	def check_cog(self, cog):
 		"""Returns the name of the cog in the correct format.
@@ -62,13 +67,13 @@ class Dev(commands.Cog):
 		Note:
 			All cognames are made lowercase with `.lower()`_.
 		"""
-		if (cog.lower()).startswith('cogs.') == True:
+		if (cog.lower()).startswith('cogs.dynamic.') == True:
 			return cog.lower()
-		return f'cogs.{cog.lower()}'
+		return f'cogs.dynamic.{cog.lower()}'
 
 	@commands.command(name='load', hidden=True)
 	@commands.is_owner()
-	async def load_cog(self, ctx, *, cog: str):
+	async def load(self, ctx, *, cog: str):
 		"""This commands loads the selected cog, as long as that cog is in the `./cogs` folder.
 				
 		Args:
@@ -82,7 +87,7 @@ class Dev(commands.Cog):
 		message = await ctx.send('Loading...')
 		await ctx.message.delete()
 		try:
-			self.bot.load_extension(self.check_cog(cog))
+			await self.bot.load_extension(self.check_cog(cog))
 		except Exception as exc:
 			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 		else:
@@ -91,7 +96,7 @@ class Dev(commands.Cog):
 
 	@commands.command(name='unload', hidden=True)
 	@commands.is_owner()
-	async def unload_cog(self, ctx, *, cog: str):
+	async def unload(self, ctx, *, cog: str):
 		"""This commands unloads the selected cog, as long as that cog is in the `./cogs` folder.
 		
 		Args:
@@ -104,33 +109,11 @@ class Dev(commands.Cog):
 		message = await ctx.send('Unloading...')
 		await ctx.message.delete()
 		try:
-			self.bot.unload_extension(self.check_cog(cog))
+			await self.bot.unload_extension(self.check_cog(cog))
 		except Exception as exc:
 			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 		else:
 			await message.edit(content=f'{self.check_cog(cog)} has been unloaded.', delete_after=20)
-
-
-	@commands.command(name='reload', hidden=True)
-	@commands.is_owner()
-	async def reload_cog(self, ctx, *, cog: str):
-		"""This commands reloads the selected cog, as long as that cog is in the `./cogs` folder.
-		
-		Args:
-			cog (str): The name of the cog to reload. The name is checked with `.check_cog(cog)`_.
-		Note:
-			This command can be used only from the bot owner.
-			This command is hidden from the help menu.
-			This command deletes its messages after 20 seconds.
-		"""
-		message = await ctx.send('Reloading...')
-		await ctx.message.delete()
-		try:
-			self.bot.reload_extension(self.check_cog(cog))
-		except Exception as exc:
-			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
-		else:
-			await message.edit(content=f'{self.check_cog(cog)} has been reloaded.', delete_after=20)
 
 	@commands.command(name='setbotoperator', hidden=True)
 	@commands.has_permissions(administrator=True)
