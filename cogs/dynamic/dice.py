@@ -1,4 +1,6 @@
+import discord
 from discord.ext import commands
+from discord import app_commands
 import random
 import re
 
@@ -51,6 +53,12 @@ class Dice(commands.Cog):
             await ctx.send(f"Results: {', '.join(map(str, results))}")
         else:
             await ctx.send("Please provide valid numbers of rolls and sides.")
+            
+    @app_commands.command(name="roll_dice", description="Roll a six-sided die.")
+    async def roll_dice(self, interaction: discord.Interaction):
+        """Rolls a six-sided die and replies with the result."""
+        result = random.randint(1, 6)
+        await interaction.response.send_message(f"🎲 You rolled a **{result}**!")
 
 async def setup(bot):
     """Every cog needs a setup function like this."""
