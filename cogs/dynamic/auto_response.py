@@ -13,7 +13,7 @@ reddit['touch grass']=['rent free','yikes','cope','seethe','cringe']
 
 def generate_karma(string):
     for key in reddit.keys():
-        if key in string.lower():
+        if string.lower().strip() == key:
             return random.choice(reddit[key])
 
 class AutoResponse(commands.Cog):
