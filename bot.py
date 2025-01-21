@@ -91,6 +91,9 @@ async def on_ready():
 	change_status.start()
 	#Starts the task `change_status`_.
 
+	await bot.tree.sync()
+	# Sync application commands with Discord
+
 
 statuslist = cycle([
 		"0101010",
