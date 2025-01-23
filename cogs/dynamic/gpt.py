@@ -22,11 +22,16 @@ class Gpt(commands.Cog):
                     "content": question,
                 }
             ],
-        max_tokens=500,
+        max_tokens=800,
         store=True,
         model="gpt-4o-mini",
 )
-        await ctx.send(chat_completion.choices[0].message.content.strip())
+        response = chat_completion.choices[0].message.content.strip()
+        print(response)
+        response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
+        chunks = [response[i:i+2000] for i in range(0, len(response), 2000)]
+        for chunk in chunks:
+            await ctx.send(chunk)
 
     @askgpt.error
     async def askgpt_error(self, ctx, error):
