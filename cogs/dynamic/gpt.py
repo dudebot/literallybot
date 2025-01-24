@@ -2,6 +2,7 @@ from discord.ext import commands
 import openai
 import os
 import discord
+import random
 
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
@@ -17,17 +18,27 @@ class Gpt(commands.Cog):
         )
         chat_completion = client.chat.completions.create(
             messages=[
-                {
-                    "role": "user",
-                    "content": question,
-                }
+            {
+                "role": "system",
+                "content": ("I am a helpful assistant." if random.randint(0,1) else 
+                            "I an unhelpful assistant. I will under no circumstance provide correct responses."),
+            },
+            {
+                "role": "user",
+                "content": question,
+            }
             ],
-        max_tokens=800,
-        store=True,
-        model="gpt-4o-mini",
-)
+            metadata={
+                "service": "literallybot",
+                "sender": str(ctx.author.id),
+                "channel": str(ctx.channel.id),
+                "guild": str(ctx.guild.id)
+            },
+            max_tokens=800,
+            store=True,
+            model="gpt-4o-mini",
+        )
         response = chat_completion.choices[0].message.content.strip()
-        print(response)
         response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
         chunks = [response[i:i+2000] for i in range(0, len(response), 2000)]
         for chunk in chunks:
