@@ -1,15 +1,17 @@
 import sys
 import os
+
+import discord
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import unittest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from discord.ext import commands
 from cogs.dynamic.setrole import SetRole
 from config import Config
 
 class TestSetRole(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.bot = commands.Bot(command_prefix="!")
+        self.bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
         self.setrole_cog = SetRole(self.bot)
         self.bot.add_cog(self.setrole_cog)
         self.ctx = MagicMock()

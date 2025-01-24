@@ -3,14 +3,21 @@ import os
 
 class Config:
     def __init__(self, server_id):
+        config_dir = "configs"
+        if not os.path.exists(config_dir):
+            os.makedirs(config_dir)
         self.server_id = server_id
-        self.config = {
-            "cogs": [],
-            "bot_operators": [],
-            "dynamic_responses": {},
-            "whitelist_roles": []
-        }
-        self.load_config()
+        self.config_path = f"{config_dir}/{server_id}.json"
+        if not os.path.exists(self.config_path):
+            self.config = {
+                "cogs": [],
+                "bot_operators": [],
+                "dynamic_responses": {},
+                "whitelist_roles": []
+            }
+            self.save_config()
+        else:
+            self.load_config()
 
     def load_config(self):
         config_path = f"configs/{self.server_id}.json"

@@ -8,7 +8,7 @@ from config import Config
 
 class TestDev(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.bot = commands.Bot(command_prefix="!")
+        self.bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
         self.dev_cog = Dev(self.bot)
         self.bot.add_cog(self.dev_cog)
         self.bot.load_extension = AsyncMock()
