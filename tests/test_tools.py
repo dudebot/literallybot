@@ -2,10 +2,9 @@ import sys
 import os
 
 import discord
-from unittest.mock import AsyncMock, MagicMock, PropertyMock  # Added PropertyMock
+from unittest.mock import AsyncMock, MagicMock, PropertyMock  # Keep PropertyMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import unittest
-from unittest.mock import AsyncMock, MagicMock
 from discord.ext import commands
 from cogs.dynamic.tools import Tools
 
@@ -13,23 +12,23 @@ class TestTools(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.bot = commands.Bot(command_prefix="!", intents=discord.Intents.default())
         self.tools_cog = Tools(self.bot)
-        self.bot.add_cog(self.tools_cog)
+        await self.bot.add_cog(self.tools_cog)  # Use await for add_cog
         self.ctx = MagicMock()
         self.ctx.send = AsyncMock()
         self.ctx.message.delete = AsyncMock()
 
     async def test_echo(self):
-        await self.tools_cog.echo(self.ctx, message="Hello, World!")
+        await self.bot.get_command('echo').callback(self.tools_cog, self.ctx, message="Hello, World!")
         self.ctx.message.delete.assert_called()
         self.ctx.send.assert_called_with("Hello, World!")
 
     async def test_ping(self):
-        type(self.bot).latency = PropertyMock(return_value=0.123)  # Use PropertyMock to mock latency
-        await self.tools_cog.ping(self.ctx)
+        type(self.bot).latency = PropertyMock(return_value=0.123)
+        await self.bot.get_command('ping').callback(self.tools_cog, self.ctx)
         self.ctx.send.assert_called_with("🏓 123 ms.")
 
     async def test_get_info(self):
-        await self.tools_cog.get_info(self.ctx)
+        await self.bot.get_command('info').callback(self.tools_cog, self.ctx)
         self.ctx.send.assert_called()
         embed = self.ctx.send.call_args[1]['embed']
         self.assertEqual(embed.title, 'Info')
