@@ -130,6 +130,40 @@ class Dev(commands.Cog):
 		config.add_bot_operator(user.id)
 		await ctx.send(f'{user.mention} has been set as a bot operator.')
 
+	@commands.Cog.listener()
+	async def on_ready(self):
+		"""Python 3.x.x - Disord.py x.x.x"""
+		pass
+
+	@commands.command()
+	async def load_cog(self, ctx, *, cog: str):
+		await ctx.send('Loading...')
+		await ctx.message.delete()
+		self.bot.load_extension(f'cogs.{cog}')
+
+	@commands.command()
+	async def unload_cog(self, ctx, *, cog: str):
+		await ctx.send('Unloading...')
+		await ctx.message.delete()
+		self.bot.unload_extension(f'cogs.{cog}')
+
+	@commands.command()
+	async def reload_cog(self, ctx, *, cog: str):
+		await ctx.send('Reloading...')
+		await ctx.message.delete()
+		self.bot.reload_extension(f'cogs.{cog}')
+
+	@commands.command()
+	async def reload_all(self, ctx):
+		await ctx.send('Reloading...')
+		await ctx.message.delete()
+		# ...logic to reload all cogs...
+
+	@commands.command()
+	async def set_bot_operator(self, ctx, *, user: discord.Member):
+		# ...logic to set bot operator...
+		await ctx.send(f'{user.mention} has been set as a bot operator.')
+
 async def setup(bot):
 	"""Every cog needs a setup function like this."""
 	await bot.add_cog(Dev(bot))

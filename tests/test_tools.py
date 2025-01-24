@@ -2,6 +2,7 @@ import sys
 import os
 
 import discord
+from unittest.mock import AsyncMock, MagicMock, PropertyMock  # Added PropertyMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import unittest
 from unittest.mock import AsyncMock, MagicMock
@@ -23,7 +24,7 @@ class TestTools(unittest.IsolatedAsyncioTestCase):
         self.ctx.send.assert_called_with("Hello, World!")
 
     async def test_ping(self):
-        self.bot.latency = 0.123
+        type(self.bot).latency = PropertyMock(return_value=0.123)  # Use PropertyMock to mock latency
         await self.tools_cog.ping(self.ctx)
         self.ctx.send.assert_called_with("🏓 123 ms.")
 
