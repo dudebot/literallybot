@@ -31,8 +31,8 @@ class TestQuote(unittest.IsolatedAsyncioTestCase):
     async def test_quote(self):
         self.quote_cog.qod = "Test quote"
         self.quote_cog.qod_auth = "Test author"
-        await self.quote_cog.quote(self.ctx)
-        self.ctx.send.assert_called_with(">>> Test quote    -_Test author_")
+        await self.quote_cog.quote(self.ctx, "Your test quote")
+        self.ctx.send.assert_called_with("Expected response")
 
 if __name__ == '__main__':
     unittest.main()

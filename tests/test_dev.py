@@ -19,11 +19,11 @@ class TestDev(unittest.IsolatedAsyncioTestCase):
         self.ctx.message.delete = AsyncMock()
 
     async def test_on_ready(self):
-        with patch('cogs.dev.sysv', new_callable=MagicMock) as mock_sysv:
+        with patch('cogs.static.dev.sysv', new_callable=MagicMock) as mock_sysv:
             mock_sysv.major = 3
             mock_sysv.minor = 8
             mock_sysv.micro = 5
-            with patch('cogs.dev.discord.__version__', '1.4.0a'):
+            with patch('cogs.static.dev.discord.__version__', '1.4.0a'):
                 await self.dev_cog.on_ready()
                 self.assertIn('Python 3.8.5 - Disord.py 1.4.0a', self.dev_cog.on_ready.__doc__)
 
@@ -54,7 +54,7 @@ class TestDev(unittest.IsolatedAsyncioTestCase):
     async def test_set_bot_operator(self):
         config = Config(self.ctx.guild.id)
         config.add_bot_operator = AsyncMock()
-        with patch('cogs.dev.Config', return_value=config):
+        with patch('cogs.static.dev.Config', return_value=config):
             await self.dev_cog.set_bot_operator(self.ctx, user=self.ctx.message.author)
             config.add_bot_operator.assert_called_with(self.ctx.message.author.id)
             self.ctx.send.assert_called_with(f'{self.ctx.message.author.mention} has been set as a bot operator.')

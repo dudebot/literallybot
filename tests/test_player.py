@@ -47,7 +47,7 @@ class TestMusicPlayer(unittest.IsolatedAsyncioTestCase):
         self.ctx.send.assert_called_with("Now playing: test_url")
 
     async def test_queue(self):
-        self.music_cog.queue = ["test_url"]
+        self.music_cog.queue_list = ["test_url"]  # Updated attribute name
         await self.music_cog.queue(self.ctx)
         self.ctx.send.assert_called_with("Current queue:\ntest_url")
 
