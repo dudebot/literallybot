@@ -31,6 +31,17 @@ class Dice(commands.Cog):
                 await ctx.send(random.choice(values))
         else:
             await ctx.send("Please provide some options.")
+            
+    @commands.command(name='order', description='Randomly orders the given options.')
+    async def order(self, ctx, *, options: str):
+        vals = get_options(options)
+        if vals:
+            random.shuffle(vals)
+            reply = "\n".join(f"{i+1}) {val}" for i, val in enumerate(vals))
+            await ctx.send(reply)
+        else:
+            await ctx.send("No valid options given.")
+
 
     @commands.command(name='diceroll', aliases=['dice','d6'], description='Rolls a dice with the specified number of sides.')
     async def dice(self, ctx, sides: int = 6):
