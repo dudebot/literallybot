@@ -8,3 +8,4 @@ setuptools
 wheel
 beautifulsoup4
 openai
+yt-dlp
