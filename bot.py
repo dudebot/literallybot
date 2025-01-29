@@ -48,7 +48,7 @@ def get_prefix(bot, message):
 		"""
 		return '!'
 
-	return ['!', '?', '>']
+	return ['!']
 
 
 bot = commands.Bot(command_prefix=get_prefix, description='A simple example of bot made with Discord.py', intents=discord.Intents.all())

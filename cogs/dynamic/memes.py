@@ -10,7 +10,7 @@ class Meme(commands.Cog):
         self.bot = bot
 
     @commands.command(name='squish', description='Cat command.')
-    async def should(self, ctx):
+    async def squish(self, ctx):
         await ctx.send(file=File("media/squish.webm"))
 
     @commands.command(name='ding', description='Cute command.')
