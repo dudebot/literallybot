@@ -1,3 +1,5 @@
+import datetime
+import random
 from discord.ext import commands
 from discord import File
 import os
@@ -6,17 +8,6 @@ class Meme(commands.Cog):
     """This is a cog with dice roll commands, including !random."""
     def __init__(self, bot):
         self.bot = bot
-
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        if message.author == self.bot.user:
-            return
-
-        if message.content.startswith('!'):
-            file_name = message.content[1:]
-            file_path = f'media/{file_name}.mp4'
-            if os.path.exists(file_path):
-                await message.channel.send(file=File(file_path))
 
     @commands.command(name='squish', description='Cat command.')
     async def should(self, ctx):
