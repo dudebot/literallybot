@@ -1,13 +1,22 @@
 from discord.ext import commands
 from discord import File
-import random
-from datetime import datetime
+import os
 
 class Meme(commands.Cog):
     """This is a cog with dice roll commands, including !random."""
     def __init__(self, bot):
         self.bot = bot
 
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author == self.bot.user:
+            return
+
+        if message.content.startswith('!'):
+            file_name = message.content[1:]
+            file_path = f'media/{file_name}.mp4'
+            if os.path.exists(file_path):
+                await message.channel.send(file=File(file_path))
 
     @commands.command(name='squish', description='Cat command.')
     async def should(self, ctx):
@@ -29,13 +38,6 @@ class Meme(commands.Cog):
     async def yahallo(self, ctx):
         await ctx.send(file=File("media/yahallo.mp4"))
         
-    # @commands.Cog.listener()
-    # async def on_message(self, message):
-    #     if (message.guild 
-    #         and (message.guild.id == 191762537438511104 or message.guild.id == 1046929409455693905) # todo use configuration
-    #         and message.content.startswith('"') 
-    #         and message.content.endswith('"')):
-    
     @commands.command(name='quoteme', description='Mock your enemies.')
     async def quoteme(self, ctx, *, message):
             toggled = []
