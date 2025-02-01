@@ -3,6 +3,7 @@ import discord
 from sys import version_info as sysv
 from os import listdir
 from config import Config
+import subprocess
 
 class Dev(commands.Cog):
 	"""This is a cog with owner-only commands.
@@ -163,6 +164,26 @@ class Dev(commands.Cog):
 	async def set_bot_operator(self, ctx, *, user: discord.Member):
 		# ...logic to set bot operator...
 		await ctx.send(f'{user.mention} has been set as a bot operator.')
+
+	@commands.command(name='update', hidden=True)
+	@commands.is_owner()
+	async def update(self, ctx):
+		"""This command executes a git pull command in the current environment to update the code.
+		
+		Note:
+			This command can be used only from the bot owner.
+			This command is hidden from the help menu.
+		"""
+		message = await ctx.send('Updating code...')
+		await ctx.message.delete()
+		try:
+			result = subprocess.run(['git', 'pull'], capture_output=True, text=True)
+			if result.returncode == 0:
+				await message.edit(content=f'Code updated successfully:\n{result.stdout}', delete_after=20)
+			else:
+				await message.edit(content=f'Error updating code:\n{result.stderr}', delete_after=20)
+		except Exception as exc:
+			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
 async def setup(bot):
 	"""Every cog needs a setup function like this."""
