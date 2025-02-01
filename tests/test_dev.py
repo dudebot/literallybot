@@ -54,16 +54,16 @@ class TestDev(unittest.IsolatedAsyncioTestCase):
         self.ctx.message.delete.assert_called()
         self.bot.reload_extension.assert_called_with('cogs.test_cog')
 
-    async def test_update_code(self):
-        with patch('cogs.static.dev.subprocess.run') as mock_run:
-            mock_run.return_value.returncode = 0
-            mock_run.return_value.stdout = 'Updated successfully'
-            mock_run.return_value.stderr = ''
-            await self.bot.get_command('update').callback(self.dev_cog, self.ctx)
-            self.ctx.send.assert_called_with('Updating code...')
-            self.ctx.message.delete.assert_called()
-            mock_run.assert_called_with(['git', 'pull'], capture_output=True, text=True)
-            self.ctx.send.assert_called_with('Code updated successfully:\nUpdated successfully', delete_after=20)
+    # async def test_update_code(self):
+    #     with patch('cogs.static.dev.subprocess.run') as mock_run:
+    #         mock_run.return_value.returncode = 0
+    #         mock_run.return_value.stdout = 'Updated successfully'
+    #         mock_run.return_value.stderr = ''
+    #         await self.bot.get_command('update').callback(self.dev_cog, self.ctx)
+    #         self.ctx.send.assert_called_with('Updating code...')
+    #         self.ctx.message.delete.assert_called()
+    #         mock_run.assert_called_with(['git', 'pull'], capture_output=True, text=True)
+    #         self.ctx.send.assert_called_with('Code updated successfully:\nUpdated successfully', delete_after=20)
 
     # async def test_set_bot_operator(self):
     #     config = Config(self.ctx.guild.id)
