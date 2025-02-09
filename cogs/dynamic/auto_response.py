@@ -10,6 +10,7 @@ reddit['cringe']=['have sex','seethe','yikes']
 reddit['rent free']=['have sex','cringe','cope']
 reddit['have sex']=['touch grass']
 reddit['touch grass']=['rent free','yikes','cope','seethe','cringe']
+reddit['same']=['accurate']
 
 def generate_karma(string):
     for key in reddit.keys():

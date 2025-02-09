@@ -4,9 +4,11 @@ Wants=network-online.target
 After=network.target
 
 [Service]
-WorkingDirectory=/path/to/discordbot
-ExecStart=/usr/bin/python3 /path/to/discordbot/discordbot.py
-ExecStop=pkill -9 -f discordbot.py
+User=dudebot
+Group=dudebot
+WorkingDirectory=/home/dudebot/literallybot
+ExecStart=/usr/bin/python3 /home/dudebot/literallybot/bot.py
+ExecStop=pkill -9 -f bot.py
 Restart=always
 RestartSec=3
 
