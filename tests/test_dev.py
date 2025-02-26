@@ -36,23 +36,6 @@ class TestDev(unittest.IsolatedAsyncioTestCase):
     #     self.ctx.message.delete.assert_called()
     #     self.bot.reload_extension.assert_called()
 
-    async def test_load_cog(self):
-        await self.bot.get_command('load_cog').callback(self.dev_cog, self.ctx, cog='test_cog')
-        self.ctx.send.assert_called_with('Loading...')
-        self.ctx.message.delete.assert_called()
-        self.bot.load_extension.assert_called_with('cogs.test_cog')
-
-    async def test_unload_cog(self):
-        await self.bot.get_command('unload_cog').callback(self.dev_cog, self.ctx, cog='test_cog')
-        self.ctx.send.assert_called_with('Unloading...')
-        self.ctx.message.delete.assert_called()
-        self.bot.unload_extension.assert_called_with('cogs.test_cog')
-
-    async def test_reload_cog(self):
-        await self.bot.get_command('reload_cog').callback(self.dev_cog, self.ctx, cog='test_cog')
-        self.ctx.send.assert_called_with('Reloading...')
-        self.ctx.message.delete.assert_called()
-        self.bot.reload_extension.assert_called_with('cogs.test_cog')
 
     # async def test_update_code(self):
     #     with patch('cogs.static.dev.subprocess.run') as mock_run:

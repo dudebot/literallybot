@@ -13,20 +13,32 @@ class Gpt(commands.Cog):
     @commands.cooldown(10, 240, commands.BucketType.guild)
     async def askgpt(self, ctx, *, question: str):
         """Ask a question to GPT-4o-mini and get a response."""
+        # Retrieve last 10 messages from channel history using async for loop
+        history = []
+        messages = []
+        async for msg in ctx.channel.history(limit=10):
+            messages.append(msg)
+        
+        
         client = openai.OpenAI(
-            api_key=os.environ.get("OPENAI_API_KEY"),  # This is the default and can be omitted
+            api_key=os.environ.get("OPENAI_API_KEY"),
         )
+        
+        for msg in reversed(messages):
+            role = "assistant" if msg.author.bot else "user"
+            history.append({"role": role, "content": f"{msg.author.display_name}: {msg.content}"})
+            
         chat_completion = client.chat.completions.create(
             messages=[
-            {
-                "role": "system",
-                "content": ("I am a helpful assistant." if random.randint(0,1) else 
-                            "I an unhelpful assistant. I will under no circumstance provide correct responses."),
-            },
-            {
-                "role": "user",
-                "content": question,
-            }
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant."
+                },
+                *history,
+                {
+                    "role": "user",
+                    "content": question,
+                }
             ],
             metadata={
                 "service": "literallybot",
