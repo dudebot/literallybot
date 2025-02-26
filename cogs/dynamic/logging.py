@@ -4,7 +4,7 @@ import random
 from datetime import datetime
 
 class Logging(commands.Cog):
-    """This is a cog with dice roll commands, including !random."""
+    """Writes status messages to """
     def __init__(self, bot):
         self.bot = bot
 

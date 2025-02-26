@@ -3,27 +3,18 @@ from discord.ext import commands
 from discord import app_commands
 import random
 import re
+from utils import smart_split
 
 
-def get_options(options):
-    if re.search(r',? ?\bor\b ?|, ?',options.lower()) is not None:
-        values = re.split(r',? ?\bor\b ?|, ?',options.lower())
-    elif ' ' in options:
-        values = options.split(' ')
-    else:
-        values = re.split(r'\W',options)
-    return [value for value in values if value != ""]
-class Dice(commands.Cog):
+class RNG(commands.Cog):
     """This is a cog with dice roll commands, including !random."""
     def __init__(self, bot):
         self.bot = bot
 
-
-
     @commands.command(name='random', description='Picks a random item from a space-separated list.')
     async def random(self, ctx, *, options: str):
         """Picks a random item from a space-separated list."""
-        values = get_options(options)
+        values = smart_split(options)
         if values:
             if random.random()<0.05:
                 await ctx.channel.send( "All of these options are terrible. Please think about your life and try later.")
@@ -34,7 +25,7 @@ class Dice(commands.Cog):
             
     @commands.command(name='order', description='Randomly orders the given options.')
     async def order(self, ctx, *, options: str):
-        vals = get_options(options)
+        vals = smart_split(options)
         if vals:
             random.shuffle(vals)
             reply = "\n".join(f"{i+1}) {val}" for i, val in enumerate(vals))
@@ -73,4 +64,4 @@ class Dice(commands.Cog):
 
 async def setup(bot):
     """Every cog needs a setup function like this."""
-    await bot.add_cog(Dice(bot))
+    await bot.add_cog(RNG(bot))
