@@ -27,11 +27,9 @@ class Dev(commands.Cog):
 
 
 	@commands.command(name='reload', hidden=True)#This command is hidden from the help menu.
-	#This is the decorator for commands (inside of cogs).
 	@commands.is_owner()
-	#Only the owner (or owners) can use the commands decorated with this.
 	async def reload(self, ctx, cog=None):
-		"""This commands reloads all the cogs in the `./cogs` folder.
+		"""This commands reloads a specific cog or all cogs in the `./cogs/dynamic` folder.
 		
 		Note:
 			This command can be used only from the bot owner.
@@ -50,12 +48,11 @@ class Dev(commands.Cog):
 				if cog.endswith('.py') == True:
 					config = Config(ctx.guild.id)
 					if cog[:-3] in config.config["cogs"]:
-						self.bot.reload_extension(f'cogs.dynamic.{cog[:-3]}')
-			ctx.send('All cogs have been reloaded.', delete_after=20)
+						await self.bot.unload_extension(f'cogs.dynamic.{cog[:-3]}')
+						await self.bot.load_extension(f'cogs.dynamic.{cog[:-3]}')
+			await message.edit(content='All cogs have been reloaded.', delete_after=20)
 		except Exception as exc:
 			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
-		else:
-			await message.edit(content='All cogs have been reloaded.', delete_after=20)
 
 	def check_cog(self, cog):
 		"""Returns the name of the cog in the correct format.
@@ -158,11 +155,22 @@ class Dev(commands.Cog):
 	async def reload_all(self, ctx):
 		await ctx.send('Reloading...')
 		await ctx.message.delete()
-		# ...logic to reload all cogs...
+		cogs = listdir('./cogs/dynamic')
+		try:
+			for cog in cogs:
+				if cog.endswith('.py') == True:
+					config = Config(ctx.guild.id)
+					if cog[:-3] in config.config["cogs"]:
+						await self.bot.unload_extension(f'cogs.dynamic.{cog[:-3]}')
+						await self.bot.load_extension(f'cogs.dynamic.{cog[:-3]}')
+			await ctx.send('All cogs have been reloaded.', delete_after=20)
+		except Exception as exc:
+			await ctx.send(f'An error has occurred: {exc}', delete_after=20)
 
 	@commands.command()
 	async def set_bot_operator(self, ctx, *, user: discord.Member):
-		# ...logic to set bot operator...
+		config = Config(ctx.guild.id)
+		config.add_bot_operator(user.id)
 		await ctx.send(f'{user.mention} has been set as a bot operator.')
 
 	@commands.command(name='update', hidden=True)
@@ -179,7 +187,10 @@ class Dev(commands.Cog):
 		try:
 			result = subprocess.run(['git', 'pull'], capture_output=True, text=True)
 			if result.returncode == 0:
-				await message.edit(content=f'Code updated successfully:\n{result.stdout}', delete_after=20)
+				commit_info = subprocess.run(['git', 'log', '-1', '--format="%H %ct"'], capture_output=True, text=True)
+				commit_hash, commit_timestamp = commit_info.stdout.strip().split()
+				await message.edit(content=f'Code updated successfully:\nCommit Hash: {commit_hash}\nTimestamp: {commit_timestamp}', delete_after=20)
+				await self.reload_all(ctx)
 			else:
 				await message.edit(content=f'Error updating code:\n{result.stderr}', delete_after=20)
 		except Exception as exc:
