@@ -1,6 +1,5 @@
 from discord.ext import commands
 import random
-import re
 
 reddit = {}
 reddit['yikes']=['have sex','rent free','seethe']
@@ -29,7 +28,7 @@ class AutoResponse(commands.Cog):
         response = generate_karma(message.content)
         if response:
             await message.channel.send(response)
-	
+    
 async def setup(bot):
     """Every cog needs a setup function like this."""
     await bot.add_cog(AutoResponse(bot))

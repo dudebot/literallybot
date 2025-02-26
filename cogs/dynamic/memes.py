@@ -5,29 +5,9 @@ from discord import File
 import os
 
 class Meme(commands.Cog):
-    """This is a cog with dice roll commands, including !random."""
+    """This is a cog with meme commands."""
     def __init__(self, bot):
         self.bot = bot
-
-    @commands.command(name='squish', description='Cat command.')
-    async def squish(self, ctx):
-        await ctx.send(file=File("media/squish.webm"))
-
-    @commands.command(name='ding', description='Cute command.')
-    async def ding(self, ctx):
-        await ctx.send(file=File("media/dingdingdoo.webm"))
-
-    @commands.command(name='aaa', aliases=["aaaa", "aaaaa", "aaaaaa", "aaaaaaa"], description='Hell command.')
-    async def aaa(self, ctx):
-        await ctx.send(file=File("media/aaaaaaaa_hd.mp4"))
-
-    @commands.command(name='pog', description='Pog command.')
-    async def pog(self, ctx):
-        await ctx.send(file=File("media/poggers.mp4"))
-
-    @commands.command(name='hi', aliases=["yahallo", "hello"], description='hi :3 command.')
-    async def yahallo(self, ctx):
-        await ctx.send(file=File("media/yahallo.mp4"))
         
     @commands.command(name='quoteme', description='Mock your enemies.')
     async def quoteme(self, ctx, *, message):
