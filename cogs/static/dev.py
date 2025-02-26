@@ -133,39 +133,6 @@ class Dev(commands.Cog):
 		"""Python 3.x.x - Disord.py x.x.x"""
 		pass
 
-	@commands.command()
-	async def load_cog(self, ctx, *, cog: str):
-		await ctx.send('Loading...')
-		await ctx.message.delete()
-		self.bot.load_extension(f'cogs.{cog}')
-
-	@commands.command()
-	async def unload_cog(self, ctx, *, cog: str):
-		await ctx.send('Unloading...')
-		await ctx.message.delete()
-		self.bot.unload_extension(f'cogs.{cog}')
-
-	@commands.command()
-	async def reload_cog(self, ctx, *, cog: str):
-		await ctx.send('Reloading...')
-		await ctx.message.delete()
-		self.bot.reload_extension(f'cogs.{cog}')
-
-	@commands.command()
-	async def reload_all(self, ctx):
-		await ctx.send('Reloading...')
-		await ctx.message.delete()
-		cogs = listdir('./cogs/dynamic')
-		try:
-			for cog in cogs:
-				if cog.endswith('.py') == True:
-					config = Config(ctx.guild.id)
-					if cog[:-3] in config.config["cogs"]:
-						await self.bot.unload_extension(f'cogs.dynamic.{cog[:-3]}')
-						await self.bot.load_extension(f'cogs.dynamic.{cog[:-3]}')
-			await ctx.send('All cogs have been reloaded.', delete_after=20)
-		except Exception as exc:
-			await ctx.send(f'An error has occurred: {exc}', delete_after=20)
 
 	@commands.command()
 	async def set_bot_operator(self, ctx, *, user: discord.Member):
@@ -193,6 +160,23 @@ class Dev(commands.Cog):
 				await self.reload_all(ctx)
 			else:
 				await message.edit(content=f'Error updating code:\n{result.stderr}', delete_after=20)
+		except Exception as exc:
+			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
+
+	@commands.command(name='list_cogs', hidden=True)
+	@commands.is_owner()
+	async def list_cogs(self, ctx):
+		"""This command lists all the cogs in the `cogs/dynamic` directory.
+		
+		Note:
+			This command can be used only from the bot owner.
+			This command is hidden from the help menu.
+		"""
+		message = await ctx.send('Listing all cogs...')
+		await ctx.message.delete()
+		try:
+			cogs = [cog[:-3] for cog in listdir('./cogs/dynamic') if cog.endswith('.py')]
+			await message.edit(content=f'Available cogs: {", ".join(cogs)}', delete_after=20)
 		except Exception as exc:
 			await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
