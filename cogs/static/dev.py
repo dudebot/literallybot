@@ -157,7 +157,7 @@ class Dev(commands.Cog):
 				commit_info = subprocess.run(['git', 'log', '-1', '--format="%H %ct"'], capture_output=True, text=True)
 				commit_hash, commit_timestamp = commit_info.stdout.strip().split()
 				await message.edit(content=f'Code updated successfully:\nCommit Hash: {commit_hash}\nTimestamp: {commit_timestamp}', delete_after=20)
-				await self.reload_all(ctx)
+				await self.reload(ctx)
 			else:
 				await message.edit(content=f'Error updating code:\n{result.stderr}', delete_after=20)
 		except Exception as exc:
