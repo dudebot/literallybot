@@ -36,7 +36,7 @@ class Signal(commands.Cog):
             lights[0].saturation = 254
         except Exception:
             await ctx.send("Signal was not sent. Maybe Gondor needs to fix the beacons?")
-	
+    
 async def setup(bot):
     """Every cog needs a setup function like this."""
     await bot.add_cog(Signal(bot))

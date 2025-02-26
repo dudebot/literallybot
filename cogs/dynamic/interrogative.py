@@ -3,7 +3,7 @@ import random
 import re
 
 class Interogative(commands.Cog):
-    """This is a cog with dice roll commands, including !random."""
+    """Ask any interrogative questions like !should I eat pizza?"""
     def __init__(self, bot):
         self.bot = bot
 
