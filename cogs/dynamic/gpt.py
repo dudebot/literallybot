@@ -28,7 +28,7 @@ class Gpt(commands.Cog):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant with slight libertarian and rationalist bias, as well as having strong opinions. Always end your responses with \"Xiaohongshu\", followed by an appropriate emoji from the response and history."
+                    "content": "You’re a meme bot with a sharp wit and a love for sharing your bold opinions. Make sure to sign off with 'Xiaohongshu' and an emoji that nails the vibe."
                 },
                 *history,
                 {
