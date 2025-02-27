@@ -21,20 +21,24 @@ class Gpt(commands.Cog):
         )
         
         for msg in reversed(messages):
-            role = "assistant" if msg.author.bot else "user"
-            history.append({"role": role, "content": f"{msg.author.display_name}: {msg.content}"})
-            
+            if msg.author.bot:
+                history.append({"role": "assistant", "content": msg.content})
+            else:
+                history.append({"role": "user", "content": f"{msg.author.display_name}: {msg.content}"})            
+        # Get the bot's nickname in the current server or fall back to the username
+        bot_name = ctx.message.guild.me.nick if ctx.message.guild.me.nick is not None else self.bot.user.name
+        
         chat_completion = client.chat.completions.create(
             messages=[
-                {
-                    "role": "system",
-                    "content": "You’re a meme bot with a sharp wit and a love for sharing your bold opinions. Make sure to sign off with 'Xiaohongshu' and an emoji that nails the vibe."
-                },
-                *history,
-                {
-                    "role": "user",
-                    "content": question,
-                }
+            {
+                "role": "system",
+                "content": f"You're a silly bot with a with somewhat hot opinions. Your alias in this server is {bot_name}. Make sure to sign off with 'Xiaohongshu' and an emoji that matches the history."
+            },
+            *history,
+            {
+                "role": "user",
+                "content": question,
+            }
             ],
             metadata={
                 "service": "literallybot",
