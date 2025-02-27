@@ -9,16 +9,12 @@ class Gpt(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name='askgpt', aliases=['gpt'], description='Ask a question to GPT.', hidden=True)
-    @commands.cooldown(10, 240, commands.BucketType.guild)
-    async def askgpt(self, ctx, *, question: str):
-        """Ask a question to GPT-4o-mini and get a response."""
+    async def process_askgpt(self, ctx, question: str):
         # Retrieve last 10 messages from channel history using async for loop
         history = []
         messages = []
         async for msg in ctx.channel.history(limit=10):
             messages.append(msg)
-        
         
         client = openai.OpenAI(
             api_key=os.environ.get("OPENAI_API_KEY"),
@@ -32,7 +28,7 @@ class Gpt(commands.Cog):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant with slight libertarian bias. Always end your responses with \"Xiaohongshu\", followed by an appropriate emoji from the history."
+                    "content": "You are a helpful assistant with slight libertarian and rationalist bias, as well as having strong opinions. Always end your responses with \"Xiaohongshu\", followed by an appropriate emoji from the response and history."
                 },
                 *history,
                 {
@@ -55,6 +51,25 @@ class Gpt(commands.Cog):
         chunks = [response[i:i+2000] for i in range(0, len(response), 2000)]
         for chunk in chunks:
             await ctx.send(chunk)
+
+    @commands.command(name='askgpt', aliases=['gpt'], description='Ask a question to GPT.', hidden=True)
+    @commands.cooldown(10, 240, commands.BucketType.guild)
+    async def askgpt(self, ctx, *, question: str):
+        await self.process_askgpt(ctx, question)
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        # Avoid processing bot messages
+        if message.author.bot:
+            return
+        # Trigger when bot is mentioned
+        if self.bot.user in message.mentions:
+            ctx = await self.bot.get_context(message)
+            # Remove the bot mention from the message
+            mention_str = f'<@!{self.bot.user.id}>'
+            question = message.content.replace(mention_str, 'assistant').strip()
+            if question:
+                await self.process_askgpt(ctx, question)
 
     @askgpt.error
     async def askgpt_error(self, ctx, error):
