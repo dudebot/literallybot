@@ -32,7 +32,7 @@ class Gpt(commands.Cog):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a helpful assistant."
+                    "content": "You are a helpful assistant with slight libertarian bias. Always end your responses with \"Xiaohongshu\", followed by an appropriate emoji from the history."
                 },
                 *history,
                 {
