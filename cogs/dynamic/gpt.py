@@ -32,13 +32,9 @@ class Gpt(commands.Cog):
             messages=[
             {
                 "role": "system",
-                "content": f"You're a silly bot with a with somewhat hot opinions. Your alias in this server is {bot_name}. Make sure to sign off with 'Xiaohongshu' and an emoji that matches the history."
+                "content": f"You're a silly bot with a with somewhat hot opinions. Your job is to balance being helpful and entertaining. Your alias in this server is {bot_name}. Your ID is {self.bot.user.id}. Make sure to sign off with 'Xiaohongshu' and an emoji that matches the history."
             },
-            *history,
-            {
-                "role": "user",
-                "content": question,
-            }
+            *history
             ],
             metadata={
                 "service": "literallybot",
