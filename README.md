@@ -32,6 +32,16 @@ LiterallyBot is a Discord bot built with discord.py. This bot includes various c
 
 2. (Optional) Configure additional settings in the `config.py` file.
 
+## GPT System Setup
+To enable GPT-based commands, add these environment variables (examples) to your .env file:
+
+```
+OPENAI_API_KEY=[your OpenAI-compatible key]
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_BASE_URL=https://api.x.ai/v1 (OPTIONAL)
+```
+
+
 ## Usage
 
 1. Run the bot:
@@ -40,6 +50,11 @@ LiterallyBot is a Discord bot built with discord.py. This bot includes various c
    ```
 
 2. The bot will be online and ready to use. You can interact with it using the defined commands.
+
+## Cog System Overview
+The bot's commands and features are split into "cogs", each defined by a class in the cogs folder. 
+Each cog self-contains related commands and logic, keeping the code well-organized. 
+You can easily expand functionality by creating additional cog files in the same directory, following the same structure and setup function.
 
 ## Commands
 
