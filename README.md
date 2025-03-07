@@ -41,6 +41,14 @@ OPENAI_MODEL=gpt-4o-mini
 OPENAI_BASE_URL=https://api.x.ai/v1 (OPTIONAL)
 ```
 
+## Danbooru System Setup
+To enable Danbooru-based commands, add these environment variables (examples) to your .env file:
+
+```
+DANBOORU_API_KEY=[your Danbooru API key]
+DANBOORU_LOGIN=[your Danbooru account name]
+```
+
 
 ## Usage
 
