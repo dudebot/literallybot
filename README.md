@@ -51,6 +51,10 @@ OPENAI_BASE_URL=https://api.x.ai/v1 (OPTIONAL)
 
 2. The bot will be online and ready to use. You can interact with it using the defined commands.
 
+## Updating a Running Server
+To pull the latest changes, call `!update` (which runs a git pull) and then `!reload` to reload all cogs. 
+If you're running the bot using systemctl, you can use `!kys` to exit, letting systemctl restart the bot automatically.
+
 ## Cog System Overview
 The bot's commands and features are split into "cogs", each defined by a class in the cogs folder. 
 Each cog self-contains related commands and logic, keeping the code well-organized. 

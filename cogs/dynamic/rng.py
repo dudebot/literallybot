@@ -34,27 +34,50 @@ class RNG(commands.Cog):
             await ctx.send("No valid options given.")
 
 
-    @commands.command(name='diceroll', aliases=['dice','d6'], description='Rolls a dice with the specified number of sides.')
-    async def dice(self, ctx, sides: int = 6):
-        """Rolls a dice with the specified number of sides."""
-        if sides > 0:
-            await ctx.send(random.randint(1, sides))
+    async def handle_dice_roll(self, arg: str) -> str:
+        pattern = r"^(?P<rolls>\d+)?d(?P<sides>\d+)$"
+        match = re.fullmatch(pattern, arg, re.IGNORECASE)
+        if not match:
+            return None  # signal that the pattern did not match
+        roll_count = int(match.group("rolls")) if match.group("rolls") else 1
+        sides = int(match.group("sides"))
+        if roll_count > 100:
+            return "Too many dice. Please roll 100 or fewer dice."
+        if not (2 <= sides <= 100):
+            return "Please use a dice with between 2 and 100 sides."
+        results = [random.randint(1, sides) for _ in range(roll_count)]
+        if roll_count == 1:
+            return f"🎲 You rolled: {results[0]}"
         else:
-            await ctx.send("Please provide a valid number of sides.")
+            return f"🎲 You rolled: {', '.join(map(str, results))} (Sum: {sum(results)})"
 
-    @commands.command(name='d20', description='Rolls a twenty-sided die.')
-    async def d20(self, ctx):
-        """Rolls a twenty-sided die."""
-        await ctx.send(random.randint(1, 20))
-
-    @commands.command(name='multidice', description='Rolls multiple dice with the specified number of sides.')
-    async def multidice(self, ctx, rolls: int, sides: int):
-        """Rolls multiple dice with the specified number of sides."""
-        if rolls > 0 and sides > 0:
-            results = [random.randint(1, sides) for _ in range(rolls)]
-            await ctx.send(f"Results: {', '.join(map(str, results))}")
+    @commands.command(name='dice', description='Roll dice in NdX format. E.g., !dice d6 or !2d20')
+    async def dice(self, ctx, *, arg: str = "d6"):
+        result = await self.handle_dice_roll(arg)
+        if result is None:
+            await ctx.send("Invalid format. Use something like d6 or 2d20.")
         else:
-            await ctx.send("Please provide valid numbers of rolls and sides.")
+            await ctx.send(result)
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot:
+            return
+
+        # Determine the command prefix.
+        prefix = self.bot.command_prefix(self.bot,message) #wonky but it works
+        prefixes = prefix if isinstance(prefix, (list, tuple)) else [prefix]
+
+        for p in prefixes:
+            if message.content.startswith(p):
+                # Grab the text after the prefix.
+                content = message.content[len(p):].strip()
+                # Only auto-handle messages that are exactly in the NdX format (no spaces)
+                if " " not in content:
+                    result = await self.handle_dice_roll(content)
+                    if result is not None:
+                        await message.channel.send(result)
+                        return
             
     @app_commands.command(name="roll_dice", description="Roll a six-sided die.")
     async def roll_dice(self, interaction: discord.Interaction):
