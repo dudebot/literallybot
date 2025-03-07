@@ -16,9 +16,16 @@ class Gpt(commands.Cog):
         async for msg in ctx.channel.history(limit=10):
             messages.append(msg)
         
-        client = openai.OpenAI(
-            api_key=os.environ.get("OPENAI_API_KEY"),
-        )
+        custom_endpoint = os.environ.get("OPENAI_BASE_URL")
+        if custom_endpoint:
+            client = openai.OpenAI(
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                base_url=custom_endpoint
+            )
+        else:
+            client = openai.OpenAI(
+                api_key=os.environ.get("OPENAI_API_KEY"),
+            )
         
         for msg in reversed(messages):
             if msg.author.bot:
@@ -44,7 +51,7 @@ class Gpt(commands.Cog):
             },
             max_tokens=800,
             store=True,
-            model="gpt-4o-mini",
+            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
         )
         response = chat_completion.choices[0].message.content.strip()
         response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
