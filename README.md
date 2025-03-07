@@ -10,16 +10,8 @@ LiterallyBot is a Discord bot built with discord.py. This bot includes various c
    cd literallybot
    ```
 
-2. Set up a virtual environment:
+2. Install the dependencies:
    ```sh
-   python -m venv venv
-   source venv/bin/activate  # On Windows use `venv\Scripts\activate`
-   ```
-
-3. Install the dependencies:
-   ```sh
-   python -m pip install --upgrade pip
-   pip install setuptools wheel
    pip install -r requirements.txt
    ```
 
@@ -63,7 +55,30 @@ HUE_BRIDGE_IP=[your Hue bridge IP]
    python bot.py
    ```
 
-2. The bot will be online and ready to use. You can interact with it using the defined commands.
+2. Set superadmin permissions with !claim_superadmin
+
+## Systemd Setup
+
+Here's an example usage of how to install the bot on systemd. Replace [your install folder], [your user], and [your group] with your actual setup:
+
+```
+[Unit]
+Description=Literally a Discord Bot
+Wants=network-online.target
+After=network.target
+
+[Service]
+User=[your user]
+Group=[your group]
+WorkingDirectory=[your install folder]/literallybot/
+ExecStart=/usr/bin/python3 [your install folder]/literallybot/bot.py
+ExecStop=pkill -9 -f bot.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ## Updating a Running Server
 To pull the latest changes, call `!update` (which runs a git pull) and then `!reload` to reload all cogs. 
