@@ -49,6 +49,12 @@ DANBOORU_API_KEY=[your Danbooru API key]
 DANBOORU_LOGIN=[your Danbooru account name]
 ```
 
+## Hue System Setup
+To enable Hue-based commands, add these environment variables (examples) to your .env file:
+
+```
+HUE_BRIDGE_IP=[your Hue bridge IP]
+```   
 
 ## Usage
 
