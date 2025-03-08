@@ -50,7 +50,6 @@ def get_prefix(bot, message):
 
     return ['!']
 
-
 bot = commands.Bot(command_prefix=get_prefix, description='A simple example of bot made with Discord.py', intents=discord.Intents.all())
 
 # Function to load all cogs in the './cogs_static' and './cogs_dynamic' directories
