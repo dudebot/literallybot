@@ -13,7 +13,7 @@ class Admin(commands.Cog):
             global_config.set("superadmin", ctx.author.id)
             await ctx.send("Superadmin claimed.")
         else:
-            await ctx.send("There can only be one superadmin.")
+            await ctx.send("There can only be one bot superadmin.")
 
     @commands.command(name="claimadmin", description="Claim admin status if you have Administrator permissions.")
     async def claimadmin(self, ctx):
@@ -28,11 +28,11 @@ class Admin(commands.Cog):
         config = Config(ctx)
         admins = config.get("admins", [])
         if ctx.author.id in admins:
-            await ctx.send("You are already an admin.")
+            await ctx.send("You are already an bot admin.")
         else:
             admins.append(ctx.author.id)
             config.set("admins", admins)
-            await ctx.send("You are now an admin of this server.")
+            await ctx.send("You are now a bot admin.")
 
     @commands.command(name="addadmin", description="Add a user as a server admin (if you're superadmin or already admin).")
     async def addadmin(self, ctx, member: discord.Member = None):
@@ -40,7 +40,7 @@ class Admin(commands.Cog):
             await ctx.send("This command cannot be used in direct messages.")
             return
         if not member:
-            await ctx.send("Please specify a user to add as admin.")
+            await ctx.send("Please specify a user to add as bot admin.")
             return
         config = Config(ctx)
         admins = config.get("admins", [])
@@ -48,14 +48,14 @@ class Admin(commands.Cog):
             ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner or 
             ctx.author.id in admins
         ):
-            await ctx.send("You don't have permission to add admins.")
+            await ctx.send("You don't have permission to add bot admins.")
             return
         if member.id in admins:
-            await ctx.send(f"{member} is already an admin.")
+            await ctx.send(f"{member} is already an bot admin.")
         else:
             admins.append(member.id)
             config.set("admins", admins)
-            await ctx.send(f"{member} has been added as an admin.")
+            await ctx.send(f"{member} has been added as an bot admin.")
 
 async def setup(bot):
     await bot.add_cog(Admin(bot))
