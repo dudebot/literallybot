@@ -207,6 +207,24 @@ class Dev(commands.Cog):
             sys.exit()
         except Exception as exc:
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
+            
+    @commands.command(name='sync', hidden=True)
+    @commands.is_owner()
+    async def sync(self, ctx):
+        """This command syncs the bot's commands with Discord.
+        
+        Note:
+            This command can be used only from the bot owner.
+            This command is hidden from the help menu.
+        """
+        message = await ctx.send('Syncing commands...')
+        await ctx.message.delete()
+        try:
+            self.bot.tree.copy_global_to(guild=ctx.guild)
+            await self.bot.tree.sync(guild=ctx.guild)
+            await message.edit(content='Commands synced successfully.', delete_after=20)
+        except Exception as exc:
+            await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
 async def setup(bot):
     """Every cog needs a setup function like this."""
