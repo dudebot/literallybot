@@ -45,7 +45,8 @@ DANBOORU_LOGIN=[your Danbooru account name]
 To enable Hue-based commands, add these environment variables (examples) to your .env file:
 
 ```
-HUE_BRIDGE_IP=[your Hue bridge IP]
+press the button on the bridge
+!sethuebridgeip [IP of your Hue Bridge]
 ```   
 
 ## Usage
