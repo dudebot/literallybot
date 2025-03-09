@@ -1,8 +1,8 @@
 from discord.ext import commands
 import openai
 import os
-import discord
-import random
+
+from config import Config
 
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
@@ -35,11 +35,15 @@ class Gpt(commands.Cog):
         # Get the bot's nickname in the current server or fall back to the username
         bot_name = ctx.message.guild.me.nick if ctx.message.guild.me.nick is not None else self.bot.user.name
         
+        prompt = Config(ctx).get("gpt_prompt")
+        if not prompt:
+            prompt = f"You are a helpful assistant. Respond to the following conversation matching the tone of the room. Make sure to end each response with Xiaohongshu followed by a contextually appropriate emoji."
+        
         chat_completion = client.chat.completions.create(
             messages=[
             {
                 "role": "system",
-                "content": f"You're a silly bot with a with somewhat hot opinions. Your job is to balance being helpful and entertaining. Your alias in this server is {bot_name}. Your ID is {self.bot.user.id}. Make sure to sign off with 'Xiaohongshu' and an emoji that matches the history."
+                "content": prompt
             },
             *history
             ],
@@ -77,6 +81,16 @@ class Gpt(commands.Cog):
             question = message.content.replace(mention_str, 'assistant').strip()
             if question:
                 await self.process_askgpt(ctx, question)
+                
+    @commands.command(name='setpersonality', description='Set the GPT personality prompt.', hidden=True)
+    async def setpersonality(self, ctx, *, personality: str):
+        config = Config(ctx)
+        admin_ids = config.get("admins")
+        if not admin_ids or ctx.author.id not in admin_ids:
+            await ctx.send("You do not have permission to use this command.")
+            return
+        config.set("gpt_prompt", personality)
+        await ctx.send("GPT personality prompt updated.")
 
     @askgpt.error
     async def askgpt_error(self, ctx, error):
