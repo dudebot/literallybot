@@ -4,6 +4,7 @@ from discord.ext import commands
 from discord import File
 import yt_dlp
 import requests
+from config import Config
 
 class Media(commands.Cog):
     def __init__(self, bot):
@@ -22,9 +23,15 @@ class Media(commands.Cog):
                     await message.channel.send(file=File(os.path.join(media_dir, file)))
                     break
 
-    @commands.command(name='addmedia', description='Download and save YouTube videos or direct file links as media files.')
-    @commands.is_owner()
+    @commands.command(name='addmedia')
     async def addmedia(self, ctx, link: str, file_name: str):
+        """Download and save YouTube videos or direct file links as media files."""
+        config = Config(ctx)
+        admin_ids = config.get("admins")
+        if not admin_ids or ctx.author.id not in admin_ids:
+            await ctx.send("You do not have permission to use this command.")
+            return
+
         file_name = file_name.lower()
         file_extension = link.split('.')[-1]
         file_path = f'media/{file_name}.{file_extension}'

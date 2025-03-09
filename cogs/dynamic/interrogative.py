@@ -8,8 +8,9 @@ class Interogative(commands.Cog):
         self.bot = bot
 
 
-    @commands.command(name='should', aliases=['would','could','can','will','does','may','might','shall','must','is','am','are','has','had','have','were','was','do','did'], description='Yes or no question. Compatible with most interrogatiges (eg is, are, will, etc).')
+    @commands.command(name='should', aliases=['would','could','can','will','does','may','might','shall','must','is','am','are','has','had','have','were','was','do','did'])
     async def should(self, ctx):
+        "Yes or no question. Compatible with most interrogatiges (eg !is, !are, !will, !shall etc)."
         if random.random()>0.5:
             await  ctx.send("No")
         else:
