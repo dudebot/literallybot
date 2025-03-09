@@ -11,7 +11,7 @@ class RNG(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name='random', description='Picks a random item from a space-separated list.')
+    @commands.command(name='random')
     async def random(self, ctx, *, options: str):
         """Picks a random item from a space-separated list."""
         values = smart_split(options)
@@ -23,8 +23,9 @@ class RNG(commands.Cog):
         else:
             await ctx.send("Please provide some options.")
             
-    @commands.command(name='order', description='Randomly orders the given options.')
+    @commands.command(name='order')
     async def order(self, ctx, *, options: str):
+        "Randomly orders the given options."
         vals = smart_split(options)
         if vals:
             random.shuffle(vals)
@@ -51,8 +52,9 @@ class RNG(commands.Cog):
         else:
             return f"🎲 You rolled: {', '.join(map(str, results))} (Sum: {sum(results)})"
 
-    @commands.command(name='dice', description='Roll dice in NdX format. E.g., !dice d6 or !2d20')
+    @commands.command(name='dice')
     async def dice(self, ctx, *, arg: str = "d6"):
+        "Roll dice in NdX format. E.g., !dice d6 or !2d20"
         result = await self.handle_dice_roll(arg)
         if result is None:
             await ctx.send("Invalid format. Use something like d6 or 2d20.")
@@ -79,7 +81,7 @@ class RNG(commands.Cog):
                         await message.channel.send(result)
                         return
             
-    @app_commands.command(name="roll_dice", description="Roll a six-sided die.")
+    @app_commands.command(name="roll_dice")
     async def roll_dice(self, interaction: discord.Interaction):
         """Rolls a six-sided die and replies with the result."""
         result = random.randint(1, 6)

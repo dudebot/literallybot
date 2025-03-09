@@ -10,7 +10,7 @@ class MusicPlayer(commands.Cog):
         self.bot = bot
         self.queue = []  # P418f
 
-    @commands.command(name='play', aliases=['p'], description='Plays a local mp3 file or a audio stream.')
+    @commands.command(name='play', aliases=['p'])
     async def play(self, ctx, *, url: str):
         """Plays a local mp3 file or a audio stream.
         
@@ -36,7 +36,7 @@ class MusicPlayer(commands.Cog):
         else:
             await ctx.send(f'Added to queue: {url}')
 
-    @commands.command(name='stop', description='Stops the audio stream.')
+    @commands.command(name='stop',)
     async def stop(self, ctx):
         """Stops the audio stream.
         
@@ -51,7 +51,7 @@ class MusicPlayer(commands.Cog):
         ctx.guild.voice_client.stop()
         await ctx.send('Audio stream stopped.')
 
-    @commands.command(name='pause', description='Pauses the audio stream.')
+    @commands.command(name='pause')
     async def pause(self, ctx):
         """Pauses the audio stream.
         
@@ -68,7 +68,7 @@ class MusicPlayer(commands.Cog):
             ctx.guild.voice_client.pause()
             await ctx.send('Audio stream paused.')
 
-    @commands.command(name='resume', description='Resumes the audio stream.')
+    @commands.command(name='resume')
     async def resume(self, ctx):
         """Resumes the audio stream.
         
@@ -85,7 +85,7 @@ class MusicPlayer(commands.Cog):
             ctx.guild.voice_client.resume()
             await ctx.send('Audio stream resumed.')
 
-    @commands.command(name='skip', description='Skips the current audio stream.')
+    @commands.command(name='skip')
     async def skip(self, ctx):
         """Skips the current audio stream.
         
@@ -105,7 +105,7 @@ class MusicPlayer(commands.Cog):
             else:
                 await ctx.send('Queue is empty.')
 
-    @commands.command(name='queue', description='Shows the current audio stream queue.')
+    @commands.command(name='queue')
     async def queue(self, ctx):
         """Shows the current audio stream queue.
         
@@ -119,7 +119,7 @@ class MusicPlayer(commands.Cog):
             queue_list = '\n'.join(self.queue)
             await ctx.send(f'Current queue:\n{queue_list}')
 
-    @commands.command(name='volume', description='Sets the volume of the audio stream.')
+    @commands.command(name='volume')
     async def volume(self, ctx, volume: int):
         """Sets the volume of the audio stream.
         
@@ -133,7 +133,7 @@ class MusicPlayer(commands.Cog):
         ctx.guild.voice_client.source.volume = volume / 100
         await ctx.send(f'Volume set to {volume}%')
 
-    @commands.command(name='loop', description='Loops the current audio stream.')
+    @commands.command(name='loop')
     async def loop(self, ctx):
         """Loops the current audio stream.
         
@@ -146,7 +146,7 @@ class MusicPlayer(commands.Cog):
         ctx.guild.voice_client.loop = not ctx.guild.voice_client.loop
         await ctx.send(f'Looping is now {"enabled" if ctx.guild.voice_client.loop else "disabled"}.')
 
-    @commands.command(name='shuffle', description='Shuffles the current audio stream queue.')
+    @commands.command(name='shuffle')
     async def shuffle(self, ctx):
         """Shuffles the current audio stream queue.
         

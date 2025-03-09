@@ -63,9 +63,10 @@ class Gpt(commands.Cog):
         for chunk in chunks:
             await ctx.send(chunk)
 
-    @commands.command(name='askgpt', aliases=['gpt'], description='Ask a question to GPT.', hidden=True)
+    @commands.command(name='gpt')
     @commands.cooldown(10, 240, commands.BucketType.guild)
     async def askgpt(self, ctx, *, question: str):
+        """Ask GPT a question."""
         await self.process_askgpt(ctx, question)
 
     @commands.Cog.listener()
@@ -82,8 +83,9 @@ class Gpt(commands.Cog):
             if question:
                 await self.process_askgpt(ctx, question)
                 
-    @commands.command(name='setpersonality', description='Set the GPT personality prompt.', hidden=True)
+    @commands.command(name='setpersonality')
     async def setpersonality(self, ctx, *, personality: str):
+        """Set the GPT personality prompt."""
         config = Config(ctx)
         admin_ids = config.get("admins")
         if not admin_ids or ctx.author.id not in admin_ids:

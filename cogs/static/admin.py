@@ -6,8 +6,9 @@ class Admin(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name="claimsuper", aliases = ["claimsuperadmin"], description="Claim the sole superadmin spot.")
+    @commands.command(name="claimsuper", aliases=["claimsuperadmin"])
     async def claimsuper(self, ctx):
+        """Claim the sole superadmin spot."""
         global_config = Config()
         if global_config.get("superadmin") is None:
             global_config.set("superadmin", ctx.author.id)
@@ -15,8 +16,9 @@ class Admin(commands.Cog):
         else:
             await ctx.send("There can only be one bot superadmin.")
 
-    @commands.command(name="claimadmin", description="Claim admin status if you have Administrator permissions.")
+    @commands.command(name="claimadmin")
     async def claimadmin(self, ctx):
+        """Claim admin status if you have Administrator permissions."""
         if ctx.guild is None:
             await ctx.send("This command cannot be used in direct messages.")
             return
@@ -28,14 +30,15 @@ class Admin(commands.Cog):
         config = Config(ctx)
         admins = config.get("admins", [])
         if ctx.author.id in admins:
-            await ctx.send("You are already an bot admin.")
+            await ctx.send("You are already a bot admin.")
         else:
             admins.append(ctx.author.id)
             config.set("admins", admins)
             await ctx.send("You are now a bot admin.")
 
-    @commands.command(name="addadmin", description="Add a user as a server admin (if you're superadmin or already admin).")
+    @commands.command(name="addadmin")
     async def addadmin(self, ctx, member: discord.Member = None):
+        """Add a user as a server admin (if you're superadmin or already admin)."""
         if ctx.guild is None:
             await ctx.send("This command cannot be used in direct messages.")
             return
