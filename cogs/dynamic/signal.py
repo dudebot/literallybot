@@ -39,6 +39,8 @@ class Signal(commands.Cog):
 
     @commands.command(name='annoydudebot', hidden=True)
     async def annoydudebot(self, ctx):
+        if ctx.author.id != 219309814856024064:
+            return
         self.flash_lights(3, 3)
         await ctx.send("signal sent")
         
