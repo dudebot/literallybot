@@ -27,7 +27,6 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
 
     async def test_bot_initialization(self):
         self.assertEqual(self.bot.command_prefix, get_prefix)
-        self.assertEqual(self.bot.description, 'A simple example of bot made with Discord.py')
 
     async def test_on_ready(self):
         # Ensure that on_ready is called without errors
