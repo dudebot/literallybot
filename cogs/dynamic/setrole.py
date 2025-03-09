@@ -7,8 +7,9 @@ class SetRole(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @commands.command(name='setrole', description='Adds or removes available roles. Optionally apply to a specified user.')
+    @commands.command(name='setrole')
     async def setrole(self, ctx, role: str, member: discord.Member = None):
+        """Adds or removes available roles. Optionally apply to a specified user."""
         config = Config(ctx)
         whitelist_roles = config.get("whitelist_roles", [])
         # Determine target; default to invoking user if no member provided.
@@ -42,8 +43,9 @@ class SetRole(commands.Cog):
         else:
             await ctx.send(f"Could not find role: {rolename}")
 
-    @commands.command(name='whitelistrole', description='Adds a role to the whitelist roles.')
+    @commands.command(name='whitelistrole')
     async def whitelistrole(self, ctx, *, role: str):
+        """Adds a role to the whitelist roles."""
         if not ctx.author.guild_permissions.manage_roles:
             await ctx.send("You need the manage roles permission to use this command.")
             return

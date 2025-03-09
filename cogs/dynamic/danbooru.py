@@ -13,6 +13,7 @@ class Danbooru(commands.Cog):
 
     @commands.command(name="danbooru")
     async def danbooru(self, ctx, *tags):
+        """Fetch a random image from Danbooru based on tags."""
         # Validate tags
         if not tags:
             await ctx.send("Usage: !danbooru tag1 tag2 ...")
