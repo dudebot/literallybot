@@ -10,11 +10,16 @@ class Gpt(commands.Cog):
         self.bot = bot
 
     async def process_askgpt(self, ctx, question: str):
-        # Retrieve last 10 messages from channel history using async for loop
         history = []
         messages = []
         async for msg in ctx.channel.history(limit=10):
             messages.append(msg)
+        
+        # Build a mapping from user IDs to display names for non-bot messages
+        user_mapping = {}
+        for msg in messages:
+            if not msg.author.bot:
+                user_mapping[str(msg.author.id)] = msg.author.display_name
         
         custom_endpoint = os.environ.get("OPENAI_BASE_URL")
         if custom_endpoint:
@@ -27,17 +32,33 @@ class Gpt(commands.Cog):
                 api_key=os.environ.get("OPENAI_API_KEY"),
             )
         
+        # Construct history with bot messages unchanged and non-bot with user ID prefix
         for msg in reversed(messages):
             if msg.author.bot:
                 history.append({"role": "assistant", "content": msg.content})
             else:
-                history.append({"role": "user", "content": f"{msg.author.display_name}: {msg.content}"})            
-        # Get the bot's nickname in the current server or fall back to the username
-        bot_name = ctx.message.guild.me.nick if ctx.message.guild.me.nick is not None else self.bot.user.name
+                history.append({"role": "user", "content": f"{msg.author.id}: {msg.content}"})            
         
-        prompt = Config(ctx).get("gpt_prompt")
-        if not prompt:
-            prompt = f"You are a helpful assistant. Respond to the following conversation matching the tone of the room. Make sure to end each response with Xiaohongshu followed by a contextually appropriate emoji."
+        # Retrieve personality prompt; use a default if not set
+        personality_prompt = Config(ctx).get("gpt_prompt")
+        if not personality_prompt:
+            personality_prompt = ("You are a helpful assistant. Respond to the following conversation "
+                                  "matching the tone of the room. Make sure to end each response with Xiaohongshu followed by a contextually appropriate emoji.")
+        
+        # Create a formatted string for the user mapping
+        mapping_str = ", ".join([f"{uid}: {name}" for uid, name in user_mapping.items()])
+        
+        # Construct the overall prompt with detailed instructions
+        prompt = (
+            "You are a helpful assistant built for engaging Discord conversations. "
+            "Below is the conversation history where each non-bot message is prefixed by the user's ID. "
+            "A mapping of user IDs to their display names is provided for reference: "
+            f"{mapping_str}. "
+            "Prefer to respond only to the most recent message in the history. "
+            "If you need to mention a user to get their attention, use the Discord text format <@[user_id]>. "
+            "User-specified personality details follow: "
+            f"{personality_prompt}"
+        )
         
         chat_completion = client.chat.completions.create(
             messages=[
