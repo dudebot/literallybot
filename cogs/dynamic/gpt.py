@@ -3,6 +3,7 @@ import openai
 import os
 
 from config import Config
+import re
 
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
@@ -20,6 +21,12 @@ class Gpt(commands.Cog):
         for msg in messages:
             if not msg.author.bot:
                 user_mapping[str(msg.author.id)] = msg.author.display_name
+                # Extract user ids from user mentions in the message (formats like <@123456> and <@!123456>)
+                mentioned_ids = [(str(user.id), user.name)  for user in msg.mentions]
+                for uid, name in mentioned_ids:
+                    if uid not in user_mapping and uid != str(self.bot.user.id):
+                        member = ctx.guild.get_member(int(uid))
+                        user_mapping[uid] = member.display_name if member else name
         
         custom_endpoint = os.environ.get("OPENAI_BASE_URL")
         if custom_endpoint:
