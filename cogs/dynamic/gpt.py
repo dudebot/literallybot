@@ -101,7 +101,7 @@ class Gpt(commands.Cog):
         
         # Update context by auto summarizing important tidbits from conversation
         #todo should be a little more comprehensive, and essentially set dynamic context window via summarizations as well
-        #await self.auto_summarize_history(ctx, messages)
+        await self.auto_summarize_history(ctx, messages)
 
     @commands.command(name='gpt')
     @commands.cooldown(10, 240, commands.BucketType.guild)
@@ -129,13 +129,12 @@ class Gpt(commands.Cog):
         config = Config(ctx)
         admin_ids = config.get("admins")
         if not admin_ids or ctx.author.id not in admin_ids:
-            await ctx.send("You do not have permission to use this command.", delete_after=10)
-            await ctx.message.delete()
+            await ctx.send("You do not have permission to use this command.")
+            
             return
         config.set("gpt_prompt", personality)
-        response = await ctx.send(f"The current personality is now: {personality}", delete_after=10)
-        await ctx.message.delete()
-
+        response = await ctx.send(f"The current personality is now: {personality}")
+        
     @askgpt.error
     async def askgpt_error(self, ctx, error):
         if isinstance(error, commands.CommandOnCooldown):
