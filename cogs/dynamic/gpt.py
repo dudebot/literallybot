@@ -134,6 +134,17 @@ class Gpt(commands.Cog):
             return
         config.set("gpt_prompt", personality)
         response = await ctx.send(f"The current personality is now: {personality}")
+
+    @commands.command(name='setbotnickname')
+    async def setbotnickname(self, ctx, *, new_nickname: str):
+        config = Config(ctx)
+        admin_ids = config.get("admins")
+        if not admin_ids or ctx.author.id not in admin_ids:
+            await ctx.send("You do not have permission to use this command.")
+            return
+        bot_member = ctx.guild.get_member(self.bot.user.id)
+        await bot_member.edit(nick=new_nickname)
+        await ctx.send(f"Bot nickname changed to {new_nickname}")
         
     @askgpt.error
     async def askgpt_error(self, ctx, error):
@@ -143,27 +154,39 @@ class Gpt(commands.Cog):
             raise error
 
     async def auto_summarize_history(self, ctx, messages):
-        # Scans messages for important tidbits and saves them with an expiration timestamp.
         config = Config(ctx)
         existing_tidbits = config.get("gpt_context_tidbits") or []
         new_tidbits = []
+        # Define regex patterns with their durations (in seconds) and type identifiers
+        patterns = [
+            {"pattern": r"you'?re\s+to\s+always\s+(.+)", "duration": 604800, "type": "directive"},
+            {"pattern": r"\bmy name(?:'s| is)?\s+([^\.,!\n]+)", "duration": 1209600, "type": "stated_name"},
+            {"pattern": r"\bcall me\s+([^\.,!\n]+)", "duration": 604800, "type": "nickname"},
+            {"pattern": r"\bI(?:'m| am)\s+(.+)", "duration": 86400, "type": "personal_statement"},
+            {"pattern": r"\bI(?: want|'?d like)\s+(.+)", "duration": 43200, "type": "desire_request"},
+            {"pattern": r"\bI love\s+(.+)", "duration": 604800, "type": "positive_preference"},
+            {"pattern": r"\bI hate\s+(.+)", "duration": 604800, "type": "negative_preference"},
+            {"pattern": r"\bremind me to\s+(.+)", "duration": 86400, "type": "reminder"},
+            {"pattern": r"\bI (?:feel|am feeling)\s+(.+)", "duration": 43200, "type": "emotional_state"},
+            {"pattern": r"\bmy birthday(?:'s| is)?\s+([^\.,!\n]+)", "duration": 2592000, "type": "birthday"},
+            {"pattern": r"\bI(?:'m| am) excited (?:about|for)\s+(.+)", "duration": 172800, "type": "enthusiasm"}
+        ]
         for msg in messages:
             content = msg.content
-            # High priority tidbit extraction (long expiration)
-            m = re.search(r"you'?re\s+to\s+always\s+(.+)", content, flags=re.I)
-            if m:
-                text = m.group(0)
-                expires = time.time() + 604800  # 7 days
-                new_tidbits.append({'text': text, 'expires': expires})
-            # Lower priority tidbit extraction (shorter expiration)
-            m2 = re.search(r"\bI(?:'m| am)\s+(.+)", content, flags=re.I)
-            if m2:
-                text = m2.group(0)
-                expires = time.time() + 86400  # 1 day
-                new_tidbits.append({'text': text, 'expires': expires})
-        # Merge new tidbits, avoiding duplicates
+            for item in patterns:
+                m = re.search(item["pattern"], content, flags=re.I)
+                if m:
+                    text = m.group(0)
+                    expires = time.time() + item["duration"]
+                    new_tidbits.append({
+                        'text': text,
+                        'expires': expires,
+                        'type': item["type"],
+                        'sender': msg.author.id
+                    })
+        # Merge new tidbits, avoiding duplicates (based on text, type, and sender)
         for nt in new_tidbits:
-            if not any(nt['text'] == t.get('text', '') for t in existing_tidbits):
+            if not any(nt['text'] == t.get('text', '') and nt['type'] == t.get('type', '') and nt['sender'] == t.get('sender') for t in existing_tidbits):
                 existing_tidbits.append(nt)
         config.set("gpt_context_tidbits", existing_tidbits)
 
