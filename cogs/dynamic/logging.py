@@ -4,7 +4,7 @@ import random
 from datetime import datetime
 
 class Logging(commands.Cog):
-    """Writes status messages to """
+    """Writes status messages to a log channel."""
     def __init__(self, bot):
         self.bot = bot
 
@@ -35,7 +35,7 @@ class Logging(commands.Cog):
             
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        if member.name in ["AIRHORN SOLUTIONS"]:
+        if member.bot:
             return
         if (after.channel is not None and "Voice Chat" in after.channel.name) or (before.channel is not None and 'Voice Chat' in before.channel.name):
             return
@@ -53,5 +53,4 @@ class Logging(commands.Cog):
                 await channel.send(f"{member.name} moved from **{before.channel.name}** to **{after.channel.name}**")
 
 async def setup(bot):
-    """Every cog needs a setup function like this."""
     await bot.add_cog(Logging(bot))
