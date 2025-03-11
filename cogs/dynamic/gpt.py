@@ -1,9 +1,10 @@
 from discord.ext import commands
 import openai
 import os
+import time
+import re
 
 from config import Config
-import re
 
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
@@ -52,6 +53,13 @@ class Gpt(commands.Cog):
             personality_prompt = ("You are a helpful assistant. Respond to the following conversation "
                                   "matching the tone of the room. Make sure to end each response with Xiaohongshu followed by a contextually appropriate emoji.")
         
+        # Retrieve saved context tidbits and build additional context string
+        context_tidbits = Config(ctx).get("gpt_context_tidbits") or []
+        # Filter out expired tidbits
+        context_tidbits = [t for t in context_tidbits if t.get('expires', 0) > time.time()]
+        tidbits_str = " ".join(t.get('text', '') for t in context_tidbits)
+        additional_context = f" Additional context: {tidbits_str}" if tidbits_str else ""
+        
         # Create a formatted string for the user mapping
         mapping_str = ", ".join([f"{uid}: {name}" for uid, name in user_mapping.items()])
         
@@ -64,7 +72,7 @@ class Gpt(commands.Cog):
             "Prefer to respond only to the most recent message in the history. "
             "If you need to mention a user to get their attention, use the Discord text format <@[user_id]>. "
             "User-specified personality details follow: "
-            f"{personality_prompt}"
+            f"{personality_prompt}{additional_context}"
         )
         
         chat_completion = client.chat.completions.create(
@@ -90,6 +98,10 @@ class Gpt(commands.Cog):
         chunks = [response[i:i+2000] for i in range(0, len(response), 2000)]
         for chunk in chunks:
             await ctx.send(chunk)
+        
+        # Update context by auto summarizing important tidbits from conversation
+        #todo should be a little more comprehensive, and essentially set dynamic context window via summarizations as well
+        #await self.auto_summarize_history(ctx, messages)
 
     @commands.command(name='gpt')
     @commands.cooldown(10, 240, commands.BucketType.guild)
@@ -117,10 +129,12 @@ class Gpt(commands.Cog):
         config = Config(ctx)
         admin_ids = config.get("admins")
         if not admin_ids or ctx.author.id not in admin_ids:
-            await ctx.send("You do not have permission to use this command.")
+            await ctx.send("You do not have permission to use this command.", delete_after=10)
+            await ctx.message.delete()
             return
         config.set("gpt_prompt", personality)
-        await ctx.send("GPT personality prompt updated.")
+        response = await ctx.send(f"The current personality is now: {personality}", delete_after=10)
+        await ctx.message.delete()
 
     @askgpt.error
     async def askgpt_error(self, ctx, error):
@@ -128,6 +142,31 @@ class Gpt(commands.Cog):
             await ctx.send(f"You are on cooldown. Try again in {error.retry_after:.2f}s")
         else:
             raise error
+
+    async def auto_summarize_history(self, ctx, messages):
+        # Scans messages for important tidbits and saves them with an expiration timestamp.
+        config = Config(ctx)
+        existing_tidbits = config.get("gpt_context_tidbits") or []
+        new_tidbits = []
+        for msg in messages:
+            content = msg.content
+            # High priority tidbit extraction (long expiration)
+            m = re.search(r"you'?re\s+to\s+always\s+(.+)", content, flags=re.I)
+            if m:
+                text = m.group(0)
+                expires = time.time() + 604800  # 7 days
+                new_tidbits.append({'text': text, 'expires': expires})
+            # Lower priority tidbit extraction (shorter expiration)
+            m2 = re.search(r"\bI(?:'m| am)\s+(.+)", content, flags=re.I)
+            if m2:
+                text = m2.group(0)
+                expires = time.time() + 86400  # 1 day
+                new_tidbits.append({'text': text, 'expires': expires})
+        # Merge new tidbits, avoiding duplicates
+        for nt in new_tidbits:
+            if not any(nt['text'] == t.get('text', '') for t in existing_tidbits):
+                existing_tidbits.append(nt)
+        config.set("gpt_context_tidbits", existing_tidbits)
 
 async def setup(bot):
     """Every cog needs a setup function like this."""
