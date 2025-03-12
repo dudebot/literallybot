@@ -95,7 +95,28 @@ class Gpt(commands.Cog):
         )
         response = chat_completion.choices[0].message.content.strip()
         response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
-        chunks = [response[i:i+2000] for i in range(0, len(response), 2000)]
+        def recursive_split(text, max_size=2000):
+            if len(text) <= max_size:
+                return [text]
+            mid = len(text) // 2
+
+            # Try splitting on delimiters in order: period with whitespace, newline, then space.
+            for pattern in [r'\n+', r'\.\s+', r'\s+']:
+                matches = list(re.finditer(pattern, text))
+                if matches:
+                    # Find the match closest to the middle.
+                    best_match = min(matches, key=lambda m: abs(m.start() - mid))
+                    split_index = best_match.end()  # split after the delimiter
+                    # Avoid degenerate splits.
+                    if split_index <= 0 or split_index >= len(text):
+                        continue
+                    left = text[:split_index].strip()
+                    right = text[split_index:].strip()
+                    return recursive_split(left, max_size) + recursive_split(right, max_size)
+                # If no delimiter was found, force a split at max_size.
+                return [text[:max_size]] + recursive_split(text[max_size:], max_size)
+
+        chunks = recursive_split(response, 2000)
         for chunk in chunks:
             await ctx.send(chunk)
         
