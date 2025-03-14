@@ -29,6 +29,9 @@ class Admin(commands.Cog):
             return
         config = Config(ctx)
         admins = config.get("admins", [])
+        if not ctx.author.id == global_superadmin and admins: # user is not a superadmin and there are already admins
+            await ctx.send("There are already admins for this server. You must be added by one of the admins with !addadmin @you.")
+            return
         if ctx.author.id in admins:
             await ctx.send("You are already a bot admin.")
         else:
