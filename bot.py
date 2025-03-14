@@ -25,7 +25,6 @@ import discord
 from os import listdir
 from dotenv import load_dotenv
 import os
-from config import Config
 
 def get_prefix(bot, message):
     """This function returns a Prefix for our bot's commands.
@@ -54,14 +53,25 @@ bot = commands.Bot(command_prefix=get_prefix, intents=discord.Intents.all())
 
 # Function to load all cogs in the './cogs_static' and './cogs_dynamic' directories
 async def load_cogs():
+    # Load Config cog first to make it available to other cogs
+    try:
+        await bot.load_extension('cogs.static.config')
+        print(f'Successfully loaded cogs.static.config')
+        # Store config cog as an attribute for easier access
+        bot.config = bot.get_cog("Config")
+    except Exception as e:
+        print(f'Failed to load cogs.static.config: {e}')
+    
+    # Load remaining cogs
     for filename in listdir('./cogs/static'):
-        if filename.endswith('.py'):
+        if filename.endswith('.py') and filename != 'config.py':  # Skip config.py as we already loaded it
             cog_name = f'cogs.static.{filename[:-3]}'
             try:
                 await bot.load_extension(cog_name)
                 print(f'Successfully loaded {cog_name}')
             except Exception as e:
                 print(f'Failed to load {cog_name}: {e}')
+                
     for filename in listdir('./cogs/dynamic'):
         if filename.endswith('.py'):
             cog_name = f'cogs.dynamic.{filename[:-3]}'
