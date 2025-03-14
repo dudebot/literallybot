@@ -36,7 +36,7 @@ class Reminders(commands.Cog):
         global_config.set("reminders", reminders)
         await ctx.send(f"Reminder set for {number} {unit_lower} from now.")
     
-    @tasks.loop(minutes=5)
+    @tasks.loop(minutes=1)
     async def check_reminders(self):
         current_time = int(time.time())
         global_config = Config()  # load global config
