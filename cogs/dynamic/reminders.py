@@ -19,13 +19,13 @@ class Reminders(commands.Cog):
           !remindme 10 minutes Check the oven
         """
         unit_lower = unit.lower()
-        if unit_lower not in ["minutes", "hours", "days", "minute", "hour", "day"]:
+        if unit_lower not in ["minutes", "hours", "days", "minute", "hour", "day", "m", "h", "d", "min", "hr"]:
             await ctx.send(f"Unit {unit} must be 'minutes', 'hours' or 'days'.")
             return
         current_time = int(time.time())
-        if unit_lower == "minutes" or unit_lower == "minute":
+        if unit_lower == "minutes" or unit_lower == "minute" or unit_lower == "m" or unit_lower == "min":
             delay = number * 60
-        elif unit_lower == "hours" or unit_lower == "hour":
+        elif unit_lower == "hours" or unit_lower == "hour" or unit_lower == "h" or unit_lower == "hr":
             delay = number * 3600
         else:
             delay = number * 86400
