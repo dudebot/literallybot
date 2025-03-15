@@ -131,7 +131,7 @@ class Gpt(commands.Cog):
         
         # Update context by auto summarizing important tidbits from conversation
         #todo should be a little more comprehensive, and essentially set dynamic context window via summarizations as well
-        await self.auto_summarize_history(ctx, messages)
+        #await self.auto_summarize_history(ctx, messages)
 
     def check_message_compliance(self, ctx, message):
         """
