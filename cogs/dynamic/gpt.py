@@ -142,7 +142,7 @@ class Gpt(commands.Cog):
                     if inside_code_block and code_delimiter:
                         header = code_delimiter + code_lang  # Preserve language specifier.
                         if not left.endswith(header):
-                            left = left + "\n" + header
+                            left = left + "\n" + "```"
                         if not right.startswith(header):
                             right = header + "\n" + right
 
@@ -172,7 +172,7 @@ class Gpt(commands.Cog):
                     left = left + "\n" + header
                 if not right.startswith(header):
                     right = header + "\n" + right
-            if inside_inline_code:
+            elif inside_inline_code:
                 if not left.endswith("`"):
                     left = left.rstrip("`") + "`"
                 if not right.startswith("`"):
