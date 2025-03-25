@@ -109,6 +109,14 @@ class Gpt(commands.Cog):
                 return [text]
             mid = len(text) // 2
 
+            # Check for code blocks and inline code
+            code_block_pattern = r'```[\s\S]*?```'
+            inline_code_pattern = r'`[^`]+`'
+            
+            # Find all code blocks and inline code in the text
+            code_blocks = list(re.finditer(code_block_pattern, text))
+            inline_codes = list(re.finditer(inline_code_pattern, text))
+            
             # Try splitting on delimiters in order: period with whitespace, newline, then space.
             for pattern in [r'\n+', r'\.\s+', r'\s+']:
                 matches = list(re.finditer(pattern, text))
@@ -116,14 +124,88 @@ class Gpt(commands.Cog):
                     # Find the match closest to the middle.
                     best_match = min(matches, key=lambda m: abs(m.start() - mid))
                     split_index = best_match.end()  # split after the delimiter
+                    
                     # Avoid degenerate splits.
                     if split_index <= 0 or split_index >= len(text):
                         continue
+                    
+                    # Check if we're splitting inside a code block
+                    inside_code_block = False
+                    code_block_language = None
+                    for block in code_blocks:
+                        if block.start() < split_index < block.end():
+                            inside_code_block = True
+                            # Extract language if present
+                            block_start = text[block.start():block.start()+10]
+                            lang_match = re.match(r'```(\w*)', block_start)
+                            code_block_language = lang_match.group(1) if lang_match else ""
+                            break
+                    
+                    # Check if we're splitting inside an inline code
+                    inside_inline_code = False
+                    for code in inline_codes:
+                        if code.start() < split_index < code.end():
+                            inside_inline_code = True
+                            break
+                    
                     left = text[:split_index].strip()
                     right = text[split_index:].strip()
+                    
+                    # Handle code block splits
+                    if inside_code_block:
+                        # Close the code block in the left part
+                        left += "\n```"
+                        # Reopen the code block in the right part with the same language
+                        right = f"```{code_block_language}\n{right}"
+                    
+                    # Handle inline code splits
+                    if inside_inline_code:
+                        # Close the inline code in the left part
+                        left += "`"
+                        # Reopen the inline code in the right part
+                        right = f"`{right}"
+                    
                     return recursive_split(left, max_size) + recursive_split(right, max_size)
-                # If no delimiter was found, force a split at max_size.
-                return [text[:max_size]] + recursive_split(text[max_size:], max_size)
+            
+            # If no suitable delimiter was found, force a split at max_size
+            # For forced splits, we need to check if we're breaking a code block
+            left = text[:max_size]
+            right = text[max_size:]
+            
+            # Check if we're splitting inside a code block
+            inside_code_block = False
+            code_block_language = None
+            for block in code_blocks:
+                if block.start() < max_size < block.end():
+                    inside_code_block = True
+                    # Extract language if present
+                    block_start = text[block.start():block.start()+10]
+                    lang_match = re.match(r'```(\w*)', block_start)
+                    code_block_language = lang_match.group(1) if lang_match else ""
+                    break
+            
+            # Check if we're splitting inside an inline code
+            inside_inline_code = False
+            for code in inline_codes:
+                if code.start() < max_size < code.end():
+                    inside_inline_code = True
+                    break
+            
+            # Handle code block splits for forced splits
+            if inside_code_block:
+                # Close the code block in the left part
+                left += "\n```"
+                # Reopen the code block in the right part with the same language
+                right = f"```{code_block_language}\n{right}"
+            
+            # Handle inline code splits for forced splits
+            if inside_inline_code:
+                # Close the inline code in the left part
+                left += "`"
+                # Reopen the inline code in the right part
+                right = f"`{right}"
+            
+            return [left] + recursive_split(right, max_size)
 
         chunks = recursive_split(response, 2000)
         for chunk in chunks:
