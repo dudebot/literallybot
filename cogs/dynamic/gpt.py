@@ -132,28 +132,32 @@ class Gpt(commands.Cog):
                     for block in code_blocks:
                         if block.start() < split_index < block.end():
                             inside_code_block = True
-                            code_delimiter = block.group(1)  # to preserve the exact delimiter (e.g. "```")
+                            code_delimiter = block.group(1)  # preserves the exact delimiter, e.g. "```"
                             break
                     
                     # Check if we're splitting inside inline code.
                     inside_inline_code = any(code.start() < split_index < code.end() for code in inline_codes)
 
-                    left = text[:split_index].strip()
-                    right = text[split_index:].strip()
+                    left = text[:split_index].rstrip()
+                    right = text[split_index:].lstrip()
 
                     if inside_code_block and code_delimiter:
-                        left += "\n" + code_delimiter
-                        right = f"{code_delimiter}\n" + right
+                        if not left.endswith(code_delimiter):
+                            left = left + "\n" + code_delimiter
+                        if not right.startswith(code_delimiter):
+                            right = code_delimiter + "\n" + right
 
                     if inside_inline_code:
-                        left += "`"
-                        right = "`" + right
-
+                        if not left.endswith("`"):
+                            left = left.rstrip("`") + "`"
+                        if not right.startswith("`"):
+                            right = "`" + right.lstrip("`")
+                    
                     return recursive_split(left, max_size) + recursive_split(right, max_size)
             
             # Forced split if no suitable delimiter is found.
-            left = text[:max_size]
-            right = text[max_size:]
+            left = text[:max_size].rstrip()
+            right = text[max_size:].lstrip()
             inside_code_block = False
             code_delimiter = None
             for block in code_blocks:
@@ -163,11 +167,15 @@ class Gpt(commands.Cog):
                     break
             inside_inline_code = any(code.start() < max_size < code.end() for code in inline_codes)
             if inside_code_block and code_delimiter:
-                left += "\n" + code_delimiter
-                right = f"{code_delimiter}\n" + right
+                if not left.endswith(code_delimiter):
+                    left = left + "\n" + code_delimiter
+                if not right.startswith(code_delimiter):
+                    right = code_delimiter + "\n" + right
             if inside_inline_code:
-                left += "`"
-                right = "`" + right
+                if not left.endswith("`"):
+                    left = left.rstrip("`") + "`"
+                if not right.startswith("`"):
+                    right = "`" + right.lstrip("`")
             return [left] + recursive_split(right, max_size)
         
         chunks = recursive_split(response, 2000)
