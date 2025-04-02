@@ -95,10 +95,11 @@ async def on_ready():
 
 
 statuslist = cycle([
-        "0101010",
-        "1010101",
+        "01010101",
+        "01110111",
+        "01010101",
+        "00100001"
     ])
-
 
 @tasks.loop(seconds=16)
 async def change_status():
