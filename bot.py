@@ -26,6 +26,19 @@ from os import listdir
 from dotenv import load_dotenv
 import os
 from config import Config
+# Logging setup
+import logging
+from logging.handlers import RotatingFileHandler
+# Ensure logs directory exists
+os.makedirs('logs', exist_ok=True)
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+    format='%(asctime)s %(levelname)s:%(name)s: %(message)s',
+    handlers=[
+        RotatingFileHandler('logs/bot.log', maxBytes=5*1024*1024, backupCount=5),
+        logging.StreamHandler()
+    ])
+logger = logging.getLogger(__name__)
 
 def get_prefix(bot, message):
     """This function returns a Prefix for our bot's commands.
@@ -51,6 +64,8 @@ def get_prefix(bot, message):
     return ['!']
 
 bot = commands.Bot(command_prefix=get_prefix, intents=discord.Intents.all())
+# Attach central logger to bot for use in cogs
+bot.logger = logger
 
 # Function to load all cogs in the './cogs_static' and './cogs_dynamic' directories
 async def load_cogs():
@@ -59,17 +74,17 @@ async def load_cogs():
             cog_name = f'cogs.static.{filename[:-3]}'
             try:
                 await bot.load_extension(cog_name)
-                print(f'Successfully loaded {cog_name}')
+                logger.info(f'Successfully loaded {cog_name}')
             except Exception as e:
-                print(f'Failed to load {cog_name}: {e}')
+                logger.error(f'Failed to load {cog_name}: {e}', exc_info=True)
     for filename in listdir('./cogs/dynamic'):
         if filename.endswith('.py'):
             cog_name = f'cogs.dynamic.{filename[:-3]}'
             try:
                 await bot.load_extension(cog_name)
-                print(f'Successfully loaded {cog_name}')
+                logger.info(f'Successfully loaded {cog_name}')
             except Exception as e:
-                print(f'Failed to load {cog_name}: {e}')
+                logger.error(f'Failed to load {cog_name}: {e}', exc_info=True)
 
 @bot.event
 #This is the decorator for events (outside of cogs).
@@ -84,15 +99,39 @@ async def on_ready():
 
     await load_cogs()
     
-    print(f'{bot.user.name} is online and ready!')
+    logger.info(f'{bot.user.name} is online and ready!')
     #Prints a message with the bot name.
 
-    change_status.start()
+    if not change_status.is_running():
+        change_status.start()
     #Starts the task `change_status`_.
 
     await bot.tree.sync()
     # Sync application commands with Discord
 
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    if isinstance(message.channel, discord.DMChannel):
+        logger.info(f'Received DM from {message.author} (ID: {message.author.id}): {message.content}')
+    await bot.process_commands(message)
+
+@bot.event
+async def on_command_error(ctx, error):
+    logger.error(f'Error in command {ctx.command}: {error}', exc_info=True)
+
+@bot.event
+async def on_command(ctx):
+    logger.info(f'Command {ctx.command} invoked by {ctx.author} (ID: {ctx.author.id}) args={ctx.args} kwargs={ctx.kwargs}')
+
+@bot.event
+async def on_command_completion(ctx):
+    logger.info(f'Command {ctx.command} completed by {ctx.author} in {ctx.channel}')
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    logger.exception(f'Unhandled exception in event {event}', exc_info=True)
 
 statuslist = cycle([
         "01010101",
@@ -118,4 +157,8 @@ if __name__ == "__main__":
     load_dotenv()
     TOKEN = os.getenv('DISCORD_TOKEN')
 
-    bot.run(TOKEN) #Runs the bot with its token. Don't put code below this command.
+    try:
+        bot.run(TOKEN)
+    except Exception:
+        logger.critical('Bot terminated unexpectedly', exc_info=True)
+    #Runs the bot with its token. Don't put code below this command.
