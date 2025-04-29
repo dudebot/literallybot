@@ -3,7 +3,6 @@ import time
 from discord.ext import commands
 from phue import Bridge, PhueRegistrationException
 import os
-from config import Config
 
 
 class Signal(commands.Cog):
@@ -13,7 +12,9 @@ class Signal(commands.Cog):
         self.bridge = None
 
     def connect_to_bridge(self):
-        self.bridge = Bridge(Config().get("hue_bridge_ip"))
+        # retrieve global hue_bridge_ip from bot.config
+        ip = self.bot.config.get(None, "hue_bridge_ip")
+        self.bridge = Bridge(ip)
         self.bridge.connect()
         self.lights = self.bridge.lights
         
@@ -46,7 +47,8 @@ class Signal(commands.Cog):
         
     @commands.command(name='sethuebridgeip', hidden=True)
     async def sethuebridgeip(self, ctx, ip: str):
-        Config().set("hue_bridge_ip", ip)
+        # store global hue_bridge_ip
+        self.bot.config.set(None, "hue_bridge_ip", ip)
         try:
             self.connect_to_bridge()
         except PhueRegistrationException as e:

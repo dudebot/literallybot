@@ -1,39 +1,61 @@
-import json, os
+import os, json
 
 class Config:
-    def __init__(self, ctx=None):
-        directory = os.path.join("configs")
-        if isinstance(ctx, int):
-            self.config_path = os.path.join(directory, f"{ctx}.json")
-        elif ctx and hasattr(ctx, 'guild') and hasattr(ctx.guild, 'id'):
-            self.config_path = os.path.join(directory, f"{ctx.guild.id}.json")
-        else:
-            self.config_path = os.path.join(directory, "global.json")
-        if not os.path.exists(directory):
-            os.makedirs(directory)
-        if not os.path.exists(self.config_path):
-            if ctx and hasattr(ctx, 'guild') and getattr(ctx.guild, 'name', None):
-                self.config = {"guild_name": ctx.guild.name}  # default with guild name included
+    def __init__(self, config_dir='configs'):
+        self.config_dir = config_dir
+        os.makedirs(self.config_dir, exist_ok=True)
+        self._configs = {}  # maps guild_id (int) or None for global to config dict
+        self._load_all()
+
+    def _load_all(self):
+        for fname in os.listdir(self.config_dir):
+            if not fname.endswith('.json'):
+                continue
+            path = os.path.join(self.config_dir, fname)
+            with open(path, 'r') as f:
+                data = json.load(f)
+            key = fname[:-5]
+            if key == 'global':
+                gid = None
             else:
-                self.config = {}
-            self.save_config()
+                try:
+                    gid = int(key)
+                except ValueError:
+                    continue
+            self._configs[gid] = data
+        # ensure global config exists
+        if None not in self._configs:
+            self._configs[None] = {}
+            self._save(None)
+
+    def _save(self, gid):
+        fname = 'global.json' if gid is None else f'{gid}.json'
+        path = os.path.join(self.config_dir, fname)
+        with open(path, 'w') as f:
+            json.dump(self._configs.get(gid, {}), f, indent=4)
+
+    def get(self, ctx, key, default=None):
+        # Determine guild key
+        if hasattr(ctx, 'guild') and getattr(ctx.guild, 'id', None) is not None:
+            gid = ctx.guild.id
+        elif isinstance(ctx, int):
+            gid = ctx
         else:
-            self.load_config()
+            gid = None
+        cfg = self._configs.setdefault(gid, {})
+        if key not in cfg:
+            cfg[key] = default
+            self._save(gid)
+        return cfg.get(key)
 
-    def load_config(self):
-        with open(self.config_path, "r") as f:
-            self.config = json.load(f)
-
-    def save_config(self):
-        with open(self.config_path, "w") as f:
-            json.dump(self.config, f, indent=4)
-
-    def get(self, key, default=None):
-        if key not in self.config:
-            self.config[key] = default
-            self.save_config()
-        return self.config.get(key, default)
-
-    def set(self, key, value):
-        self.config[key] = value
-        self.save_config()
+    def set(self, ctx, key, value):
+        # Determine guild key
+        if hasattr(ctx, 'guild') and getattr(ctx.guild, 'id', None) is not None:
+            gid = ctx.guild.id
+        elif isinstance(ctx, int):
+            gid = ctx
+        else:
+            gid = None
+        cfg = self._configs.setdefault(gid, {})
+        cfg[key] = value
+        self._save(gid)
