@@ -4,7 +4,6 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from discord.ext import commands
 import discord
 from cogs.static.dev import Dev
-from config import Config
 
 class TestDev(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

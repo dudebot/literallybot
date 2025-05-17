@@ -36,12 +36,14 @@ class Config:
 
     def get(self, ctx, key, default=None):
         # Determine guild key
-        if hasattr(ctx, 'guild') and getattr(ctx.guild, 'id', None) is not None:
+        if ctx is None:
+            gid = None # global config
+        elif hasattr(ctx, 'guild') and getattr(ctx.guild, 'id', None) is not None:
             gid = ctx.guild.id
         elif isinstance(ctx, int):
             gid = ctx
         else:
-            gid = None
+            gid = None # global config
         cfg = self._configs.setdefault(gid, {})
         if key not in cfg:
             cfg[key] = default

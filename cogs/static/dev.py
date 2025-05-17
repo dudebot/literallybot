@@ -2,7 +2,6 @@ from discord.ext import commands
 import discord
 from sys import version_info as sysv
 from os import listdir
-from config import Config
 import subprocess
 from datetime import datetime
 from utils import smart_split
@@ -139,22 +138,6 @@ class Dev(commands.Cog):
 
         await message.edit(content=response, delete_after=20)
         
-    @commands.command(name='setbotoperator', hidden=True)
-    @commands.has_permissions(administrator=True)
-    async def set_bot_operator(self, ctx, user: discord.Member):
-        """This command sets the specified user as a bot operator if the command invoker has administrator permissions.
-        
-        Args:
-            user (discord.Member): The user to set as a bot operator.
-        Note:
-            This command can be used only by server administrators.
-            This command is hidden from the help menu.
-        """
-        config = Config(ctx.guild.id)
-        config.add_bot_operator(user.id)
-        self.logger.info(f"Bot operator set: {user} (ID: {user.id}) by {ctx.author} in guild {ctx.guild.id}")
-        await ctx.send(f'{user.mention} has been set as a bot operator.')
-
     @commands.command(name='update', hidden=True)
     @commands.is_owner()
     async def update(self, ctx):
