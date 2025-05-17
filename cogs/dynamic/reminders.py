@@ -1,7 +1,6 @@
 import discord
 from discord.ext import commands, tasks
 import time
-from config import Config
 
 class Reminders(commands.Cog):
     def __init__(self, bot):
@@ -11,7 +10,7 @@ class Reminders(commands.Cog):
     def cog_unload(self):
         self.check_reminders.cancel()
     
-    @commands.command(name="remindme")
+    @commands.command(name="remindme", aliases=["setreminder"])
     async def remindme(self, ctx, number: int, unit: str, *, text: str):
         """
         Sets a reminder for the user.
@@ -30,17 +29,17 @@ class Reminders(commands.Cog):
         else:
             delay = number * 86400
         remind_time = current_time + delay
-        global_config = Config()  # load global config
-        reminders = global_config.get("reminders", [])
+        config = self.bot.config
+        reminders = config.get(None, "reminders", [])
         reminders.append({"user_id": ctx.author.id, "timestamp": remind_time, "text": text})
-        global_config.set("reminders", reminders)
+        config.set(None, "reminders", reminders)
         await ctx.send(f"Reminder set for {number} {unit_lower} from now.")
     
     @tasks.loop(minutes=1)
     async def check_reminders(self):
         current_time = int(time.time())
-        global_config = Config()  # load global config
-        reminders = global_config.get("reminders", [])
+        config = self.bot.config
+        reminders = config.get(None, "reminders", [])
         updated_reminders = []
         for reminder in reminders:
             if reminder["timestamp"] <= current_time:
@@ -58,7 +57,7 @@ class Reminders(commands.Cog):
             else:
                 updated_reminders.append(reminder)
         if len(updated_reminders) != len(reminders):
-            global_config.set("reminders", updated_reminders)
+            config.set(None, "reminders", updated_reminders)
     
     @check_reminders.before_loop
     async def before_check_reminders(self):
