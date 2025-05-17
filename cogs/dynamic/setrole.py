@@ -137,21 +137,17 @@ class SetRole(commands.Cog):
         else:
             await interaction.response.send_message("Emoji role toggle not found.", ephemeral=True)
 
-    async def _process_reaction_toggle(self, payload, add: bool):
-        guild = self.bot.get_guild(payload.guild_id)
-        if not guild:
-            return
-        Dummy = type("Dummy", (), {})
-        dummy = Dummy()
-        dummy.guild = guild
-        config = self.bot.config
-        toggles = config.get("emoji_role_toggles", {})
+    async def _process_reaction_toggle(self, payload, add: bool):  
+        toggles = self.bot.config.get(payload.guild_id, "emoji_role_toggles", {})
         msg_key = str(payload.message_id)
         if msg_key not in toggles:
             return
         mapping = toggles[msg_key]
         emoji_identifier = str(payload.emoji.id) if payload.emoji.id else payload.emoji.name
         if emoji_identifier not in mapping:
+            return
+        guild = self.bot.get_guild(payload.guild_id)
+        if not guild:
             return
         member = guild.get_member(payload.user_id)
         if not member:
