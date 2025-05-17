@@ -7,7 +7,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 import unittest
 from discord.ext import commands
 from bot import bot, get_prefix, change_status
-from config import Config
 
 class TestBot(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
