@@ -10,7 +10,7 @@ class Reminders(commands.Cog):
     def cog_unload(self):
         self.check_reminders.cancel()
     
-    @commands.command(name="remindme")
+    @commands.command(name="remindme", aliases=["setreminder"])
     async def remindme(self, ctx, number: int, unit: str, *, text: str):
         """
         Sets a reminder for the user.
