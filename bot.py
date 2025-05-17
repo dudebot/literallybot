@@ -66,6 +66,7 @@ def get_prefix(bot, message):
 bot = commands.Bot(command_prefix=get_prefix, intents=discord.Intents.all())
 # Attach central logger to bot for use in cogs
 bot.logger = logger
+bot.config = Config()
 
 # Function to load all cogs in the './cogs_static' and './cogs_dynamic' directories
 async def load_cogs():

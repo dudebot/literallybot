@@ -7,7 +7,6 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from discord.ext import commands
 from cogs.dynamic.setrole import SetRole
-from config import Config
 
 class TestSetRole(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
