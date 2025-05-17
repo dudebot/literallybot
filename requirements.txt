@@ -1,7 +1,6 @@
 discord.py
 phue
 python-dotenv
-youtube_dl
 beautifulsoup4
 openai
 yt-dlp
