@@ -4,12 +4,11 @@ import os
 import time
 import re
 
-from config import Config
-
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
     def __init__(self, bot):
         self.bot = bot
+        self.logger = bot.logger
 
     async def process_askgpt(self, ctx, question: str):
         history = []
@@ -30,14 +29,18 @@ class Gpt(commands.Cog):
                         user_mapping[uid] = member.display_name if member else name
         
         custom_endpoint = os.environ.get("OPENAI_BASE_URL")
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            self.logger.warn("OPENAI_API_KEY is not set. Exiting process_askgpt.")
+            return
         if custom_endpoint:
             client = openai.OpenAI(
-                api_key=os.environ.get("OPENAI_API_KEY"),
+                api_key=api_key,
                 base_url=custom_endpoint
             )
         else:
             client = openai.OpenAI(
-                api_key=os.environ.get("OPENAI_API_KEY"),
+                api_key=api_key,
             )
         
         # Construct history with bot messages unchanged and non-bot with user ID prefix
@@ -48,13 +51,13 @@ class Gpt(commands.Cog):
                 history.append({"role": "user", "content": f"{msg.author.id}: {msg.content}"})            
         
         # Retrieve personality prompt; use a default if not set
-        personality_prompt = Config(ctx).get("gpt_prompt")
+        personality_prompt = self.bot.config.get(ctx, "gpt_prompt")
         if not personality_prompt:
             personality_prompt = ("You are a helpful assistant. Respond to the following conversation "
                                   "matching the tone of the room. Make sure to end each response with Xiaohongshu followed by a contextually appropriate emoji.")
         
         # Retrieve saved context tidbits and build additional context string
-        context_tidbits = Config(ctx).get("gpt_context_tidbits") or []
+        context_tidbits = self.bot.config.get(ctx, "gpt_context_tidbits") or []
         # Filter out expired tidbits
         context_tidbits = [t for t in context_tidbits if t.get('expires', 0) > time.time()]
         tidbits_str = " ".join(t.get('text', '') for t in context_tidbits)
@@ -222,19 +225,19 @@ class Gpt(commands.Cog):
     @commands.command(name='setpersonality')
     async def setpersonality(self, ctx, *, personality: str):
         """Set the GPT personality prompt."""
-        config = Config(ctx)
-        admin_ids = config.get("admins")
+        config = self.bot.config
+        admin_ids = config.get(ctx, "admins")
         if not admin_ids or ctx.author.id not in admin_ids:
             await ctx.send("You do not have permission to use this command.")
             
             return
-        config.set("gpt_prompt", personality)
+        config.set(ctx, "gpt_prompt", personality)
         response = await ctx.send(f"The current personality is now: {personality}")
 
     @commands.command(name='setbotnickname')
     async def setbotnickname(self, ctx, *, new_nickname: str):
-        config = Config(ctx)
-        admin_ids = config.get("admins")
+        config = self.bot.config
+        admin_ids = config.get(ctx, "admins")
         if not admin_ids or ctx.author.id not in admin_ids:
             await ctx.send("You do not have permission to use this command.")
             return
@@ -250,8 +253,8 @@ class Gpt(commands.Cog):
             raise error
 
     async def auto_summarize_history(self, ctx, messages):
-        config = Config(ctx)
-        existing_tidbits = config.get("gpt_context_tidbits") or []
+        config = self.bot.config
+        existing_tidbits = config.get(ctx, "gpt_context_tidbits") or []
         new_tidbits = []
         # Define regex patterns with their durations (in seconds) and type identifiers
         patterns = [
@@ -284,7 +287,7 @@ class Gpt(commands.Cog):
         for nt in new_tidbits:
             if not any(nt['text'] == t.get('text', '') and nt['type'] == t.get('type', '') and nt['sender'] == t.get('sender') for t in existing_tidbits):
                 existing_tidbits.append(nt)
-        config.set("gpt_context_tidbits", existing_tidbits)
+        config.set(ctx, "gpt_context_tidbits", existing_tidbits)
 
 async def setup(bot):
     """Every cog needs a setup function like this."""

@@ -60,22 +60,22 @@ class SetRole(commands.Cog):
     # Modified: App Command for setting up emoji role toggle; change message_id to string and convert to int.
     @discord.app_commands.command(name="setemojiroletoggle", description="Configure a reaction role toggle (mod-only)")
     @discord.app_commands.default_permissions(manage_messages=True)
-    async def setemojiroletoggle(self, interaction: discord.Interaction, message_id: str, emoji: str, role: discord.Role):
+    async def setemojiroletoggle(self, ctx: discord.Interaction, message_id: str, emoji: str, role: discord.Role):
         try:
             msg_id_int = int(message_id)
         except Exception as e:
-            await interaction.response.send_message(f"Invalid message ID provided: {e}", ephemeral=True)
+            await ctx.response.send_message(f"Invalid message ID provided: {e}", ephemeral=True)
             return
         # Convert emoji string to PartialEmoji
         try:
             partial_emoji = discord.PartialEmoji.from_str(emoji)
         except Exception as e:
-            await interaction.response.send_message(f"Invalid emoji provided: {e}", ephemeral=True)
+            await ctx.response.send_message(f"Invalid emoji provided: {e}", ephemeral=True)
             return
 
-        guild = interaction.guild
+        guild = ctx.guild
         if not guild:
-            await interaction.response.send_message("This command must be used in a guild.", ephemeral=True)
+            await ctx.response.send_message("This command must be used in a guild.", ephemeral=True)
             return
 
         # For custom emoji: if the emoji isn't in the guild, fetch and add it.
@@ -85,7 +85,7 @@ class SetRole(commands.Cog):
                 async with aiohttp.ClientSession() as session:
                     async with session.get(partial_emoji.url) as resp:
                         if resp.status != 200:
-                            await interaction.response.send_message("Failed to fetch emoji image.", ephemeral=True)
+                            await ctx.response.send_message("Failed to fetch emoji image.", ephemeral=True)
                             return
                         image_data = await resp.read()
                 new_emoji = await guild.create_custom_emoji(name=partial_emoji.name, image=image_data)
@@ -93,23 +93,23 @@ class SetRole(commands.Cog):
 
         # Pre-populate the reaction on the target message.
         try:
-            message = await interaction.channel.fetch_message(msg_id_int)
+            message = await ctx.channel.fetch_message(msg_id_int)
             await message.add_reaction(partial_emoji)
         except Exception as e:
-            await interaction.response.send_message(f"Failed to add reaction to the message: {e}", ephemeral=True)
+            await ctx.response.send_message(f"Failed to add reaction to the message: {e}", ephemeral=True)
             return
 
         # Store the emoji-role mapping; use emoji.id (as string) for custom emoji, else emoji.name.
         key = str(partial_emoji.id) if partial_emoji.id else partial_emoji.name
         config = self.bot.config
-        toggles = config.get(interaction, "emoji_role_toggles", {})
+        toggles = config.get(ctx, "emoji_role_toggles", {})
         msg_key = str(msg_id_int)
         if msg_key not in toggles:
             toggles[msg_key] = {}
         toggles[msg_key][key] = role.id
-        config.set(interaction, "emoji_role_toggles", toggles)
+        config.set(ctx, "emoji_role_toggles", toggles)
 
-        await interaction.response.send_message("Emoji role toggle configured.", ephemeral=True)
+        await ctx.response.send_message("Emoji role toggle configured.", ephemeral=True)
 
     @discord.app_commands.command(name="removeemojiroletoggle", description="Remove a reaction role toggle (mod-only)")
     @discord.app_commands.default_permissions(manage_messages=True)
@@ -136,9 +136,6 @@ class SetRole(commands.Cog):
             await interaction.response.send_message("Emoji role toggle removed.", ephemeral=True)
         else:
             await interaction.response.send_message("Emoji role toggle not found.", ephemeral=True)
-
-    # New: UI components for removing toggle via dropdown
-    import discord.ui
 
     async def _process_reaction_toggle(self, payload, add: bool):
         guild = self.bot.get_guild(payload.guild_id)
