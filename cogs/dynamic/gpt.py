@@ -94,7 +94,7 @@ class Gpt(commands.Cog):
                 "channel": str(ctx.channel.id),
                 "guild": str(ctx.guild.id)
             },
-            max_tokens=800,
+            max_tokens=3000,
             store=True,
             model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
         )
