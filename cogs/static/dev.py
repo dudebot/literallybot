@@ -148,22 +148,82 @@ class Dev(commands.Cog):
             This command is hidden from the help menu.
         """
         self.logger.info(f"{ctx.author} invoked update command")
-        message = await ctx.send('Updating code...')
-        await ctx.message.delete()
+        message = await ctx.send('Attempting to update code via git pull...')
         try:
-            result = subprocess.run(['git', 'pull'], capture_output=True, text=True)
+            # Delete the command message if possible, but don't fail if it's already gone or permissions are an issue
+            try:
+                await ctx.message.delete()
+            except discord.HTTPException:
+                self.logger.warning("Could not delete update command message, it might have been already deleted or permissions are missing.")
+
+            # Execute git pull
+            result = subprocess.run(['git', 'pull'], capture_output=True, text=True, check=False)
+
+            stdout_output = result.stdout.strip() if result.stdout else ""
+            stderr_output = result.stderr.strip() if result.stderr else ""
+
             if result.returncode == 0:
-                self.logger.info(f"Git pull success: {result.stdout.strip()}")
-                commit_info = subprocess.run(['git', 'log', '-1', '--format="%H %ct"'], capture_output=True, text=True)
-                commit_hash, commit_timestamp = commit_info.stdout.replace("\"","").strip().split()
-                human_time = datetime.fromtimestamp(int(commit_timestamp)).strftime("%Y-%m-%d %H:%M")
-                await message.edit(content=f'Code updated successfully:\nCommit Hash: {commit_hash}\nTimestamp: {human_time}', delete_after=20)
-            else:
-                self.logger.error(f"Git pull error: {result.stderr.strip()}")
-                await message.edit(content=f'Error updating code:\n{result.stderr}', delete_after=20)
+                self.logger.info(f"Git pull successful. Output: {stdout_output if stdout_output else 'No output.'}")
+                
+                commit_hash = "N/A"
+                human_time = "N/A"
+                try:
+                    commit_info_result = subprocess.run(
+                        ['git', 'log', '-1', '--format="%H %ct"'], 
+                        capture_output=True, text=True, check=False
+                    )
+                    if commit_info_result.returncode == 0 and commit_info_result.stdout:
+                        parsed_commit_hash, commit_timestamp_str = commit_info_result.stdout.replace("\"", "").strip().split()
+                        commit_timestamp = int(commit_timestamp_str)
+                        commit_hash = parsed_commit_hash
+                        human_time = datetime.fromtimestamp(commit_timestamp).strftime("%Y-%m-%d %H:%M")
+                    else:
+                        self.logger.warning(f"Failed to get commit info after successful pull. Git log stderr: {commit_info_result.stderr.strip() if commit_info_result.stderr else 'None'}")
+                except Exception as e_commit:
+                    self.logger.warning(f"Error processing commit info after successful pull: {e_commit}")
+
+                response_content = (
+                    f'Code update pull completed successfully!\n'
+                    f'Current Commit Hash: {commit_hash}\n'
+                    f'Commit Timestamp: {human_time}\n\n'
+                )
+                if stdout_output:
+                    response_content += f'Git Pull Output:\n```\n{stdout_output}\n```'
+                else:
+                    response_content += 'No specific output from git pull.'
+                
+                await message.edit(content=response_content, delete_after=60)
+            
+            else: # result.returncode != 0, git pull encountered issues
+                log_message_parts = [f"Git pull command finished with return code {result.returncode}."]
+                if stdout_output: log_message_parts.append(f"Stdout: {stdout_output}")
+                if stderr_output: log_message_parts.append(f"Stderr: {stderr_output}")
+                full_log_message = "\n".join(log_message_parts)
+
+                user_message_content = f"Git pull finished with return code {result.returncode}.\n"
+                if stdout_output:
+                    user_message_content += f"Output:\n```\n{stdout_output}\n```\n"
+                if stderr_output:
+                    user_message_content += f"Errors:\n```\n{stderr_output}\n```\n"
+
+                if "Permission denied" in stderr_output or "unable to unlink" in stderr_output or "failed to unlink" in stderr_output:
+                    self.logger.warning(f"Git pull encountered permission issues. {full_log_message}")
+                    user_message_content += ("\n**Some files may not have been updated due to permission issues** (e.g., unable to delete old files). "
+                                             "The bot continues to run. You might need to resolve permissions manually. "
+                                             "Consider reloading cogs if applicable after resolving.")
+                else:
+                    self.logger.error(f"Git pull failed. {full_log_message}")
+                    user_message_content += ("\n**The code update may have failed or is incomplete.** "
+                                             "The bot continues to run. Check the output above and bot logs for details.")
+                
+                await message.edit(content=user_message_content, delete_after=180) # Keep message much longer for review
+
         except Exception as exc:
-            self.logger.error("Exception during update", exc_info=True)
-            await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
+            self.logger.error("Exception during update command execution", exc_info=True)
+            try:
+                await message.edit(content=f'An unexpected error occurred during the update command: {exc}\nThe bot continues to run.', delete_after=60)
+            except discord.HTTPException: # If message itself is gone
+                self.logger.error(f"Failed to send update error to Discord, message gone. Error: {exc}")
 
     @commands.command(name='list_cogs', hidden=True)
     @commands.is_owner()
