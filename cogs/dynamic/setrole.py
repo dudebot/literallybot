@@ -5,6 +5,7 @@ class SetRole(commands.Cog):
     """This is a cog with role commands."""
     def __init__(self, bot):
         self.bot = bot
+        self.logger = bot.logger
 
     @commands.command(name='setrole')
     async def setrole(self, ctx, role: str, member: discord.Member = None):
@@ -161,7 +162,7 @@ class SetRole(commands.Cog):
             else:
                 await member.remove_roles(target_role)
         except Exception as e:
-            print("Error toggling role:", e)
+            self.logger.error(f"Error toggling role: {e}")
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload):
