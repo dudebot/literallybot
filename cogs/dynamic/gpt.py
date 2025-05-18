@@ -3,6 +3,7 @@ import openai
 import os
 import time
 import re
+import asyncio  # Add asyncio import
 from datetime import datetime # Added for memory timestamp formatting
 
 class Gpt(commands.Cog):
@@ -111,10 +112,12 @@ class Gpt(commands.Cog):
                         f"- User {sender_display_name} ({sender_id_str}): \"{memory_text}\" (Type: {memory_type}, Stored: {stored_at_str})"
                     )
                 prompt_parts.append("Use these memories to inform your responses appropriately, remembering they are statements from users, not your own.")
-
             prompt = "\n".join(prompt_parts)
             
-            chat_completion = client.chat.completions.create(
+            # Run the API call in a non-blocking way using asyncio.to_thread
+            # This prevents blocking the event loop and heartbeat issues
+            chat_completion = await asyncio.to_thread(
+                client.chat.completions.create,
                 messages=[
                 {
                     "role": "system",
@@ -130,7 +133,7 @@ class Gpt(commands.Cog):
                 },
                 max_tokens=3000,
                 store=True,
-                model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+                model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
             )
             response = chat_completion.choices[0].message.content.strip()
             response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
