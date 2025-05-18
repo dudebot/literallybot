@@ -16,16 +16,13 @@ class Logging(commands.Cog):
         channel = self.get_log_channel(member.guild)
         if not channel:
             return
-        if member.guild.id == 125817769923969024:
-            await channel.send(f"<@{member.id}>, DM this bot with a \"Kong Strong!\" for the kong role.")
-        else:
-            await channel.send(f"Welcome <@{member.id}>")
+        await channel.send(f"Welcome <@{member.id}>")
             
     @commands.Cog.listener()
     async def on_member_remove(self, member):
         channel = self.get_log_channel(member.guild)
         if channel:
-            await channel.send(f"We sure told <@{member.id}> AKA {member.name}")
+            await channel.send(f"<@{member.id}> AKA {member.name} has left the server")
 
     @commands.Cog.listener()
     async def on_member_update(self, before, after):

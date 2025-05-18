@@ -86,9 +86,16 @@ To pull the latest changes, call `!update` (which runs a git pull) and then `!re
 If you're running the bot using systemctl, you can use `!kys` to exit, letting systemctl restart the bot automatically.
 
 ## Cog System Overview
-The bot's commands and features are split into "cogs", each defined by a class in the cogs folder. 
-Each cog self-contains related commands and logic, keeping the code well-organized. 
+The bot\'s commands and features are split into \"cogs\", each defined by a class in the cogs folder. 
 You can easily expand functionality by creating additional cog files in the same directory, following the same structure and setup function.
+
+### Cog Ontology
+The cogs are organized into two main categories:
+
+*   **Static Cogs (`cogs/static`):** These cogs are essential for the bot's fundamental operation, security, administration, and development lifecycle. They are expected to be always loaded and are critical for the bot's stability and manageability. Examples include `admin.py` (for bot administration) and `dev.py` (for owner-only development commands).
+*   **Dynamic Cogs (`cogs/dynamic`):** These cogs provide specific user-facing features, integrations, or entertainment. They can be added, removed, or updated more frequently without destabilizing the core bot. They represent the primary way to extend the bot's functionality. Examples include `gpt.py` (for AI chat), `player.py` (for music playback), and `rng.py` (for dice rolls).
+
+This distinction helps in managing the bot's architecture and allows for modular development.
 
 ## Commands
 
