@@ -31,7 +31,7 @@ class Gpt(commands.Cog):
         custom_endpoint = os.environ.get("OPENAI_BASE_URL")
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
-            self.logger.warn("OPENAI_API_KEY is not set. Exiting process_askgpt.")
+            self.logger.warning("OPENAI_API_KEY is not set. Exiting process_askgpt.")
             return
         if custom_endpoint:
             client = openai.OpenAI(

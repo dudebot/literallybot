@@ -25,7 +25,7 @@ import discord
 from os import listdir
 from dotenv import load_dotenv
 import os
-from config import Config
+from core.config import Config
 # Logging setup
 import logging
 from logging.handlers import RotatingFileHandler
