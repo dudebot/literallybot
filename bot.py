@@ -162,4 +162,8 @@ if __name__ == "__main__":
         bot.run(TOKEN)
     except Exception:
         logger.critical('Bot terminated unexpectedly', exc_info=True)
+    finally:
+        # Properly shutdown config system
+        bot.config.shutdown()
+        logger.info('Config system shutdown complete')
     #Runs the bot with its token. Don't put code below this command.
