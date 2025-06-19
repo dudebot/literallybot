@@ -8,15 +8,10 @@ class Config:
         os.makedirs(self.config_dir, exist_ok=True)
         self._configs = {}  # maps config_id (str) to config dict
         self._dirty_configs = set()  # Track what needs saving
-        self._file_mtimes = {}  # Track file modification times
         self._save_timer = None
-        self._reload_timer = None
         self._save_delay = 5.0  # seconds
-        self._reload_delay = 2.0  # seconds - check for external changes
         self._lock = Lock()  # Thread safety for timer operations
-        self._writing = False  # Flag to prevent read-during-write
         self._load_all()
-        self._schedule_reload()  # Start monitoring for external changes
 
     def _load_all(self):
         for fname in os.listdir(self.config_dir):
@@ -28,8 +23,6 @@ class Config:
             
             config_id = fname[:-5]  # Remove .json extension
             self._configs[config_id] = data
-            # Track initial modification time
-            self._file_mtimes[config_id] = os.path.getmtime(path)
         
         # ensure global config exists
         if 'global' not in self._configs:
@@ -41,8 +34,6 @@ class Config:
         if scope == 'global' or ctx is None:
             return 'global'
         elif scope == 'user':
-            if hasattr(ctx, 'id'):
-                return f'user_{ctx.id}'
             if hasattr(ctx, 'author'):
                 return f'user_{ctx.author.id}'
             elif isinstance(ctx, int):
@@ -65,7 +56,6 @@ class Config:
         path = os.path.join(self.config_dir, fname)
         temp_path = path + '.tmp'
         
-        self._writing = True  # Set flag to prevent reload during write
         try:
             # Atomic write
             with open(temp_path, 'w') as f:
@@ -79,9 +69,6 @@ class Config:
                 os.rename(temp_path, path)
             else:  # Unix/Linux - supports atomic replace
                 os.rename(temp_path, path)
-            
-            # Update modification time after successful write
-            self._file_mtimes[config_id] = os.path.getmtime(path)
                 
         except Exception as e:
             # Clean up temp file if something goes wrong
@@ -91,8 +78,6 @@ class Config:
                 except:
                     pass
             raise e
-        finally:
-            self._writing = False  # Clear flag
 
     def _schedule_save(self):
         """Schedule a delayed save to batch writes"""
@@ -161,93 +146,10 @@ class Config:
         """Set a global config value"""
         self.set(None, key, value, scope='global')
 
-    def _schedule_reload(self):
-        """Schedule periodic check for external file changes"""
-        with self._lock:
-            if self._reload_timer:
-                self._reload_timer.cancel()
-            self._reload_timer = Timer(self._reload_delay, self._timer_reload)
-            self._reload_timer.daemon = True
-            self._reload_timer.start()
-    
-    def _timer_reload(self):
-        """Timer callback to check for external changes"""
-        with self._lock:
-            self._check_external_changes()
-        self._schedule_reload()  # Reschedule next check outside lock
-    
-    def _merge_configs(self, config_id, external_data):
-        """Merge external changes with current config, handling conflicts"""
-        current_data = self._configs.get(config_id, {})
-        
-        # If this config is dirty, we need to handle conflicts
-        if config_id in self._dirty_configs:
-            conflicts = []
-            
-            # Find keys that exist in both and have different values
-            for key in external_data:
-                if key in current_data and current_data[key] != external_data[key]:
-                    conflicts.append({
-                        'key': key,
-                        'memory_value': current_data[key],
-                        'file_value': external_data[key]
-                    })
-            
-            if conflicts:
-                print(f"[Config] Merge conflicts detected in {config_id}.json:")
-                for conflict in conflicts:
-                    print(f"  - Key '{conflict['key']}': memory={conflict['memory_value']}, file={conflict['file_value']} (using file value)")
-        
-        # Merge: external data takes precedence
-        self._configs[config_id] = external_data.copy()
-    
-    def _check_external_changes(self):
-        """Check for external file modifications and reload if needed"""
-        if self._writing:
-            return  # Skip if we're currently writing
-        
-        for fname in os.listdir(self.config_dir):
-            if not fname.endswith('.json'):
-                continue
-            
-            config_id = fname[:-5]
-            path = os.path.join(self.config_dir, fname)
-            
-            try:
-                current_mtime = os.path.getmtime(path)
-                
-                # Check if this is a new file or was modified externally
-                is_new = config_id not in self._file_mtimes
-                is_modified = not is_new and current_mtime > self._file_mtimes[config_id]
-                
-                if is_new or is_modified:
-                    # Load the external changes
-                    with open(path, 'r') as f:
-                        external_data = json.load(f)
-                    
-                    # Merge with current config
-                    self._merge_configs(config_id, external_data)
-                    
-                    # Update modification time
-                    self._file_mtimes[config_id] = current_mtime
-                    
-                    # If this config was dirty, it's not anymore (external changes win)
-                    if config_id in self._dirty_configs:
-                        self._dirty_configs.remove(config_id)
-                    
-                    action = "Loaded new" if is_new else "Reloaded"
-                    print(f"[Config] {action} {config_id}.json due to external changes")
-                    
-            except (OSError, json.JSONDecodeError) as e:
-                print(f"[Config] Error reloading {config_id}.json: {e}")
-    
     def shutdown(self):
         """Clean shutdown - flush all pending writes and cancel timers"""
         with self._lock:
             if self._save_timer:
                 self._save_timer.cancel()
                 self._save_timer = None
-            if self._reload_timer:
-                self._reload_timer.cancel()
-                self._reload_timer = None
             self._flush_all()
