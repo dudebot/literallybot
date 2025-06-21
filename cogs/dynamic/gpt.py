@@ -16,16 +16,41 @@ class Gpt(commands.Cog):
         async with ctx.typing():
             history = []
             messages = []
+            # Get the last 10 messages in the channel
             async for msg in ctx.channel.history(limit=10):
                 messages.append(msg)
             
+            # Track referenced messages to include in context
+            referenced_msgs = {}
+            reply_chain_ids = set()
+            
+            # First pass: Identify all message references
+            for msg in messages:
+                if msg.reference and msg.reference.message_id:
+                    reply_chain_ids.add(msg.reference.message_id)
+            
+            # Second pass: Fetch messages that are referenced but not in our current history
+            if reply_chain_ids:
+                self.logger.debug(f"Found {len(reply_chain_ids)} referenced messages to fetch")
+                for ref_id in reply_chain_ids:
+                    # Skip if message is already in our history
+                    if any(msg.id == ref_id for msg in messages):
+                        continue
+                    
+                    try:
+                        # Try to fetch the referenced message
+                        ref_msg = await ctx.channel.fetch_message(ref_id)
+                        referenced_msgs[ref_id] = ref_msg
+                    except Exception as e:
+                        self.logger.warning(f"Failed to fetch referenced message {ref_id}: {e}")
+            
             # Build a mapping from user IDs to display names for non-bot messages
             user_mapping = {}
-            for msg in messages:
+            for msg in list(messages) + list(referenced_msgs.values()):
                 if not msg.author.bot:
                     user_mapping[str(msg.author.id)] = msg.author.display_name
                     # Extract user ids from user mentions in the message (formats like <@123456> and <@!123456>)
-                    mentioned_ids = [(str(user.id), user.name)  for user in msg.mentions]
+                    mentioned_ids = [(str(user.id), user.name) for user in msg.mentions]
                     for uid, name in mentioned_ids:
                         if uid not in user_mapping and uid != str(self.bot.user.id):
                             member = ctx.guild.get_member(int(uid))
@@ -45,13 +70,43 @@ class Gpt(commands.Cog):
                 client = openai.OpenAI(
                     api_key=api_key,
                 )
+              # Prepare all messages for history (regular messages + referenced messages)
+            all_messages_for_history = list(messages)
+            
+            # Add referenced messages to the history preparation
+            for ref_id, ref_msg in referenced_msgs.items():
+                # Add a special note indicating this is a referenced message
+                modified_content = f"[REFERENCED MESSAGE] {ref_msg.content}"
+                # Create a temporary copy with modified content to avoid changing the original
+                ref_msg_copy = type('MessageCopy', (), {
+                    'id': ref_msg.id,
+                    'author': ref_msg.author,
+                    'content': modified_content,
+                    'created_at': ref_msg.created_at,
+                    'reference': ref_msg.reference
+                })
+                all_messages_for_history.append(ref_msg_copy)
+            
+            # Sort all messages chronologically to preserve conversation flow
+            all_messages_for_history.sort(key=lambda x: getattr(x, 'created_at', 0))
             
             # Construct history with bot messages unchanged and non-bot with user ID prefix
-            for msg in reversed(messages):
-                if msg.author.bot:
+            for msg in all_messages_for_history:
+                if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
                     history.append({"role": "assistant", "content": msg.content})
                 else:
-                    history.append({"role": "user", "content": f"{msg.author.id}: {msg.content}"})            
+                    # For user messages, add context about whether it's a reply
+                    reply_context = ""
+                    if hasattr(msg, 'reference') and msg.reference and msg.reference.message_id:
+                        # Find who they're replying to
+                        replied_to_id = msg.reference.message_id
+                        replied_to_msg = next((m for m in all_messages_for_history if hasattr(m, 'id') and m.id == replied_to_id), None)
+                        if replied_to_msg and hasattr(replied_to_msg, 'author'):
+                            reply_context = f" [replying to {replied_to_msg.author.display_name}]"
+                    
+                    content = getattr(msg, 'content', 'No content')
+                    author_id = getattr(msg.author, 'id', 'unknown') if hasattr(msg, 'author') else 'unknown'
+                    history.append({"role": "user", "content": f"{author_id}{reply_context}: {content}"})            
             
             # Retrieve personality data (prompt and version)
             personality_data = self.bot.config.get(ctx, "gpt_personality_data")
@@ -90,6 +145,8 @@ class Gpt(commands.Cog):
                 "", # Blank line for separation
                 "You are in a Discord chat. Here's the situation and how to respond:",
                 "- The conversation history is below; user messages are prefixed with their ID.",
+                "- Some messages may be marked as [REFERENCED MESSAGE] - these are messages that were replied to.",
+                "- Some users may be shown as [replying to Username] to indicate they replied to someone's message.",
                 f"- User-ID → display-name mapping for reference: {mapping_str}.",
                 "- Focus your reply on the most-recent message(s).",
                 "- To mention someone, use their Discord ID like this: <@[user_id]> (e.g., <@123456789012345678>).",
@@ -256,19 +313,35 @@ class Gpt(commands.Cog):
         
         # Capture memories from all relevant messages
         await self.capture_and_store_memories(ctx, [message], current_personality_version)
-
-        # Trigger GPT response only when bot is mentioned
-        if not message.author.bot and self.bot.user in message.mentions:
-            # Remove the bot mention from the message content to get the actual question/statement
+        
+        # Skip messages from bots
+        if message.author.bot:
+            return
+            
+        should_respond = False
+        cleaned_content = message.content
+        
+        # Case 1: Bot is directly mentioned
+        if self.bot.user in message.mentions:
             # Handle both <@!USER_ID> and <@USER_ID> mention formats
-            cleaned_content = message.content
             mention_formats = [f'<@!{self.bot.user.id}>', f'<@{self.bot.user.id}>']
             for m_format in mention_formats:
                 cleaned_content = cleaned_content.replace(m_format, '')
+            should_respond = True
             
+        # Case 2: Message is a reply to a bot message
+        elif message.reference and message.reference.message_id:
+            try:
+                referenced_message = await ctx.channel.fetch_message(message.reference.message_id)
+                if referenced_message.author.id == self.bot.user.id:
+                    self.logger.debug(f"Responding to reply to bot message from {message.author.display_name}")
+                    should_respond = True
+            except Exception as e:
+                self.logger.warning(f"Failed to fetch referenced message: {e}")
+        
+        if should_respond:
             question = cleaned_content.strip()
-
-            if question: # Ensure there's content after removing the mention
+            if question:  # Ensure there's content
                 await self.process_askgpt(ctx, question)
                 
     @commands.command(name='setpersonality')
