@@ -244,10 +244,10 @@ class Dev(commands.Cog):
             self.logger.error("Error listing cogs", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
             
-    @commands.command(name='shutdown', aliases=['kys'], hidden=True)
+    @commands.command(name='restart', aliases=['kys', 'shutdown'], hidden=True)
     @commands.is_owner()
-    async def shutdown(self, ctx):
-        """This command shuts down the bot.
+    async def restart(self, ctx):
+        """This command restarts the bot.
         
         Note:
             This command can be used only from the bot owner.
