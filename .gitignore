@@ -3,3 +3,13 @@ __pycache__
 *.pyc
 configs
 logs/*
+.claude
+settings.local.json
+# Protect media files - ignore all except already tracked files
+/media/*
+!/media/aaaaaaaa_hd.mp4
+!/media/dingdingdoo.webm
+!/media/fuck.mp4
+!/media/poggers.mp4
+!/media/squish.webm
+!/media/yahallo.mp4

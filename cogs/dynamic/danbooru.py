@@ -11,13 +11,22 @@ class Danbooru(commands.Cog):
         self.danbooru_base = "http://danbooru.donmai.us"
         #self.danbooru_base = "https://testbooru.donmai.us"
 
-    @commands.command(name="danbooru")
+    @commands.command(name="danbooru", aliases=["db"])
     async def danbooru(self, ctx, *tags):
         """Fetch a random image from Danbooru based on tags."""
         # Validate tags
         if not tags:
-            await ctx.send("Usage: !danbooru tag1 tag2 ...")
+            await ctx.send("Usage: !danbooru (or !db) tag1 tag2 ...")
             return
+        
+        # Check if channel is NSFW and add rating filter if not
+        tags = list(tags)
+        if ctx.channel and not ctx.channel.is_nsfw():
+            # Only add rating:safe if no rating tag is already specified
+            has_rating = any(tag.startswith('rating:') for tag in tags)
+            if not has_rating:
+                tags.append('rating:safe')
+        
         # Retrieve API key and login from environment
         api_key = os.getenv("DANBOORU_API_KEY")
         login = os.getenv("DANBOORU_LOGIN")
