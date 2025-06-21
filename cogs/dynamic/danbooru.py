@@ -27,9 +27,10 @@ class Danbooru(commands.Cog):
             if not has_rating:
                 tags.append('rating:safe')
         
-        # Retrieve API key and login from environment
-        api_key = os.getenv("DANBOORU_API_KEY")
-        login = os.getenv("DANBOORU_LOGIN")
+        # Retrieve API key and login from global config, fallback to environment
+        config = self.bot.config
+        api_key = config.get(None, "DANBOORU_API_KEY", scope="global") or os.getenv("DANBOORU_API_KEY")
+        login = config.get(None, "DANBOORU_LOGIN", scope="global") or os.getenv("DANBOORU_LOGIN")
         # Build tag query string
         tag_string = "+".join(tags)
         url = f"{self.danbooru_base}/posts.json?tags={tag_string}&limit=100"
