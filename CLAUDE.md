@@ -74,23 +74,28 @@ Feature cogs that can be loaded/unloaded:
 
 #### Config API Usage
 ```python
+# In cogs, access config via self.bot.config
+config = self.bot.config
+
 # Guild-specific (default scope)
-bot.config.get(ctx, key, default)
-bot.config.set(ctx, key, value)
+config.get(ctx, key, default)
+config.set(ctx, key, value)
 
 # User-specific  
-bot.config.get_user(ctx, key, default)
-bot.config.set_user(ctx, key, value)
-# OR: bot.config.get(ctx, key, default, scope='user')
+config.get_user(ctx, key, default)
+config.set_user(ctx, key, value)
+# OR: config.get(ctx, key, default, scope='user')
 
 # Global
-bot.config.get_global(key, default)
-bot.config.set_global(key, value)
-# OR: bot.config.get(None, key, default, scope='global')
+config.get_global(key, default)
+config.set_global(key, value)
+# OR: config.get(None, key, default, scope='global')
 
 # Manual flush
-bot.config.flush()  # Force immediate save
+config.flush()  # Force immediate save
 ```
+
+**Note for cog development:** Always access config through `self.bot.config` within cog methods.
 
 ### Permission System
 - **Superadmin**: Single global bot owner (claim with `!claimsuper`)

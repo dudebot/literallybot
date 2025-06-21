@@ -5,6 +5,8 @@ configs
 logs/*
 .claude
 settings.local.json
+cogs/vibes/*
+!cogs/vibes/__init__.py
 # Protect media files - ignore all except already tracked files
 /media/*
 !/media/aaaaaaaa_hd.mp4
