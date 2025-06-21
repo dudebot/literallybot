@@ -37,9 +37,15 @@ class Dev(commands.Cog):
         Note:
             All cognames are made lowercase with `.lower()`_.
         """
-        if (cog.lower()).startswith('cogs.dynamic.') == True:
-            return cog.lower()
-        return f'cogs.dynamic.{cog.lower()}'
+        cog_lower = cog.lower()
+        # If already properly formatted, return as-is
+        if cog_lower.startswith('cogs.'):
+            return cog_lower
+        # Check if this is a vibe cog
+        if cog_lower.startswith('vibes.') or cog_lower.startswith('vibe_'):
+            return f'cogs.vibes.{cog_lower.replace("vibes.", "")}'
+        # Default to dynamic cogs
+        return f'cogs.dynamic.{cog_lower}'
 
     @commands.command(name='load', hidden=True)
     @commands.is_owner()
