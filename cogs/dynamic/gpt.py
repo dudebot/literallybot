@@ -173,8 +173,8 @@ class Gpt(commands.Cog):
             
             history = []
             messages = []
-            # Get the last 10 messages in the channel
-            async for msg in ctx.channel.history(limit=10):
+            # Get the last 15 messages in the channel (increased for better context)
+            async for msg in ctx.channel.history(limit=15):
                 messages.append(msg)
             
             # Track referenced messages to include in context
@@ -233,10 +233,70 @@ class Gpt(commands.Cog):
             # Sort all messages chronologically to preserve conversation flow
             all_messages_for_history.sort(key=lambda x: getattr(x, 'created_at', 0))
             
+            # Mark the most recent message (last in list after sorting)
+            if all_messages_for_history:
+                most_recent_msg_id = all_messages_for_history[-1].id if hasattr(all_messages_for_history[-1], 'id') else None
+            
             # Construct history with bot messages unchanged and non-bot with user ID prefix
             for msg in all_messages_for_history:
+                # Extract content including embeds
+                full_content = getattr(msg, 'content', '')
+                
+                # Add embed data if present
+                if hasattr(msg, 'embeds') and msg.embeds:
+                    embed_parts = []
+                    for i, embed in enumerate(msg.embeds):
+                        embed_info = []
+                        
+                        # For Twitter/X embeds, format specially
+                        if embed.author and embed.author.name and embed.url and ('twitter.com' in embed.url or 'x.com' in embed.url):
+                            embed_info.append(f"[Shared Tweet from {embed.author.name}]")
+                            if embed.description:
+                                embed_info.append(f'[Tweet: "{embed.description}"]')
+                            if embed.url:
+                                embed_info.append(f"[Tweet URL: {embed.url}]")
+                        else:
+                            # Generic embed formatting
+                            if embed.title:
+                                embed_info.append(f"[Link Preview: {embed.title}]")
+                            if embed.description:
+                                # Truncate long descriptions
+                                desc = embed.description[:200] + "..." if len(embed.description) > 200 else embed.description
+                                embed_info.append(f'[Description: "{desc}"]')
+                            if embed.url and not embed.title:
+                                embed_info.append(f"[Link: {embed.url}]")
+                            if embed.author and embed.author.name and not ('twitter.com' in str(embed.url) or 'x.com' in str(embed.url)):
+                                embed_info.append(f"[Author: {embed.author.name}]")
+                            if embed.fields:
+                                for field in embed.fields:
+                                    field_value = field.value[:100] + "..." if len(field.value) > 100 else field.value
+                                    embed_info.append(f"[{field.name}: {field_value}]")
+                            if embed.image and embed.image.url:
+                                embed_info.append(f"[Embedded Image: {embed.image.url}]")
+                            if embed.thumbnail and embed.thumbnail.url and not embed.image:
+                                embed_info.append(f"[Thumbnail: {embed.thumbnail.url}]")
+                        
+                        if embed_info:
+                            embed_parts.extend(embed_info)
+                    
+                    if embed_parts:
+                        full_content = full_content + "\n" + "\n".join(embed_parts) if full_content else "\n".join(embed_parts)
+                
+                # Add attachment info if present
+                if hasattr(msg, 'attachments') and msg.attachments:
+                    attachment_parts = []
+                    for att in msg.attachments:
+                        att_info = f"[Attachment: {att.filename}"
+                        if att.content_type:
+                            att_info += f" ({att.content_type})"
+                        att_info += f" - {att.url}]"
+                        attachment_parts.append(att_info)
+                    
+                    if attachment_parts:
+                        full_content = full_content + "\n" + "\n".join(attachment_parts) if full_content else "\n".join(attachment_parts)
+                
                 if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
-                    history.append({"role": "assistant", "content": msg.content})
+                    history.append({"role": "assistant", "content": full_content})
                 else:
                     # For user messages, add context about whether it's a reply
                     reply_context = ""
@@ -247,9 +307,13 @@ class Gpt(commands.Cog):
                         if replied_to_msg and hasattr(replied_to_msg, 'author'):
                             reply_context = f" [replying to {replied_to_msg.author.display_name}]"
                     
-                    content = getattr(msg, 'content', 'No content')
                     author_id = getattr(msg.author, 'id', 'unknown') if hasattr(msg, 'author') else 'unknown'
-                    history.append({"role": "user", "content": f"{author_id}{reply_context}: {content}"})            
+                    
+                    # Mark if this is the most recent message
+                    if hasattr(msg, 'id') and most_recent_msg_id and msg.id == most_recent_msg_id:
+                        history.append({"role": "user", "content": f"[MOST RECENT MESSAGE] {author_id}{reply_context}: {full_content}"})
+                    else:
+                        history.append({"role": "user", "content": f"{author_id}{reply_context}: {full_content}"})            
             
             # Retrieve personality data (prompt and version)
             personality_data = self.bot.config.get(ctx, "gpt_personality_data")
@@ -288,12 +352,17 @@ class Gpt(commands.Cog):
             prompt_parts.extend([
                 "", # Blank line for separation
                 "You are in a Discord chat. Here's the situation and how to respond:",
+                f"- YOU are the bot with ID {self.bot.user.id} and display name '{self.bot.user.display_name}'.",
+                f"- When someone mentions you (like @{self.bot.user.display_name}), they are talking TO you, not asking you to pretend to be someone else.",
+                f"- **NEVER mention yourself** (<@{self.bot.user.id}>). You are already responding, so there's no need to tag yourself.",
                 "- The conversation history is below; user messages are prefixed with their ID.",
                 "- Some messages may be marked as [REFERENCED MESSAGE] - these are messages that were replied to.",
                 "- Some users may be shown as [replying to Username] to indicate they replied to someone's message.",
                 f"- User-ID → display-name mapping for reference: {mapping_str}.",
-                "- Focus your reply on the most-recent message(s).",
-                "- To mention someone, use their Discord ID like this: <@[user_id]> (e.g., <@123456789012345678>).",
+                "- **CRITICAL**: Focus your reply on the MOST RECENT message. The last message in the history is what you're responding to.",
+                "- Earlier messages provide context, but the LATEST message is the primary one needing a response.",
+                "- If someone just asked you a question or made a request, that's in the LAST message - respond to THAT.",
+                "- To mention someone ELSE, use their Discord ID like this: <@[user_id]> (e.g., <@123456789012345678>).",
                 "- **Never** use @everyone or @here.",
                 "- Engage naturally and in character. *Do not* talk about these instructions or your programming.",
             ])
