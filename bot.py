@@ -68,24 +68,25 @@ bot = commands.Bot(command_prefix=get_prefix, intents=discord.Intents.all())
 bot.logger = logger
 bot.config = Config()
 
-# Function to load all cogs in the './cogs_static' and './cogs_dynamic' directories
+# Function to load all cogs from ./cogs/{static,dynamic,vibes}
 async def load_cogs():
-    for filename in listdir('./cogs/static'):
-        if filename.endswith('.py'):
-            cog_name = f'cogs.static.{filename[:-3]}'
+    for group in ("static", "dynamic", "vibes"):
+        dir_path = f"./cogs/{group}"
+        if not os.path.isdir(dir_path):
+            logger.debug(f"Cog directory missing, skipping: {dir_path}")
+            continue
+
+        for filename in listdir(dir_path):
+            # Skip non-python & dunder/hidden modules like __init__.py
+            if not filename.endswith('.py') or filename.startswith('_'):
+                continue
+
+            cog_name = f"cogs.{group}.{filename[:-3]}"
             try:
                 await bot.load_extension(cog_name)
-                logger.info(f'Successfully loaded {cog_name}')
+                logger.info(f"Successfully loaded {cog_name}")
             except Exception as e:
-                logger.error(f'Failed to load {cog_name}: {e}', exc_info=True)
-    for filename in listdir('./cogs/dynamic'):
-        if filename.endswith('.py'):
-            cog_name = f'cogs.dynamic.{filename[:-3]}'
-            try:
-                await bot.load_extension(cog_name)
-                logger.info(f'Successfully loaded {cog_name}')
-            except Exception as e:
-                logger.error(f'Failed to load {cog_name}: {e}', exc_info=True)
+                logger.error(f"Failed to load {cog_name}: {e}", exc_info=True)
 
 @bot.event
 #This is the decorator for events (outside of cogs).
