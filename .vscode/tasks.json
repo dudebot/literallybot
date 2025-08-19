@@ -1,64 +1,115 @@
 {
-    "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "Run Bot",
-            "type": "shell",
-            "command": "python3",
-            "args": ["bot.py"],
-            "group": {
-                "kind": "build",
-                "isDefault": true
-            },
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "new"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Install Dependencies",
-            "type": "shell",
-            "command": "pip",
-            "args": ["install", "-r", "requirements.txt"],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "new"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Run Tests",
-            "type": "shell",
-            "command": "python3",
-            "args": ["-m", "pytest", "tests/", "-v"],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "new"
-            },
-            "problemMatcher": []
-        },
-        {
-            "label": "Install Test Dependencies",
-            "type": "shell",
-            "command": "pip",
-            "args": ["install", "-r", "tests/requirements.txt"],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "new"
-            },
-            "problemMatcher": []
-        }
-    ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Bot",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"bot.py"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "new"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Install Dependencies",
+			"type": "shell",
+			"command": "pip",
+			"args": [
+				"install",
+				"-r",
+				"requirements.txt"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "new"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Run Tests",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"-m",
+				"pytest",
+				"-v",
+				"tests/test_config_local.py"
+			],
+			"group": "test",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "new"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Install Test Dependencies",
+			"type": "shell",
+			"command": "pip",
+			"args": [
+				"install",
+				"-r",
+				"tests/requirements.txt"
+			],
+			"group": "build",
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "new"
+			},
+			"problemMatcher": []
+		},
+		{
+			"label": "Run E2E Harness (Windows)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"e2e/harness.py"
+			],
+			"options": {
+				"env": {
+					"DISCORD_TOKEN": "${env:DISCORD_TOKEN}",
+					"E2E_GUILD_ID": "${env:E2E_GUILD_ID}",
+					"E2E_CHANNEL_ID": "${env:E2E_CHANNEL_ID}",
+					"E2E_OWNER_ID": "${env:E2E_OWNER_ID}"
+				}
+			},
+			"group": "test",
+			"problemMatcher": []
+		},
+		{
+			"label": "Run E2E Selective (Windows)",
+			"type": "shell",
+			"command": "python",
+			"args": [
+				"e2e/selective.py"
+			],
+			"options": {
+				"env": {
+					"DISCORD_TOKEN": "${env:DISCORD_TOKEN}",
+					"E2E_GUILD_ID": "${env:E2E_GUILD_ID}",
+					"E2E_CHANNEL_ID": "${env:E2E_CHANNEL_ID}",
+					"E2E_OWNER_ID": "${env:E2E_OWNER_ID}"
+				}
+			},
+			"group": "test",
+			"problemMatcher": []
+		}
+	]
 }

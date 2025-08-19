@@ -6,8 +6,8 @@ import re
 import asyncio
 from datetime import datetime
 import json
-import aiohttp
 from typing import Dict, List, Optional, Any
+from core.ai import call_chat_completion
 
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
@@ -82,89 +82,18 @@ class Gpt(commands.Cog):
         if not api_key:
             raise ValueError(f"No API key found for provider {provider}")
             
-        api_type = provider_info.get("api_type", "openai")
-        
-        if api_type == "anthropic":
-            # Use Claude API
-            return await self.call_anthropic_api(api_key, model, messages, metadata)
-        else:
-            # Use OpenAI-compatible API
-            base_url = provider_info.get("base_url")
-            # Only pass base_url if it's actually set (for xAI, etc)
-            if base_url:
-                client = openai.OpenAI(api_key=api_key, base_url=base_url)
-            else:
-                client = openai.OpenAI(api_key=api_key)
-            
-            # Run the API call in a non-blocking way
-            # Handle different parameter names for reasoning models
-            create_params = {
-                "messages": messages,
-                "metadata": metadata,
-                "store": True,
-                "model": model
-            }
-            
-            # Check if this is a reasoning model (o3, o4, etc) - they use max_completion_tokens
-            if model.startswith("o3") or model.startswith("o4") or model == "o1" or model == "o1-preview" or model == "o1-mini":
-                # Check if provider info has specific max_completion_tokens for this model
-                models_info = provider_info.get("models", {})
-                model_info = models_info.get(model, {})
-                max_completion_tokens = model_info.get("max_completion_tokens", 3000)
-                create_params["max_completion_tokens"] = max_completion_tokens
-            else:
-                create_params["max_tokens"] = 3000
-            
-            chat_completion = await asyncio.to_thread(
-                client.chat.completions.create,
-                **create_params
-            )
-            return chat_completion.choices[0].message.content.strip()
+        # Use shared OpenAI-compatible helper
+        base_url = provider_info.get("base_url")
+        return await call_chat_completion(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            messages=messages,
+            metadata=metadata,
+            provider_info=provider_info,
+        )
 
-    async def call_anthropic_api(self, api_key: str, model: str, messages: List[Dict], metadata: Dict) -> str:
-        """Call Anthropic's Claude API"""
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
-        
-        # Convert OpenAI format to Anthropic format
-        system_message = None
-        claude_messages = []
-        
-        for msg in messages:
-            if msg["role"] == "system":
-                system_message = msg["content"]
-            else:
-                # Map assistant/user roles
-                role = "assistant" if msg["role"] == "assistant" else "user"
-                claude_messages.append({
-                    "role": role,
-                    "content": msg["content"]
-                })
-        
-        data = {
-            "model": model,
-            "messages": claude_messages,
-            "max_tokens": 3000
-        }
-        
-        if system_message:
-            data["system"] = system_message
-            
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=data
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise ValueError(f"Anthropic API error: {error_text}")
-                    
-                result = await response.json()
-                return result["content"][0]["text"]
+    # Anthropic API support removed intentionally (use OpenAI-compatible providers only)
 
     async def process_askgpt(self, ctx, question: str):
         async with ctx.typing():

@@ -1,0 +1,14 @@
+{
+  "default": {
+    "commands": [
+      "!ping",
+      "!echo test-from-scenarios"
+    ]
+  },
+  "cogs.static.tools": {
+    "commands": [
+      "!ping",
+      "!echo hello"
+    ]
+  }
+}

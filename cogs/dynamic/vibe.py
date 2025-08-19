@@ -6,6 +6,9 @@ import re
 import asyncio
 import json
 from typing import Dict, List, Any
+import shutil
+from datetime import datetime
+from core.ai import call_chat_completion
 
 class Vibe(commands.Cog):
     """AI-powered dynamic cog generation."""
@@ -42,45 +45,19 @@ class Vibe(commands.Cog):
         if not api_key:
             raise ValueError(f"No API key found for provider {provider}")
             
-        api_type = provider_info.get("api_type", "openai")
-        
-        if api_type == "anthropic":
-            raise ValueError("Anthropic API not supported for vibe generation")
-        else:
-            # Use OpenAI-compatible API
-            base_url = provider_info.get("base_url")
-            # Only pass base_url if it's actually set (for xAI, etc)
-            if base_url:
-                client = openai.OpenAI(api_key=api_key, base_url=base_url)
-            else:
-                client = openai.OpenAI(api_key=api_key)
-            
-            # Run the API call in a non-blocking way
-            # Handle different parameter names for reasoning models
-            create_params = {
-                "messages": messages,
-                "metadata": metadata,
-                "store": True,
-                "model": model
-            }
-            
-            # Check if this is a reasoning model (o3, o4, etc) - they use max_completion_tokens
-            if model.startswith("o3") or model.startswith("o4") or model == "o1" or model == "o1-preview" or model == "o1-mini":
-                # Check if provider info has specific max_completion_tokens for this model
-                models_info = provider_info.get("models", {})
-                model_info = models_info.get(model, {})
-                max_completion_tokens = model_info.get("max_completion_tokens", 3000)
-                create_params["max_completion_tokens"] = max_completion_tokens
-            else:
-                create_params["max_tokens"] = 3000
-            
-            chat_completion = await asyncio.to_thread(
-                client.chat.completions.create,
-                **create_params
-            )
-            return chat_completion.choices[0].message.content.strip()
+        # Use shared OpenAI-compatible helper
+        base_url = provider_info.get("base_url")
+        return await call_chat_completion(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            messages=messages,
+            metadata=metadata,
+            provider_info=provider_info,
+        )
 
     @commands.command(name='vibe')
+    @commands.cooldown(1, 120, commands.BucketType.guild)
     async def vibe(self, ctx, *, description: str):
         """Generate a custom cog using AI (admin only)"""
         if not self.is_authorized(ctx):
@@ -155,90 +132,50 @@ Focus on exactly what the user asked for, no more."""
             spec_for_impl = json.dumps(spec, indent=2)
             self.logger.info(f"Sending specification to implementation stage:\n{spec_for_impl}")
             
-            impl_prompt = """Generate a Discord bot cog implementation.
-
-ORIGINAL USER REQUEST: """ + f'"{description}"' + """
-
-SPECIFICATION FROM ANALYSIS:
-""" + spec_for_impl + """
-
-IMPORTANT: Follow the ORIGINAL USER REQUEST exactly. Use any specific values mentioned (user IDs, exact phrases, etc).
-
-Here's a simple auto-response example:
-
-```python
-from discord.ext import commands
-
-class SimpleResponder(commands.Cog):
-    \"\"\"Responds to specific messages.\"\"\"
-    def __init__(self, bot):
-        self.bot = bot
-        self.logger = bot.logger
-    
-    @commands.Cog.listener()
-    async def on_message(self, message):
-        # Skip bot messages
-        if message.author.bot:
-            return
-        
-        # Check conditions and respond
-        if message.author.id == 123456789 and "hello" in message.content.lower():
-            await message.channel.send("world")
-
-async def setup(bot):
-    await bot.add_cog(SimpleResponder(bot))
-```
-
-For auto-responses and monitoring messages, use the on_message listener:
-
-```python
-@commands.Cog.listener()
-async def on_message(self, message):
-    # Skip bot messages to avoid loops
-    if message.author == self.bot.user:
-        return
-        
-    # Skip if not in a guild
-    if not message.guild:
-        return
-    
-    # Get context for config operations
-    ctx = await self.bot.get_context(message)
-    
-    # Example: respond when specific user says something
-    config = self.bot.config
-    # Get monitored user ID from guild config
-    monitored_user_id = config.get(ctx, "hello_world_user_id")
-    
-    if monitored_user_id and message.author.id == monitored_user_id:
-        if message.content.lower() == "hello":
-            await message.channel.send("world")
-
-# Add a command to configure the monitored user
-@commands.command(name='sethellouser')
-async def sethellouser(self, ctx, user: discord.User):
-    \"\"\"Set which user triggers the hello/world response.\"\"\"
-    config = self.bot.config
-    config.set(ctx, "hello_world_user_id", user.id)
-    await ctx.send(f"Now monitoring {user.mention} for 'hello' messages")
-```
-
-Config system reference:
-- Guild: config.get(ctx, "key", default) / config.set(ctx, "key", value)
-- Global: config.get(None, "key") / config.set(None, "key", value)
-- IMPORTANT: In on_message, create context first: ctx = await self.bot.get_context(message)
-
-Requirements:
-- PRIORITY: Follow the ORIGINAL USER REQUEST exactly, including specific IDs and phrases
-- Keep it SIMPLE - don't add features that weren't requested
-- Use hardcoded values when appropriate (especially for simple auto-responses)
-- Only use config if the user wants toggles/configuration
-- Use minimal imports
-- Include the async def setup(bot) function at the end
-- Add brief docstrings
-- For auto-responses, use @commands.Cog.listener() with on_message
-
-Generate ONLY the Python code, no explanations."""
+            impl_prompt = (
+                "Generate a Discord bot cog implementation.\n\n"
+                f"ORIGINAL USER REQUEST: \"{description}\"\n\n"
+                "SPECIFICATION FROM ANALYSIS:\n"
+                f"{spec_for_impl}\n\n"
+                "IMPORTANT: Follow the ORIGINAL USER REQUEST exactly. Use any specific values mentioned (user IDs, exact phrases, etc).\n\n"
+                "Here's a simple auto-response example:\n\n"
+                "```python\n"
+                "from discord.ext import commands\n\n"
+                "class SimpleResponder(commands.Cog):\n"
+                "    \"\"\"Responds to specific messages.\"\"\"\n"
+                "    def __init__(self, bot):\n"
+                "        self.bot = bot\n"
+                "        self.logger = bot.logger\n"
+                "    \n"
+                "    @commands.Cog.listener()\n"
+                "    async def on_message(self, message):\n"
+                "        # Skip bot messages\n"
+                "        if message.author.bot:\n"
+                "            return\n"
+                "        \n"
+                "        # Check conditions and respond\n"
+                "        if message.author.id == 123456789 and \"hello\" in message.content.lower():\n"
+                "            await message.channel.send(\"world\")\n"
+                "```\n\n"
+                "Config system reference:\n"
+                "- Guild: config.get(ctx, \"key\", default) / config.set(ctx, \"key\", value)\n"
+                "- Global: config.get(None, \"key\") / config.set(None, \"key\", value)\n"
+                "- IMPORTANT: In on_message, create context first: ctx = await self.bot.get_context(message)\n\n"
+                "Requirements:\n"
+                "- PRIORITY: Follow the ORIGINAL USER REQUEST exactly, including specific IDs and phrases\n"
+                "- Keep it SIMPLE - don't add features that weren't requested\n"
+                "- Use hardcoded values when appropriate (especially for simple auto-responses)\n"
+                "- Only use config if the user wants toggles/configuration\n"
+                "- Use minimal imports\n"
+                "- Include the async def setup(bot) function at the end\n"
+                "- Add brief docstrings\n"
+                "- For auto-responses, use @commands.Cog.listener() with on_message\n\n"
+                "Persistence guidance:\n"
+                "- Never rely on in-memory state across restarts. Read state from self.bot.config at the start of each command or listener.\n"
+                "- Choose scope explicitly: use guild-scoped config (config.get(ctx, key)/config.set(ctx, key, val)) for per-server data, or global for shared across servers.\n"
+                "- Do not require on_ready to rebuild state. Avoid one-time initialization unless absolutely necessary.\n\n"
+                "Generate ONLY the Python code, no explanations.\n"
+            )
 
             impl_messages = [
                 {"role": "system", "content": "You are an expert Python developer specializing in Discord bots. Generate clean, safe, working code."},
@@ -337,24 +274,22 @@ Generate ONLY the Python code, no explanations."""
                 # Send to owner for approval
                 owner = self.bot.get_user(owner_id)
                 if owner:
-                    # Save pending vibe
+                    # Save pending vibe (global, no guild/channel coupling)
                     pending_vibes = self.bot.config.get(None, "pending_vibes", scope="global") or {}
-                    vibe_id = f"{ctx.guild.id}_{timestamp}"
+                    vibe_id = f"{int(time.time())}_{ctx.author.id}"
                     pending_vibes[vibe_id] = {
                         "filepath": str(filepath),
                         "implementation": implementation,
                         "spec": spec,
                         "requester_id": ctx.author.id,
-                        "guild_id": ctx.guild.id,
-                        "channel_id": ctx.channel.id,
-                        "description": description
+                        "description": description,
                     }
                     self.bot.config.set(None, "pending_vibes", pending_vibes, scope="global")
                     
                     # DM owner
                     dm_message = f"""**New Vibe Request**
-Guild: {ctx.guild.name}
-Requester: {ctx.author.name}
+Requester: {ctx.author} (ID: {ctx.author.id})
+Guild: {ctx.guild.name if ctx.guild else 'DM'}
 Description: {description}
 
 **Specification:**
@@ -386,18 +321,18 @@ To reject: `!rejectvibe {vibe_id}`"""
         """Save and load a generated vibe cog"""
         try:
             # Write the file
-            with open(filepath, 'w') as f:
+            with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(implementation)
                 
             # Track active vibes
-            active_vibes = self.bot.config.get(ctx, "active_vibes") or {}
+            active_vibes = self.bot.config.get(None, "active_vibes", scope="global") or {}
             cog_name = f"cogs.vibes.{os.path.basename(filepath)[:-3]}"
             active_vibes[cog_name] = {
                 "spec": spec,
                 "created_at": time.time(),
                 "filepath": filepath
             }
-            self.bot.config.set(ctx, "active_vibes", active_vibes)
+            self.bot.config.set(None, "active_vibes", active_vibes, scope="global")
             
             # Load the cog
             try:
@@ -410,20 +345,23 @@ To reject: `!rejectvibe {vibe_id}`"""
                     else:
                         # If commands are just strings
                         command_names = commands_list
-                    await ctx.send(f"✅ Vibe loaded! Commands: {', '.join(command_names)}")
+                    if ctx and hasattr(ctx, 'send'):
+                        await ctx.send(f"✅ Vibe loaded! Commands: {', '.join(command_names)}")
                 else:
                     # No commands (e.g., auto-responder)
-                    await ctx.send(f"✅ Vibe loaded! Auto-responder: {spec.get('class_name', 'Unknown')}")
+                    if ctx and hasattr(ctx, 'send'):
+                        await ctx.send(f"✅ Vibe loaded! Auto-responder: {spec.get('class_name', 'Unknown')}")
             except Exception as e:
                 # Clean up on failure
                 os.remove(filepath)
                 active_vibes.pop(cog_name, None)
-                self.bot.config.set(ctx, "active_vibes", active_vibes)
+                self.bot.config.set(None, "active_vibes", active_vibes, scope="global")
                 raise e
                 
         except Exception as e:
             self.logger.error(f"Failed to load vibe: {e}", exc_info=True)
-            await ctx.send(f"❌ Failed to load vibe: {str(e)}")
+            if ctx and hasattr(ctx, 'send'):
+                await ctx.send(f"❌ Failed to load vibe: {str(e)}")
 
     @commands.command(name='approvevibe')
     async def approvevibe(self, ctx, vibe_id: str):
@@ -438,28 +376,19 @@ To reject: `!rejectvibe {vibe_id}`"""
             
         vibe_data = pending_vibes[vibe_id]
         
-        # Get the original context
-        guild = self.bot.get_guild(vibe_data["guild_id"])
-        channel = guild.get_channel(vibe_data["channel_id"]) if guild else None
-        
-        if channel:
-            # Create a minimal context for config operations
-            class MinimalContext:
-                def __init__(self, guild, channel):
-                    self.guild = guild
-                    self.channel = channel
-                    
-            minimal_ctx = MinimalContext(guild, channel)
-            
-            await self.save_and_load_vibe(
-                minimal_ctx,
-                vibe_data["filepath"],
-                vibe_data["implementation"],
-                vibe_data["spec"]
-            )
-            
-            # Notify requester
-            await channel.send(f"<@{vibe_data['requester_id']}> Your vibe has been approved and loaded!")
+        # Load globally and notify requester via DM (no guild/channel coupling)
+        await self.save_and_load_vibe(
+            None,
+            vibe_data["filepath"],
+            vibe_data["implementation"],
+            vibe_data["spec"]
+        )
+        try:
+            requester = self.bot.get_user(vibe_data.get("requester_id"))
+            if requester:
+                await requester.send("Your vibe has been approved and loaded!")
+        except Exception:
+            pass
             
         # Remove from pending
         pending_vibes.pop(vibe_id)
@@ -480,22 +409,313 @@ To reject: `!rejectvibe {vibe_id}`"""
             
         vibe_data = pending_vibes.pop(vibe_id)
         self.bot.config.set(None, "pending_vibes", pending_vibes, scope="global")
-        
-        # Notify requester
-        guild = self.bot.get_guild(vibe_data["guild_id"])
-        channel = guild.get_channel(vibe_data["channel_id"]) if guild else None
-        if channel:
-            await channel.send(f"<@{vibe_data['requester_id']}> Your vibe request was rejected.")
-            
+
+        # Notify requester via DM
+        try:
+            requester = self.bot.get_user(vibe_data.get("requester_id"))
+            if requester:
+                await requester.send("Your vibe request was rejected.")
+        except Exception:
+            pass
+
         await ctx.send("Vibe rejected.")
+
+    @commands.command(name='revibe')
+    async def revibe(self, ctx, *, args: str):
+        """Modify an existing vibe by name and replace its code (admin only).
+
+        Usage: !revibe <VibeClassName> <new description>
+        - Creates a timestamped backup of the existing file.
+        - Generates new implementation based on the new description, preserving class name.
+        - Reloads the cog in place.
+        """
+        if not self.is_authorized(ctx):
+            await ctx.send("You do not have permission to use this command.")
+            return
+
+        try:
+            target, new_description = args.strip().split(" ", 1)
+        except ValueError:
+            await ctx.send("Usage: !revibe <VibeClassName> <new description>")
+            return
+
+        # Locate existing vibe by class name from active_vibes or by scanning files (global)
+        config = self.bot.config
+        active_vibes = config.get(None, "active_vibes", scope="global") or {}
+
+        matching_cog = None
+        matching_info = None
+        for cog_name, info in active_vibes.items():
+            cls = (info.get("spec") or {}).get("class_name", "")
+            if cls.lower() == target.lower():
+                matching_cog = cog_name
+                matching_info = info
+                break
+
+        import pathlib, re
+        bot_root = pathlib.Path(__file__).parent.parent.parent
+        vibes_dir = bot_root / "cogs" / "vibes"
+        vibes_dir.mkdir(exist_ok=True)
+
+        def scan_for_class(filepath: pathlib.Path) -> List[str]:
+            try:
+                text = filepath.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return []
+            return re.findall(r"class\s+([A-Za-z_][A-Za-z0-9_]*)\(commands\.Cog\):", text)
+
+        if not matching_cog:
+            # Fallback: scan vibe files for class name match
+            for file in vibes_dir.iterdir():
+                if file.suffix == ".py" and not file.name.startswith("_"):
+                    classes = scan_for_class(file)
+                    if any(c.lower() == target.lower() for c in classes):
+                        module_name = file.stem
+                        matching_cog = f"cogs.vibes.{module_name}"
+                        matching_info = {
+                            "filepath": str(file),
+                            "spec": {"class_name": target},
+                        }
+                        break
+
+        if not matching_cog or not matching_info:
+            await ctx.send("Vibe not found. Make sure the class name matches exactly.")
+            return
+
+        filepath = pathlib.Path(matching_info.get("filepath"))
+        if not filepath.exists():
+            await ctx.send("Existing vibe file not found on disk.")
+            return
+
+        # Read current implementation (for context and backup)
+        try:
+            current_code = filepath.read_text(encoding="utf-8")
+        except Exception as e:
+            self.logger.error(f"Failed reading existing vibe file: {e}", exc_info=True)
+            await ctx.send("Could not read existing vibe file.")
+            return
+
+        # Backup existing file
+        ts = int(time.time())
+        backup_path = filepath.with_suffix(f".bak.{ts}.py")
+        try:
+            shutil.copy2(str(filepath), str(backup_path))
+        except Exception as e:
+            self.logger.error(f"Failed to create backup: {e}", exc_info=True)
+            await ctx.send("Failed to create a backup; aborting.")
+            return
+
+        await ctx.send(f"🔧 Updating vibe '{target}'. Backup created: `{backup_path.name}`. Generating new implementation…")
+
+        # Build a spec prompt focused on modification
+        mod_spec_prompt = f"""You are updating an existing Discord bot cog.
+Cog class name: {target}
+Original description (context): {new_description}
+
+Goals:
+- Modify/extend the current behavior per the new description while keeping the same class name '{target}'.
+- Preserve persisted data compatibility (same config keys/types) unless the request requires changes; if changes are needed, add migration logic.
+- Keep commands names stable when possible.
+
+Generate a specification JSON with keys: class_name, commands, imports, storage_needs, safety_notes, approach.
+"""
+
+        repo_context = await self.get_repo_context()
+        spec_messages = [
+            {"role": "system", "content": "You are an expert Discord bot developer. Generate detailed, safe specifications."},
+            {"role": "user", "content": mod_spec_prompt + "\n\nREPO STRUCTURE:\n" + repo_context},
+        ]
+
+        all_providers = self.bot.config.get(None, "ai_providers", scope="global") or {}
+        spec_provider = {
+            "provider": "openai",
+            "model": "o3",
+            "provider_info": all_providers.get("openai", {}),
+        }
+
+        try:
+            spec_response = await self.call_ai_api(spec_provider, spec_messages, {})
+            json_match = re.search(r'\{.*\}', spec_response, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON found in spec response")
+            new_spec = json.loads(json_match.group(0))
+        except Exception as e:
+            self.logger.error(f"revibe spec generation failed: {e}", exc_info=True)
+            await ctx.send("❌ Failed to generate modification spec.")
+            return
+
+        # Build implementation prompt using old code as context
+        impl_prompt = (
+            "Modify the following Discord bot cog code in full to satisfy the NEW REQUEST.\n\n"
+            f"NEW REQUEST: \"{new_description}\"\n"
+            f"CLASS NAME TO KEEP: {target}\n"
+            "Preserve existing config keys and data structures when possible so persisted data keeps working across restarts.\n"
+            "Do not rely on in-memory state across restarts; read from self.bot.config as needed.\n"
+            "Keep command names unless the request mandates changes.\n"
+            "Output ONLY the full Python module, including async def setup(bot).\n\n"
+            "CURRENT CODE:\n" + current_code + "\n\n"
+            "SPECIFICATION FOR UPDATE:\n" + json.dumps(new_spec, indent=2)
+        )
+
+        impl_messages = [
+            {"role": "system", "content": "You are an expert Python developer specializing in Discord bots. Generate clean, safe, working code."},
+            {"role": "user", "content": impl_prompt},
+        ]
+
+        impl_provider = {
+            "provider": "openai",
+            "model": "o4-mini",
+            "provider_info": all_providers.get("openai", {}),
+        }
+        impl_provider["provider_info"] = impl_provider["provider_info"].copy()
+        if "models" not in impl_provider["provider_info"]:
+            impl_provider["provider_info"]["models"] = {}
+        impl_provider["provider_info"]["models"]["o4-mini"] = {
+            "timeout_multiplier": 2.0,
+            "max_completion_tokens": 16000,
+        }
+
+        implementation = None
+        for attempt in range(2):
+            try:
+                implementation = await self.call_ai_api(impl_provider, impl_messages, {})
+                if implementation and len(implementation.strip()) > 50:
+                    break
+            except Exception as e:
+                self.logger.error(f"revibe implementation generation failed on attempt {attempt+1}: {e}")
+            await asyncio.sleep(1)
+
+        if not implementation:
+            await ctx.send("❌ Failed to generate updated implementation.")
+            return
+
+        # Cleanup fencing
+        code = implementation.strip()
+        if code.startswith("```python"):
+            code = code[9:]
+        if code.startswith("```"):
+            code = code[3:]
+        if code.endswith("```"):
+            code = code[:-3]
+        code = code.strip()
+
+        # Unload, write, reload
+        try:
+            if matching_cog in self.bot.extensions:
+                await self.bot.unload_extension(matching_cog)
+        except Exception as e:
+            self.logger.warning(f"Failed to unload before revibe (continuing): {e}")
+
+        try:
+            filepath.write_text(code, encoding="utf-8")
+        except Exception as e:
+            self.logger.error(f"Failed writing updated vibe file: {e}", exc_info=True)
+            # attempt restore
+            try:
+                shutil.copy2(str(backup_path), str(filepath))
+            except Exception:
+                pass
+            await ctx.send("❌ Failed to write updated file; original restored.")
+            return
+
+        try:
+            await self.bot.load_extension(matching_cog)
+        except Exception as e:
+            self.logger.error(f"Failed to load updated vibe: {e}", exc_info=True)
+            # Restore from backup on failure
+            try:
+                if matching_cog in self.bot.extensions:
+                    await self.bot.unload_extension(matching_cog)
+            except Exception:
+                pass
+            try:
+                shutil.copy2(str(backup_path), str(filepath))
+                await self.bot.load_extension(matching_cog)
+            except Exception:
+                pass
+            await ctx.send("❌ Failed to reload updated vibe; original restored.")
+            return
+
+        # Record history entry for undo (global)
+        history = config.get(None, "vibe_rev_history", scope="global") or []
+        history.append({
+            "cog_name": matching_cog,
+            "filepath": str(filepath),
+            "backup_path": str(backup_path),
+            "prev_spec": matching_info.get("spec"),
+            "timestamp": ts,
+        })
+        config.set(None, "vibe_rev_history", history, scope="global")
+
+        # Update active_vibes spec (global)
+        active_vibes = config.get(None, "active_vibes", scope="global") or {}
+        entry = active_vibes.get(matching_cog, {})
+        entry["spec"] = new_spec
+        entry["created_at"] = time.time()
+        entry["filepath"] = str(filepath)
+        active_vibes[matching_cog] = entry
+        config.set(None, "active_vibes", active_vibes, scope="global")
+
+        await ctx.send(f"✅ Updated vibe '{target}' and reloaded.")
+
+    @commands.command(name='unvibe')
+    async def unvibe(self, ctx):
+        """Undo the last !revibe (global, admin only)."""
+        if not self.is_authorized(ctx):
+            await ctx.send("You do not have permission to use this command.")
+            return
+
+        config = self.bot.config
+        history = config.get(None, "vibe_rev_history", scope="global") or []
+        if not history:
+            await ctx.send("No revibe history to undo.")
+            return
+
+        last = history.pop()
+        config.set(None, "vibe_rev_history", history, scope="global")
+
+        cog_name = last.get("cog_name")
+        filepath = last.get("filepath")
+        backup_path = last.get("backup_path")
+        prev_spec = last.get("prev_spec")
+
+        try:
+            if cog_name in self.bot.extensions:
+                await self.bot.unload_extension(cog_name)
+        except Exception:
+            pass
+
+        try:
+            shutil.copy2(backup_path, filepath)
+        except Exception as e:
+            self.logger.error(f"Failed to restore backup: {e}", exc_info=True)
+            await ctx.send("❌ Failed to restore backup.")
+            return
+
+        try:
+            await self.bot.load_extension(cog_name)
+        except Exception as e:
+            self.logger.error(f"Failed to reload original after undo: {e}", exc_info=True)
+            await ctx.send("❌ Restored file but failed to reload the cog.")
+            return
+
+        # Restore active_vibes metadata
+        active_vibes = config.get(None, "active_vibes", scope="global") or {}
+        entry = active_vibes.get(cog_name, {})
+        entry["spec"] = prev_spec or entry.get("spec")
+        entry["filepath"] = filepath
+        active_vibes[cog_name] = entry
+        config.set(None, "active_vibes", active_vibes, scope="global")
+
+        await ctx.send("✅ Undid last revibe and restored the previous version.")
 
     @commands.command(name='listvibes')
     async def listvibes(self, ctx):
-        """List active vibes in this server"""
-        active_vibes = self.bot.config.get(ctx, "active_vibes") or {}
+        """List active vibes (global)"""
+        active_vibes = self.bot.config.get(None, "active_vibes", scope="global") or {}
         
         if not active_vibes:
-            await ctx.send("No active vibes in this server.")
+            await ctx.send("No active vibes.")
             return
             
         vibe_list = []
@@ -521,26 +741,28 @@ To reject: `!rejectvibe {vibe_id}`"""
 
     @commands.command(name='deletevibe', aliases=['unloadvibe'])
     async def deletevibe(self, ctx, vibe_name: str):
-        """Delete a vibe (admin only)"""
+        """Delete a vibe (admin only, global)"""
         if not self.is_authorized(ctx):
             await ctx.send("You do not have permission to use this command.")
             return
-            
+
         config = self.bot.config
-            
-        active_vibes = config.get(ctx, "active_vibes") or {}
-        
+        active_vibes = config.get(None, "active_vibes", scope="global") or {}
+
         # Find matching vibe
         matching_cog = None
         for cog_name, vibe_data in active_vibes.items():
-            if vibe_name.lower() in cog_name.lower() or vibe_name.lower() == vibe_data.get("spec", {}).get("class_name", "").lower():
+            if (
+                vibe_name.lower() in cog_name.lower()
+                or vibe_name.lower() == vibe_data.get("spec", {}).get("class_name", "").lower()
+            ):
                 matching_cog = cog_name
                 break
-                
+
         if not matching_cog:
             await ctx.send("Vibe not found.")
             return
-            
+
         try:
             # Try to unload the cog if it's loaded
             if matching_cog in self.bot.extensions:
@@ -548,19 +770,19 @@ To reject: `!rejectvibe {vibe_id}`"""
                 self.logger.info(f"Unloaded extension: {matching_cog}")
             else:
                 self.logger.info(f"Extension not loaded, skipping unload: {matching_cog}")
-            
+
             # Delete the file
             filepath = active_vibes[matching_cog].get("filepath")
             if filepath and os.path.exists(filepath):
                 os.remove(filepath)
                 self.logger.info(f"Deleted file: {filepath}")
-                
+
             # Remove from active vibes
-            active_vibes.pop(matching_cog)
-            config.set(ctx, "active_vibes", active_vibes)
-            
+            active_vibes.pop(matching_cog, None)
+            config.set(None, "active_vibes", active_vibes, scope="global")
+
             await ctx.send(f"✅ Removed vibe: {matching_cog}")
-            
+
         except Exception as e:
             self.logger.error(f"Failed to unload vibe: {e}", exc_info=True)
             await ctx.send(f"❌ Failed to unload vibe: {str(e)}")
