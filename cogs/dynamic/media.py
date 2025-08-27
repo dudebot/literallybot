@@ -70,5 +70,51 @@ class Media(commands.Cog):
             except yt_dlp.utils.DownloadError as e:
                 await ctx.send(f'Failed to download the video: {e}')
 
+    @commands.command(name='listmedia')
+    async def listmedia(self, ctx, prefix: str = None):
+        """List available media files. Optionally filter by a starting prefix.
+
+        Usage: !listmedia [prefix]
+        """
+        media_dir = 'media/'
+        allowed = ('.mp4', '.ogg', '.webm', '.mp3')
+
+        if not os.path.isdir(media_dir):
+            await ctx.send('Media directory not found.')
+            return
+
+        try:
+            files = [f for f in os.listdir(media_dir) if f.lower().endswith(allowed)]
+        except OSError as e:
+            await ctx.send(f'Failed to read media directory: {e}')
+            return
+
+        if prefix:
+            p = prefix.lower()
+            files = [f for f in files if f.lower().startswith(p)]
+
+        files.sort(key=str.lower)
+
+        if not files:
+            if prefix:
+                await ctx.send(f'No media files found starting with "{prefix}".')
+            else:
+                await ctx.send('No media files found.')
+            return
+
+        # Chunk messages to avoid exceeding Discord limits
+        header = f'Media files ({len(files)} total' + (f', filtered by "{prefix}"' if prefix else '') + '):\n'
+        chunk_limit = 1900  # leave room for header/formatting
+        current = header
+        lines = []
+        for name in files:
+            line = name + '\n'
+            if len(current) + len(line) > 2000:
+                await ctx.send(current.rstrip('\n'))
+                current = ''
+            current += line
+        if current:
+            await ctx.send(current.rstrip('\n'))
+
 async def setup(bot):
     await bot.add_cog(Media(bot))
