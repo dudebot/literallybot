@@ -119,6 +119,8 @@ async def on_message(message):
         logger.info(f'Received DM from {message.author} (ID: {message.author.id}): {message.content}')
     await bot.process_commands(message)
 
+#todo this doesn't show the actual error type nor line numbers. also i dont think we log slash commands
+#exc_info=True also seems to spam "NoneType: None" somehow
 @bot.event
 async def on_command_error(ctx, error):
     logger.error(f'Error in command {ctx.command}: {error}', exc_info=True)
