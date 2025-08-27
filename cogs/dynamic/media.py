@@ -16,6 +16,8 @@ class Media(commands.Cog):
 
         if message.content.startswith('!'):
             file_name = message.content[1:].lower()
+            if len(file_name) < 4:
+                return
             media_dir = 'media/'
             for file in os.listdir(media_dir):
                 if file.startswith(file_name):
@@ -32,6 +34,15 @@ class Media(commands.Cog):
             return
 
         file_name = file_name.lower()
+        
+        if not link or not link.strip():
+            await ctx.send("Link cannot be empty.\nUsage: `!addmedia <link> <filename>`")
+            return
+            
+        if len(file_name) < 4:
+            await ctx.send("Filename must be at least 4 characters long.\nUsage: `!addmedia <link> <filename>`")
+            return
+            
         file_extension = link.split('.')[-1]
         file_path = f'media/{file_name}.{file_extension}'
 
