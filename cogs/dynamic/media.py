@@ -25,7 +25,7 @@ class Media(commands.Cog):
                     break
 
     @commands.command(name='addmedia')
-    async def addmedia(self, ctx, link: str, file_name: str):
+    async def addmedia(self, ctx, link: str = None, file_name: str = None):
         """Download and save YouTube videos or direct file links as media files."""
         config = self.bot.config
         admin_ids = config.get(ctx, "admins", [])
@@ -33,6 +33,10 @@ class Media(commands.Cog):
             await ctx.send("You do not have permission to use this command.")
             return
 
+        if not link or not file_name:
+            await ctx.send("Missing required arguments.\nUsage: `!addmedia <link> <filename>`")
+            return
+            
         file_name = file_name.lower()
         
         if not link or not link.strip():
