@@ -56,23 +56,29 @@ class Vibe(commands.Cog):
                 client = openai.OpenAI(api_key=api_key)
             
             # Run the API call in a non-blocking way
-            # Handle different parameter names for reasoning models
+            # Handle different parameter names based on model capabilities
             create_params = {
                 "messages": messages,
                 "metadata": metadata,
                 "store": True,
                 "model": model
             }
-            
-            # Check if this is a reasoning model (o3, o4, etc) - they use max_completion_tokens
-            if model.startswith("o3") or model.startswith("o4") or model == "o1" or model == "o1-preview" or model == "o1-mini":
-                # Check if provider info has specific max_completion_tokens for this model
-                models_info = provider_info.get("models", {})
-                model_info = models_info.get(model, {})
-                max_completion_tokens = model_info.get("max_completion_tokens", 3000)
-                create_params["max_completion_tokens"] = max_completion_tokens
+
+            models_info = provider_info.get("models", {})
+            model_info = models_info.get(model, {})
+
+            uses_completion_tokens = (
+                model.startswith("o3")
+                or model.startswith("o4")
+                or model.startswith("gpt-5")
+                or model in {"o1", "o1-preview", "o1-mini"}
+                or "max_completion_tokens" in model_info
+            )
+
+            if uses_completion_tokens:
+                create_params["max_completion_tokens"] = model_info.get("max_completion_tokens", 3000)
             else:
-                create_params["max_tokens"] = 3000
+                create_params["max_tokens"] = model_info.get("max_tokens", 3000)
             
             chat_completion = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -104,9 +110,11 @@ IMPORTANT PRINCIPLES:
 CONTEXT:
 - Bot framework: discord.py with commands.Cog
 - Available: self.bot, self.logger, self.bot.config
-- Config system (only use if needed):
-  - Guild: config.get(ctx, "key", default) / config.set(ctx, "key", value)
-  - Global: config.get(None, "key") / config.set(None, "key", value)
+- Config system (only when persistent state is required):
+  - Guild-scoped: config.get(ctx, "key", default) / config.set(ctx, "key", value)
+  - User-scoped: config.get_user(ctx, "key", default) / config.set_user(ctx, "key", value)
+  - Global: config.get(None, "key") / config.set(None, "key", value) (only for bot-wide settings shared across all guilds)
+  - Never store per-user or per-guild state in the global scope
 
 Generate a specification including:
 1. Cog class name (descriptive)
@@ -127,11 +135,11 @@ Focus on exactly what the user asked for, no more."""
                 {"role": "user", "content": spec_prompt + "\n\nREPO STRUCTURE:\n" + repo_context}
             ]
             
-            # Use o3 for reasoning
+            # Use gpt-5 for reasoning
             all_providers = self.bot.config.get(None, "ai_providers", scope="global") or {}
             spec_provider = {
                 "provider": "openai",
-                "model": "o3",
+                "model": "gpt-5",
                 "provider_info": all_providers.get("openai", {})
             }
             
@@ -163,6 +171,11 @@ SPECIFICATION FROM ANALYSIS:
 """ + spec_for_impl + """
 
 IMPORTANT: Follow the ORIGINAL USER REQUEST exactly. Use any specific values mentioned (user IDs, exact phrases, etc).
+- Only persist data when absolutely required.
+- Guild-level settings must use config.get/config.set with ctx.
+- User-specific data must use config.get_user/config.set_user.
+- Reserve global config for truly global settings shared across every guild.
+- Prefer in-memory constants for fixed behaviours instead of config writes.
 
 Here's a simple auto-response example:
 
@@ -245,10 +258,10 @@ Generate ONLY the Python code, no explanations."""
                 {"role": "user", "content": impl_prompt}
             ]
             
-            # Use o4-mini for implementation
+            # Use gpt-5 for implementation
             impl_provider = {
                 "provider": "openai", 
-                "model": "o4-mini",
+                "model": "gpt-5",
                 "provider_info": all_providers.get("openai", {})
             }
             
@@ -256,12 +269,12 @@ Generate ONLY the Python code, no explanations."""
             impl_provider["provider_info"] = impl_provider["provider_info"].copy()
             if "models" not in impl_provider["provider_info"]:
                 impl_provider["provider_info"]["models"] = {}
-            impl_provider["provider_info"]["models"]["o4-mini"] = {
+            impl_provider["provider_info"]["models"]["gpt-5"] = {
                 "timeout_multiplier": 2.0,
                 "max_completion_tokens": 16000  # High limit for code generation
             }
             
-            # Try up to 3 times for o4-mini implementation
+            # Try up to 3 times for gpt-5 implementation
             implementation = None
             for attempt in range(3):
                 try:

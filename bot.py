@@ -123,6 +123,11 @@ async def on_message(message):
 #exc_info=True also seems to spam "NoneType: None" somehow
 @bot.event
 async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        handled_ids = getattr(bot, '_lb_media_handled_ids', None)
+        if handled_ids is not None and ctx.message.id in handled_ids:
+            handled_ids.discard(ctx.message.id)
+            return
     logger.error(f'Error in command {ctx.command}: {error}', exc_info=True)
 
 @bot.event
