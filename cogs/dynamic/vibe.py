@@ -115,6 +115,7 @@ CONTEXT:
   - User-scoped: config.get_user(ctx, "key", default) / config.set_user(ctx, "key", value)
   - Global: config.get(None, "key") / config.set(None, "key", value) (only for bot-wide settings shared across all guilds)
   - Never store per-user or per-guild state in the global scope
+- Command dispatch is handled by bot.on_message; do not call self.bot.process_commands() inside cog listeners
 
 Generate a specification including:
 1. Cog class name (descriptive)
@@ -176,6 +177,7 @@ IMPORTANT: Follow the ORIGINAL USER REQUEST exactly. Use any specific values men
 - User-specific data must use config.get_user/config.set_user.
 - Reserve global config for truly global settings shared across every guild.
 - Prefer in-memory constants for fixed behaviours instead of config writes.
+- Do not call self.bot.process_commands(); the core bot.on_message already handles command dispatch.
 
 Here's a simple auto-response example:
 
