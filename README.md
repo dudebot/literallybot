@@ -40,12 +40,16 @@ That's it! Your bot is now running with all core features available.
 ## 🔧 Optional Integrations
 
 ### AI Chat (GPT)
-Add to your `.env` file:
-```bash
-OPENAI_API_KEY=your_openai_key
-OPENAI_MODEL=gpt-4o-mini  # optional
-OPENAI_BASE_URL=https://api.x.ai/v1  # optional, for alternative providers
+Store AI credentials in `configs/global.json`. Example keys:
+```json
+"XAI_API_KEY": "xai-XXXX",
+"OPENAI_API_KEY": "sk-XXXX"
 ```
+Once the keys are present, use the GPT commands to manage behaviour:
+- `!aiinfo` – list available providers/models and confirm keys are detected
+- `!setprovider <provider>` – switch between configured providers (e.g., `xai`, `openai`, `anthropic`)
+- `!setmodel <model>` – choose a model for the current provider
+- `!setpersonality` – update the bot’s response personality
 
 ### Image Search (Danbooru)
 Add to your `.env` file:

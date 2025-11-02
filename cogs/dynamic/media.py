@@ -8,6 +8,8 @@ import requests
 class Media(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        if not hasattr(bot, "_lb_media_handled_ids"):
+            bot._lb_media_handled_ids = set()
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -16,13 +18,16 @@ class Media(commands.Cog):
 
         if message.content.startswith('!'):
             file_name = message.content[1:].lower()
-            if len(file_name) < 4:
+            if len(file_name) < 2:
                 return
             media_dir = 'media/'
             for file in os.listdir(media_dir):
                 if file.startswith(file_name):
                     await message.channel.send(file=File(os.path.join(media_dir, file)))
-                    break
+                    handled = getattr(self.bot, '_lb_media_handled_ids', None)
+                    if handled is not None:
+                        handled.add(message.id)
+                    return
 
     @commands.command(name='addmedia')
     async def addmedia(self, ctx, link: str = None, file_name: str = None):
@@ -43,8 +48,8 @@ class Media(commands.Cog):
             await ctx.send("Link cannot be empty.\nUsage: `!addmedia <link> <filename>`")
             return
             
-        if len(file_name) < 4:
-            await ctx.send("Filename must be at least 4 characters long.\nUsage: `!addmedia <link> <filename>`")
+        if len(file_name) < 2:
+            await ctx.send("Filename must be at least 2 characters long.\nUsage: `!addmedia <link> <filename>`")
             return
             
         file_extension = link.split('.')[-1]

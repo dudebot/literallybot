@@ -97,23 +97,29 @@ class Gpt(commands.Cog):
                 client = openai.OpenAI(api_key=api_key)
             
             # Run the API call in a non-blocking way
-            # Handle different parameter names for reasoning models
+            # Handle different parameter names based on model capabilities
             create_params = {
                 "messages": messages,
                 "metadata": metadata,
                 "store": True,
                 "model": model
             }
-            
-            # Check if this is a reasoning model (o3, o4, etc) - they use max_completion_tokens
-            if model.startswith("o3") or model.startswith("o4") or model == "o1" or model == "o1-preview" or model == "o1-mini":
-                # Check if provider info has specific max_completion_tokens for this model
-                models_info = provider_info.get("models", {})
-                model_info = models_info.get(model, {})
-                max_completion_tokens = model_info.get("max_completion_tokens", 3000)
-                create_params["max_completion_tokens"] = max_completion_tokens
+
+            models_info = provider_info.get("models", {})
+            model_info = models_info.get(model, {})
+
+            uses_completion_tokens = (
+                model.startswith("o3")
+                or model.startswith("o4")
+                or model.startswith("gpt-5")
+                or model in {"o1", "o1-preview", "o1-mini"}
+                or "max_completion_tokens" in model_info
+            )
+
+            if uses_completion_tokens:
+                create_params["max_completion_tokens"] = model_info.get("max_completion_tokens", 3000)
             else:
-                create_params["max_tokens"] = 3000
+                create_params["max_tokens"] = model_info.get("max_tokens", 3000)
             
             chat_completion = await asyncio.to_thread(
                 client.chat.completions.create,
