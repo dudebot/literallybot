@@ -26,6 +26,7 @@ from os import listdir
 from dotenv import load_dotenv
 import os
 from core.config import Config
+from core.error_handler import log_error_to_discord
 # Logging setup
 import logging
 from logging.handlers import RotatingFileHandler
@@ -129,6 +130,13 @@ async def on_command_error(ctx, error):
             handled_ids.discard(ctx.message.id)
             return
     logger.error(f'Error in command {ctx.command}: {error}', exc_info=True)
+    try:
+        command_name = ctx.command.name if ctx.command else 'unknown'
+        extra_info = f"User: {ctx.author} (ID: {ctx.author.id})\nChannel: {ctx.channel}"
+        import asyncio as _asyncio
+        _asyncio.create_task(log_error_to_discord(bot, error, f'command_{command_name}', extra_info))
+    except Exception:
+        pass
 
 @bot.event
 async def on_command(ctx):
@@ -141,6 +149,15 @@ async def on_command_completion(ctx):
 @bot.event
 async def on_error(event, *args, **kwargs):
     logger.exception(f'Unhandled exception in event {event}', exc_info=True)
+    try:
+        import sys as _sys
+        err = _sys.exc_info()[1]
+        if err:
+            import asyncio as _asyncio
+            extra_info = f"Event: {event}\nArgs: {str(args)[:500]}"
+            _asyncio.create_task(log_error_to_discord(bot, err, f'event_{event}', extra_info))
+    except Exception:
+        pass
 
 statuslist = cycle([
         "01010101",
@@ -175,3 +192,14 @@ if __name__ == "__main__":
         bot.config.shutdown()
         logger.info('Config system shutdown complete')
     #Runs the bot with its token. Don't put code below this command.
+
+
+@change_status.error
+async def change_status_error(error):
+    """Handle errors in the change_status task loop."""
+    logger.error(f"Error in change_status task: {error}", exc_info=True)
+    try:
+        import asyncio as _asyncio
+        _asyncio.create_task(log_error_to_discord(bot, error, 'task_change_status'))
+    except Exception:
+        pass
