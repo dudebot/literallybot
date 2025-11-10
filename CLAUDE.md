@@ -98,7 +98,7 @@ config.flush()  # Force immediate save
 **Note for cog development:** Always access config through `self.bot.config` within cog methods.
 
 ### Permission System
-- **Superadmin**: Single global bot owner (claim with `!claimsuper`)
+- **Superadmins**: Global bot owners (claim with `!claimsuper`, add others with `!addsuperadmin`)
 - **Admins**: Per-guild administrators (claim with `!claimadmin` if Discord admin)
 - **Moderators**: Server-specific moderation permissions
 - Commands check permissions via config system
@@ -123,8 +123,8 @@ DANBOORU_LOGIN=your_danbooru_username (for Danbooru features)
 
 ## Bot Management Commands
 
-### Administrative
 - `!claimsuper` - Claim superadmin (first use only)
+- `!addsuperadmin @user` - Promote an additional superadmin
 - `!claimadmin` - Claim guild admin (requires Discord admin)
 - `!load <cog>` - Load cog (e.g., `!load dynamic.gpt`)
 - `!unload <cog>` - Unload cog

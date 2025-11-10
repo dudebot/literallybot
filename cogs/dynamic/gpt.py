@@ -9,6 +9,8 @@ import json
 import aiohttp
 from typing import Dict, List, Optional, Any
 
+from core.utils import is_superadmin
+
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
     def __init__(self, bot):
@@ -24,10 +26,9 @@ class Gpt(commands.Cog):
     def is_authorized(self, ctx) -> bool:
         """Check if user is authorized to use admin commands"""
         config = self.bot.config
-        superadmin = config.get(None, "superadmin", scope="global")
         
         # Superadmin always authorized
-        if ctx.author.id == superadmin:
+        if is_superadmin(config, ctx.author.id):
             return True
             
         # In guilds, check admin list
@@ -521,8 +522,7 @@ class Gpt(commands.Cog):
         """Ask GPT a question."""
         # Restrict DM usage to superadmin only
         if not ctx.guild:
-            superadmin = self.bot.config.get(None, "superadmin", scope="global")
-            if ctx.author.id != superadmin:
+            if not is_superadmin(self.bot.config, ctx.author.id):
                 await ctx.send("This command cannot be used in DMs.")
                 return
                 
