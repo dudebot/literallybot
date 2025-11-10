@@ -4,27 +4,23 @@ A modular Discord bot built with discord.py that's designed to be a "jack of all
 
 ## 🚀 Quick Start
 
-1. **Clone and install:**
-   ```bash
-   git clone https://github.com/dudebot/literallybot.git
-   cd literallybot
-   pip install -r requirements.txt
-   ```
+**Copy-paste these commands** (replace `your_bot_token_here` with your actual Discord bot token):
 
-2. **Set up your bot token:**
-   ```bash
-   # Create .env file
-   echo "DISCORD_TOKEN=your_discord_token_here" > .env
-   ```
+```bash
+git clone https://github.com/dudebot/literallybot.git
+cd literallybot
+echo "DISCORD_TOKEN=your_bot_token_here" > .env
+./start_bot.sh
+```
 
-3. **Run the bot:**
-   ```bash
-   python bot.py
-   ```
+The start script will:
+- Create a virtual environment automatically
+- Install all dependencies
+- Start the bot
 
-4. **Claim admin permissions:**
-   - Invite bot to your Discord server
-   - Run `!claimsuper` in any channel to become a superadmin
+**First-time setup:**
+1. Invite bot to your Discord server
+2. Run `!claimsuper` in any channel to become a superadmin
 
 That's it! Your bot is now running with all core features available.
 
@@ -130,9 +126,6 @@ For deeper walkthroughs, see:
 - `docs/cog-development.md` – building cogs end-to-end
 - `docs/config-system.md` – advanced config usage and patterns
 
-### Reference
-- **[CLAUDE.md](CLAUDE.md)** - Development setup guide
-
 ### Administrative Commands
 - `!claimsuper` - Become a bot superadmin (first time only)
 - `!addsuperadmin @user` - Promote an additional bot superadmin
@@ -149,7 +142,7 @@ Notes:
 - Errors are rate-limited to avoid spam. Per-guild logging and broader coverage are planned in the upgrade issue.
 
 ### Production Deployment
-For Linux servers, use the provided `bot.service` systemd template and `install_service.sh` script.
+For Linux servers, use the provided service template in `scripts/` and the `install_service.sh` script.
 
 ## Contributing
 

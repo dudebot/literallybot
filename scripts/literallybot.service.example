@@ -1,0 +1,16 @@
+[Unit]
+Description=LiterallyBot Discord Bot
+Wants=network-online.target
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+Group=YOUR_USERNAME
+WorkingDirectory=/path/to/literallybot
+ExecStart=/usr/bin/python3 /path/to/literallybot/bot.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

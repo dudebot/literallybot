@@ -1,12 +1,32 @@
-.env
-__pycache__
+# Python
 *.pyc
-configs
-logs/*
-.claude
-settings.local.json
-cogs/vibes/*
+__pycache__/
+*.py[cod]
+
+# Virtual Environment
+venv/
+.venv/
+
+# Environment & Secrets
+.env
+.env.*
+
+# Bot Data
+configs/
+logs/
+*logs/
+
+# Backups
 backups/
+*backup*/
+
+# Development Tools
+.claude/
+.vscode/
+.pytest_cache/
+settings.local.json
+
+# Bot-Specific: literallybot media files
 # Protect media files - ignore all except already tracked files
 /media/*
 !/media/aaaaaaaa_hd.mp4
@@ -15,4 +35,6 @@ backups/
 !/media/poggers.mp4
 !/media/squish.webm
 !/media/yahallo.mp4
-venv/
+
+# Legacy - keeping for safety
+cogs/vibes/*
