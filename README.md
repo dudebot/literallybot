@@ -24,7 +24,7 @@ A modular Discord bot built with discord.py that's designed to be a "jack of all
 
 4. **Claim admin permissions:**
    - Invite bot to your Discord server
-   - Run `!claimsuper` in any channel to become superadmin
+   - Run `!claimsuper` in any channel to become a superadmin
 
 That's it! Your bot is now running with all core features available.
 
@@ -82,8 +82,6 @@ Press the button on your Hue Bridge, then run:
 - `!remind <time> <message>` - Set reminders
 - `!setrole <role>` - Self-assign roles
 
-See [COGS_LIST.md](COGS_LIST.md) for complete command documentation.
-
 ## 🏗️ Development & Extension
 
 ### Creating Custom Cogs
@@ -109,14 +107,31 @@ async def setup(bot):
 
 Load with `!load my_feature` - no restart needed!
 
-### Documentation
-- **[docs/cog-development.md](docs/cog-development.md)** - Complete cog development guide
-- **[docs/config-system.md](docs/config-system.md)** - Configuration system guide
-- **[COGS_LIST.md](COGS_LIST.md)** - Complete feature documentation  
+### Config Quick Reference
+LiterallyBot's config helper is available as `self.bot.config` in every cog:
+
+```python
+# Per-guild (default scope)
+prefix = self.bot.config.get(ctx, "prefix", "!")
+self.bot.config.set(ctx, "prefix", "?")
+
+# Per-user
+timezone = self.bot.config.get_user(ctx, "timezone", "UTC")
+self.bot.config.set_user(ctx, "timezone", "UTC")
+
+# Global (bot-wide)
+superadmins = self.bot.config.get_global("superadmins", [])
+self.bot.config.set_global("maintenance_mode", True)
+```
+
+Lists are just Python lists—get, mutate, then `set` the updated list. Call `self.bot.config.flush()` before shutdown if you need to force writes immediately.
+
+### Reference
 - **[CLAUDE.md](CLAUDE.md)** - Development setup guide
 
 ### Administrative Commands
-- `!claimsuper` - Become bot superadmin (first time only)
+- `!claimsuper` - Become a bot superadmin (first time only)
+- `!addsuperadmin @user` - Promote an additional bot superadmin
 - `!load <cog>` / `!unload <cog>` - Manage features
 - `!reload <cog>` - Hot-reload code changes
 - `!update` - Pull latest changes from git
