@@ -10,13 +10,12 @@ class SetRole(commands.Cog):
     @commands.command(name='setrole')
     async def setrole(self, ctx, role: str, member: discord.Member = None):
         """Adds or removes available roles. Optionally apply to a specified user."""
-        config = self.bot.config
-        whitelist_roles = config.get(ctx, "whitelist_roles", [])
+        whitelist_roles = self.bot.config.get(ctx, "whitelist_roles", [])
         # Determine target; default to invoking user if no member provided.
         target = member if member else ctx.author
         # If the target is not the invoker, verify admin/superadmin permission.
         if member:
-            admins = config.get(ctx, "admins", [])
+            admins = self.bot.config.get(ctx, "admins", [])
             if not (ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner or
                     ctx.author.id in admins):
                 await ctx.send("You don't have permission to modify roles for other users.")
@@ -49,13 +48,12 @@ class SetRole(commands.Cog):
         if not ctx.author.guild_permissions.manage_roles:
             await ctx.send("You need the manage roles permission to use this command.")
             return
-        config = self.bot.config
-        whitelist_roles = config.get(ctx, "whitelist_roles", [])
+        whitelist_roles = self.bot.config.get(ctx, "whitelist_roles", [])
         if role.lower() in [r.lower() for r in whitelist_roles]:
             await ctx.send(f"Role '{role}' is already whitelisted.")
         else:
             whitelist_roles.append(role)
-            config.set(ctx, "whitelist_roles", whitelist_roles)
+            self.bot.config.set(ctx, "whitelist_roles", whitelist_roles)
             await ctx.send(f"Role '{role}' added to the whitelist.")
             
     # Modified: App Command for setting up emoji role toggle; change message_id to string and convert to int.
@@ -102,13 +100,12 @@ class SetRole(commands.Cog):
 
         # Store the emoji-role mapping; use emoji.id (as string) for custom emoji, else emoji.name.
         key = str(partial_emoji.id) if partial_emoji.id else partial_emoji.name
-        config = self.bot.config
-        toggles = config.get(ctx, "emoji_role_toggles", {})
+        toggles = self.bot.config.get(ctx, "emoji_role_toggles", {})
         msg_key = str(msg_id_int)
         if msg_key not in toggles:
             toggles[msg_key] = {}
         toggles[msg_key][key] = role.id
-        config.set(ctx, "emoji_role_toggles", toggles)
+        self.bot.config.set(ctx, "emoji_role_toggles", toggles)
 
         await ctx.response.send_message("Emoji role toggle configured.", ephemeral=True)
 
@@ -126,14 +123,13 @@ class SetRole(commands.Cog):
             await interaction.response.send_message(f"Invalid emoji provided: {e}", ephemeral=True)
             return
         key = str(partial_emoji.id) if partial_emoji.id else partial_emoji.name
-        config = self.bot.config
-        toggles = config.get(interaction, "emoji_role_toggles", {})
+        toggles = self.bot.config.get(interaction, "emoji_role_toggles", {})
         msg_key = str(msg_id_int)
         if msg_key in toggles and key in toggles[msg_key]:
             del toggles[msg_key][key]
             if not toggles[msg_key]:
                 del toggles[msg_key]
-            config.set(interaction, "emoji_role_toggles", toggles)
+            self.bot.config.set(interaction, "emoji_role_toggles", toggles)
             await interaction.response.send_message("Emoji role toggle removed.", ephemeral=True)
         else:
             await interaction.response.send_message("Emoji role toggle not found.", ephemeral=True)
