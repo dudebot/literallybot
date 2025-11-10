@@ -21,6 +21,14 @@ class Dev(commands.Cog):
         self.bot = bot
         self.logger = bot.logger
 
+    async def _delete_invocation(self, ctx):
+        """Attempt to delete the invoking command message without failing the command."""
+        try:
+            await ctx.message.delete()
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            channel_name = getattr(ctx.channel, "name", ctx.channel.id)
+            self.logger.warning(f"Unable to delete command invocation in {channel_name}: {exc}")
+
     @commands.Cog.listener()
     #This is the decorator for events (inside of cogs).
     async def on_ready(self):
@@ -62,7 +70,7 @@ class Dev(commands.Cog):
         """
         self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked load on {cog}")
         message = await ctx.send('Loading...')
-        await ctx.message.delete()
+        await self._delete_invocation(ctx)
         try:
             await self.bot.load_extension(self.check_cog(cog))
         except Exception as exc:
@@ -87,7 +95,7 @@ class Dev(commands.Cog):
 		
         self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked unload on {cog}")
         message = await ctx.send('Unloading...')
-        await ctx.message.delete()
+        await self._delete_invocation(ctx)
         try:
             await self.bot.unload_extension(self.check_cog(cog))
         except Exception as exc:
@@ -108,7 +116,7 @@ class Dev(commands.Cog):
             This command deletes its messages after 20 seconds."""
 
         self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked reload on {cog or 'all dynamic'}")
-        await ctx.message.delete()
+        await self._delete_invocation(ctx)
         
         if cog is None:
             cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.dynamic.")]
@@ -242,7 +250,7 @@ class Dev(commands.Cog):
         """
         self.logger.info(f"{ctx.author} invoked list_cogs")
         message = await ctx.send('Listing all cogs...')
-        await ctx.message.delete()
+        await self._delete_invocation(ctx)
         try:
             cogs = [cog[:-3] for cog in listdir('./cogs/dynamic') if cog.endswith('.py')]
             await message.edit(content=f'Available cogs: {", ".join(cogs)}', delete_after=20)
@@ -261,7 +269,7 @@ class Dev(commands.Cog):
         """
         self.logger.info(f"{ctx.author} invoked shutdown")
         message = await ctx.send('I am sudoku...')
-        await ctx.message.delete()
+        await self._delete_invocation(ctx)
         try:
             await self.bot.close()
             sys.exit()
@@ -280,7 +288,7 @@ class Dev(commands.Cog):
         """
         self.logger.info(f"{ctx.author} invoked sync for guild {ctx.guild.id}")
         message = await ctx.send('Syncing commands...')
-        await ctx.message.delete()
+        await self._delete_invocation(ctx)
         try:
             self.bot.tree.copy_global_to(guild=ctx.guild)
             await self.bot.tree.sync(guild=ctx.guild)

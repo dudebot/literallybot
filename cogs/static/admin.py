@@ -1,5 +1,7 @@
-from discord.ext import commands
 import discord
+from discord.ext import commands
+
+from core.utils import get_superadmins, is_admin, is_superadmin
 
 class Admin(commands.Cog):
     def __init__(self, bot):
@@ -8,15 +10,43 @@ class Admin(commands.Cog):
 
     @commands.command(name="claimsuper", aliases=["claimsuperadmin"])
     async def claimsuper(self, ctx):
-        """Claim the sole superadmin spot."""
-        # use global config for superadmin
-        if self.bot.config.get(None, "superadmin") is None:
-            self.bot.config.set(None, "superadmin", ctx.author.id)
-            self.logger.info(f"Superadmin claimed by {ctx.author} (ID: {ctx.author.id})")
-            await ctx.send("Superadmin claimed.")
-        else:
-            self.logger.warning(f"Failed superadmin claim by {ctx.author} (ID: {ctx.author.id}); already set")
-            await ctx.send("There can only be one bot superadmin.")
+        """Claim superadmin privileges (first come, first served)."""
+        config = self.bot.config
+        superadmins = get_superadmins(config)
+
+        if ctx.author.id in superadmins:
+            self.logger.warning(
+                f"Failed superadmin claim by {ctx.author} (ID: {ctx.author.id}); already superadmin"
+            )
+            await ctx.send("You are already a bot superadmin.")
+            return
+
+        superadmins.append(ctx.author.id)
+        config.set(None, "superadmins", superadmins)
+        self.logger.info(f"Superadmin claimed by {ctx.author} (ID: {ctx.author.id})")
+        await ctx.send("Superadmin claimed.")
+
+    @commands.command(name="addsuperadmin")
+    @commands.check(lambda ctx: is_superadmin(ctx.bot.config, ctx.author.id))
+    async def addsuperadmin(self, ctx, member: discord.Member = None):
+        """Promote another user to superadmin (superadmins only)."""
+        if not member:
+            await ctx.send("Please specify a user to add as bot superadmin.")
+            self.logger.warning(f"addsuperadmin called without member by {ctx.author} (ID: {ctx.author.id})")
+            return
+
+        config = self.bot.config
+        superadmins = get_superadmins(config)
+
+        if member.id in superadmins:
+            self.logger.info(f"{member} (ID: {member.id}) already superadmin")
+            await ctx.send(f"{member} is already a bot superadmin.")
+            return
+
+        superadmins.append(member.id)
+        config.set(None, "superadmins", superadmins)
+        self.logger.info(f"{member} (ID: {member.id}) added as superadmin by {ctx.author} (ID: {ctx.author.id})")
+        await ctx.send(f"{member} has been added as a bot superadmin.")
 
     @commands.command(name="claimadmin")
     async def claimadmin(self, ctx):
@@ -25,16 +55,17 @@ class Admin(commands.Cog):
             await ctx.send("This command cannot be used in direct messages.")
             self.logger.warning(f"claimadmin attempted in DMs by {ctx.author} (ID: {ctx.author.id})")
             return
-        
-        global_superadmin = self.bot.config.get(None, "superadmin")
-        if not (ctx.author.id == global_superadmin or ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner):
+
+        config = self.bot.config
+        superadmins = get_superadmins(config)
+
+        if not (ctx.author.id in superadmins or ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner):
             self.logger.warning(f"Unauthorized claimadmin attempt by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild.id}")
             await ctx.send("You lack admin privileges on this server.")
             return
         # use per-guild config for admins
-        config = self.bot.config
-        admins = config.get(ctx, "admins", [])
-        if not ctx.author.id == global_superadmin and admins: # user is not a superadmin and there are already admins
+        admins = config.get(ctx, "admins", []) or []
+        if ctx.author.id not in superadmins and admins:  # user is not a superadmin and there are already admins
             await ctx.send("There are already admins for this server. You must be added by one of the admins with !addadmin @you.")
             return
         if ctx.author.id in admins:
@@ -57,15 +88,14 @@ class Admin(commands.Cog):
             await ctx.send("Please specify a user to add as bot admin.")
             self.logger.warning(f"addadmin called without member by {ctx.author} (ID: {ctx.author.id})")
             return
+
         config = self.bot.config
-        admins = config.get(ctx, "admins", [])
-        if ctx.author.id != self.bot.config.get(None, "superadmin") and not (
-            ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner or 
-            ctx.author.id in admins
-        ):
+
+        if not is_admin(config, ctx):
             self.logger.warning(f"Unauthorized addadmin attempt by {ctx.author} (ID: {ctx.author.id}) to add {member} (ID: {member.id}) in guild {ctx.guild.id}")
             await ctx.send("You don't have permission to add bot admins.")
             return
+        admins = config.get(ctx, "admins", []) or []
         if member.id in admins:
             self.logger.info(f"{member} (ID: {member.id}) already admin in guild {ctx.guild.id}")
             await ctx.send(f"{member} is already an bot admin.")
