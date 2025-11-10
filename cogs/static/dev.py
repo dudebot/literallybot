@@ -4,8 +4,8 @@ from sys import version_info as sysv
 from os import listdir
 import subprocess
 from datetime import datetime
-from utils import smart_split
 import sys
+from core.utils import is_superadmin, safe_delete
 
 class Dev(commands.Cog):
     """This is a cog with owner-only commands.
@@ -21,14 +21,6 @@ class Dev(commands.Cog):
         self.bot = bot
         self.logger = bot.logger
 
-    async def _delete_invocation(self, ctx):
-        """Attempt to delete the invoking command message without failing the command."""
-        try:
-            await ctx.message.delete()
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            channel_name = getattr(ctx.channel, "name", ctx.channel.id)
-            self.logger.warning(f"Unable to delete command invocation in {channel_name}: {exc}")
-
     @commands.Cog.listener()
     #This is the decorator for events (inside of cogs).
     async def on_ready(self):
@@ -39,30 +31,24 @@ class Dev(commands.Cog):
         Args:
             self
             cog (str): The cogname to check
-        
+
         Returns:
             cog if cog starts with `cogs.`, otherwise an fstring with this format`cogs.{cog}`_.
         Note:
             All cognames are made lowercase with `.lower()`_.
         """
-        cog_lower = cog.lower()
-        # If already properly formatted, return as-is
-        if cog_lower.startswith('cogs.'):
-            return cog_lower
-        # Check if this is a vibe cog
-        if cog_lower.startswith('vibes.') or cog_lower.startswith('vibe_'):
-            return f'cogs.vibes.{cog_lower.replace("vibes.", "")}'
-        # Default to dynamic cogs
-        return f'cogs.dynamic.{cog_lower}'
+        if (cog.lower()).startswith('cogs.dynamic.') == True:
+            return cog.lower()
+        return f'cogs.dynamic.{cog.lower()}'
 
     @commands.command(name='load', hidden=True)
-    @commands.is_owner()
+    @commands.check(is_superadmin)
     async def load(self, ctx, *, cog: str):
         """This commands loads the selected cog, as long as that cog is in the `./cogs` folder.
-                
+
         Args:
             cog (str): The name of the cog to load. The name is checked with `.check_cog(cog)`_.
-        
+
         Note:
             This command can be used only from the bot owner.
             This command is hidden from the help menu.
@@ -70,7 +56,7 @@ class Dev(commands.Cog):
         """
         self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked load on {cog}")
         message = await ctx.send('Loading...')
-        await self._delete_invocation(ctx)
+        await safe_delete(ctx, self.logger)
         try:
             await self.bot.load_extension(self.check_cog(cog))
         except Exception as exc:
@@ -81,10 +67,10 @@ class Dev(commands.Cog):
             await message.edit(content=f'{self.check_cog(cog)} has been loaded.', delete_after=20)
 
     @commands.command(name='unload', hidden=True)
-    @commands.is_owner()
+    @commands.check(is_superadmin)
     async def unload(self, ctx, *, cog: str):
         """This commands unloads the selected cog, as long as that cog is in the `./cogs` folder.
-        
+
         Args:
             cog (str): The name of the cog to unload. The name is checked with `.check_cog(cog)`_.
         Note:
@@ -92,10 +78,10 @@ class Dev(commands.Cog):
             This command is hidden from the help menu.
             This command deletes its messages after 20 seconds.
         """
-		
+
         self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked unload on {cog}")
         message = await ctx.send('Unloading...')
-        await self._delete_invocation(ctx)
+        await safe_delete(ctx, self.logger)
         try:
             await self.bot.unload_extension(self.check_cog(cog))
         except Exception as exc:
@@ -104,20 +90,20 @@ class Dev(commands.Cog):
         else:
             self.logger.info(f"Unloaded {cog} successfully by {ctx.author}")
             await message.edit(content=f'{self.check_cog(cog)} has been unloaded.', delete_after=20)
-            
+
     @commands.command(name='reload', hidden=True)#This command is hidden from the help menu.
-    @commands.is_owner()
+    @commands.check(is_superadmin)
     async def reload(self, ctx, cog=None):
         """This commands reloads a specific cog or all cogs in the `./cogs/dynamic` folder.
-        
+
         Note:
             This command can be used only from the bot owner.
             This command is hidden from the help menu.
             This command deletes its messages after 20 seconds."""
 
         self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked reload on {cog or 'all dynamic'}")
-        await self._delete_invocation(ctx)
-        
+        await safe_delete(ctx, self.logger)
+
         if cog is None:
             cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.dynamic.")]
             cogs_to_load = [f'cogs.dynamic.{filename[:-3]}' for filename in listdir('./cogs/dynamic') if filename.endswith('.py')]
@@ -135,14 +121,14 @@ class Dev(commands.Cog):
             except Exception as exc:
                 self.logger.error(f"Error unloading {cog} during reload by {ctx.author}", exc_info=True)
                 errors.append(f'Error unloading {cog}: {exc}')
-        
+
         for cog in cogs_to_load:
             try:
                 await self.bot.load_extension(cog)
             except Exception as exc:
                 self.logger.error(f"Error loading {cog} during reload by {ctx.author}", exc_info=True)
                 errors.append(f'Error loading {cog}: {exc}')
-        
+
         if errors:
             formatted_errors = '\n'.join([f"- {error}" for error in errors])
             response = f'Errors occurred:\n{formatted_errors}'
@@ -151,12 +137,12 @@ class Dev(commands.Cog):
             response = f'All cogs reloaded successfully:\n{formatted_cogs}'
 
         await message.edit(content=response, delete_after=20)
-        
+
     @commands.command(name='update', hidden=True)
-    @commands.is_owner()
+    @commands.check(is_superadmin)
     async def update(self, ctx):
         """This command executes a git pull command in the current environment to update the code.
-        
+
         Note:
             This command can be used only from the bot owner.
             This command is hidden from the help menu.
@@ -178,12 +164,12 @@ class Dev(commands.Cog):
 
             if result.returncode == 0:
                 self.logger.info(f"Git pull successful. Output: {stdout_output if stdout_output else 'No output.'}")
-                
+
                 commit_hash = "N/A"
                 human_time = "N/A"
                 try:
                     commit_info_result = subprocess.run(
-                        ['git', 'log', '-1', '--format="%H %ct"'], 
+                        ['git', 'log', '-1', '--format="%H %ct"'],
                         capture_output=True, text=True, check=False
                     )
                     if commit_info_result.returncode == 0 and commit_info_result.stdout:
@@ -205,9 +191,9 @@ class Dev(commands.Cog):
                     response_content += f'Git Pull Output:\n```\n{stdout_output}\n```'
                 else:
                     response_content += 'No specific output from git pull.'
-                
+
                 await message.edit(content=response_content, delete_after=60)
-            
+
             else: # result.returncode != 0, git pull encountered issues
                 log_message_parts = [f"Git pull command finished with return code {result.returncode}."]
                 if stdout_output: log_message_parts.append(f"Stdout: {stdout_output}")
@@ -229,7 +215,7 @@ class Dev(commands.Cog):
                     self.logger.error(f"Git pull failed. {full_log_message}")
                     user_message_content += ("\n**The code update may have failed or is incomplete.** "
                                              "The bot continues to run. Check the output above and bot logs for details.")
-                
+
                 await message.edit(content=user_message_content, delete_after=180) # Keep message much longer for review
 
         except Exception as exc:
@@ -240,61 +226,66 @@ class Dev(commands.Cog):
                 self.logger.error(f"Failed to send update error to Discord, message gone. Error: {exc}")
 
     @commands.command(name='list_cogs', hidden=True)
-    @commands.is_owner()
+    @commands.check(is_superadmin)
     async def list_cogs(self, ctx):
         """This command lists all the cogs in the `cogs/dynamic` directory.
-        
+
         Note:
             This command can be used only from the bot owner.
             This command is hidden from the help menu.
         """
         self.logger.info(f"{ctx.author} invoked list_cogs")
         message = await ctx.send('Listing all cogs...')
-        await self._delete_invocation(ctx)
+        await safe_delete(ctx, self.logger)
         try:
             cogs = [cog[:-3] for cog in listdir('./cogs/dynamic') if cog.endswith('.py')]
             await message.edit(content=f'Available cogs: {", ".join(cogs)}', delete_after=20)
         except Exception as exc:
             self.logger.error("Error listing cogs", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
-            
+
     @commands.command(name='restart', aliases=['kys', 'shutdown'], hidden=True)
-    @commands.is_owner()
+    @commands.check(is_superadmin)
     async def restart(self, ctx):
-        """This command restarts the bot.
-        
+        """This command restarts the bot (expects systemctl auto-restart).
+
         Note:
-            This command can be used only from the bot owner.
+            This command can be used by superadmins only.
             This command is hidden from the help menu.
+            Use 'restart' alias for cleaner command.
         """
         self.logger.info(f"{ctx.author} invoked shutdown")
-        message = await ctx.send('I am sudoku...')
-        await self._delete_invocation(ctx)
+
+        # Use different message based on the command used
+        if ctx.invoked_with == 'kys':
+            restart_message = 'I am sudoku...'
+        else:
+            restart_message = 'Restarting...'
+
+        # Send message first
+        message = await ctx.send(restart_message)
+
+        # Actually shut down
         try:
             await self.bot.close()
             sys.exit()
         except Exception as exc:
             self.logger.error("Error during shutdown", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
-            
+
     @commands.command(name='sync', hidden=True)
-    @commands.is_owner()
+    @commands.check(is_superadmin)
     async def sync(self, ctx):
-        """This command syncs the bot's commands with Discord.
-        
-        Note:
-            This command can be used only from the bot owner.
-            This command is hidden from the help menu.
-        """
-        self.logger.info(f"{ctx.author} invoked sync for guild {ctx.guild.id}")
+        """Sync application commands with Discord (canonical)."""
+        self.logger.info(f"{ctx.author} invoked sync for guild {getattr(ctx.guild, 'id', 'N/A')}")
         message = await ctx.send('Syncing commands...')
-        await self._delete_invocation(ctx)
+        await safe_delete(ctx, self.logger)
         try:
             self.bot.tree.copy_global_to(guild=ctx.guild)
             await self.bot.tree.sync(guild=ctx.guild)
-            await message.edit(content='Commands synced successfully.', delete_after=20)
+            await message.edit(content='Application commands synced.', delete_after=20)
         except Exception as exc:
-            self.logger.error("Error syncing commands", exc_info=True)
+            self.logger.error("Error during sync", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
 async def setup(bot):

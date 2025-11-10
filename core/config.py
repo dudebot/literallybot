@@ -43,8 +43,6 @@ class Config:
         elif scope == 'user':
             if hasattr(ctx, 'id'):
                 return f'user_{ctx.id}'
-            if hasattr(ctx, 'author'):
-                return f'user_{ctx.author.id}'
             elif isinstance(ctx, int):
                 return f'user_{ctx}'
             else:

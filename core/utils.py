@@ -9,6 +9,7 @@ Normalization goals:
   - is_admin(ctx)
 """
 from typing import List, Union, Any
+import discord
 
 
 def _normalize_superadmins_list(config) -> List[int]:
@@ -91,3 +92,23 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
         return True
 
     return False
+
+
+async def safe_delete(ctx, logger=None):
+    """Safely attempt to delete a command message without raising exceptions.
+
+    Args:
+        ctx: Discord command context
+        logger: Optional logger instance for warnings
+
+    Returns:
+        bool: True if deletion succeeded, False otherwise
+    """
+    try:
+        await ctx.message.delete()
+        return True
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        if logger:
+            channel_name = getattr(ctx.channel, "name", ctx.channel.id)
+            logger.warning(f"Unable to delete command message in {channel_name}: {exc}")
+        return False

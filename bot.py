@@ -69,9 +69,9 @@ bot = commands.Bot(command_prefix=get_prefix, intents=discord.Intents.all())
 bot.logger = logger
 bot.config = Config()
 
-# Function to load all cogs from ./cogs/{static,dynamic,vibes}
+# Function to load all cogs from ./cogs/{static,dynamic}
 async def load_cogs():
-    for group in ("static", "dynamic", "vibes"):
+    for group in ("static", "dynamic"):
         dir_path = f"./cogs/{group}"
         if not os.path.isdir(dir_path):
             logger.debug(f"Cog directory missing, skipping: {dir_path}")
