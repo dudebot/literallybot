@@ -244,12 +244,6 @@ class ChannelMigrator(commands.Cog):
         if attachments:
             await self._handle_attachments(channel, attachments)
 
-        embeds = entry.get("embeds") or []
-        if embeds:
-            embed_notice = f"[Original message contained {len(embeds)} embed(s); re-post manually if needed.]"
-            await channel.send(embed_notice, allowed_mentions=self._no_mentions)
-            await asyncio.sleep(self.POST_DELAY)
-
     def _parse_timestamp(self, raw: Optional[str]) -> Optional[datetime]:
         if not raw:
             return None
@@ -274,14 +268,10 @@ class ChannelMigrator(commands.Cog):
                 )
                 await asyncio.sleep(self.POST_DELAY)
                 continue
-            try:
-                async with self._http_session.get(url) as resp:
-                    if resp.status != 200:
-                        raise RuntimeError(f"HTTP {resp.status}")
-                    payload = await resp.read()
-            except Exception as exc:
+            payload = await self._download_with_retry(url, filename)
+            if payload is None:
                 await channel.send(
-                    f"[Failed to download `{filename}` ({exc}). Linking original instead.]\n{url}",
+                    f"[Failed to download `{filename}` after retries. Linking original instead.]\n{url}",
                     allowed_mentions=self._no_mentions,
                 )
                 await asyncio.sleep(self.POST_DELAY)
@@ -296,6 +286,27 @@ class ChannelMigrator(commands.Cog):
                     allowed_mentions=self._no_mentions,
                 )
             await asyncio.sleep(self.POST_DELAY)
+
+    async def _download_with_retry(self, url: str, filename: str, attempts: int = 3) -> Optional[bytes]:
+        for attempt in range(1, attempts + 1):
+            try:
+                async with self._http_session.get(url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    return await resp.read()
+            except Exception as exc:
+                if attempt == attempts:
+                    return None
+                if self.logger:
+                    self.logger.warning(
+                        "Failed to download %s (attempt %d/%d): %s",
+                        filename,
+                        attempt,
+                        attempts,
+                        exc,
+                    )
+                await asyncio.sleep(self.POST_DELAY)
+        return None
 
     def _chunk_text(self, text: str, limit: int) -> List[str]:
         if not text:
