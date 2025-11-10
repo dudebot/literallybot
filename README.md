@@ -126,6 +126,10 @@ self.bot.config.set_global("maintenance_mode", True)
 
 Lists are just Python lists—get, mutate, then `set` the updated list. Call `self.bot.config.flush()` before shutdown if you need to force writes immediately.
 
+For deeper walkthroughs, see:
+- `docs/cog-development.md` – building cogs end-to-end
+- `docs/config-system.md` – advanced config usage and patterns
+
 ### Reference
 - **[CLAUDE.md](CLAUDE.md)** - Development setup guide
 
