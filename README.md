@@ -141,6 +141,13 @@ For deeper walkthroughs, see:
 - `!update` - Pull latest changes from git
 - `!kys` - Graceful shutdown (useful with systemd)
 
+### Error Logging (optional)
+- `!seterrorlog #channel` — Set the global error log channel for exceptions
+- `!testerror` — Trigger a test exception to verify logging
+
+Notes:
+- Errors are rate-limited to avoid spam. Per-guild logging and broader coverage are planned in the upgrade issue.
+
 ### Production Deployment
 For Linux servers, use the provided `bot.service` systemd template and `install_service.sh` script.
 
