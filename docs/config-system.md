@@ -15,6 +15,31 @@ LiterallyBot uses a JSON-based configuration system that supports per-guild, per
 - **Cross-platform**: Handles Windows and Unix filesystem differences
 - **Thread-safe**: Safe for concurrent access from multiple cogs
 
+## CRUD Operations
+
+The config system supports four core operations:
+
+| Operation | Purpose | Returns |
+|-----------|---------|---------|
+| `get()` | Retrieve a value (with optional default) | The value or default |
+| `set()` | Store a value | None |
+| `has()` | Check if a key exists | `True`/`False` |
+| `rem()` | Remove a key | `True` if removed, `False` if didn't exist |
+
+**Important:** Use `has()` to check existence instead of checking if `get()` returns `None`, since config values themselves could be `None`, `False`, or `0`.
+
+### Why `has()` is Better Than `get() is not None`
+
+```python
+# ❌ BAD: Ambiguous - what if the value IS None/False/0?
+if self.bot.config.get(ctx, "disabled_feature"):
+    # This fails if disabled_feature is legitimately False!
+
+# ✅ GOOD: Clear existence check
+if self.bot.config.has(ctx, "premium_features"):
+    features = self.bot.config.get(ctx, "premium_features")
+```
+
 ## Basic Usage
 
 ### Accessing the Config System
@@ -39,6 +64,13 @@ prefix = self.bot.config.get(ctx, "prefix", "!")
 # Set guild setting
 self.bot.config.set(ctx, "prefix", "?")
 
+# Check if setting exists (avoids None/False/0 ambiguity)
+if self.bot.config.has(ctx, "custom_prefix"):
+    prefix = self.bot.config.get(ctx, "custom_prefix")
+
+# Remove a setting (returns True if removed, False if didn't exist)
+removed = self.bot.config.rem(ctx, "old_setting")
+
 # Example: Server-specific feature toggles
 music_enabled = self.bot.config.get(ctx, "music_enabled", True)
 self.bot.config.set(ctx, "music_enabled", False)
@@ -52,9 +84,18 @@ timezone = self.bot.config.get_user(ctx, "timezone", "UTC")
 # Set user preference
 self.bot.config.set_user(ctx, "theme", "dark")
 
+# Check if user has a preference set
+if self.bot.config.has_user(ctx, "theme"):
+    theme = self.bot.config.get_user(ctx, "theme")
+
+# Remove user preference
+self.bot.config.rem_user(ctx, "old_preference")
+
 # Alternative syntax with scope parameter
 theme = self.bot.config.get(ctx, "theme", "light", scope="user")
 self.bot.config.set(ctx, "theme", "dark", scope="user")
+exists = self.bot.config.has(ctx, "theme", scope="user")
+removed = self.bot.config.rem(ctx, "theme", scope="user")
 ```
 
 ### Global Settings
@@ -65,8 +106,17 @@ maintenance_mode = self.bot.config.get_global("maintenance", False)
 # Set global setting
 self.bot.config.set_global("maintenance", True)
 
+# Check if global setting exists
+if self.bot.config.has_global("api_key"):
+    api_key = self.bot.config.get_global("api_key")
+
+# Remove global setting
+self.bot.config.rem_global("deprecated_feature")
+
 # Alternative syntax
 superadmins = self.bot.config.get(None, "superadmins", scope="global")
+exists = self.bot.config.has(None, "superadmins", scope="global")
+removed = self.bot.config.rem(None, "old_setting", scope="global")
 ```
 
 ## Working with Lists and Arrays

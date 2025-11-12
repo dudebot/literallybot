@@ -1,6 +1,20 @@
 """
 Enhanced error logging system with categories, severity levels, and per-guild channels.
-Supports both global and per-guild error logging with flexible configuration.
+
+ERROR ROUTING:
+- Guild errors (commands/events in a guild) go to:
+  1. Guild-specific channel if configured via !errorlog setchannel
+  2. Global channel if guild has no config (DMs, cog failures, uncaught errors always go to global)
+
+- Global channel receives:
+  1. All DM errors
+  2. Cog load failures
+  3. Uncaught exceptions
+  4. Errors from guilds without their own config
+
+CONFIGURATION:
+- Guild admins: !errorlog setchannel #channel (guild-specific)
+- Superadmins: !errorlog setglobal #channel (global fallback)
 """
 
 import discord
@@ -31,66 +45,54 @@ class ErrorSeverity(Enum):
         self.emoji = emoji
 
 
-# Rate limiting storage: maps error_key to (last_sent_time, occurrence_count)
-_error_history: Dict[str, Tuple[datetime, int]] = {}
+# Rate limiting storage: maps error_key to last_sent_time
+# Auto-purges entries older than rate limit to prevent unbounded growth
+_error_history: Dict[str, datetime] = {}
 _default_rate_limit_minutes = 5
 
 
-def _get_error_config(bot, guild_id: Optional[int] = None) -> dict:
-    """Get error configuration for a guild or global."""
-    if guild_id:
-        # Try guild-specific config first
-        guild_config = bot.config.get(guild_id, "error_logging", scope="guild")
-        if guild_config:
-            return guild_config
-
-    # Fallback to global config
-    global_config = bot.config.get_global("error_logging", {})
-
-    # Legacy support: if old error_channel_id exists, migrate it
-    if not global_config and bot.config.get_global("error_channel_id"):
-        global_config = {
-            "default_channel": bot.config.get_global("error_channel_id"),
-            "enabled": True
-        }
-
-    return global_config
-
-
-def _should_send_error(error_key: str, rate_limit_minutes: int = None) -> Tuple[bool, int]:
+def _should_send_error(error_key: str, rate_limit_minutes: int = None) -> bool:
     """
     Check if error should be sent based on rate limiting.
+    Auto-purges old entries from history.
 
     Returns:
-        Tuple of (should_send, occurrence_count)
+        bool: True if error should be sent, False if still in cooldown
     """
     if rate_limit_minutes is None:
         rate_limit_minutes = _default_rate_limit_minutes
 
     now = datetime.now()
+    cutoff = now - timedelta(minutes=rate_limit_minutes)
 
+    # Purge old entries (older than rate limit duration)
+    keys_to_remove = [key for key, last_sent in _error_history.items() if last_sent < cutoff]
+    for key in keys_to_remove:
+        del _error_history[key]
+
+    # Check if we should send this error
     if error_key not in _error_history:
-        _error_history[error_key] = (now, 1)
-        return True, 1
+        _error_history[error_key] = now
+        return True
 
-    last_sent, count = _error_history[error_key]
+    last_sent = _error_history[error_key]
     time_since_last = now - last_sent
 
     if time_since_last >= timedelta(minutes=rate_limit_minutes):
         # Time to send again
-        _error_history[error_key] = (now, count + 1)
-        return True, count + 1
+        _error_history[error_key] = now
+        return True
     else:
-        # Still in cooldown, increment count
-        _error_history[error_key] = (last_sent, count + 1)
-        return False, count + 1
+        # Still in cooldown
+        return False
 
 
-def _create_error_key(error: Exception, context: str, category: ErrorCategory) -> str:
-    """Create a unique key for error deduplication."""
+def _create_error_key(error: Exception, context: str, category: ErrorCategory, guild_id: Optional[int] = None) -> str:
+    """Create a unique key for error deduplication (per-guild)."""
     error_type = type(error).__name__
     error_msg = str(error)[:100]
-    return f"{category.value}:{context}:{error_type}:{error_msg}"
+    guild_part = f"{guild_id}" if guild_id else "dm"
+    return f"{guild_part}:{category.value}:{context}:{error_type}:{error_msg}"
 
 
 def _get_target_channel(bot, config: dict, category: ErrorCategory, severity: ErrorSeverity) -> Optional[int]:
@@ -101,8 +103,10 @@ def _get_target_channel(bot, config: dict, category: ErrorCategory, severity: Er
     1. Category-specific channel
     2. Severity-specific channel
     3. Default channel
+
+    Returns None if config doesn't exist or has no default_channel (disabled state).
     """
-    if not config or not config.get("enabled", True):
+    if not config or not config.get("default_channel"):
         return None
 
     # Check for category-specific routing
@@ -125,18 +129,12 @@ def _create_error_embed(
     category: ErrorCategory,
     severity: ErrorSeverity,
     extra_info: str = "",
-    occurrence_count: int = 1,
     guild_name: Optional[str] = None
 ) -> discord.Embed:
     """Create a rich embed for error logging."""
 
-    # Build title
-    title = f"{severity.emoji} Error Detected"
-    if occurrence_count > 1:
-        title += f" (×{occurrence_count})"
-
     embed = discord.Embed(
-        title=title,
+        title=f"{severity.emoji} Error Detected",
         color=severity.color,
         timestamp=datetime.now()
     )
@@ -173,10 +171,7 @@ def _create_error_embed(
     embed.add_field(name="Traceback", value=f"```python\n{tb}\n```", inline=False)
 
     # Footer with metadata
-    footer_text = f"Category: {category.value} | Severity: {severity.severity_name}"
-    if occurrence_count > 1:
-        footer_text += f" | Occurrences: {occurrence_count}"
-    embed.set_footer(text=footer_text)
+    embed.set_footer(text=f"Category: {category.value} | Severity: {severity.severity_name}")
 
     return embed
 
@@ -208,16 +203,15 @@ async def log_error_to_discord(
     if not hasattr(bot, 'config'):
         return
 
-    # Create error key for deduplication
-    error_key = _create_error_key(error, context, category)
+    # Create error key for deduplication (per-guild)
+    error_key = _create_error_key(error, context, category, guild_id)
 
     # Get rate limit from global config (use global for consistency)
     global_config = bot.config.get_global("error_logging", {})
     rate_limit = global_config.get("rate_limit_minutes", _default_rate_limit_minutes)
 
     # Check if we should send (using global rate limit)
-    should_send, occurrence_count = _should_send_error(error_key, rate_limit)
-    if not should_send:
+    if not _should_send_error(error_key, rate_limit):
         return
 
     # Get guild name if available
@@ -234,7 +228,6 @@ async def log_error_to_discord(
         category=category,
         severity=severity,
         extra_info=extra_info,
-        occurrence_count=occurrence_count,
         guild_name=guild_name
     )
 
@@ -242,9 +235,10 @@ async def log_error_to_discord(
     sent_channels = set()
 
     # 1. Send to guild channel if configured
+    # Only send to guild-specific channel if the guild has its own config (don't fallback to global here)
     if guild_id:
-        guild_config = bot.config.get(guild_id, "error_logging", {})
-        if guild_config and guild_config.get("enabled", True):
+        guild_config = bot.config.get(guild_id, "error_logging", None)
+        if guild_config and guild_config.get("default_channel"):
             guild_channel_id = _get_target_channel(bot, guild_config, category, severity)
             if guild_channel_id and guild_channel_id not in sent_channels:
                 guild_channel = bot.get_channel(guild_channel_id)
@@ -256,7 +250,7 @@ async def log_error_to_discord(
                         print(f"Failed to send error to guild channel: {send_error}")
 
     # 2. ALWAYS send to global channel if configured (superadmin visibility)
-    if global_config and global_config.get("enabled", True):
+    if global_config and global_config.get("default_channel"):
         global_channel_id = _get_target_channel(bot, global_config, category, severity)
         if global_channel_id and global_channel_id not in sent_channels:
             global_channel = bot.get_channel(global_channel_id)
@@ -278,33 +272,6 @@ async def log_error_to_discord(
                     sent_channels.add(global_channel_id)
                 except Exception as send_error:
                     print(f"Failed to send error to global channel: {send_error}")
-
-
-def get_error_statistics() -> Dict[str, any]:
-    """Get statistics about logged errors for monitoring."""
-    now = datetime.now()
-
-    stats = {
-        "total_unique_errors": len(_error_history),
-        "total_occurrences": sum(count for _, count in _error_history.values()),
-        "recent_errors": []
-    }
-
-    # Get errors from last hour
-    for error_key, (last_time, count) in _error_history.items():
-        if now - last_time <= timedelta(hours=1):
-            stats["recent_errors"].append({
-                "key": error_key,
-                "last_occurrence": last_time,
-                "count": count
-            })
-
-    return stats
-
-
-def clear_error_history():
-    """Clear error history (useful for testing or manual resets)."""
-    _error_history.clear()
 
 
 def _determine_severity(error: Exception, test_severity: Optional[str] = None) -> ErrorSeverity:
