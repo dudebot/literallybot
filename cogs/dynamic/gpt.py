@@ -404,7 +404,7 @@ class Gpt(commands.Cog):
                 "service": "literallybot",
                 "sender": str(ctx.author.id),
                 "channel": str(ctx.channel.id),
-                "guild": str(ctx.guild.id)
+                "guild": str(ctx.guild.id) if ctx.guild else "DM"
             }
             
             try:
@@ -525,7 +525,7 @@ class Gpt(commands.Cog):
             if not is_superadmin(self.bot.config, ctx.author.id):
                 await ctx.send("This command cannot be used in DMs.")
                 return
-                
+
         await self.process_askgpt(ctx, question)
 
     @commands.command(name='setprovider')
