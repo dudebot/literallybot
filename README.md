@@ -135,11 +135,14 @@ For deeper walkthroughs, see:
 - `!kys` - Graceful shutdown (useful with systemd)
 
 ### Error Logging (optional)
-- `!seterrorlog #channel` — Set the global error log channel for exceptions
-- `!testerror` — Trigger a test exception to verify logging
+- `!errorlog setchannel #channel` — Set error logging channel for this guild
+- `!errorlog setglobal #channel` — Set global error channel (superadmin only)
+- `!errorlog status` — View current error logging configuration
+- `!errorlog disable` — Disable error logging
 
 Notes:
-- Errors are rate-limited to avoid spam. Per-guild logging and broader coverage are planned in the upgrade issue.
+- Supports per-guild and global error logging with category/severity routing
+- Errors are rate-limited globally to avoid spam (configurable by superadmin)
 
 ### Production Deployment
 For Linux servers, use the provided service template in `scripts/` and the `install_service.sh` script.

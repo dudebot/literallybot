@@ -141,6 +141,21 @@ class Config:
         self._dirty_configs.add(config_id)
         self._schedule_save()
 
+    def rem(self, ctx, key, scope='guild'):
+        """Remove a config key from guild, user, or global scope"""
+        config_id = self._resolve_config_id(ctx, scope)
+        if config_id in self._configs and key in self._configs[config_id]:
+            del self._configs[config_id][key]
+            self._dirty_configs.add(config_id)
+            self._schedule_save()
+            return True
+        return False
+
+    def has(self, ctx, key, scope='guild'):
+        """Check if a config key exists in guild, user, or global scope"""
+        config_id = self._resolve_config_id(ctx, scope)
+        return config_id in self._configs and key in self._configs[config_id]
+
     # Convenience methods for user configs
     def get_user(self, ctx, key, default=None):
         """Get a user-specific config value"""
@@ -150,6 +165,14 @@ class Config:
         """Set a user-specific config value"""
         self.set(ctx, key, value, scope='user')
 
+    def rem_user(self, ctx, key):
+        """Remove a user-specific config value"""
+        return self.rem(ctx, key, scope='user')
+
+    def has_user(self, ctx, key):
+        """Check if a user-specific config key exists"""
+        return self.has(ctx, key, scope='user')
+
     # Convenience methods for global configs
     def get_global(self, key, default=None):
         """Get a global config value"""
@@ -158,6 +181,14 @@ class Config:
     def set_global(self, key, value):
         """Set a global config value"""
         self.set(None, key, value, scope='global')
+
+    def rem_global(self, key):
+        """Remove a global config value"""
+        return self.rem(None, key, scope='global')
+
+    def has_global(self, key):
+        """Check if a global config key exists"""
+        return self.has(None, key, scope='global')
 
     def _schedule_reload(self):
         """Schedule periodic check for external file changes"""
