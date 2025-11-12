@@ -121,11 +121,38 @@ class Gpt(commands.Cog):
                 create_params["max_completion_tokens"] = model_info.get("max_completion_tokens", 3000)
             else:
                 create_params["max_tokens"] = model_info.get("max_tokens", 3000)
-            
-            chat_completion = await asyncio.to_thread(
-                client.chat.completions.create,
-                **create_params
-            )
+
+            # Try the API call with fallback for token parameter
+            try:
+                chat_completion = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    **create_params
+                )
+            except Exception as e:
+                error_msg = str(e).lower()
+                # Check if error is about max_tokens parameter
+                if "max_tokens" in error_msg or "max_completion_tokens" in error_msg:
+                    self.logger.warning(f"Token parameter error for model {model}, attempting fallback: {e}")
+
+                    # Try swapping the token parameter
+                    if "max_tokens" in create_params:
+                        token_value = create_params.pop("max_tokens")
+                        create_params["max_completion_tokens"] = token_value
+                        self.logger.info(f"Retrying with max_completion_tokens instead of max_tokens")
+                    elif "max_completion_tokens" in create_params:
+                        token_value = create_params.pop("max_completion_tokens")
+                        create_params["max_tokens"] = token_value
+                        self.logger.info(f"Retrying with max_tokens instead of max_completion_tokens")
+
+                    # Retry the API call
+                    chat_completion = await asyncio.to_thread(
+                        client.chat.completions.create,
+                        **create_params
+                    )
+                else:
+                    # Not a token parameter error, re-raise
+                    raise
+
             return chat_completion.choices[0].message.content.strip()
 
     async def call_anthropic_api(self, api_key: str, model: str, messages: List[Dict], metadata: Dict) -> str:
@@ -584,13 +611,13 @@ class Gpt(commands.Cog):
         model = provider_config["model"]
         provider_info = provider_config["provider_info"]
         all_providers = provider_config["all_providers"]
-        
+
         # Get timeout multiplier for current model
         models_info = provider_info.get("models", {})
         model_info = models_info.get(model, {})
         timeout_mult = model_info.get("timeout_multiplier", 1.0)
         cooldown_time = int(240 * timeout_mult)
-        
+
         info_lines = [
             f"**Current Provider:** {provider_info['name']} ({provider})",
             f"**Current Model:** {model}",
@@ -599,33 +626,329 @@ class Gpt(commands.Cog):
             "",
             "**All Providers:**"
         ]
-        
+
         # Check which providers have API keys configured
         for prov_id, prov_info in all_providers.items():
             api_key_name = f"{prov_id.upper()}_API_KEY"
             has_key = bool(self.bot.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name))
             status = "✅ Configured" if has_key else "❌ No API key"
             models_dict = prov_info.get("models", {})
-            
+
             # Format models with their timeout info
             model_details = []
             for model_name, model_cfg in models_dict.items():
                 timeout = model_cfg.get("timeout_multiplier", 1.0)
                 cooldown = int(240 * timeout)
                 model_details.append(f"{model_name} ({cooldown}s)")
-            
+
             info_lines.append(f"• **{prov_info['name']}** ({prov_id}): {status}")
             info_lines.append(f"  Models: {', '.join(model_details)}")
-            
+
             # Show aliases if this provider has any
             aliases = [alias for alias, target in self.provider_aliases.items() if target == prov_id]
             if aliases:
                 info_lines.append(f"  Aliases: {', '.join(aliases)}")
-        
+
         info_lines.append("")
-        info_lines.append("To add API keys, update your global.json")
-        
+        info_lines.append("To add API keys, use !setapikey <provider> <key>")
+
         await ctx.send("\n".join(info_lines))
+
+    @commands.command(name='addmodel')
+    async def addmodel(self, ctx, model_name: str, provider: str = None, multiplier: float = 1.0, max_tokens: int = None):
+        """Add a model to a provider (admin only)
+        Usage: !addmodel <model_name> [provider] [multiplier] [max_tokens]
+        Example: !addmodel grok-5-fast xai 0.5
+        Example: !addmodel gpt-6-mini openai 0.5 12000
+        """
+        if not self.is_authorized(ctx):
+            await ctx.send("You do not have permission to use this command.")
+            return
+
+        config = self.bot.config
+
+        # If no provider specified, use current provider
+        if provider is None:
+            provider_config = self.get_provider_config(ctx)
+            provider = provider_config["provider"]
+        else:
+            # Apply alias if needed
+            provider = self.provider_aliases.get(provider.lower(), provider.lower())
+
+        # Get all providers
+        all_providers = config.get(None, "ai_providers", scope="global") or {}
+
+        if provider not in all_providers:
+            await ctx.send(f"Unknown provider '{provider}'. Available: {', '.join(all_providers.keys())}")
+            return
+
+        # Get provider info
+        provider_info = all_providers[provider]
+        models_dict = provider_info.get("models", {})
+
+        # Check if model already exists
+        if model_name in models_dict:
+            await ctx.send(f"Model '{model_name}' already exists for {provider}. Remove it first if you want to update it.")
+            return
+
+        # Build model config
+        model_config = {"timeout_multiplier": multiplier}
+        if max_tokens:
+            model_config["max_completion_tokens"] = max_tokens
+
+        # Add model to provider
+        models_dict[model_name] = model_config
+        provider_info["models"] = models_dict
+        all_providers[provider] = provider_info
+
+        # Save back to global config
+        config.set(None, "ai_providers", all_providers, scope="global")
+
+        cooldown = int(240 * multiplier)
+        await ctx.send(f"Added model '{model_name}' to {provider_info['name']} with {multiplier}x multiplier ({cooldown}s cooldown)")
+
+    @commands.command(name='removemodel')
+    async def removemodel(self, ctx, model_name: str, provider: str = None):
+        """Remove a model from a provider (admin only)
+        Usage: !removemodel <model_name> [provider]
+        """
+        if not self.is_authorized(ctx):
+            await ctx.send("You do not have permission to use this command.")
+            return
+
+        config = self.bot.config
+
+        # If no provider specified, use current provider
+        if provider is None:
+            provider_config = self.get_provider_config(ctx)
+            provider = provider_config["provider"]
+        else:
+            # Apply alias if needed
+            provider = self.provider_aliases.get(provider.lower(), provider.lower())
+
+        # Get all providers
+        all_providers = config.get(None, "ai_providers", scope="global") or {}
+
+        if provider not in all_providers:
+            await ctx.send(f"Unknown provider '{provider}'")
+            return
+
+        provider_info = all_providers[provider]
+        models_dict = provider_info.get("models", {})
+
+        # Check if model exists
+        if model_name not in models_dict:
+            await ctx.send(f"Model '{model_name}' not found in {provider}")
+            return
+
+        # Safety check: Cannot remove if it's the global default model
+        if provider_info.get("default_model") == model_name:
+            await ctx.send(f"Cannot remove '{model_name}' - it's the default model for {provider}. Change the default first.")
+            return
+
+        # Check if this is the currently active model for this guild
+        current_provider_config = self.get_provider_config(ctx)
+        if current_provider_config["provider"] == provider and current_provider_config["model"] == model_name:
+            # Clear guild's model selection, forcing fallback to provider default
+            if ctx.guild:
+                config.rem(ctx, "current_ai_model")
+                await ctx.send(f"'{model_name}' was your active model. Cleared guild model selection (will use {provider}'s default: {provider_info['default_model']})")
+
+        # Remove the model
+        del models_dict[model_name]
+        provider_info["models"] = models_dict
+        all_providers[provider] = provider_info
+
+        # Save back to global config
+        config.set(None, "ai_providers", all_providers, scope="global")
+
+        await ctx.send(f"Removed model '{model_name}' from {provider}")
+
+    @commands.command(name='listmodels')
+    async def listmodels(self, ctx, provider: str = None):
+        """List all models for a provider
+        Usage: !listmodels [provider]
+        """
+        config = self.bot.config
+
+        # If no provider specified, use current provider
+        if provider is None:
+            provider_config = self.get_provider_config(ctx)
+            provider = provider_config["provider"]
+        else:
+            # Apply alias if needed
+            provider = self.provider_aliases.get(provider.lower(), provider.lower())
+
+        # Get all providers
+        all_providers = config.get(None, "ai_providers", scope="global") or {}
+
+        if provider not in all_providers:
+            await ctx.send(f"Unknown provider '{provider}'. Available: {', '.join(all_providers.keys())}")
+            return
+
+        provider_info = all_providers[provider]
+        models_dict = provider_info.get("models", {})
+        default_model = provider_info.get("default_model")
+
+        if not models_dict:
+            await ctx.send(f"No models configured for {provider_info['name']}")
+            return
+
+        info_lines = [f"**Models for {provider_info['name']}:**"]
+
+        for model_name, model_cfg in models_dict.items():
+            multiplier = model_cfg.get("timeout_multiplier", 1.0)
+            cooldown = int(240 * multiplier)
+            max_tokens = model_cfg.get("max_completion_tokens", model_cfg.get("max_tokens", "default"))
+
+            default_marker = " (default)" if model_name == default_model else ""
+            info_lines.append(f"• {model_name}{default_marker}: {multiplier}x ({cooldown}s), max_tokens: {max_tokens}")
+
+        await ctx.send("\n".join(info_lines))
+
+    @commands.command(name='setapikey')
+    async def setapikey(self, ctx, provider: str, api_key: str):
+        """Set API key for a provider (admin only, deletes your message for security)
+        Usage: !setapikey <provider> <key>
+        """
+        if not self.is_authorized(ctx):
+            await ctx.send("You do not have permission to use this command.")
+            return
+
+        # Delete the user's message immediately for security
+        try:
+            await ctx.message.delete()
+        except Exception as e:
+            self.logger.warning(f"Failed to delete setapikey message: {e}")
+            await ctx.send("Warning: Could not delete your message. Please delete it manually!")
+
+        config = self.bot.config
+
+        # Apply alias if needed
+        provider = self.provider_aliases.get(provider.lower(), provider.lower())
+
+        # Get all providers
+        all_providers = config.get(None, "ai_providers", scope="global") or {}
+
+        if provider not in all_providers:
+            await ctx.send(f"Unknown provider '{provider}'. Available: {', '.join(all_providers.keys())}")
+            return
+
+        # Store the API key
+        api_key_name = f"{provider.upper()}_API_KEY"
+        config.set(None, api_key_name, api_key, scope="global")
+
+        provider_info = all_providers[provider]
+        await ctx.send(f"API key set for {provider_info['name']}. Attempting to discover available models...")
+
+        # Try to auto-discover models
+        try:
+            discovered_models = await self.discover_models(provider, api_key, provider_info)
+
+            if discovered_models:
+                await ctx.send(f"Discovered {len(discovered_models)} models. Use !listmodels {provider} to see them.")
+            else:
+                await ctx.send("Could not auto-discover models. You can add them manually with !addmodel")
+        except Exception as e:
+            self.logger.error(f"Model discovery failed for {provider}: {e}", exc_info=True)
+            await ctx.send(f"API key saved, but model discovery failed: {str(e)}")
+
+    async def discover_models(self, provider: str, api_key: str, provider_info: Dict) -> List[str]:
+        """Attempt to discover available models from provider API"""
+        discovered = []
+
+        try:
+            if provider == "xai":
+                # xAI uses OpenAI-compatible endpoint
+                client = openai.OpenAI(api_key=api_key, base_url=provider_info.get("base_url"))
+                models = await asyncio.to_thread(client.models.list)
+
+                for model in models.data:
+                    model_id = model.id
+                    discovered.append(model_id)
+
+                    # Smart multiplier assignment
+                    if "fast" in model_id.lower() or "mini" in model_id.lower():
+                        multiplier = 0.5
+                    elif "reasoning" in model_id.lower():
+                        multiplier = 1.5
+                    else:
+                        multiplier = 1.0
+
+                    # Add to provider config if not already present
+                    models_dict = provider_info.get("models", {})
+                    if model_id not in models_dict:
+                        models_dict[model_id] = {"timeout_multiplier": multiplier}
+                        provider_info["models"] = models_dict
+
+            elif provider == "openai":
+                client = openai.OpenAI(api_key=api_key)
+                models = await asyncio.to_thread(client.models.list)
+
+                for model in models.data:
+                    model_id = model.id
+                    # Only include GPT/O-series models
+                    if not (model_id.startswith("gpt-") or model_id.startswith("o") or model_id.startswith("chatgpt")):
+                        continue
+
+                    discovered.append(model_id)
+
+                    # Smart multiplier assignment
+                    if "mini" in model_id.lower():
+                        multiplier = 0.5
+                    elif model_id.startswith("o3") or model_id.startswith("o4"):
+                        multiplier = 2.0
+                    elif "turbo" in model_id.lower():
+                        multiplier = 0.7
+                    else:
+                        multiplier = 1.0
+
+                    # Add to provider config if not already present
+                    models_dict = provider_info.get("models", {})
+                    if model_id not in models_dict:
+                        model_cfg = {"timeout_multiplier": multiplier}
+                        # Add max_completion_tokens for reasoning models
+                        if model_id.startswith("o"):
+                            model_cfg["max_completion_tokens"] = 16000
+                        models_dict[model_id] = model_cfg
+                        provider_info["models"] = models_dict
+
+            elif provider == "anthropic":
+                # Anthropic doesn't have a models list endpoint, so we'll just verify the key works
+                async with aiohttp.ClientSession() as session:
+                    headers = {
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json"
+                    }
+                    # Try a minimal request to verify the key
+                    data = {
+                        "model": "claude-3-5-haiku-latest",
+                        "messages": [{"role": "user", "content": "Hi"}],
+                        "max_tokens": 1
+                    }
+                    async with session.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers=headers,
+                        json=data
+                    ) as response:
+                        if response.status == 200:
+                            # Key is valid, but can't auto-discover models
+                            self.logger.info(f"Anthropic API key validated successfully")
+                        else:
+                            raise ValueError(f"API key validation failed: {await response.text()}")
+
+            # Save updated provider info if models were discovered
+            if discovered:
+                all_providers = self.bot.config.get(None, "ai_providers", scope="global") or {}
+                all_providers[provider] = provider_info
+                self.bot.config.set(None, "ai_providers", all_providers, scope="global")
+
+            return discovered
+
+        except Exception as e:
+            self.logger.error(f"Failed to discover models for {provider}: {e}", exc_info=True)
+            raise
 
     @commands.Cog.listener()
     async def on_message(self, message):
