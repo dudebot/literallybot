@@ -90,6 +90,11 @@ async def load_cogs():
 
             cog_name = f"cogs.{group}.{filename[:-3]}"
             try:
+                # Skip if already loaded (handles reconnection scenarios)
+                if cog_name in bot.extensions:
+                    logger.debug(f"{cog_name} already loaded, skipping")
+                    continue
+
                 await bot.load_extension(cog_name)
                 logger.info(f"Successfully loaded {cog_name}")
             except Exception as e:
@@ -188,7 +193,7 @@ async def on_error(event, *args, **kwargs):
 
 def load_status_messages():
     """Load status messages from config file, falling back to defaults if file not found."""
-    status_file = "config/status_messages.txt"
+    status_file = "configs/status_messages.txt"
     default_statuses = ["01010101", "01110111", "01010101", "01111110"]
 
     try:
