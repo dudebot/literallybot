@@ -21,7 +21,7 @@ class Admin(commands.Cog):
             await ctx.send("You are already a bot superadmin.")
 
     @commands.command(name="addsuperadmin")
-    @commands.check(lambda ctx: is_superadmin(ctx.bot.config, ctx.author.id))
+    @commands.check(is_superadmin)
     async def addsuperadmin(self, ctx, member: discord.Member = None):
         """Add a user as a bot superadmin (owner only)."""
         if not member:
