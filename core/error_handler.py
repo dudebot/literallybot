@@ -20,7 +20,7 @@ CONFIGURATION:
 import discord
 import traceback
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Callable
 from enum import Enum
 
 
@@ -48,6 +48,26 @@ class ErrorSeverity(Enum):
 # Rate limiting storage: maps error_key to last_sent_time
 # Auto-purges entries older than rate limit to prevent unbounded growth
 _error_history: Dict[str, datetime] = {}
+
+# Whitelist hooks: callables that take (ctx, error) and return True to suppress error logging
+_command_error_whitelist_hooks: List[callable] = []
+
+
+def register_error_whitelist_hook(hook: callable):
+    """
+    Register a hook to whitelist certain CommandNotFound errors.
+    Hook should take (ctx, error) and return True if error should be suppressed.
+    """
+    if hook not in _command_error_whitelist_hooks:
+        _command_error_whitelist_hooks.append(hook)
+
+
+def unregister_error_whitelist_hook(hook: callable):
+    """Remove a previously registered whitelist hook."""
+    if hook in _command_error_whitelist_hooks:
+        _command_error_whitelist_hooks.remove(hook)
+
+
 _default_rate_limit_minutes = 5
 
 
@@ -343,12 +363,14 @@ async def handle_command_error(bot, ctx, error: Exception):
     from discord.ext import commands
     import asyncio
 
-    # Special handling for CommandNotFound with media handler
+    # Check whitelist hooks for CommandNotFound suppression
     if isinstance(error, commands.CommandNotFound):
-        handled_ids = getattr(bot, '_lb_media_handled_ids', None)
-        if handled_ids is not None and ctx.message.id in handled_ids:
-            handled_ids.discard(ctx.message.id)
-            return
+        for hook in _command_error_whitelist_hooks:
+            try:
+                if hook(ctx, error):
+                    return  # Hook says suppress this error
+            except Exception:
+                pass  # Don't let a broken hook break error handling
 
     bot.logger.error(f'Error in command {ctx.command}: {error}', exc_info=True)
 
