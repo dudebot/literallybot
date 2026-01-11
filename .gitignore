@@ -35,6 +35,7 @@ settings.local.json
 !/media/poggers.mp4
 !/media/squish.webm
 !/media/yahallo.mp4
+!/media/heyhey.mp4
 
 # Legacy - keeping for safety
 cogs/vibes/*
