@@ -52,10 +52,12 @@ class Media(commands.Cog):
             await ctx.send("Filename must be at least 2 characters long.\nUsage: `!addmedia <link> <filename>`")
             return
             
-        file_extension = link.split('.')[-1]
+        # Strip query params from URL before extracting extension
+        clean_url = link.split('?')[0]
+        file_extension = clean_url.split('.')[-1]
         file_path = f'media/{file_name}.{file_extension}'
 
-        if link.endswith(('.mp4', '.ogg', '.webm', '.mp3')):
+        if clean_url.endswith(('.mp4', '.ogg', '.webm', '.mp3')):
             try:
                 response = requests.get(link)
                 with open(file_path, 'wb') as f:
