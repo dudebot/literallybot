@@ -4,12 +4,31 @@ from discord.ext import commands
 from discord import File
 import yt_dlp
 import requests
+from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
 
 class Media(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        if not hasattr(bot, "_lb_media_handled_ids"):
-            bot._lb_media_handled_ids = set()
+        self._media_dir = 'media/'
+        register_error_whitelist_hook(self._is_media_command)
+
+    def cog_unload(self):
+        unregister_error_whitelist_hook(self._is_media_command)
+
+    def _is_media_command(self, ctx, error):
+        """Return True if the failed command matches a media file (suppress error)."""
+        if not ctx.message.content.startswith('!'):
+            return False
+        file_name = ctx.message.content[1:].split()[0].lower()
+        if len(file_name) < 2:
+            return False
+        try:
+            for file in os.listdir(self._media_dir):
+                if file.startswith(file_name):
+                    return True
+        except OSError:
+            pass
+        return False
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -20,13 +39,9 @@ class Media(commands.Cog):
             file_name = message.content[1:].lower()
             if len(file_name) < 2:
                 return
-            media_dir = 'media/'
-            for file in os.listdir(media_dir):
+            for file in os.listdir(self._media_dir):
                 if file.startswith(file_name):
-                    await message.channel.send(file=File(os.path.join(media_dir, file)))
-                    handled = getattr(self.bot, '_lb_media_handled_ids', None)
-                    if handled is not None:
-                        handled.add(message.id)
+                    await message.channel.send(file=File(os.path.join(self._media_dir, file)))
                     return
 
     @commands.command(name='addmedia')
