@@ -11,12 +11,31 @@ class Reminders(commands.Cog):
         self.check_reminders.cancel()
     
     @commands.command(name="remindme", aliases=["setreminder"])
-    async def remindme(self, ctx, number: int, unit: str, *, text: str):
+    async def remindme(self, ctx, *, args: str = None):
         """
         Sets a reminder for the user.
         Example usage:
           !remindme 10 minutes Check the oven
         """
+        usage = "Usage: `!remindme <number> <unit> <message>`\nExample: `!remindme 10 minutes Check the oven`"
+
+        if not args:
+            await ctx.send(usage)
+            return
+
+        parts = args.split(maxsplit=2)
+        if len(parts) < 3:
+            await ctx.send(usage)
+            return
+
+        number_str, unit, text = parts
+
+        try:
+            number = int(number_str)
+        except ValueError:
+            await ctx.send(usage)
+            return
+
         unit_lower = unit.lower()
         if unit_lower not in ["minutes", "hours", "days", "minute", "hour", "day", "m", "h", "d", "min", "hr"]:
             await ctx.send(f"Unit {unit} must be 'minutes', 'hours' or 'days'.")
@@ -34,7 +53,7 @@ class Reminders(commands.Cog):
         reminders.append({"user_id": ctx.author.id, "timestamp": remind_time, "text": text})
         config.set(None, "reminders", reminders)
         await ctx.send(f"Reminder set for {number} {unit_lower} from now.")
-    
+
     @tasks.loop(seconds=10)
     async def check_reminders(self):
         current_time = int(time.time())

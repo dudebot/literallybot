@@ -58,19 +58,35 @@ async def say(self, ctx, *, message: str):
 ```
 
 ### Error Handling
+
+Unhandled errors are automatically logged to Discord channels via the global error handler. For user input validation, parse arguments yourself rather than relying on discord.py converters - see [error-handling.md](error-handling.md) for details.
+
 ```python
 @commands.command()
-async def divide(self, ctx, num1: float, num2: float):
+async def divide(self, ctx, *, args: str = None):
     """Divide two numbers"""
+    usage = "Usage: `!divide <num1> <num2>`"
+
+    if not args:
+        await ctx.send(usage)
+        return
+
+    parts = args.split()
+    if len(parts) != 2:
+        await ctx.send(usage)
+        return
+
     try:
-        if num2 == 0:
-            await ctx.send("Cannot divide by zero!")
-            return
-        result = num1 / num2
-        await ctx.send(f"{num1} / {num2} = {result}")
-    except Exception as e:
-        self.logger.error(f"Error in divide command: {e}", exc_info=True)
-        await ctx.send("Something went wrong with the calculation!")
+        num1, num2 = float(parts[0]), float(parts[1])
+    except ValueError:
+        await ctx.send(usage)
+        return
+
+    if num2 == 0:
+        await ctx.send("Cannot divide by zero!")
+        return
+
+    await ctx.send(f"{num1} / {num2} = {num1 / num2}")
 ```
 
 ## Configuration Integration
