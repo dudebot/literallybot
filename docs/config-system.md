@@ -1,262 +1,217 @@
-# Configuration System Documentation
+# Configuration System
 
-LiterallyBot uses a JSON-based configuration system that supports per-guild, per-user, and global settings with automatic persistence and write buffering.
+A JSON-based key-value store with per-guild, per-user, and global scopes. Features write buffering, atomic saves, and live reloading when files change externally.
 
-## Overview
+## Storage Layout
 
-### Storage Types
-- **Global Config**: `configs/global.json` - Bot-wide settings (superadmins, global features)
-- **Guild Config**: `configs/{guild_id}.json` - Server-specific settings (admins, features, server preferences)
-- **User Config**: `configs/user_{user_id}.json` - Individual user preferences and data
-
-### Key Features
-- **5-second write buffering**: Batches rapid config changes to reduce filesystem I/O
-- **Atomic writes**: Uses temporary files with atomic rename to prevent corruption
-- **Cross-platform**: Handles Windows and Unix filesystem differences
-- **Thread-safe**: Safe for concurrent access from multiple cogs
-
-## CRUD Operations
-
-The config system supports four core operations:
-
-| Operation | Purpose | Returns |
-|-----------|---------|---------|
-| `get()` | Retrieve a value (with optional default) | The value or default |
-| `set()` | Store a value | None |
-| `has()` | Check if a key exists | `True`/`False` |
-| `rem()` | Remove a key | `True` if removed, `False` if didn't exist |
-
-**Important:** Use `has()` to check existence instead of checking if `get()` returns `None`, since config values themselves could be `None`, `False`, or `0`.
-
-### Why `has()` is Better Than `get() is not None`
-
-```python
-# ❌ BAD: Ambiguous - what if the value IS None/False/0?
-if self.bot.config.get(ctx, "disabled_feature"):
-    # This fails if disabled_feature is legitimately False!
-
-# ✅ GOOD: Clear existence check
-if self.bot.config.has(ctx, "premium_features"):
-    features = self.bot.config.get(ctx, "premium_features")
+```
+configs/
+├── global.json              # Bot-wide settings (superadmins, global features)
+├── 123456789.json           # Guild-specific (guild ID as filename)
+├── user_987654321.json      # User-specific (user ID as filename)
+└── ...
 ```
 
-## Basic Usage
+## Core Features
 
-### Accessing the Config System
-The config system is available as `self.bot.config` in all cogs:
+| Feature | Details |
+|---------|---------|
+| Write buffering | Changes batch for 5 seconds before writing to disk |
+| Atomic writes | Uses temp file + rename to prevent corruption |
+| Live reload | Polls every 2 seconds for external file changes |
+| Merge on conflict | External changes win; conflicts logged to console |
+| Thread-safe | Lock-protected timer operations |
 
-```python
-class MyCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-    
-    @commands.command()
-    async def my_command(self, ctx):
-        # Access config here
-        value = self.bot.config.get(ctx, "my_setting", "default")
-```
+## API Reference
 
-### Guild-Specific Settings (Default)
-```python
-# Get guild setting with default
-prefix = self.bot.config.get(ctx, "prefix", "!")
+Access via `self.bot.config` in any cog.
 
-# Set guild setting
-self.bot.config.set(ctx, "prefix", "?")
-
-# Check if setting exists (avoids None/False/0 ambiguity)
-if self.bot.config.has(ctx, "custom_prefix"):
-    prefix = self.bot.config.get(ctx, "custom_prefix")
-
-# Remove a setting (returns True if removed, False if didn't exist)
-removed = self.bot.config.rem(ctx, "old_setting")
-
-# Example: Server-specific feature toggles
-music_enabled = self.bot.config.get(ctx, "music_enabled", True)
-self.bot.config.set(ctx, "music_enabled", False)
-```
-
-### User-Specific Settings
-```python
-# Get user preference
-timezone = self.bot.config.get_user(ctx, "timezone", "UTC")
-
-# Set user preference
-self.bot.config.set_user(ctx, "theme", "dark")
-
-# Check if user has a preference set
-if self.bot.config.has_user(ctx, "theme"):
-    theme = self.bot.config.get_user(ctx, "theme")
-
-# Remove user preference
-self.bot.config.rem_user(ctx, "old_preference")
-
-# Alternative syntax with scope parameter
-theme = self.bot.config.get(ctx, "theme", "light", scope="user")
-self.bot.config.set(ctx, "theme", "dark", scope="user")
-exists = self.bot.config.has(ctx, "theme", scope="user")
-removed = self.bot.config.rem(ctx, "theme", scope="user")
-```
-
-### Global Settings
-```python
-# Get global setting
-maintenance_mode = self.bot.config.get_global("maintenance", False)
-
-# Set global setting
-self.bot.config.set_global("maintenance", True)
-
-# Check if global setting exists
-if self.bot.config.has_global("api_key"):
-    api_key = self.bot.config.get_global("api_key")
-
-# Remove global setting
-self.bot.config.rem_global("deprecated_feature")
-
-# Alternative syntax
-superadmins = self.bot.config.get(None, "superadmins", scope="global")
-exists = self.bot.config.has(None, "superadmins", scope="global")
-removed = self.bot.config.rem(None, "old_setting", scope="global")
-```
-
-## Working with Lists and Arrays
-
-Managing arrays in config requires manual operations:
+### CRUD Operations
 
 ```python
-# Add item to list
-admins = self.bot.config.get(ctx, "admins", [])
-if user_id not in admins:  # Check for duplicates if needed
-    admins.append(user_id)
-    self.bot.config.set(ctx, "admins", admins)
+# Get a value (returns default if key missing)
+value = config.get(ctx, "key", default)
 
-# Remove item from list
-blocked_users = self.bot.config.get(ctx, "blocked_users", [])
-if user_id in blocked_users:
-    blocked_users.remove(user_id)
-    self.bot.config.set(ctx, "blocked_users", blocked_users)
+# Set a value
+config.set(ctx, "key", value)
+
+# Check if key exists
+if config.has(ctx, "key"):
+    ...
+
+# Remove a key (returns True if existed)
+removed = config.rem(ctx, "key")
 ```
 
-### Cleanup Expired Data
-For data with expiration timestamps:
+### Scopes
+
+**Guild scope** (default) - uses `ctx.guild.id`, falls back to global in DMs:
+```python
+config.get(ctx, "prefix", "!")
+config.set(ctx, "prefix", "?")
+```
+
+**User scope** - uses `ctx.author.id`:
+```python
+config.get_user(ctx, "timezone", "UTC")
+config.set_user(ctx, "theme", "dark")
+# Or with explicit scope:
+config.get(ctx, "timezone", scope="user")
+```
+
+**Global scope** - bot-wide:
+```python
+config.get_global("maintenance", False)
+config.set_global("maintenance", True)
+# Or:
+config.get(None, "superadmins", scope="global")
+```
+
+### Context-Free Access
+
+When you have an ID but no Discord context:
+```python
+# Guild by ID
+config.set(guild_id, "setting", value)
+
+# User by ID
+config.set_user(user_id, "preference", value)
+```
+
+## Gotchas
+
+### `get()` Persists Defaults
+
+When you call `get()` with a default and the key doesn't exist, the default is written to disk:
+
+```python
+# First call: key doesn't exist, writes "!" to disk
+prefix = config.get(ctx, "prefix", "!")
+
+# Second call: reads "!" from disk
+prefix = config.get(ctx, "prefix", "!")
+```
+
+This is usually fine, but be aware if you're checking for "unconfigured" state:
+
+```python
+# To check without persisting:
+if config.has(ctx, "prefix"):
+    prefix = config.get(ctx, "prefix")
+else:
+    prefix = "!"  # Use default without saving
+```
+
+### Lists Are References
+
+When you get a list, modify it, and set it back, you're modifying the same object in memory:
+
+```python
+admins = config.get(ctx, "admins", [])
+admins.append(user_id)
+config.set(ctx, "admins", admins)  # Works, but admins is already modified in memory
+```
+
+This is fine for normal use. Just don't assume `get()` returns a copy.
+
+### DMs Fall Back to Global
+
+Guild-scoped operations in DMs use the global config:
+
+```python
+# In a DM, this writes to global.json, not a guild file
+config.set(ctx, "some_setting", value)
+```
+
+Check `ctx.guild` if you need to handle DMs differently.
+
+## Live Reload
+
+The config system watches for external file changes every 2 seconds. If you edit a JSON file directly:
+
+1. Bot detects the mtime change
+2. Reloads the file into memory
+3. If there were unsaved in-memory changes, logs a conflict warning
+4. External changes win
+
+This enables patterns like:
+- Hot-editing config without restarting the bot
+- External tools writing to config files
+- Two cogs communicating via a shared user config file
+
+### Inter-Cog Communication Example
+
+Two cogs can coordinate by writing to shared config keys:
+
+```python
+# Cog A: Producer
+config.set_user(user_id, "pending_action", {"type": "verify", "data": "..."})
+
+# Cog B: Consumer (on next command or event)
+action = config.get_user(user_id, "pending_action")
+if action:
+    # Process it
+    config.rem_user(user_id, "pending_action")
+```
+
+Since both cogs share the same `bot.config` instance, changes are immediately visible in memory. The file write is just for persistence.
+
+## Working with Lists
+
+```python
+# Add to list
+items = config.get(ctx, "items", [])
+if new_item not in items:
+    items.append(new_item)
+    config.set(ctx, "items", items)
+
+# Remove from list
+items = config.get(ctx, "items", [])
+if old_item in items:
+    items.remove(old_item)
+    config.set(ctx, "items", items)
+```
+
+### Expiring Data
+
+For data with TTL:
 
 ```python
 import time
 
-# Remove expired items manually
-items = self.bot.config.get(ctx, "temp_data", [])
-current_time = time.time()
-active_items = [item for item in items if item.get("expires", 0) > current_time]
-if len(active_items) != len(items):
-    self.bot.config.set(ctx, "temp_data", active_items)
-```
-
-## Real-World Examples
-
-### Permission System (Admin Cog)
-```python
-# Check if user is admin
-admins = self.bot.config.get(ctx, "admins", [])
-if ctx.author.id not in admins:
-    await ctx.send("You don't have permission.")
-    return
-
-# Add new admin
-admins = self.bot.config.get(ctx, "admins", [])
-if new_user.id not in admins:
-    admins.append(new_user.id)
-    self.bot.config.set(ctx, "admins", admins)
-```
-
-### User Preferences (Hypothetical Settings Cog)
-```python
-@commands.command()
-async def set_timezone(self, ctx, timezone: str):
-    """Set your personal timezone"""
-    # Validate timezone here...
-    self.bot.config.set_user(ctx, "timezone", timezone)
-    await ctx.send(f"Timezone set to {timezone}")
-
-@commands.command()
-async def my_settings(self, ctx):
-    """View your personal settings"""
-    timezone = self.bot.config.get_user(ctx, "timezone", "UTC")
-    theme = self.bot.config.get_user(ctx, "theme", "default")
-    await ctx.send(f"Timezone: {timezone}, Theme: {theme}")
-```
-
-### Feature Toggles (Per-Guild)
-```python
-@commands.command()
-async def toggle_music(self, ctx):
-    """Toggle music functionality for this server"""
-    current = self.bot.config.get(ctx, "music_enabled", True)
-    self.bot.config.set(ctx, "music_enabled", not current)
-    status = "enabled" if not current else "disabled"
-    await ctx.send(f"Music {status} for this server")
-```
-
-### Memory System (GPT Cog Pattern)
-```python
-# Store user interaction with expiration
-memory_item = {
-    "text": user_message,
-    "expires": time.time() + (30 * 24 * 60 * 60),  # 30 days
-    "type": "conversation",
-    "user_id": ctx.author.id
+# Store with expiration
+record = {
+    "value": "...",
+    "expires": time.time() + 3600  # 1 hour
 }
+records = config.get(ctx, "records", [])
+records.append(record)
+config.set(ctx, "records", records)
 
-memories = self.bot.config.get(ctx, "memories", [])
-memories.append(memory_item)
-self.bot.config.set(ctx, "memories", memories)
-
-# Later, clean up expired memories
-memories = self.bot.config.get(ctx, "memories", [])
-current_time = time.time()
-active_memories = [m for m in memories if m.get("expires", 0) > current_time]
-if len(active_memories) != len(memories):
-    self.bot.config.set(ctx, "memories", active_memories)
+# Cleanup expired
+records = config.get(ctx, "records", [])
+now = time.time()
+active = [r for r in records if r.get("expires", 0) > now]
+if len(active) != len(records):
+    config.set(ctx, "records", active)
 ```
 
-## Advanced Usage
+## Shutdown
 
-### Manual Flush
-Force immediate save (useful before bot shutdown):
+For clean shutdown (flush pending writes, cancel timers):
+
 ```python
-# Force all pending writes to disk
-self.bot.config.flush()
+config.shutdown()
 ```
 
-### Context-Free Usage
-When you don't have a Discord context:
+Called automatically if you use the bot's shutdown handler.
+
+## Manual Flush
+
+Force immediate write of all pending changes:
+
 ```python
-# Using user ID directly
-self.bot.config.set_user(user_id, "last_seen", time.time())
-
-# Using guild ID directly
-self.bot.config.set(guild_id, "maintenance", True)
+config.flush()
 ```
 
-### Complex Data Structures
-```python
-# Store nested objects
-user_stats = {
-    "commands_used": 42,
-    "last_active": time.time(),
-    "preferences": {
-        "notifications": True,
-        "compact_mode": False
-    }
-}
-self.bot.config.set_user(ctx, "stats", user_stats)
-```
-
-### Combining Scopes
-```python
-# Example: Allow global override falling back to guild setting
-def get_prefix(self, ctx):
-    return (
-        self.bot.config.get_global("prefix_override")
-        or self.bot.config.get(ctx, "prefix", "!")
-    )
-```
+Useful before operations that might crash, or when you need guaranteed persistence.

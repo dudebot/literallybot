@@ -294,60 +294,18 @@ async def log_error_to_discord(
                     print(f"Failed to send error to global channel: {send_error}")
 
 
-def _determine_severity(error: Exception, test_severity: Optional[str] = None) -> ErrorSeverity:
-    """
-    Determine the severity level for an error.
-
-    Args:
-        error: The exception that occurred
-        test_severity: Optional test severity override from !testerror command
-
-    Returns:
-        ErrorSeverity enum value
-    """
-    # Check for test severity override
-    if test_severity:
-        severity_map = {
-            'warning': ErrorSeverity.WARNING,
-            'error': ErrorSeverity.ERROR,
-            'critical': ErrorSeverity.CRITICAL
-        }
-        return severity_map.get(test_severity.lower(), ErrorSeverity.ERROR)
-
+def _determine_severity(error: Exception) -> ErrorSeverity:
+    """Determine the severity level for an error based on its type."""
     # Import here to avoid circular dependency
     from discord.ext import commands
     from discord import app_commands
 
-    # Determine severity based on error type
     if isinstance(error, (commands.CommandNotFound, commands.MissingPermissions, commands.CommandOnCooldown)):
         return ErrorSeverity.WARNING
     elif isinstance(error, app_commands.CommandOnCooldown):
         return ErrorSeverity.WARNING
     else:
         return ErrorSeverity.ERROR
-
-
-def _determine_category(test_category: Optional[str] = None, default: ErrorCategory = ErrorCategory.COMMAND_ERROR) -> ErrorCategory:
-    """
-    Determine the error category.
-
-    Args:
-        test_category: Optional test category override from !testerror command
-        default: Default category if no override
-
-    Returns:
-        ErrorCategory enum value
-    """
-    if test_category:
-        category_map = {
-            'command_error': ErrorCategory.COMMAND_ERROR,
-            'event_error': ErrorCategory.EVENT_ERROR,
-            'task_error': ErrorCategory.TASK_ERROR,
-            'other': ErrorCategory.OTHER
-        }
-        return category_map.get(test_category.lower(), default)
-
-    return default
 
 
 async def handle_command_error(bot, ctx, error: Exception):
@@ -376,14 +334,7 @@ async def handle_command_error(bot, ctx, error: Exception):
 
     try:
         command_name = ctx.command.name if ctx.command else 'unknown'
-
-        # Check if this is a test error with custom settings
-        test_severity = getattr(ctx, 'test_severity', None)
-        test_category = getattr(ctx, 'test_category', None)
-
-        # Determine severity and category
-        severity = _determine_severity(error, test_severity)
-        category = _determine_category(test_category, ErrorCategory.COMMAND_ERROR)
+        severity = _determine_severity(error)
 
         # Build extra info
         guild_info = f"Guild: {ctx.guild.name} (ID: {ctx.guild.id})" if ctx.guild else "DM"
@@ -403,7 +354,7 @@ async def handle_command_error(bot, ctx, error: Exception):
 
         asyncio.create_task(log_error_to_discord(
             bot, actual_error, f'command_{command_name}',
-            category=category,
+            category=ErrorCategory.COMMAND_ERROR,
             severity=severity,
             extra_info=extra_info,
             guild_id=guild_id
@@ -426,13 +377,7 @@ async def handle_app_command_error(bot, interaction, error: Exception):
     bot.logger.exception(f'Unhandled exception in slash command', exc_info=True)
 
     try:
-        # Check if this is a test error with custom settings
-        test_severity = getattr(interaction, 'test_severity', None)
-        test_category = getattr(interaction, 'test_category', None)
-
-        # Determine severity and category
-        severity = _determine_severity(error, test_severity)
-        category = _determine_category(test_category, ErrorCategory.COMMAND_ERROR)
+        severity = _determine_severity(error)
 
         # Build extra info
         guild_info = f"Guild: {interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
@@ -448,7 +393,7 @@ async def handle_app_command_error(bot, interaction, error: Exception):
 
         asyncio.create_task(log_error_to_discord(
             bot, error, f'slash_command_{interaction.command.name if interaction.command else "unknown"}',
-            category=category,
+            category=ErrorCategory.COMMAND_ERROR,
             severity=severity,
             extra_info=extra_info,
             guild_id=guild_id
