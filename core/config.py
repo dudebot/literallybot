@@ -122,15 +122,9 @@ class Config:
             self._flush_all()
 
     def get(self, ctx, key, default=None, scope='guild'):
-        """Get a config value from guild, user, or global scope"""
+        """Get a config value from guild, user, or global scope. Read-only - does not persist defaults."""
         config_id = self._resolve_config_id(ctx, scope)
         cfg = self._configs.setdefault(config_id, {})
-        
-        if key not in cfg and default is not None:
-            cfg[key] = default
-            self._dirty_configs.add(config_id)
-            self._schedule_save()
-        
         return cfg.get(key, default)
 
     def set(self, ctx, key, value, scope='guild'):
