@@ -80,26 +80,18 @@ config.set_user(user_id, "preference", value)
 
 ## Gotchas
 
-### `get()` Persists Defaults
+### `get()` Is Read-Only
 
-When you call `get()` with a default and the key doesn't exist, the default is written to disk:
-
-```python
-# First call: key doesn't exist, writes "!" to disk
-prefix = config.get(ctx, "prefix", "!")
-
-# Second call: reads "!" from disk
-prefix = config.get(ctx, "prefix", "!")
-```
-
-This is usually fine, but be aware if you're checking for "unconfigured" state:
+`get()` never writes to disk - it just returns the value or default. To persist a value, use `set()` explicitly:
 
 ```python
-# To check without persisting:
-if config.has(ctx, "prefix"):
-    prefix = config.get(ctx, "prefix")
-else:
-    prefix = "!"  # Use default without saving
+# This does NOT save "!" to disk - just returns it
+prefix = config.get(ctx, "prefix", "!")
+
+# To actually persist a default on first use:
+if not config.has(ctx, "prefix"):
+    config.set(ctx, "prefix", "!")
+prefix = config.get(ctx, "prefix")
 ```
 
 ### Lists Are References
