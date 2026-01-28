@@ -1,4 +1,6 @@
 import os
+import glob
+import subprocess
 import discord
 from discord.ext import commands
 from discord import File
@@ -44,9 +46,58 @@ class Media(commands.Cog):
                     await message.channel.send(file=File(os.path.join(self._media_dir, file)))
                     return
 
+    def _cleanup_media_files(self, file_name):
+        """Remove any media files matching the given base name, including temp files."""
+        for pattern in [f'media/{file_name}.*', f'media/{file_name}_tmp.*']:
+            for f in glob.glob(pattern):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+
+    def _trim_media(self, file_path, start_ms, end_ms):
+        """Trim media file in place using ffmpeg. Returns True on success.
+
+        Args:
+            file_path: Path to the media file
+            start_ms: Where to start from
+            end_ms: Where to end
+        """
+        base, ext = os.path.splitext(file_path)
+        temp_path = f'{base}_tmp{ext}'
+        duration_ms = end_ms - start_ms
+
+        cmd = ['ffmpeg', '-y']
+
+        if start_ms > 0:
+            cmd.extend(['-ss', str(start_ms / 1000)])
+
+        cmd.extend(['-i', file_path, '-t', str(duration_ms / 1000),
+                    '-c:v', 'libx264', '-c:a', 'aac', temp_path])
+
+        result = subprocess.run(cmd, capture_output=True)
+        if result.returncode != 0:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            return False
+
+        os.replace(temp_path, file_path)
+        return True
+
     @commands.command(name='addmedia')
-    async def addmedia(self, ctx, link: str = None, file_name: str = None):
-        """Download and save YouTube videos or direct file links as media files."""
+    async def addmedia(self, ctx, link: str = None, file_name: str = None,
+                       start_ms: int = None, end_ms: int = None):
+        """Download and save YouTube videos or direct file links as media files.
+
+        Usage: !addmedia <link> <filename> [start_ms] [end_ms]
+        - start_ms: start from this point (optional, if alone = first N ms)
+        - end_ms: end at this point (optional)
+
+        Examples:
+          !addmedia <url> clip           - full video
+          !addmedia <url> clip 2000      - first 2 seconds
+          !addmedia <url> clip 200 1700  - from 200ms to 1700ms (1500ms clip)
+        """
         config = self.bot.config
         admin_ids = config.get(ctx, "admins", [])
         if not admin_ids or ctx.author.id not in admin_ids:
@@ -54,43 +105,89 @@ class Media(commands.Cog):
             return
 
         if not link or not file_name:
-            await ctx.send("Missing required arguments.\nUsage: `!addmedia <link> <filename>`")
+            await ctx.send("Missing required arguments.\nUsage: `!addmedia <link> <filename> [start_ms] [end_ms]`")
             return
-            
-        file_name = file_name.lower()
-        
-        if not link or not link.strip():
-            await ctx.send("Link cannot be empty.\nUsage: `!addmedia <link> <filename>`")
-            return
-            
-        if len(file_name) < 2:
-            await ctx.send("Filename must be at least 2 characters long.\nUsage: `!addmedia <link> <filename>`")
-            return
-            
-        # Strip query params from URL before extracting extension
-        clean_url = link.split('?')[0]
-        file_extension = clean_url.split('.')[-1]
-        file_path = f'media/{file_name}.{file_extension}'
 
-        if clean_url.endswith(('.mp4', '.ogg', '.webm', '.mp3')):
-            try:
-                response = requests.get(link)
-                with open(file_path, 'wb') as f:
-                    f.write(response.content)
-                await ctx.send(f'Media file {file_name} has been added.')
-            except Exception as e:
-                await ctx.send(f'Failed to download the file: {e}')
-        else:
-            ydl_opts = {
-                'format': 'mp4',
-                'outtmpl': file_path,
-            }
-            try:
+        file_name = file_name.lower()
+
+        if len(file_name) < 2:
+            await ctx.send("Filename must be at least 2 characters long.")
+            return
+
+        if start_ms is not None and start_ms < 0:
+            await ctx.send("start_ms cannot be negative.")
+            return
+
+        if end_ms is not None and end_ms <= 0:
+            await ctx.send("end_ms must be positive.")
+            return
+
+        if start_ms is not None and end_ms is not None and start_ms >= end_ms:
+            await ctx.send("start_ms must be less than end_ms.")
+            return
+
+        # Check if it's a direct media URL
+        clean_url = link.split('?')[0]
+        direct_extensions = ('.mp4', '.ogg', '.webm', '.mp3')
+        file_path = None
+
+        # Clean up any existing files with this name before downloading
+        self._cleanup_media_files(file_name)
+
+        try:
+            if clean_url.lower().endswith(direct_extensions):
+                # Direct file download - extract extension from URL
+                file_extension = clean_url.split('.')[-1].lower()
+                file_path = f'media/{file_name}.{file_extension}'
+
+                with requests.get(link, stream=True) as response:
+                    response.raise_for_status()
+                    with open(file_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            f.write(chunk)
+            else:
+                # yt-dlp download - let it determine extension
+                ydl_opts = {
+                    'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                    'outtmpl': f'media/{file_name}.%(ext)s',
+                    'merge_output_format': 'mp4',
+                }
+
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([link])
-                await ctx.send(f'Media file {file_name}.mp4 has been added.')
-            except yt_dlp.utils.DownloadError as e:
-                await ctx.send(f'Failed to download the video: {e}')
+
+                # Find what yt-dlp created (exclude temp files)
+                matches = [f for f in glob.glob(f'media/{file_name}.*')
+                           if '_tmp.' not in f]
+                if not matches:
+                    await ctx.send('Download appeared to succeed but no file was created.')
+                    return
+                file_path = matches[0]
+
+            # Trim if requested
+            if start_ms is not None or end_ms is not None:
+                # If only start_ms provided, treat as "first N ms"
+                if start_ms is not None and end_ms is None:
+                    end_ms = start_ms
+                    start_ms = 0
+
+                if not self._trim_media(file_path, start_ms, end_ms):
+                    self._cleanup_media_files(file_name)
+                    await ctx.send('Failed to trim media file.')
+                    return
+
+            final_name = os.path.basename(file_path)
+            await ctx.send(f'Media file {final_name} has been added.')
+
+        except requests.RequestException as e:
+            self._cleanup_media_files(file_name)
+            await ctx.send(f'Failed to download the file: {e}')
+        except yt_dlp.utils.DownloadError as e:
+            self._cleanup_media_files(file_name)
+            await ctx.send(f'Failed to download the video: {e}')
+        except Exception as e:
+            self._cleanup_media_files(file_name)
+            await ctx.send(f'Unexpected error: {e}')
 
     @commands.command(name='listmedia')
     async def listmedia(self, ctx, prefix: str = None):
