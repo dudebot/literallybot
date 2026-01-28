@@ -126,6 +126,18 @@ class Media(commands.Cog):
             await ctx.send("start_ms must be less than end_ms.")
             return
 
+        # Check for prefix conflicts with existing files
+        for existing in os.listdir(self._media_dir):
+            existing_base = os.path.splitext(existing)[0]
+            # New file would be shadowed by existing (existing is shorter prefix)
+            if file_name.startswith(existing_base):
+                await ctx.send(f"Conflict: `!{file_name}` would be captured by existing `{existing}`")
+                return
+            # New file would shadow existing (new is shorter prefix)
+            if existing_base.startswith(file_name):
+                await ctx.send(f"Conflict: `!{file_name}` would shadow existing `{existing}`")
+                return
+
         # Check if it's a direct media URL
         clean_url = link.split('?')[0]
         direct_extensions = ('.mp4', '.ogg', '.webm', '.mp3')
