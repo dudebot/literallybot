@@ -11,14 +11,14 @@ class Admin(commands.Cog):
     async def claimsuper(self, ctx):
         """Claim superadmin privileges (first come, first served)."""
         superadmins = get_superadmins(self.bot.config)
-        if ctx.author.id not in superadmins:
-            superadmins.append(ctx.author.id)
-            self.bot.config.set_global("superadmins", superadmins)
-            self.logger.info(f"Superadmin claimed by {ctx.author} (ID: {ctx.author.id})")
-            await ctx.send("Superadmin claimed.")
-        else:
-            self.logger.warning(f"Failed superadmin claim by {ctx.author} (ID: {ctx.author.id}); already superadmin")
-            await ctx.send("You are already a bot superadmin.")
+        if superadmins:
+            self.logger.warning(f"Rejected superadmin claim by {ctx.author} (ID: {ctx.author.id}); superadmins already exist")
+            await ctx.send("Superadmin already claimed. Use `!addsuperadmin` to add more.")
+            return
+        superadmins.append(ctx.author.id)
+        self.bot.config.set_global("superadmins", superadmins)
+        self.logger.info(f"Superadmin claimed by {ctx.author} (ID: {ctx.author.id})")
+        await ctx.send("Superadmin claimed.")
 
     @commands.command(name="addsuperadmin")
     @commands.check(is_superadmin)
