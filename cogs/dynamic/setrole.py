@@ -59,7 +59,7 @@ class SetRole(commands.Cog):
     # Modified: App Command for setting up emoji role toggle; change message_id to string and convert to int.
     @discord.app_commands.command(name="setemojiroletoggle", description="Configure a reaction role toggle (mod-only)")
     @discord.app_commands.default_permissions(manage_messages=True)
-    async def setemojiroletoggle(self, ctx: discord.Interaction, message_id: str, emoji: str, role: discord.Role):
+    async def setemojiroletoggle(self, ctx: discord.Interaction, message_id: str, emoji: str, role: discord.Role, channel: discord.TextChannel = None):
         try:
             msg_id_int = int(message_id)
         except Exception as e:
@@ -91,8 +91,9 @@ class SetRole(commands.Cog):
                 partial_emoji = new_emoji  # update with newly created emoji
 
         # Pre-populate the reaction on the target message.
+        target_channel = channel or ctx.channel
         try:
-            message = await ctx.channel.fetch_message(msg_id_int)
+            message = await target_channel.fetch_message(msg_id_int)
             await message.add_reaction(partial_emoji)
         except Exception as e:
             await ctx.response.send_message(f"Failed to add reaction to the message: {e}", ephemeral=True)
