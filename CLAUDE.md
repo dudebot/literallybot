@@ -43,6 +43,6 @@ literallybot/
 - Use `!reload cogname` for hot-reload during development
 - See `docs/cog-development.md` for structure and examples
 
-## Sister Project
+## Related
 
-`../conditioner` shares the same `core/config.py` implementation. Changes to config behavior should be mirrored there.
+The `conditioner` bot (EcstasyEngineer/conditioner) uses a similar `core/config.py` derived from the same original implementation.
