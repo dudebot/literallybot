@@ -43,6 +43,6 @@ literallybot/
 - Use `!reload cogname` for hot-reload during development
 - See `docs/cog-development.md` for structure and examples
 
-## Sister Project
+## Related
 
-`../REDACTED` shares the same `core/config.py` implementation. Changes to config behavior should be mirrored there.
+The `REDACTED` bot (REDACTED/REDACTED) uses a similar `core/config.py` derived from the same original implementation.
