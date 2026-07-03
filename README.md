@@ -144,6 +144,73 @@ Notes:
 - Supports per-guild and global error logging with category/severity routing
 - Errors are rate-limited globally to avoid spam (configurable by superadmin)
 
+### MCP Ops Server (spike)
+
+`mcp_ops/` is a proof-of-concept demonstrating the "world pattern": one ops
+registry, two frontends. The bot's ops registry (permission-checked,
+typed Discord actions like `send_message`, `search_history`, `add_reaction`)
+is exposed over [MCP](https://modelcontextprotocol.io/) so an external agent
+can drive the bot the same way an in-bot command would, without either
+frontend re-implementing Discord plumbing or permission logic.
+
+**This is OFF by default.** It is a separate entrypoint, not wired into
+`bot.py`'s autostart — running the normal bot never starts it.
+
+> **Dependency note:** this spike currently imports `core/ops_stub.py`, a
+> minimal stand-in registry (three ops only). It's meant to be swapped for
+> the real `core/ops.py` ops registry (see the `feat/ops-registry` branch)
+> once that lands — the call sites don't change, since the stub mirrors the
+> real registry's shape (`OpContext`, `OpsRegistry`, `PermissionLevel`).
+
+**Security model:**
+- **Off by default** — refuses to start unless `MCP_OPS_ENABLED=1` is set.
+- **Auth required** — refuses to start unless `MCP_OPS_TOKEN` is set to a
+  non-empty shared secret. Every request must send
+  `Authorization: Bearer <token>`; requests without a matching token get a
+  `401`. Both checks fail closed (missing config = refuses to start, not
+  "runs unauthenticated").
+- Binds to `127.0.0.1` by default (`MCP_OPS_HOST` to override) — don't expose
+  this port publicly without understanding the blast radius: every tool call
+  is a live, authenticated Discord bot action.
+
+**Run it:**
+```bash
+# in your .env or exported in the shell:
+export MCP_OPS_ENABLED=1
+export MCP_OPS_TOKEN=$(openssl rand -hex 32)   # generate a real secret
+export DISCORD_TOKEN=your_bot_token_here        # same token the bot uses
+
+python3 -m mcp_ops.run_mcp_server
+# -> serves streamable-HTTP MCP at http://127.0.0.1:8765/mcp
+```
+
+**Connect to it** (e.g. from an MCP-capable client config):
+```json
+{
+  "mcpServers": {
+    "literallybot-ops": {
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer <your MCP_OPS_TOKEN value>"
+      }
+    }
+  }
+}
+```
+
+**Exposed tools:**
+| Tool | Permission | Args |
+|------|-----------|------|
+| `send_message` | EVERYONE | `channel_id`, `content`, `actor_id`, `guild_id?` |
+| `search_history` | EVERYONE | `channel_id`, `actor_id`, `limit?`, `author_id?`, `contains?`, `guild_id?` |
+| `add_reaction` | EVERYONE | `channel_id`, `message_id`, `emoji`, `actor_id`, `guild_id?` |
+
+`actor_id` is the Discord user id the call is made on behalf of — the
+registry runs the same permission check it would for an in-bot command.
+(The stub registry's ADMIN/SUPERADMIN checks are placeholders; the real
+`core/ops.py` registry checks against live bot config via
+`core.utils.is_admin`/`is_superadmin`.)
+
 ### Production Deployment
 For Linux servers, use the provided service template in `scripts/` and the `install_service.sh` script.
 
