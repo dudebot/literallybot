@@ -79,10 +79,20 @@ class Gpt(commands.Cog):
         # Get API key from global config
         api_key_name = f"{provider.upper()}_API_KEY"
         api_key = self.bot.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name)
-        
+
+        # Local/keyless providers (e.g. a local Ollama server) can opt out of the
+        # key requirement via "requires_api_key": false. Defaults to True so every
+        # existing provider (xai/openai/anthropic) keeps requiring a real key.
+        requires_api_key = provider_info.get("requires_api_key", True)
+
         if not api_key:
-            raise ValueError(f"No API key found for provider {provider}")
-            
+            if not requires_api_key:
+                # OpenAI SDK requires a non-empty api_key string even against
+                # keyless local servers; the value itself is never checked.
+                api_key = "not-needed"
+            else:
+                raise ValueError(f"No API key found for provider {provider}")
+
         api_type = provider_info.get("api_type", "openai")
         
         if api_type == "anthropic":
@@ -631,7 +641,10 @@ class Gpt(commands.Cog):
         for prov_id, prov_info in all_providers.items():
             api_key_name = f"{prov_id.upper()}_API_KEY"
             has_key = bool(self.bot.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name))
-            status = "✅ Configured" if has_key else "❌ No API key"
+            if not prov_info.get("requires_api_key", True):
+                status = "✅ No key required (local)"
+            else:
+                status = "✅ Configured" if has_key else "❌ No API key"
             models_dict = prov_info.get("models", {})
 
             # Format models with their timeout info
