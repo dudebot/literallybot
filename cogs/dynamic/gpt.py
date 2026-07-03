@@ -495,7 +495,10 @@ class Gpt(commands.Cog):
         for prov_id, prov_info in all_providers.items():
             api_key_name = f"{prov_id.upper()}_API_KEY"
             has_key = bool(self.bot.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name))
-            status = "✅ Configured" if has_key else "❌ No API key"
+            if not prov_info.get("requires_api_key", True):
+                status = "✅ No key required (local)"
+            else:
+                status = "✅ Configured" if has_key else "❌ No API key"
             models_dict = prov_info.get("models", {})
 
             # Format models with their timeout info
