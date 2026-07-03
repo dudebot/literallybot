@@ -5,3 +5,7 @@ beautifulsoup4
 openai
 yt-dlp
 requests
+
+# MCP ops server (spike, opt-in — see mcp_ops/ and README's "MCP Ops Server" section)
+mcp
+uvicorn
