@@ -148,7 +148,15 @@ class LLMClient:
 
         api_key = self._get_api_key(provider)
         if not api_key:
-            raise ValueError(f"No API key found for provider {provider}")
+            # Local/keyless providers (e.g. a local Ollama server) opt out of
+            # the key requirement via "requires_api_key": false. Defaults to
+            # True so xai/openai/anthropic keep requiring a real key. The
+            # OpenAI SDK still needs a non-empty string against keyless local
+            # servers; the value itself is never checked.
+            if not provider_info.get("requires_api_key", True):
+                api_key = "not-needed"
+            else:
+                raise ValueError(f"No API key found for provider {provider}")
 
         api_type = provider_info.get("api_type", "openai")
 
