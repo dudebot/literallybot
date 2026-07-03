@@ -1,28 +1,24 @@
 from discord.ext import commands
-import openai
 import os
 import time
 import re
-import asyncio
 from datetime import datetime
-import json
-import aiohttp
 from typing import Dict, List, Optional, Any
 
 from core.utils import is_superadmin
+from core.llm import LLMClient, PROVIDER_ALIASES
 
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
     def __init__(self, bot):
         self.bot = bot
         self.logger = bot.logger
-        # Provider aliases
-        self.provider_aliases = {
-            "oai": "openai",
-            "claude": "anthropic",
-            "anth": "anthropic"
-        }
-    
+        # Provider aliases (shared with core.llm)
+        self.provider_aliases = PROVIDER_ALIASES
+        # Provider-agnostic LLM client: provider/model resolution, API calls,
+        # model discovery, and usage/cost tracking now live in core.llm.
+        self.llm = LLMClient(self.bot.config, logger=self.logger)
+
     def is_authorized(self, ctx) -> bool:
         """Check if user is authorized to use admin commands"""
         config = self.bot.config
@@ -39,166 +35,34 @@ class Gpt(commands.Cog):
         return False
 
     def get_provider_config(self, ctx) -> Dict[str, Any]:
-        """Get the current provider configuration for a guild"""
-        config = self.bot.config
-        
-        # Get provider settings from global config
-        all_providers = config.get(None, "ai_providers", scope="global") or {}
-        
-        # Get current provider (apply alias if needed)
-        current_provider = config.get(ctx, "current_ai_provider") or "xai"  # Default to xai
-        current_provider = self.provider_aliases.get(current_provider, current_provider)
-        
-        current_model = config.get(ctx, "current_ai_model") or None
-        
-        # Get current provider details
-        provider_info = all_providers.get(current_provider)
-        if not provider_info:
-            # Fallback if provider not found
-            self.logger.warning(f"Provider {current_provider} not found in config, falling back to xai")
-            current_provider = "xai"
-            provider_info = all_providers.get("xai", {})
-        
-        # If no model specified, use default for provider
-        if not current_model:
-            current_model = provider_info.get("default_model")
-            
-        return {
-            "provider": current_provider,
-            "model": current_model,
-            "provider_info": provider_info,
-            "all_providers": all_providers
-        }
+        """Get the current provider configuration for a guild.
+
+        Delegates to core.llm.LLMClient; returns a ProviderConfig which
+        supports both attribute and dict-style (`provider_config["model"]`)
+        access so existing call sites in this cog are unaffected.
+        """
+        return self.llm.get_provider_config(ctx)
 
     async def call_ai_api(self, provider_config: Dict[str, Any], messages: List[Dict], metadata: Dict) -> str:
-        """Call the appropriate AI API based on provider configuration"""
-        provider = provider_config["provider"]
-        model = provider_config["model"]
-        provider_info = provider_config["provider_info"]
-        
-        # Get API key from global config
-        api_key_name = f"{provider.upper()}_API_KEY"
-        api_key = self.bot.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name)
-        
-        if not api_key:
-            raise ValueError(f"No API key found for provider {provider}")
-            
-        api_type = provider_info.get("api_type", "openai")
-        
-        if api_type == "anthropic":
-            # Use Claude API
-            return await self.call_anthropic_api(api_key, model, messages, metadata)
-        else:
-            # Use OpenAI-compatible API
-            base_url = provider_info.get("base_url")
-            # Only pass base_url if it's actually set (for xAI, etc)
-            if base_url:
-                client = openai.OpenAI(api_key=api_key, base_url=base_url)
-            else:
-                client = openai.OpenAI(api_key=api_key)
-            
-            # Run the API call in a non-blocking way
-            # Handle different parameter names based on model capabilities
-            create_params = {
-                "messages": messages,
-                "metadata": metadata,
-                "store": True,
-                "model": model
-            }
+        """Call the appropriate AI API based on provider configuration.
 
-            models_info = provider_info.get("models", {})
-            model_info = models_info.get(model, {})
-
-            uses_completion_tokens = (
-                model.startswith("o3")
-                or model.startswith("o4")
-                or model.startswith("gpt-5")
-                or model in {"o1", "o1-preview", "o1-mini"}
-                or "max_completion_tokens" in model_info
+        Delegates to core.llm.LLMClient.chat(); returns plain text to match
+        the original signature. Usage/cost tracking happens inside the
+        client and is available via response.usage for callers that want it
+        (see LLMClient.chat for the richer LLMResponse).
+        """
+        response = await self.llm.chat(provider_config, messages, metadata)
+        if response.usage:
+            self.logger.debug(
+                f"AI usage: provider={response.usage.provider} model={response.usage.model} "
+                f"prompt={response.usage.prompt_tokens} completion={response.usage.completion_tokens} "
+                f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd}"
             )
-
-            if uses_completion_tokens:
-                create_params["max_completion_tokens"] = model_info.get("max_completion_tokens", 3000)
-            else:
-                create_params["max_tokens"] = model_info.get("max_tokens", 3000)
-
-            # Try the API call with fallback for token parameter
-            try:
-                chat_completion = await asyncio.to_thread(
-                    client.chat.completions.create,
-                    **create_params
-                )
-            except Exception as e:
-                error_msg = str(e).lower()
-                # Check if error is about max_tokens parameter
-                if "max_tokens" in error_msg or "max_completion_tokens" in error_msg:
-                    self.logger.warning(f"Token parameter error for model {model}, attempting fallback: {e}")
-
-                    # Try swapping the token parameter
-                    if "max_tokens" in create_params:
-                        token_value = create_params.pop("max_tokens")
-                        create_params["max_completion_tokens"] = token_value
-                        self.logger.info(f"Retrying with max_completion_tokens instead of max_tokens")
-                    elif "max_completion_tokens" in create_params:
-                        token_value = create_params.pop("max_completion_tokens")
-                        create_params["max_tokens"] = token_value
-                        self.logger.info(f"Retrying with max_tokens instead of max_completion_tokens")
-
-                    # Retry the API call
-                    chat_completion = await asyncio.to_thread(
-                        client.chat.completions.create,
-                        **create_params
-                    )
-                else:
-                    # Not a token parameter error, re-raise
-                    raise
-
-            return chat_completion.choices[0].message.content.strip()
+        return response.text
 
     async def call_anthropic_api(self, api_key: str, model: str, messages: List[Dict], metadata: Dict) -> str:
-        """Call Anthropic's Claude API"""
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json"
-        }
-        
-        # Convert OpenAI format to Anthropic format
-        system_message = None
-        claude_messages = []
-        
-        for msg in messages:
-            if msg["role"] == "system":
-                system_message = msg["content"]
-            else:
-                # Map assistant/user roles
-                role = "assistant" if msg["role"] == "assistant" else "user"
-                claude_messages.append({
-                    "role": role,
-                    "content": msg["content"]
-                })
-        
-        data = {
-            "model": model,
-            "messages": claude_messages,
-            "max_tokens": 3000
-        }
-        
-        if system_message:
-            data["system"] = system_message
-            
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=data
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise ValueError(f"Anthropic API error: {error_text}")
-                    
-                result = await response.json()
-                return result["content"][0]["text"]
+        """Call Anthropic's Claude API. Delegates to core.llm.LLMClient."""
+        return await self.llm.call_anthropic_api(api_key, model, messages, metadata)
 
     async def process_askgpt(self, ctx, question: str):
         async with ctx.typing():
@@ -854,101 +718,11 @@ class Gpt(commands.Cog):
             await ctx.send(f"API key saved, but model discovery failed: {str(e)}")
 
     async def discover_models(self, provider: str, api_key: str, provider_info: Dict) -> List[str]:
-        """Attempt to discover available models from provider API"""
-        discovered = []
+        """Attempt to discover available models from provider API.
 
-        try:
-            if provider == "xai":
-                # xAI uses OpenAI-compatible endpoint
-                client = openai.OpenAI(api_key=api_key, base_url=provider_info.get("base_url"))
-                models = await asyncio.to_thread(client.models.list)
-
-                for model in models.data:
-                    model_id = model.id
-                    discovered.append(model_id)
-
-                    # Smart multiplier assignment
-                    if "fast" in model_id.lower() or "mini" in model_id.lower():
-                        multiplier = 0.5
-                    elif "reasoning" in model_id.lower():
-                        multiplier = 1.5
-                    else:
-                        multiplier = 1.0
-
-                    # Add to provider config if not already present
-                    models_dict = provider_info.get("models", {})
-                    if model_id not in models_dict:
-                        models_dict[model_id] = {"timeout_multiplier": multiplier}
-                        provider_info["models"] = models_dict
-
-            elif provider == "openai":
-                client = openai.OpenAI(api_key=api_key)
-                models = await asyncio.to_thread(client.models.list)
-
-                for model in models.data:
-                    model_id = model.id
-                    # Only include GPT/O-series models
-                    if not (model_id.startswith("gpt-") or model_id.startswith("o") or model_id.startswith("chatgpt")):
-                        continue
-
-                    discovered.append(model_id)
-
-                    # Smart multiplier assignment
-                    if "mini" in model_id.lower():
-                        multiplier = 0.5
-                    elif model_id.startswith("o3") or model_id.startswith("o4"):
-                        multiplier = 2.0
-                    elif "turbo" in model_id.lower():
-                        multiplier = 0.7
-                    else:
-                        multiplier = 1.0
-
-                    # Add to provider config if not already present
-                    models_dict = provider_info.get("models", {})
-                    if model_id not in models_dict:
-                        model_cfg = {"timeout_multiplier": multiplier}
-                        # Add max_completion_tokens for reasoning models
-                        if model_id.startswith("o"):
-                            model_cfg["max_completion_tokens"] = 16000
-                        models_dict[model_id] = model_cfg
-                        provider_info["models"] = models_dict
-
-            elif provider == "anthropic":
-                # Anthropic doesn't have a models list endpoint, so we'll just verify the key works
-                async with aiohttp.ClientSession() as session:
-                    headers = {
-                        "x-api-key": api_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json"
-                    }
-                    # Try a minimal request to verify the key
-                    data = {
-                        "model": "claude-3-5-haiku-latest",
-                        "messages": [{"role": "user", "content": "Hi"}],
-                        "max_tokens": 1
-                    }
-                    async with session.post(
-                        "https://api.anthropic.com/v1/messages",
-                        headers=headers,
-                        json=data
-                    ) as response:
-                        if response.status == 200:
-                            # Key is valid, but can't auto-discover models
-                            self.logger.info(f"Anthropic API key validated successfully")
-                        else:
-                            raise ValueError(f"API key validation failed: {await response.text()}")
-
-            # Save updated provider info if models were discovered
-            if discovered:
-                all_providers = self.bot.config.get(None, "ai_providers", scope="global") or {}
-                all_providers[provider] = provider_info
-                self.bot.config.set(None, "ai_providers", all_providers, scope="global")
-
-            return discovered
-
-        except Exception as e:
-            self.logger.error(f"Failed to discover models for {provider}: {e}", exc_info=True)
-            raise
+        Delegates to core.llm.LLMClient.
+        """
+        return await self.llm.discover_models(provider, api_key, provider_info)
 
     @commands.Cog.listener()
     async def on_message(self, message):
