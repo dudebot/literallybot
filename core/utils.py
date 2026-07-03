@@ -7,9 +7,34 @@ Normalization goals:
   - is_superadmin(ctx)
   - is_admin(config, ctx)
   - is_admin(ctx)
+- Both `ctx` forms above accept a prefix commands.Context OR a
+  discord.Interaction (slash commands) interchangeably. This is the single
+  auth gate for both command surfaces - see _actor()/_bot_of() below.
 """
 from typing import List, Union, Any
 import discord
+
+
+def _actor(ctx_or_interaction: Any) -> Any:
+    """Return the invoking user/member for either a Context or an Interaction.
+
+    commands.Context exposes `.author`; discord.Interaction exposes `.user`.
+    """
+    author = getattr(ctx_or_interaction, "author", None)
+    if author is not None:
+        return author
+    return getattr(ctx_or_interaction, "user", None)
+
+
+def _bot_of(ctx_or_interaction: Any) -> Any:
+    """Return the bot/client for either a Context or an Interaction.
+
+    commands.Context exposes `.bot`; discord.Interaction exposes `.client`.
+    """
+    bot = getattr(ctx_or_interaction, "bot", None)
+    if bot is not None:
+        return bot
+    return getattr(ctx_or_interaction, "client", None)
 
 
 def _normalize_superadmins_list(config) -> List[int]:
@@ -39,18 +64,21 @@ def is_superadmin(config_or_ctx: Any, user_id: Union[int, None] = None) -> bool:
 
     Supports both call styles:
     - is_superadmin(config, user_id)
-    - is_superadmin(ctx)
+    - is_superadmin(ctx)  # ctx may be a prefix Context or a slash Interaction
     """
     if user_id is None:
-        # Treat first arg as ctx
+        # Treat first arg as ctx/interaction
         ctx = config_or_ctx
-        config = getattr(ctx, "bot", None)
+        bot = _bot_of(ctx)
+        if bot is None:
+            return False
+        config = getattr(bot, "config", None)
         if config is None:
             return False
-        config = getattr(ctx.bot, "config", None)
-        if config is None:
+        actor = _actor(ctx)
+        if actor is None:
             return False
-        return ctx.author.id in get_superadmins(config)
+        return actor.id in get_superadmins(config)
     else:
         # First arg is config, second is user id
         config = config_or_ctx
@@ -62,33 +90,38 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
 
     Supports both call styles:
     - is_admin(config, ctx)
-    - is_admin(ctx)
+    - is_admin(ctx)  # ctx may be a prefix Context or a slash Interaction
     """
     if maybe_ctx is None:
         ctx = config_or_ctx
-        config = getattr(ctx, "bot", None)
-        if config is None:
+        bot = _bot_of(ctx)
+        if bot is None:
             return False
-        config = getattr(ctx.bot, "config", None)
+        config = getattr(bot, "config", None)
         if config is None:
             return False
     else:
         config = config_or_ctx
         ctx = maybe_ctx
-    if is_superadmin(config, ctx.author.id):
+
+    actor = _actor(ctx)
+    if actor is None:
+        return False
+
+    if is_superadmin(config, actor.id):
         return True
 
     if ctx.guild is None:
         return False
 
     admins = config.get(ctx, "admins", [])
-    if ctx.author.id in (admins or []):
+    if actor.id in (admins or []):
         return True
 
-    if getattr(ctx.author.guild_permissions, "administrator", False):
+    if getattr(actor.guild_permissions, "administrator", False):
         return True
 
-    if ctx.author == getattr(ctx.guild, "owner", None):
+    if actor == getattr(ctx.guild, "owner", None):
         return True
 
     return False
