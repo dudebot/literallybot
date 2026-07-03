@@ -64,10 +64,15 @@ def estimate_cost(record: UsageRecord) -> Optional[float]:
     prices = provider_prices.get(record.model)
     if prices is None:
         # Try prefix match (e.g. "gpt-5-mini-2026-01-01" -> "gpt-5-mini").
-        for known_model, known_prices in provider_prices.items():
-            if record.model.startswith(known_model):
-                prices = known_prices
-                break
+        # Longest-prefix-first so specific variants (gpt-5-mini) win over
+        # their broader parents (gpt-5) instead of being shadowed by them.
+        matches = [
+            (known_model, known_prices)
+            for known_model, known_prices in provider_prices.items()
+            if record.model.startswith(known_model)
+        ]
+        if matches:
+            prices = max(matches, key=lambda pair: len(pair[0]))[1]
 
     if prices is None:
         return None

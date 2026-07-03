@@ -354,7 +354,11 @@ class LLMClient:
             raise ValueError(f"No API key found for provider {provider}")
 
         base_url = provider_info.get("base_url")
-        client = openai.OpenAI(api_key=api_key, base_url=base_url) if base_url else openai.OpenAI(api_key=api_key)
+        client = (
+            openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+            if base_url
+            else openai.AsyncOpenAI(api_key=api_key)
+        )
 
         create_params: Dict[str, Any] = {
             "messages": messages,
@@ -380,11 +384,11 @@ class LLMClient:
         else:
             create_params["max_tokens"] = model_info.get("max_tokens", DEFAULT_MAX_TOKENS)
 
-        def _make_stream():
-            return client.chat.completions.create(**create_params)
-
-        stream = await asyncio.to_thread(_make_stream)
-        for chunk in stream:
+        # AsyncOpenAI keeps the whole stream (connect + chunk iteration) off
+        # the event loop -- no to_thread bridging needed, unlike the
+        # sync-client `chat()` path above.
+        stream = await client.chat.completions.create(**create_params)
+        async for chunk in stream:
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
