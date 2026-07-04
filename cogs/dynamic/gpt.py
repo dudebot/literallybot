@@ -297,6 +297,13 @@ class Gpt(commands.Cog):
             try:
                 response = await self.call_ai_api(provider_config, api_messages, metadata)
                 response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
+
+                if not response.strip():
+                    # Thinking models can spend the whole token budget on
+                    # reasoning and return no content; an empty ctx.send() is
+                    # a Discord 400 (50006).
+                    await ctx.send("The model returned an empty response (likely spent its whole token budget thinking). Try again or check the model's reasoning_effort setting.")
+                    return
                 
                 # Check if the response complies with our safety rules
                 is_compliant, checked_response = self.check_message_compliance(ctx, response)

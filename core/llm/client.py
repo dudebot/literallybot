@@ -223,6 +223,11 @@ class LLMClient:
         else:
             create_params["max_tokens"] = model_info.get("max_tokens", DEFAULT_MAX_TOKENS)
 
+        # Thinking models (e.g. qwen3.5 via ollama) can burn the entire token
+        # budget on reasoning and return empty content; "none" disables it.
+        if "reasoning_effort" in model_info:
+            create_params["reasoning_effort"] = model_info["reasoning_effort"]
+
         try:
             chat_completion = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -249,7 +254,7 @@ class LLMClient:
             else:
                 raise
 
-        text = chat_completion.choices[0].message.content.strip()
+        text = (chat_completion.choices[0].message.content or "").strip()
         usage = _usage_from_openai(chat_completion, provider=provider, model=model)
 
         return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=chat_completion)
@@ -383,6 +388,11 @@ class LLMClient:
             create_params["max_completion_tokens"] = model_info.get("max_completion_tokens", DEFAULT_MAX_TOKENS)
         else:
             create_params["max_tokens"] = model_info.get("max_tokens", DEFAULT_MAX_TOKENS)
+
+        # Thinking models (e.g. qwen3.5 via ollama) can burn the entire token
+        # budget on reasoning and return empty content; "none" disables it.
+        if "reasoning_effort" in model_info:
+            create_params["reasoning_effort"] = model_info["reasoning_effort"]
 
         # AsyncOpenAI keeps the whole stream (connect + chunk iteration) off
         # the event loop -- no to_thread bridging needed, unlike the
