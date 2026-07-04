@@ -1,28 +1,68 @@
-"""Provider-agnostic LLM client.
+"""Provider-agnostic LLM client, backed by pydantic-ai.
 
-Extracted from cogs/dynamic/gpt.py. Owns provider config resolution, the
-OpenAI-compatible call path, the Anthropic call path, model discovery, and
-usage/cost tracking. Callers (cogs) should not talk to `openai`/`aiohttp`
-directly for chat completions anymore -- go through `LLMClient`.
+Owns provider config resolution, chat completions (OpenAI-compatible and
+Anthropic), streaming, model discovery, and usage/cost tracking. Callers
+(cogs) should not talk to provider SDKs directly for chat completions --
+go through `LLMClient`.
 
-Behavior is preserved 1:1 from the original cog methods:
-- get_provider_config
-- call_ai_api (OpenAI-compatible path)
-- call_anthropic_api
-- discover_models
-- the o3/o4/gpt-5/o1 -> max_completion_tokens heuristic and its
-  max_tokens <-> max_completion_tokens fallback-on-error retry
+The public surface (LLMClient, LLMResponse, ProviderConfig, the
+call_ai_api/call_anthropic_api aliases) is unchanged from the pre-pydantic-ai
+implementation. Internally, requests are built as pydantic-ai messages and
+executed via `pydantic_ai.direct.model_request(_stream)`, which keeps this
+layer a thin client while leaving a clear upgrade path to tool-calling:
+`ModelRequestParameters.function_tools` already carries OpenAI-style tool
+schemas converted to `ToolDefinition`s, and a future agent loop can reuse
+`_build_model()` to construct `pydantic_ai.Agent(model, tools=...)` directly.
+
+Notable behavior notes vs. the old implementation:
+- The o3/o4/gpt-5/o1 `max_completion_tokens` heuristics and the
+  max_tokens<->max_completion_tokens retry-swap are gone: pydantic-ai model
+  profiles decide which wire field `max_tokens` maps to per provider/model.
+  Ollama's OpenAI-compat endpoint ignores `max_completion_tokens` (verified
+  against a live server), so the ollama model is built with a profile
+  override that forces the plain `max_tokens` wire field.
+- Per-model token caps still come from config: `max_completion_tokens`
+  wins over `max_tokens`, falling back to DEFAULT_MAX_TOKENS.
+- `reasoning_effort` from model config is passed via the
+  `openai_reasoning_effort` model setting and reaches the wire verbatim
+  (including the non-standard "none" used to disable qwen3.5 thinking).
+- `metadata` passthrough uses `extra_body={"metadata": ...}` plus
+  `openai_store=True`, producing the same request JSON as the old
+  `metadata=`/`store=` SDK kwargs. Anthropic drops metadata, as before.
 """
 
 from __future__ import annotations
 
 import os
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 import aiohttp
 import openai
+
+from pydantic_ai.direct import model_request, model_request_stream
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest as PaiModelRequest,
+    ModelResponse as PaiModelResponse,
+    PartDeltaEvent,
+    PartStartEvent,
+    SystemPromptPart,
+    TextPart,
+    TextPartDelta,
+    UserPromptPart,
+)
+from pydantic_ai.models import Model, ModelRequestParameters
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.profiles.openai import OpenAIModelProfile
+from pydantic_ai.providers.anthropic import AnthropicProvider
+from pydantic_ai.providers.ollama import OllamaProvider
+from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.settings import ModelSettings
+from pydantic_ai.tools import ToolDefinition
+from pydantic_ai.usage import RequestUsage
 
 from .usage import UsageRecord, estimate_cost
 
@@ -73,8 +113,8 @@ class LLMClient:
     """Provider-agnostic async LLM client.
 
     Tool-call capable: pass `tools` (OpenAI-style tool schema) through to
-    `chat()`. Streaming-capable in shape: `chat_stream()` yields text deltas;
-    it is not currently wired into any Discord-facing command.
+    `chat()`. Streaming-capable: `chat_stream()` yields text deltas; it is
+    not currently wired into any Discord-facing command.
     """
 
     def __init__(self, config, logger=None):
@@ -125,6 +165,107 @@ class LLMClient:
         api_key_name = f"{provider.upper()}_API_KEY"
         return self.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name)
 
+    def _resolve_api_key(self, provider: str, provider_info: Dict[str, Any]) -> str:
+        """Resolve the API key for a provider, honoring `requires_api_key: false`.
+
+        Local/keyless providers (e.g. a local Ollama server) opt out of the
+        key requirement via "requires_api_key": false. Defaults to True so
+        xai/openai/anthropic keep requiring a real key. The underlying SDK
+        still needs a non-empty string against keyless local servers; the
+        value itself is never checked.
+        """
+        api_key = self._get_api_key(provider)
+        if not api_key:
+            if not provider_info.get("requires_api_key", True):
+                api_key = "not-needed"
+            else:
+                raise ValueError(f"No API key found for provider {provider}")
+        return api_key
+
+    # ------------------------------------------------------------------
+    # pydantic-ai request assembly
+    # ------------------------------------------------------------------
+
+    def _build_model(
+        self,
+        provider: str,
+        model: str,
+        provider_info: Dict[str, Any],
+        api_key: str,
+    ) -> Model:
+        """Construct the pydantic-ai model for a provider/model pair.
+
+        A future agent loop should reuse this to build
+        `pydantic_ai.Agent(self._build_model(...), tools=[...])`.
+        """
+        api_type = provider_info.get("api_type", "openai")
+
+        if api_type == "anthropic":
+            # The configured base_url points at the messages endpoint, not a
+            # base URL; the old implementation hardcoded the endpoint too, so
+            # the provider default is used deliberately.
+            return AnthropicModel(model, provider=AnthropicProvider(api_key=api_key))
+
+        base_url = provider_info.get("base_url")
+        if provider == "ollama":
+            # Ollama's OpenAI-compat endpoint silently ignores
+            # `max_completion_tokens` (verified live), so force the plain
+            # `max_tokens` wire field. The override merges on top of the
+            # provider's per-model profile (qwen/llama/... detection).
+            return OpenAIChatModel(
+                model,
+                provider=OllamaProvider(base_url=base_url, api_key=api_key),
+                profile=OpenAIModelProfile(openai_chat_supports_max_completion_tokens=False),
+            )
+
+        if base_url:
+            return OpenAIChatModel(model, provider=OpenAIProvider(base_url=base_url, api_key=api_key))
+        return OpenAIChatModel(model, provider=OpenAIProvider(api_key=api_key))
+
+    def _build_settings(
+        self,
+        provider_info: Dict[str, Any],
+        model: str,
+        metadata: Optional[Dict],
+        tool_choice: Optional[Any] = None,
+    ) -> ModelSettings:
+        """Build pydantic-ai model settings from per-model config.
+
+        The per-model token cap comes from config (`max_completion_tokens`
+        wins over `max_tokens`); pydantic-ai's model profile decides which
+        wire field it maps to, replacing the old prefix heuristics and the
+        fallback-on-error retry swap.
+        """
+        api_type = provider_info.get("api_type", "openai")
+        models_info = provider_info.get("models", {})
+        model_info = models_info.get(model, {})
+
+        max_tokens = model_info.get(
+            "max_completion_tokens", model_info.get("max_tokens", DEFAULT_MAX_TOKENS)
+        )
+        settings: Dict[str, Any] = {"max_tokens": max_tokens}
+
+        if api_type != "anthropic":
+            # Thinking models (e.g. qwen3.5 via ollama) can burn the entire
+            # token budget on reasoning and return empty content; "none"
+            # disables it. Passed through verbatim via openai_reasoning_effort.
+            if "reasoning_effort" in model_info:
+                settings["openai_reasoning_effort"] = model_info["reasoning_effort"]
+
+            # Same wire JSON as the old `metadata=`/`store=True` SDK kwargs.
+            # (Anthropic's API has no equivalent; the old code dropped
+            # metadata there as well.)
+            if metadata is not None:
+                settings["extra_body"] = {"metadata": metadata}
+                settings["openai_store"] = True
+
+        if tool_choice is not None:
+            mapped_choice = _map_tool_choice(tool_choice)
+            if mapped_choice is not None:
+                settings["tool_choice"] = mapped_choice
+
+        return settings  # type: ignore[return-value]
+
     # ------------------------------------------------------------------
     # Chat completion (non-streaming)
     # ------------------------------------------------------------------
@@ -140,36 +281,33 @@ class LLMClient:
         """Call the appropriate AI API based on provider configuration.
 
         Returns an LLMResponse with usage/cost tracking populated when the
-        provider returns usage data.
+        provider returns usage data. `text` is always a string ("" when the
+        model returned no content, e.g. a thinking model that spent its
+        whole budget reasoning) -- never None, never an exception for empty.
         """
         provider = provider_config.provider
         model = provider_config.model
         provider_info = provider_config.provider_info
 
-        api_key = self._get_api_key(provider)
-        if not api_key:
-            # Local/keyless providers (e.g. a local Ollama server) opt out of
-            # the key requirement via "requires_api_key": false. Defaults to
-            # True so xai/openai/anthropic keep requiring a real key. The
-            # OpenAI SDK still needs a non-empty string against keyless local
-            # servers; the value itself is never checked.
-            if not provider_info.get("requires_api_key", True):
-                api_key = "not-needed"
-            else:
-                raise ValueError(f"No API key found for provider {provider}")
+        api_key = self._resolve_api_key(provider, provider_info)
 
-        api_type = provider_info.get("api_type", "openai")
+        pai_model = self._build_model(provider, model, provider_info, api_key)
+        settings = self._build_settings(provider_info, model, metadata, tool_choice=tool_choice)
+        request_parameters = _build_request_parameters(tools)
 
-        if api_type == "anthropic":
-            return await self._call_anthropic_api(
-                api_key, model, messages, metadata, provider=provider,
-                tools=tools, tool_choice=tool_choice,
-            )
-        else:
-            return await self._call_openai_compat_api(
-                api_key, model, messages, metadata, provider_info, provider=provider,
-                tools=tools, tool_choice=tool_choice,
-            )
+        response = await model_request(
+            pai_model,
+            _to_pai_messages(messages),
+            model_settings=settings,
+            model_request_parameters=request_parameters,
+        )
+
+        text = "".join(
+            part.content for part in response.parts if isinstance(part, TextPart)
+        ).strip()
+        usage = _usage_from_pai(response.usage, provider=provider, model=model)
+
+        return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=response)
 
     # Backwards-compatible alias matching the original cog method name.
     async def call_ai_api(self, provider_config: ProviderConfig, messages: List[Dict], metadata: Dict) -> str:
@@ -177,155 +315,21 @@ class LLMClient:
         response = await self.chat(provider_config, messages, metadata)
         return response.text
 
-    async def _call_openai_compat_api(
-        self,
-        api_key: str,
-        model: str,
-        messages: List[Dict],
-        metadata: Optional[Dict],
-        provider_info: Dict[str, Any],
-        provider: str,
-        tools: Optional[List[Dict]] = None,
-        tool_choice: Optional[Any] = None,
-    ) -> LLMResponse:
-        base_url = provider_info.get("base_url")
-        if base_url:
-            client = openai.OpenAI(api_key=api_key, base_url=base_url)
-        else:
-            client = openai.OpenAI(api_key=api_key)
-
-        create_params: Dict[str, Any] = {
-            "messages": messages,
-            "model": model,
-        }
-        if metadata is not None:
-            create_params["metadata"] = metadata
-            create_params["store"] = True
-
-        if tools:
-            create_params["tools"] = tools
-            if tool_choice is not None:
-                create_params["tool_choice"] = tool_choice
-
-        models_info = provider_info.get("models", {})
-        model_info = models_info.get(model, {})
-
-        uses_completion_tokens = (
-            model.startswith("o3")
-            or model.startswith("o4")
-            or model.startswith("gpt-5")
-            or model in {"o1", "o1-preview", "o1-mini"}
-            or "max_completion_tokens" in model_info
-        )
-
-        if uses_completion_tokens:
-            create_params["max_completion_tokens"] = model_info.get("max_completion_tokens", DEFAULT_MAX_TOKENS)
-        else:
-            create_params["max_tokens"] = model_info.get("max_tokens", DEFAULT_MAX_TOKENS)
-
-        # Thinking models (e.g. qwen3.5 via ollama) can burn the entire token
-        # budget on reasoning and return empty content; "none" disables it.
-        if "reasoning_effort" in model_info:
-            create_params["reasoning_effort"] = model_info["reasoning_effort"]
-
-        try:
-            chat_completion = await asyncio.to_thread(
-                client.chat.completions.create,
-                **create_params
-            )
-        except Exception as e:
-            error_msg = str(e).lower()
-            if "max_tokens" in error_msg or "max_completion_tokens" in error_msg:
-                self.logger.warning(f"Token parameter error for model {model}, attempting fallback: {e}")
-
-                if "max_tokens" in create_params:
-                    token_value = create_params.pop("max_tokens")
-                    create_params["max_completion_tokens"] = token_value
-                    self.logger.info("Retrying with max_completion_tokens instead of max_tokens")
-                elif "max_completion_tokens" in create_params:
-                    token_value = create_params.pop("max_completion_tokens")
-                    create_params["max_tokens"] = token_value
-                    self.logger.info("Retrying with max_tokens instead of max_completion_tokens")
-
-                chat_completion = await asyncio.to_thread(
-                    client.chat.completions.create,
-                    **create_params
-                )
-            else:
-                raise
-
-        text = (chat_completion.choices[0].message.content or "").strip()
-        usage = _usage_from_openai(chat_completion, provider=provider, model=model)
-
-        return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=chat_completion)
-
     # Backwards-compatible alias matching the original cog method signature/behavior.
     async def call_anthropic_api(self, api_key: str, model: str, messages: List[Dict], metadata: Dict) -> str:
-        response = await self._call_anthropic_api(api_key, model, messages, metadata, provider="anthropic")
-        return response.text
-
-    async def _call_anthropic_api(
-        self,
-        api_key: str,
-        model: str,
-        messages: List[Dict],
-        metadata: Optional[Dict],
-        provider: str = "anthropic",
-        tools: Optional[List[Dict]] = None,
-        tool_choice: Optional[Any] = None,
-    ) -> LLMResponse:
-        """Call Anthropic's Claude API."""
-        headers = {
-            "x-api-key": api_key,
-            "anthropic-version": ANTHROPIC_API_VERSION,
-            "content-type": "application/json",
-        }
-
-        system_message = None
-        claude_messages = []
-
-        for msg in messages:
-            if msg["role"] == "system":
-                system_message = msg["content"]
-            else:
-                role = "assistant" if msg["role"] == "assistant" else "user"
-                claude_messages.append({
-                    "role": role,
-                    "content": msg["content"],
-                })
-
-        data: Dict[str, Any] = {
-            "model": model,
-            "messages": claude_messages,
-            "max_tokens": DEFAULT_MAX_TOKENS,
-        }
-
-        if system_message:
-            data["system"] = system_message
-
-        if tools:
-            data["tools"] = tools
-            if tool_choice is not None:
-                data["tool_choice"] = tool_choice
-
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                ANTHROPIC_MESSAGES_URL,
-                headers=headers,
-                json=data,
-            ) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    raise ValueError(f"Anthropic API error: {error_text}")
-
-                result = await response.json()
-                text = result["content"][0]["text"]
-                usage = _usage_from_anthropic(result, provider=provider, model=model)
-
-                return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=result)
+        """Call Anthropic's Claude API with an explicit key; returns plain text."""
+        pai_model = AnthropicModel(model, provider=AnthropicProvider(api_key=api_key))
+        response = await model_request(
+            pai_model,
+            _to_pai_messages(messages),
+            model_settings={"max_tokens": DEFAULT_MAX_TOKENS},
+        )
+        return "".join(
+            part.content for part in response.parts if isinstance(part, TextPart)
+        ).strip()
 
     # ------------------------------------------------------------------
-    # Streaming (shape-only for now; not wired to Discord)
+    # Streaming
     # ------------------------------------------------------------------
 
     async def chat_stream(
@@ -338,72 +342,36 @@ class LLMClient:
     ) -> AsyncIterator[str]:
         """Stream text deltas for a chat call.
 
-        Only the OpenAI-compatible path streams natively today. The
-        Anthropic path falls back to a single non-streaming call and yields
-        its full text as one chunk -- correct output, just not incremental.
-        Not currently called from any Discord command; provided so the
-        client shape supports streaming when a caller wires it up.
+        All providers stream natively through pydantic-ai (the old
+        implementation faked streaming for Anthropic and lacked keyless
+        support and metadata passthrough; those now share the exact same
+        request assembly as `chat()`). Not currently called from any
+        Discord command; provided so the client shape supports streaming
+        when a caller wires it up.
         """
         provider = provider_config.provider
         model = provider_config.model
         provider_info = provider_config.provider_info
-        api_type = provider_info.get("api_type", "openai")
 
-        if api_type == "anthropic":
-            response = await self.chat(provider_config, messages, metadata, tools=tools, tool_choice=tool_choice)
-            yield response.text
-            return
+        api_key = self._resolve_api_key(provider, provider_info)
 
-        api_key = self._get_api_key(provider)
-        if not api_key:
-            raise ValueError(f"No API key found for provider {provider}")
+        pai_model = self._build_model(provider, model, provider_info, api_key)
+        settings = self._build_settings(provider_info, model, metadata, tool_choice=tool_choice)
+        request_parameters = _build_request_parameters(tools)
 
-        base_url = provider_info.get("base_url")
-        client = (
-            openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
-            if base_url
-            else openai.AsyncOpenAI(api_key=api_key)
-        )
-
-        create_params: Dict[str, Any] = {
-            "messages": messages,
-            "model": model,
-            "stream": True,
-        }
-        if tools:
-            create_params["tools"] = tools
-            if tool_choice is not None:
-                create_params["tool_choice"] = tool_choice
-
-        models_info = provider_info.get("models", {})
-        model_info = models_info.get(model, {})
-        uses_completion_tokens = (
-            model.startswith("o3")
-            or model.startswith("o4")
-            or model.startswith("gpt-5")
-            or model in {"o1", "o1-preview", "o1-mini"}
-            or "max_completion_tokens" in model_info
-        )
-        if uses_completion_tokens:
-            create_params["max_completion_tokens"] = model_info.get("max_completion_tokens", DEFAULT_MAX_TOKENS)
-        else:
-            create_params["max_tokens"] = model_info.get("max_tokens", DEFAULT_MAX_TOKENS)
-
-        # Thinking models (e.g. qwen3.5 via ollama) can burn the entire token
-        # budget on reasoning and return empty content; "none" disables it.
-        if "reasoning_effort" in model_info:
-            create_params["reasoning_effort"] = model_info["reasoning_effort"]
-
-        # AsyncOpenAI keeps the whole stream (connect + chunk iteration) off
-        # the event loop -- no to_thread bridging needed, unlike the
-        # sync-client `chat()` path above.
-        stream = await client.chat.completions.create(**create_params)
-        async for chunk in stream:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta and delta.content:
-                yield delta.content
+        async with model_request_stream(
+            pai_model,
+            _to_pai_messages(messages),
+            model_settings=settings,
+            model_request_parameters=request_parameters,
+        ) as stream:
+            async for event in stream:
+                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
+                    if event.part.content:
+                        yield event.part.content
+                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
+                    if event.delta.content_delta:
+                        yield event.delta.content_delta
 
     # ------------------------------------------------------------------
     # Model discovery
@@ -504,30 +472,71 @@ class _NullLogger:
     def error(self, *a, **k): pass
 
 
-def _usage_from_openai(chat_completion, provider: str, model: str) -> Optional[UsageRecord]:
-    usage = getattr(chat_completion, "usage", None)
+def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
+    """Convert OpenAI-style role/content dicts to pydantic-ai messages.
+
+    Consecutive system/user messages are grouped into a single ModelRequest;
+    assistant messages become ModelResponses. Order is preserved 1:1 on the
+    wire.
+    """
+    pai_messages: List[ModelMessage] = []
+    request_parts: List[Any] = []
+
+    for msg in messages:
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        if role == "assistant":
+            if request_parts:
+                pai_messages.append(PaiModelRequest(parts=request_parts))
+                request_parts = []
+            pai_messages.append(PaiModelResponse(parts=[TextPart(content=content)]))
+        elif role == "system":
+            request_parts.append(SystemPromptPart(content=content))
+        else:
+            request_parts.append(UserPromptPart(content=content))
+
+    if request_parts:
+        pai_messages.append(PaiModelRequest(parts=request_parts))
+
+    return pai_messages
+
+
+def _build_request_parameters(tools: Optional[List[Dict]]) -> Optional[ModelRequestParameters]:
+    """Convert OpenAI-style tool schemas to pydantic-ai request parameters."""
+    if not tools:
+        return None
+
+    function_tools = []
+    for tool in tools:
+        # Accept both {"type": "function", "function": {...}} and bare {...}.
+        fn = tool.get("function", tool)
+        function_tools.append(
+            ToolDefinition(
+                name=fn["name"],
+                description=fn.get("description"),
+                parameters_json_schema=fn.get("parameters") or {"type": "object", "properties": {}},
+            )
+        )
+    return ModelRequestParameters(function_tools=function_tools)
+
+
+def _map_tool_choice(tool_choice: Any) -> Optional[Any]:
+    """Map OpenAI-style tool_choice to pydantic-ai's ModelSettings.tool_choice."""
+    if isinstance(tool_choice, str) and tool_choice in ("none", "auto", "required"):
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        # {"type": "function", "function": {"name": "x"}} -> ["x"]
+        name = (tool_choice.get("function") or {}).get("name")
+        if name:
+            return [name]
+    return None
+
+
+def _usage_from_pai(usage: Optional[RequestUsage], provider: str, model: str) -> Optional[UsageRecord]:
     if usage is None:
         return None
-    prompt_tokens = getattr(usage, "prompt_tokens", 0) or 0
-    completion_tokens = getattr(usage, "completion_tokens", 0) or 0
-    total_tokens = getattr(usage, "total_tokens", prompt_tokens + completion_tokens) or (prompt_tokens + completion_tokens)
-    record = UsageRecord(
-        provider=provider,
-        model=model,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        total_tokens=total_tokens,
-    )
-    record.estimated_cost_usd = estimate_cost(record)
-    return record
-
-
-def _usage_from_anthropic(result: Dict[str, Any], provider: str, model: str) -> Optional[UsageRecord]:
-    usage = result.get("usage")
-    if not usage:
-        return None
-    prompt_tokens = usage.get("input_tokens", 0) or 0
-    completion_tokens = usage.get("output_tokens", 0) or 0
+    prompt_tokens = usage.input_tokens or 0
+    completion_tokens = usage.output_tokens or 0
     record = UsageRecord(
         provider=provider,
         model=model,
