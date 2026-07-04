@@ -3,6 +3,7 @@ phue
 python-dotenv
 beautifulsoup4
 openai
+pydantic-ai-slim[openai,anthropic]==2.5.0
 yt-dlp
 requests
 
