@@ -293,6 +293,29 @@ async def create_thread(ctx: OpContext, channel, name: str, message=None):
     return await channel.create_thread(name=name)
 
 
+@registry.op(
+    "list_guilds",
+    "List the guilds the bot is a member of (id and name).",
+    PermissionLevel.EVERYONE,
+    params={},
+)
+async def list_guilds(ctx: OpContext):
+    return [{"id": g.id, "name": g.name} for g in ctx.bot.guilds]
+
+
+@registry.op(
+    "list_channels",
+    "List a guild's channels the bot can see (id, name, type).",
+    PermissionLevel.EVERYONE,
+    params={"guild": "discord.Guild"},
+)
+async def list_channels(ctx: OpContext, guild):
+    return [
+        {"id": c.id, "name": c.name, "type": str(c.type)}
+        for c in guild.channels
+    ]
+
+
 # ---------------------------------------------------------------------------
 # In-file smoke test — instantiates the module-level registry and lists
 # tools WITHOUT a live bot/Discord connection. Run directly:
@@ -303,7 +326,7 @@ def _smoke_test() -> None:
     expected = {
         "send_message", "edit_message", "delete_message", "add_reaction",
         "search_history", "add_role", "remove_role", "pin_message",
-        "create_thread",
+        "create_thread", "list_guilds", "list_channels",
     }
     names = set(registry.names())
     missing = expected - names
