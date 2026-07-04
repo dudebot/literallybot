@@ -1,25 +1,31 @@
 #!/usr/bin/env python3
-"""SPIKE entrypoint: run the ops-registry MCP server standalone.
-
-THIS IS NOT STARTED BY bot.py. It is a separate process you launch explicitly:
+"""Standalone entrypoint: run the ops-registry MCP server in its own process.
 
     python3 -m mcp_ops.run_mcp_server
 
-Security model (fail-closed, both gates independently required):
-  1. Off by default: refuses to start unless MCP_OPS_ENABLED=1 is set.
-  2. Auth required: refuses to start unless MCP_OPS_TOKEN is set to a
-     non-empty shared secret; every MCP request must present it as
-     `Authorization: Bearer <token>`.
+The MCP server can run two ways, sharing the same mcp_ops.server.serve()
+guardrails (loopback-only bind, mandatory bearer auth, guild allowlist):
 
-It logs into Discord using the same DISCORD_TOKEN as the normal bot (so ops
-can actually call the Discord API), but registers NO cogs, NO command
-prefix handling, and NO event handlers beyond what's needed to become ready
-and serve MCP tool calls. It is intentionally a minimal, separate process —
-not an alternate mode of bot.py — so it can be run (or not) independently of
-the main bot's lifecycle.
+  1. In-process with the bot: bot.py starts it automatically when
+     MCP_OPS_ENABLED=1 (see maybe_start_in_bot below). This is the normal
+     path for a dev instance — the MCP tools then act through the live bot.
+  2. Standalone via this entrypoint: logs into Discord with the same
+     DISCORD_TOKEN as the bot but registers NO cogs, NO command prefix
+     handling, and NO event handlers beyond becoming ready.
 
-See README.md's "MCP Ops Server (spike)" section for the full run/connect
-walkthrough.
+Security model (fail-closed, all gates independently required):
+  - Off by default: refuses to start unless MCP_OPS_ENABLED=1.
+  - Auth required: refuses to start unless MCP_OPS_TOKEN is a non-empty
+    shared secret; every MCP request must present it as
+    `Authorization: Bearer <token>`.
+  - Guild allowlist required: refuses to start unless
+    MCP_OPS_GUILD_ALLOWLIST names at least one guild id; tool calls
+    targeting channels outside those guilds are refused.
+  - Binds to 127.0.0.1 ONLY. There is no host override; if the legacy
+    MCP_OPS_HOST var is set to anything non-loopback, startup is refused
+    rather than silently rebinding.
+
+See README.md's "MCP Ops Server" section for the run/connect walkthrough.
 """
 from __future__ import annotations
 
@@ -27,34 +33,68 @@ import asyncio
 import logging
 import os
 import sys
+from typing import Any, Optional
 
 import discord
-import uvicorn
 from dotenv import load_dotenv
 
-from mcp_ops.auth import load_token_from_env, wrap_with_auth
-from mcp_ops.server import build_server
+from mcp_ops.auth import load_token_from_env
+from mcp_ops.server import parse_guild_allowlist, serve
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
-)
 logger = logging.getLogger("mcp_ops.run_mcp_server")
 
 ENABLE_ENV_VAR = "MCP_OPS_ENABLED"
-HOST_ENV_VAR = "MCP_OPS_HOST"
+HOST_ENV_VAR = "MCP_OPS_HOST"  # legacy; only loopback values are accepted
 PORT_ENV_VAR = "MCP_OPS_PORT"
+ALLOWLIST_ENV_VAR = "MCP_OPS_GUILD_ALLOWLIST"
+
+_LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
 
 
-def _check_enabled() -> None:
-    """Off-by-default gate. Refuses to start unless explicitly enabled."""
-    if os.environ.get(ENABLE_ENV_VAR, "").strip() != "1":
-        logger.error(
-            "%s is not set to '1'. This MCP server is OFF by default and will "
-            "not start. Set %s=1 in the environment to run it explicitly.",
-            ENABLE_ENV_VAR, ENABLE_ENV_VAR,
+def is_enabled() -> bool:
+    return os.environ.get(ENABLE_ENV_VAR, "").strip() == "1"
+
+
+def _load_settings() -> "tuple[str, int, frozenset]":
+    """Read and validate token/port/allowlist from the environment.
+    Raises RuntimeError on any missing/invalid gate (fail closed)."""
+    token = load_token_from_env()  # raises RuntimeError if unset
+
+    host = os.environ.get(HOST_ENV_VAR, "").strip()
+    if host not in _LOOPBACK_HOSTS:
+        raise RuntimeError(
+            f"{HOST_ENV_VAR}={host!r} is not loopback. This server binds to "
+            f"127.0.0.1 ONLY; unset {HOST_ENV_VAR}."
         )
-        sys.exit(1)
+
+    allowlist = parse_guild_allowlist(os.environ.get(ALLOWLIST_ENV_VAR))
+    if not allowlist:
+        raise RuntimeError(
+            f"{ALLOWLIST_ENV_VAR} is not set (comma-separated guild ids). "
+            f"The MCP ops server requires an explicit guild allowlist and "
+            f"refuses to start without one."
+        )
+
+    port = int(os.environ.get(PORT_ENV_VAR, "8765"))
+    return token, port, allowlist
+
+
+def maybe_start_in_bot(bot: Any) -> Optional[asyncio.Task]:
+    """Called by bot.py once the bot is ready. Starts the MCP ops server as
+    a background task on the bot's event loop IF MCP_OPS_ENABLED=1 and all
+    fail-closed gates pass; returns None (and changes nothing) otherwise.
+    """
+    if not is_enabled():
+        return None
+    try:
+        token, port, allowlist = _load_settings()
+    except RuntimeError as exc:
+        logger.error("MCP ops server NOT started: %s", exc)
+        return None
+    return asyncio.get_running_loop().create_task(
+        serve(bot, port=port, token=token, allowed_guild_ids=allowlist),
+        name="mcp-ops-server",
+    )
 
 
 async def _make_discord_client(token: str) -> discord.Client:
@@ -63,7 +103,14 @@ async def _make_discord_client(token: str) -> discord.Client:
     intents = discord.Intents.default()
     intents.message_content = True
     intents.guilds = True
+    intents.members = True
     client = discord.Client(intents=intents)
+
+    # core.utils.is_admin / is_superadmin read permissions from
+    # `ctx.bot.config` — give the standalone client the same JSON config
+    # store the bot uses so the permission gates are truthful here too.
+    from core.config import Config
+    client.config = Config()
 
     ready = asyncio.Event()
 
@@ -90,41 +137,35 @@ async def _make_discord_client(token: str) -> discord.Client:
 
 
 async def _run() -> None:
-    _check_enabled()
-    token = load_token_from_env()  # raises RuntimeError (fail closed) if unset
-
     load_dotenv()
+
+    if not is_enabled():
+        logger.error(
+            "%s is not set to '1'. This MCP server is OFF by default and will "
+            "not start. Set %s=1 in the environment to run it explicitly.",
+            ENABLE_ENV_VAR, ENABLE_ENV_VAR,
+        )
+        sys.exit(1)
+
+    token, port, allowlist = _load_settings()
+
     discord_token = os.getenv("DISCORD_TOKEN")
     if not discord_token:
         logger.error("DISCORD_TOKEN is not set; cannot log the ops client into Discord.")
         sys.exit(1)
 
-    host = os.environ.get(HOST_ENV_VAR, "127.0.0.1")
-    port = int(os.environ.get(PORT_ENV_VAR, "8765"))
-
-    logger.warning(
-        "Starting MCP ops server on %s:%s — auth REQUIRED (Bearer token), "
-        "bind host defaults to loopback only. Do not expose this port "
-        "publicly without understanding the blast radius: every tool call "
-        "runs as a live, authenticated Discord bot action.",
-        host, port,
-    )
-
     client = await _make_discord_client(discord_token)
-    mcp = build_server(bot=client)
-
-    app = mcp.streamable_http_app()
-    app = wrap_with_auth(app, token)
-
-    config = uvicorn.Config(app, host=host, port=port, log_level="info")
-    server = uvicorn.Server(config)
     try:
-        await server.serve()
+        await serve(client, port=port, token=token, allowed_guild_ids=allowlist)
     finally:
         await client.close()
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
+    )
     try:
         asyncio.run(_run())
     except (RuntimeError, discord.LoginFailure) as exc:
