@@ -132,6 +132,16 @@ async def on_ready():
     await bot.tree.sync()
     # Sync application commands with Discord
 
+    # MCP ops server — OFF unless MCP_OPS_ENABLED=1 in the environment
+    # (plus MCP_OPS_TOKEN and MCP_OPS_GUILD_ALLOWLIST; all gates fail
+    # closed). Loopback-only. See mcp_ops/run_mcp_server.py.
+    if getattr(bot, '_mcp_ops_task', None) is None:
+        try:
+            from mcp_ops.run_mcp_server import maybe_start_in_bot
+            bot._mcp_ops_task = maybe_start_in_bot(bot)
+        except Exception as e:
+            logger.error(f"Failed to start MCP ops server: {e}", exc_info=True)
+
     # Report any failed cog loads to Discord now that we're connected
     if hasattr(bot, 'failed_cogs') and bot.failed_cogs:
         try:
