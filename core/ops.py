@@ -167,10 +167,17 @@ registry = OpsRegistry()
     "send_message",
     "Send a text message to a channel.",
     PermissionLevel.EVERYONE,
-    params={"channel": "discord.abc.Messageable", "content": "str"},
+    params={
+        "channel": "discord.abc.Messageable",
+        "content": "str",
+        "allowed_mentions": "Optional[discord.AllowedMentions] = None",
+    },
 )
-async def send_message(ctx: OpContext, channel, content: str):
-    return await channel.send(content)
+async def send_message(ctx: OpContext, channel, content: str,
+                       allowed_mentions=None):
+    if allowed_mentions is None:
+        return await channel.send(content)
+    return await channel.send(content, allowed_mentions=allowed_mentions)
 
 
 @registry.op(
