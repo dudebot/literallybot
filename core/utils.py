@@ -118,7 +118,9 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
     if actor.id in (admins or []):
         return True
 
-    if getattr(actor.guild_permissions, "administrator", False):
+    # actor may be a bare id-holder or discord.User (no guild_permissions)
+    # when called from a non-cog frontend (ops registry / MCP server).
+    if getattr(getattr(actor, "guild_permissions", None), "administrator", False):
         return True
 
     if actor == getattr(ctx.guild, "owner", None):

@@ -152,10 +152,11 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
 
     mcp = FastMCP(name=name, instructions=(
         "Ops-registry bridge for literallybot. Exposes a subset of the "
-        "bot's ops registry as MCP tools: send_message, search_history, "
-        "add_reaction. Every call is permission-checked the same way an "
-        "in-bot command would be, via the shared ops registry, and is "
-        "restricted to a server-side guild allowlist."
+        "bot's ops registry as MCP tools: send_message, edit_message, "
+        "search_history, add_reaction, list_guilds, list_channels. Every "
+        "call is permission-checked the same way an in-bot command would "
+        "be, via the shared ops registry, and is restricted to a "
+        "server-side guild allowlist."
     ))
 
     @mcp.tool(
@@ -245,6 +246,72 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
         if not result.ok:
             return {"ok": False, "error": result.error}
         return {"ok": True}
+
+    @mcp.tool(
+        name="edit_message",
+        description=registry.get("edit_message").description,
+    )
+    async def edit_message(channel_id: int, message_id: int, content: str,
+                           actor_id: int) -> dict:
+        """Edit the content of a message. Discord only permits bots to edit
+        their OWN messages — editing anyone else's returns a 403 error.
+
+        Args:
+            channel_id: Discord channel id containing the message (must be
+                in an allowlisted guild).
+            message_id: Discord message id to edit (must be authored by the bot).
+            content: Replacement message text.
+            actor_id: Discord user id on whose behalf this call is made.
+        """
+        live_bot = _require_bot(bot)
+        message = await _resolve_message(live_bot, channel_id, message_id, allowed)
+        ctx = _build_context(live_bot, actor_id, message.guild)
+        result = await registry.call("edit_message", ctx, message=message, content=content)
+        if not result.ok:
+            return {"ok": False, "error": result.error}
+        return {"ok": True, "message_id": message.id}
+
+    @mcp.tool(
+        name="list_guilds",
+        description=registry.get("list_guilds").description,
+    )
+    async def list_guilds(actor_id: int) -> dict:
+        """List guilds the bot is in, restricted to this server's allowlist
+        (guilds outside the allowlist are not disclosed).
+
+        Args:
+            actor_id: Discord user id on whose behalf this call is made.
+        """
+        live_bot = _require_bot(bot)
+        ctx = _build_context(live_bot, actor_id, None)
+        result = await registry.call("list_guilds", ctx)
+        if not result.ok:
+            return {"ok": False, "error": result.error}
+        guilds = [g for g in result.value if g["id"] in allowed]
+        return {"ok": True, "guilds": guilds, "count": len(guilds)}
+
+    @mcp.tool(
+        name="list_channels",
+        description=registry.get("list_channels").description,
+    )
+    async def list_channels(guild_id: int, actor_id: int) -> dict:
+        """List a guild's channels (id, name, type). The guild must be in
+        this server's allowlist.
+
+        Args:
+            guild_id: Discord guild id to enumerate.
+            actor_id: Discord user id on whose behalf this call is made.
+        """
+        live_bot = _require_bot(bot)
+        guild = live_bot.get_guild(guild_id)
+        if guild is None:
+            raise BotUnavailableError(f"Could not resolve guild {guild_id}.")
+        _check_guild_allowed(guild, allowed, f"Guild {guild_id}")
+        ctx = _build_context(live_bot, actor_id, guild)
+        result = await registry.call("list_channels", ctx, guild=guild)
+        if not result.ok:
+            return {"ok": False, "error": result.error}
+        return {"ok": True, "channels": result.value, "count": len(result.value)}
 
     return mcp
 
