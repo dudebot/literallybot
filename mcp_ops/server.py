@@ -1,9 +1,13 @@
 """MCP frontend over the bot's ops registry ("world pattern").
 
-One ops layer (core/ops.py), two frontends: the in-bot agent loop (not built
-yet) and this MCP server. Neither frontend re-implements Discord call
-plumbing or permission checks; both go through
-`registry.call(op_name, ctx, **kwargs)`.
+One ops layer (core/ops.py), two frontends: the in-bot agent loop
+(core/agent_loop.py) and this MCP server. Neither frontend re-implements
+Discord call plumbing, id resolution, result serialization, or permission
+checks — all of that lives in the registry. This module GENERATES its MCP
+tools mechanically from each op's typed param declarations
+(`Op.wire_params()`): the only hand-written pieces here are frontend
+policy (actor construction from `actor_id`, the guild allowlist, forced
+allowed_mentions=none on sends, allowlist-filtered list_guilds).
 
 This module does NOT start anything on import — call build_server() to get a
 configured FastMCP instance, or serve() to run it over authenticated
@@ -14,12 +18,13 @@ Guardrails (per the Codex review of the original spike, issue #58):
   helper refuses to run without a token.
 - Binds to loopback ONLY. serve() hard-codes 127.0.0.1; there is no host
   parameter on purpose.
-- Server-side guild allowlist: every tool call resolves its channel and then
-  verifies the channel belongs to an allowlisted guild. DM channels and
-  channels in other guilds are refused. An empty allowlist refuses to serve
-  (fail closed).
+- Server-side guild allowlist: every id-resolved target is verified to
+  belong to an allowlisted guild (enforced by the registry's shared
+  resolver via `allowed_guild_ids`). DM channels and channels in other
+  guilds are refused. An empty allowlist refuses to serve (fail closed).
 - send_message always sends with allowed_mentions=none — no pings, ever.
-- search_history clamps `limit` to MAX_HISTORY_LIMIT.
+- search_history clamps `limit` to core.ops.HISTORY_LIMIT_MAX (200),
+  declared on the op itself.
 - ACCEPTED RISK: `actor_id` is caller-supplied and not credential-bound, so a
   client that already holds the bearer token can act as any user id for
   permission purposes. Acceptable for localhost self-use only; do not expose
@@ -27,27 +32,47 @@ Guardrails (per the Codex review of the original spike, issue #58):
 """
 from __future__ import annotations
 
+import inspect
 import logging
-from typing import Any, Iterable, Optional
+from typing import Annotated, Any, Iterable, Optional
 
 import discord
+from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 
-from core.ops import OpContext, registry
+from core.ops import (
+    HISTORY_LIMIT_MAX,
+    Op,
+    OpContext,
+    ResolutionError,
+    GuildNotAllowedError,  # noqa: F401 - re-exported; raised via shared resolvers
+    registry,
+    resolve_context_guild,
+)
 
 logger = logging.getLogger("mcp_ops.server")
 
-MAX_HISTORY_LIMIT = 200
+# Kept for backwards compatibility with earlier imports/docs; the clamp
+# itself is declared on the search_history op in core/ops.py.
+MAX_HISTORY_LIMIT = HISTORY_LIMIT_MAX
+
+# Ops exposed over MCP. delete/pin/role/thread ops stay unexposed until a
+# concrete need shows up (same surface as the original hand-written spike).
+_EXPOSED_OPS = (
+    "send_message",
+    "search_history",
+    "add_reaction",
+    "edit_message",
+    "list_guilds",
+    "list_channels",
+)
+
+_JSON_TYPE_TO_PY = {"integer": int, "string": str, "boolean": bool}
 
 
 class BotUnavailableError(RuntimeError):
     """Raised when the MCP server needs a live discord.py bot/channel/message
     and doesn't have one (e.g. bot not passed in, or the id doesn't resolve)."""
-
-
-class GuildNotAllowedError(RuntimeError):
-    """Raised when a tool call targets a channel/guild outside the
-    server-side guild allowlist."""
 
 
 def _require_bot(bot: Any) -> Any:
@@ -56,43 +81,6 @@ def _require_bot(bot: Any) -> Any:
             "No live discord.py bot attached to this MCP server instance."
         )
     return bot
-
-
-def _check_guild_allowed(guild: Any, allowed_guild_ids: frozenset,
-                         what: str) -> None:
-    if guild is None:
-        raise GuildNotAllowedError(
-            f"{what} has no guild (DMs are not allowed through this server)."
-        )
-    if guild.id not in allowed_guild_ids:
-        raise GuildNotAllowedError(
-            f"{what} belongs to guild {guild.id}, which is not in this "
-            f"server's guild allowlist."
-        )
-
-
-async def _resolve_channel(bot: Any, channel_id: int,
-                           allowed_guild_ids: frozenset) -> Any:
-    channel = bot.get_channel(channel_id)
-    if channel is None:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-        except Exception as exc:  # noqa: BLE001 - surfaced to the MCP caller as a tool error
-            raise BotUnavailableError(f"Could not resolve channel {channel_id}: {exc}") from exc
-    _check_guild_allowed(getattr(channel, "guild", None), allowed_guild_ids,
-                         f"Channel {channel_id}")
-    return channel
-
-
-async def _resolve_message(bot: Any, channel_id: int, message_id: int,
-                           allowed_guild_ids: frozenset) -> Any:
-    channel = await _resolve_channel(bot, channel_id, allowed_guild_ids)
-    try:
-        return await channel.fetch_message(message_id)
-    except Exception as exc:  # noqa: BLE001
-        raise BotUnavailableError(
-            f"Could not resolve message {message_id} in channel {channel_id}: {exc}"
-        ) from exc
 
 
 def _build_context(bot: Any, actor_id: int, guild: Any) -> OpContext:
@@ -130,9 +118,89 @@ def parse_guild_allowlist(raw: Optional[str]) -> frozenset:
     return frozenset(ids)
 
 
+def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
+    """Generate one MCP tool function from an op's typed declaration.
+
+    The returned coroutine has an explicit `__signature__` built from the
+    op's wire params (plus the MCP-frontend `actor_id`), so FastMCP derives
+    the same JSON schema the registry declares.
+    """
+
+    async def tool_fn(**raw) -> dict:
+        live_bot = _require_bot(bot)
+        actor_id = raw.pop("actor_id")
+
+        # Resolve the target guild first (raises on unknown ids and on
+        # allowlist violations — surfaced as MCP tool errors) so the actor
+        # can be built as a real Member of that guild.
+        try:
+            guild = await resolve_context_guild(live_bot, raw, allowed)
+        except ResolutionError as exc:
+            raise BotUnavailableError(str(exc)) from exc
+
+        ctx = _build_context(live_bot, actor_id, guild)
+
+        extra = {}
+        if op.name == "send_message":
+            # MCP policy: never ping. Mentions are always suppressed.
+            extra["allowed_mentions"] = discord.AllowedMentions.none()
+
+        result = await registry.call_ids(op.name, ctx, allowed_guild_ids=allowed,
+                                         **raw, **extra)
+        if not result.ok:
+            return {"ok": False, "error": result.error}
+
+        value = result.value
+        if op.name == "list_guilds":
+            # MCP policy: guilds outside the allowlist are not disclosed.
+            value = [g for g in value if g["id"] in allowed]
+
+        return {"ok": True, **op.serialize_result(value)}
+
+    # Build the explicit signature FastMCP introspects.
+    parameters = []
+    annotations = {}
+    for wp in op.wire_params():
+        py_type: Any = _JSON_TYPE_TO_PY[wp.json_type]
+        if not wp.required and wp.default is None:
+            py_type = Optional[py_type]
+        annotation = (
+            Annotated[py_type, Field(description=wp.description)]
+            if wp.description else py_type
+        )
+        default = (
+            inspect.Parameter.empty if wp.required and wp.default is None
+            else wp.default
+        )
+        parameters.append(inspect.Parameter(
+            wp.name, inspect.Parameter.KEYWORD_ONLY,
+            annotation=annotation, default=default,
+        ))
+        annotations[wp.name] = annotation
+
+    actor_annotation = Annotated[int, Field(
+        description="Discord user id on whose behalf this call is made "
+                    "(used for permission checks)."
+    )]
+    parameters.append(inspect.Parameter(
+        "actor_id", inspect.Parameter.KEYWORD_ONLY, annotation=actor_annotation,
+    ))
+    annotations["actor_id"] = actor_annotation
+
+    # Required params (no default) must precede optional ones in a Signature.
+    parameters.sort(key=lambda p: p.default is not inspect.Parameter.empty)
+
+    tool_fn.__name__ = op.name
+    tool_fn.__doc__ = op.description
+    tool_fn.__signature__ = inspect.Signature(parameters)  # type: ignore[attr-defined]
+    tool_fn.__annotations__ = annotations
+    return tool_fn
+
+
 def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
                  name: str = "literallybot-ops") -> FastMCP:
-    """Construct a FastMCP server exposing three ops-registry tools.
+    """Construct a FastMCP server whose tools are generated from the ops
+    registry (`_EXPOSED_OPS`).
 
     `bot` should be a live discord.py Bot/Client instance (with `.config`
     attached, as bot.py does) so the tools can resolve channel/message ids
@@ -140,7 +208,7 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
     smoke test), the tools raise BotUnavailableError when invoked.
 
     `allowed_guild_ids` is the server-side guild allowlist; every call is
-    refused unless its resolved channel belongs to one of these guilds.
+    refused unless its resolved target belongs to one of these guilds.
     """
     allowed = frozenset(int(g) for g in allowed_guild_ids)
     if not allowed:
@@ -152,166 +220,18 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
 
     mcp = FastMCP(name=name, instructions=(
         "Ops-registry bridge for literallybot. Exposes a subset of the "
-        "bot's ops registry as MCP tools: send_message, edit_message, "
-        "search_history, add_reaction, list_guilds, list_channels. Every "
-        "call is permission-checked the same way an in-bot command would "
-        "be, via the shared ops registry, and is restricted to a "
+        "bot's ops registry as MCP tools: " + ", ".join(_EXPOSED_OPS) + ". "
+        "Every call is permission-checked the same way an in-bot command "
+        "would be, via the shared ops registry, and is restricted to a "
         "server-side guild allowlist."
     ))
 
-    @mcp.tool(
-        name="send_message",
-        description=registry.get("send_message").description,
-    )
-    async def send_message(channel_id: int, content: str, actor_id: int) -> dict:
-        """Send a text message to a channel (mentions are always suppressed).
-
-        Args:
-            channel_id: Discord channel id to send into (must be in an
-                allowlisted guild).
-            content: Message text to send.
-            actor_id: Discord user id on whose behalf this call is made
-                (used for permission checks — send_message is EVERYONE-level).
-        """
-        live_bot = _require_bot(bot)
-        channel = await _resolve_channel(live_bot, channel_id, allowed)
-        ctx = _build_context(live_bot, actor_id, channel.guild)
-        result = await registry.call(
-            "send_message", ctx, channel=channel, content=content,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-        return {"ok": True, "message_id": getattr(result.value, "id", None)}
-
-    @mcp.tool(
-        name="search_history",
-        description=registry.get("search_history").description,
-    )
-    async def search_history(channel_id: int, actor_id: int,
-                             limit: int = 100,
-                             author_id: Optional[int] = None,
-                             contains: Optional[str] = None) -> dict:
-        """Search a channel's message history.
-
-        Args:
-            channel_id: Discord channel id to search (must be in an
-                allowlisted guild).
-            actor_id: Discord user id on whose behalf this call is made.
-            limit: Max number of messages to scan, most recent first
-                (clamped to 200).
-            author_id: Optional filter — only messages from this user id.
-            contains: Optional filter — substring match on message content.
-        """
-        live_bot = _require_bot(bot)
-        channel = await _resolve_channel(live_bot, channel_id, allowed)
-        ctx = _build_context(live_bot, actor_id, channel.guild)
-        limit = max(1, min(int(limit), MAX_HISTORY_LIMIT))
-        result = await registry.call(
-            "search_history", ctx, channel=channel, limit=limit,
-            author_id=author_id, contains=contains,
-        )
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-        messages = [
-            {
-                "id": m.id,
-                "author_id": m.author.id,
-                "content": m.content,
-                "created_at": m.created_at.isoformat() if getattr(m, "created_at", None) else None,
-            }
-            for m in result.value
-        ]
-        return {"ok": True, "messages": messages, "count": len(messages)}
-
-    @mcp.tool(
-        name="add_reaction",
-        description=registry.get("add_reaction").description,
-    )
-    async def add_reaction(channel_id: int, message_id: int, emoji: str,
-                           actor_id: int) -> dict:
-        """Add an emoji reaction to a message.
-
-        Args:
-            channel_id: Discord channel id containing the message (must be
-                in an allowlisted guild).
-            message_id: Discord message id to react to.
-            emoji: Emoji to react with (unicode emoji or `name:id` custom emoji).
-            actor_id: Discord user id on whose behalf this call is made.
-        """
-        live_bot = _require_bot(bot)
-        message = await _resolve_message(live_bot, channel_id, message_id, allowed)
-        ctx = _build_context(live_bot, actor_id, message.guild)
-        result = await registry.call("add_reaction", ctx, message=message, emoji=emoji)
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-        return {"ok": True}
-
-    @mcp.tool(
-        name="edit_message",
-        description=registry.get("edit_message").description,
-    )
-    async def edit_message(channel_id: int, message_id: int, content: str,
-                           actor_id: int) -> dict:
-        """Edit the content of a message. Discord only permits bots to edit
-        their OWN messages — editing anyone else's returns a 403 error.
-
-        Args:
-            channel_id: Discord channel id containing the message (must be
-                in an allowlisted guild).
-            message_id: Discord message id to edit (must be authored by the bot).
-            content: Replacement message text.
-            actor_id: Discord user id on whose behalf this call is made.
-        """
-        live_bot = _require_bot(bot)
-        message = await _resolve_message(live_bot, channel_id, message_id, allowed)
-        ctx = _build_context(live_bot, actor_id, message.guild)
-        result = await registry.call("edit_message", ctx, message=message, content=content)
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-        return {"ok": True, "message_id": message.id}
-
-    @mcp.tool(
-        name="list_guilds",
-        description=registry.get("list_guilds").description,
-    )
-    async def list_guilds(actor_id: int) -> dict:
-        """List guilds the bot is in, restricted to this server's allowlist
-        (guilds outside the allowlist are not disclosed).
-
-        Args:
-            actor_id: Discord user id on whose behalf this call is made.
-        """
-        live_bot = _require_bot(bot)
-        ctx = _build_context(live_bot, actor_id, None)
-        result = await registry.call("list_guilds", ctx)
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-        guilds = [g for g in result.value if g["id"] in allowed]
-        return {"ok": True, "guilds": guilds, "count": len(guilds)}
-
-    @mcp.tool(
-        name="list_channels",
-        description=registry.get("list_channels").description,
-    )
-    async def list_channels(guild_id: int, actor_id: int) -> dict:
-        """List a guild's channels (id, name, type). The guild must be in
-        this server's allowlist.
-
-        Args:
-            guild_id: Discord guild id to enumerate.
-            actor_id: Discord user id on whose behalf this call is made.
-        """
-        live_bot = _require_bot(bot)
-        guild = live_bot.get_guild(guild_id)
-        if guild is None:
-            raise BotUnavailableError(f"Could not resolve guild {guild_id}.")
-        _check_guild_allowed(guild, allowed, f"Guild {guild_id}")
-        ctx = _build_context(live_bot, actor_id, guild)
-        result = await registry.call("list_channels", ctx, guild=guild)
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-        return {"ok": True, "channels": result.value, "count": len(result.value)}
+    for op_name in _EXPOSED_OPS:
+        op = registry.get(op_name)
+        if op is None:  # registry drift — fail loudly at build time
+            raise ValueError(f"Op '{op_name}' not found in the ops registry.")
+        mcp.add_tool(_make_mcp_tool(bot, op, allowed),
+                     name=op.name, description=op.description)
 
     return mcp
 
