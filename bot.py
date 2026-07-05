@@ -172,7 +172,27 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    if message.author == bot.user:
+    if message.author.bot:
+        # discord.py's process_commands drops ALL bot-authored messages, so a
+        # bot (including this bot itself, e.g. via its MCP ops server) can
+        # never trigger a command through the normal path. Config-gated shim:
+        # authors on the global `command_author_allowlist` (default empty =
+        # feature off) get their prefixed messages processed as commands.
+        # Requiring the command prefix keeps this bot's own replies — which
+        # never start with the prefix — from re-triggering commands.
+        allowlist = bot.config.get(None, "command_author_allowlist", scope="global") or []
+        if message.author.id in allowlist:
+            prefixes = await bot.get_prefix(message)
+            if isinstance(prefixes, str):
+                prefixes = [prefixes]
+            if any(message.content.startswith(p) for p in prefixes):
+                ctx = await bot.get_context(message)
+                if ctx.valid:
+                    logger.info(
+                        f'Processing allowlisted bot-authored command from '
+                        f'{message.author} (ID: {message.author.id}): {message.content[:100]}'
+                    )
+                    await bot.invoke(ctx)
         return
     if isinstance(message.channel, discord.DMChannel):
         logger.info(f'Received DM from {message.author} (ID: {message.author.id}): {message.content}')
