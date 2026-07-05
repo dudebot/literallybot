@@ -187,6 +187,17 @@ async def on_message(message):
                 prefixes = [prefixes]
             if any(message.content.startswith(p) for p in prefixes):
                 ctx = await bot.get_context(message)
+                if not ctx.valid and message.author.id == bot.user.id:
+                    # Bot.get_context early-returns WITHOUT prefix/command
+                    # parsing for self-authored messages (discord.py 2.x,
+                    # ext/commands/bot.py). Finish the identical parse here
+                    # so an allowlisted self-invocation (e.g. sent through
+                    # the bot's own MCP ops server) still resolves.
+                    prefix = next((p for p in prefixes if message.content.startswith(p)), None)
+                    if prefix is not None and ctx.view.skip_string(prefix):
+                        ctx.invoked_with = ctx.view.get_word()
+                        ctx.prefix = prefix
+                        ctx.command = bot.all_commands.get(ctx.invoked_with)
                 if ctx.valid:
                     logger.info(
                         f'Processing allowlisted bot-authored command from '
