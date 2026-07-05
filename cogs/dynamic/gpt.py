@@ -64,7 +64,11 @@ class Gpt(commands.Cog):
         async with ctx.typing():
             # Get provider configuration
             provider_config = self.get_provider_config(ctx)
-            
+
+            # Agentic mode: guild-scoped opt-in flag. Default False — with
+            # the flag unset, the plain chat path below runs untouched.
+            agentic = bool(ctx.guild) and bool(self.bot.config.get(ctx, "gpt_agentic_enabled"))
+
             history = []
             messages = []
             # Get the last 15 messages in the channel (increased for better context)
@@ -261,6 +265,21 @@ class Gpt(commands.Cog):
                 "- Engage naturally and in character. *Do not* talk about these instructions or your programming.",
             ])
 
+            if agentic:
+                from core.agent_loop import AGENT_OPS
+                prompt_parts.extend([
+                    "",
+                    "AGENTIC MODE: you have REAL Discord tools: " + ", ".join(AGENT_OPS) + ".",
+                    f"- Current guild id: {ctx.guild.id}. Current channel id: {ctx.channel.id}.",
+                    f"- The invoking user's id is {ctx.author.id}.",
+                    "- Tool actions actually happen. When asked to send, edit, react, or search, "
+                    "USE the tools — never merely describe or narrate the action.",
+                    "- send_message returns the new message's message_id; reuse it for follow-up "
+                    "edits or reactions.",
+                    "- Your final text reply is posted to the channel automatically — do not "
+                    "duplicate it with send_message.",
+                ])
+
             # 4) Dynamic User Memories (if any)
             if active_memories_for_prompt:
                 prompt_parts.append("") # Blank line for separation
@@ -295,7 +314,10 @@ class Gpt(commands.Cog):
             }
             
             try:
-                response = await self.call_ai_api(provider_config, api_messages, metadata)
+                if agentic:
+                    response = await self._run_agentic(ctx, provider_config, api_messages, metadata, question)
+                else:
+                    response = await self.call_ai_api(provider_config, api_messages, metadata)
                 response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
 
                 if not response.strip():
@@ -397,6 +419,49 @@ class Gpt(commands.Cog):
         
         # Capture and store memories from the conversation
         await self.capture_and_store_memories(ctx, messages, current_personality_version)
+
+    async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question) -> str:
+        """Run the request through the in-bot agent loop (ops-registry tools).
+
+        The actor for every tool call is the INVOKING USER's Member (ctx
+        passes through as the OpContext), targets are confined to ctx.guild,
+        and the loop is capped at 8 tool calls. The model's final text comes
+        back to the caller and flows through the normal compliance/split/send
+        path, exactly like a plain chat response.
+        """
+        from pydantic_ai.exceptions import UsageLimitExceeded
+        from core.agent_loop import build_agent_tools
+
+        tools = build_agent_tools(ctx, self.logger)
+        self.logger.info(
+            f"agentic gpt run: guild={ctx.guild.id} channel={ctx.channel.id} "
+            f"actor={ctx.author.id} provider={provider_config.provider} "
+            f"model={provider_config.model} tools={[t.name for t in tools]}"
+        )
+        try:
+            response = await self.llm.run_agent(
+                provider_config,
+                api_messages,
+                tools=tools,
+                metadata=metadata,
+                # The command text is repeated as the closing user turn so the
+                # actionable instruction is unambiguous even when the channel
+                # scrape attributed the invoking message oddly (e.g. a
+                # bot-authored `!gpt` landing in history as an assistant turn).
+                user_prompt=f"[COMMAND from user {ctx.author.id}] {question}",
+                max_tool_calls=8,
+            )
+        except UsageLimitExceeded as e:
+            self.logger.warning(f"agentic gpt run hit its tool budget: {e}")
+            return "I hit my tool-call limit (8) before finishing that request."
+
+        if response.usage:
+            self.logger.info(
+                f"agentic usage: provider={response.usage.provider} model={response.usage.model} "
+                f"prompt={response.usage.prompt_tokens} completion={response.usage.completion_tokens} "
+                f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd}"
+            )
+        return response.text
 
     def check_message_compliance(self, ctx, message):
         """
