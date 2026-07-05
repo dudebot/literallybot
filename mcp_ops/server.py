@@ -65,6 +65,7 @@ _EXPOSED_OPS = (
     "edit_message",
     "list_guilds",
     "list_channels",
+    "list_members",
 )
 
 _JSON_TYPE_TO_PY = {"integer": int, "string": str, "boolean": bool}
