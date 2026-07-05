@@ -555,21 +555,32 @@ registry = OpsRegistry()
 
 @registry.op(
     "send_message",
-    "Send a text message to a channel.",
+    "Send a text message to a channel, optionally as a reply to an existing "
+    "message in that channel.",
     PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to send into."),
         OpParam("content", ParamKind.STRING, "Message text to send."),
+        OpParam("reference_message_id", ParamKind.INTEGER,
+                "Optional message id in the same channel to reply to.",
+                required=False),
         OpParam("allowed_mentions", ParamKind.INTERNAL),
     ],
     serialize=lambda m: {"message_id": m.id},
 )
 async def send_message(ctx: OpContext, channel, content: str,
+                       reference_message_id: Optional[int] = None,
                        allowed_mentions=None):
-    if allowed_mentions is None:
-        return await channel.send(content)
-    return await channel.send(content, allowed_mentions=allowed_mentions)
+    kwargs = {}
+    if allowed_mentions is not None:
+        kwargs["allowed_mentions"] = allowed_mentions
+    if reference_message_id is not None:
+        # Reply to a message in the same channel. mention_author is governed
+        # by allowed_mentions (the frontends pass none), so a reply never pings.
+        ref = await fetch_message_in(channel, int(reference_message_id))
+        kwargs["reference"] = ref
+    return await channel.send(content, **kwargs)
 
 
 @registry.op(
@@ -740,6 +751,48 @@ async def list_channels(ctx: OpContext, guild):
     ]
 
 
+@registry.op(
+    "list_members",
+    "List members who can see a channel and their online status "
+    "(online/idle/dnd/offline). Same visibility as the Discord member "
+    "sidebar for that channel.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id whose members to list."),
+        OpParam("status", ParamKind.STRING,
+                "Optional filter — only members with this status "
+                "(online/idle/dnd/offline).",
+                required=False),
+        OpParam("include_bots", ParamKind.BOOLEAN,
+                "Include bot accounts (default false).",
+                required=False, default=False),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max members to return (default 100, clamped to 1000).",
+                required=False, default=100, minimum=1, maximum=1000),
+    ],
+    serialize=lambda ms: {"members": ms, "count": len(ms)},
+)
+async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
+                       include_bots: bool = False, limit: int = 100):
+    want = status.lower() if status else None
+    results = []
+    for m in getattr(channel, "members", []):
+        if not include_bots and getattr(m, "bot", False):
+            continue
+        member_status = str(getattr(m, "status", "offline"))
+        if want is not None and member_status != want:
+            continue
+        results.append({
+            "id": m.id,
+            "display_name": m.display_name,
+            "status": member_status,
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
 # ---------------------------------------------------------------------------
 # In-file smoke test — instantiates the module-level registry and lists
 # tools WITHOUT a live bot/Discord connection. Run directly:
@@ -750,7 +803,7 @@ def _smoke_test() -> None:
     expected = {
         "send_message", "edit_message", "delete_message", "add_reaction",
         "search_history", "add_role", "remove_role", "pin_message",
-        "create_thread", "list_guilds", "list_channels",
+        "create_thread", "list_guilds", "list_channels", "list_members",
     }
     names = set(registry.names())
     missing = expected - names
@@ -771,8 +824,8 @@ def _smoke_test() -> None:
     # Generated wire schemas: entity params travel as ids; MESSAGE implies
     # channel_id; INTERNAL params (allowed_mentions) never hit the wire.
     send = registry.get("send_message").to_json_schema()
-    assert set(send["properties"]) == {"channel_id", "content"}, send
-    assert send["required"] == ["channel_id", "content"]
+    assert set(send["properties"]) == {"channel_id", "content", "reference_message_id"}, send
+    assert send["required"] == ["channel_id", "content"]  # reference is optional
 
     edit = registry.get("edit_message").to_json_schema()
     assert set(edit["properties"]) == {"channel_id", "message_id", "content"}, edit

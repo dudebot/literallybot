@@ -36,6 +36,7 @@ AGENT_OPS = (
     "add_reaction",
     "search_history",
     "list_channels",
+    "list_members",
 )
 
 
