@@ -108,6 +108,14 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
     if actor is None:
         return False
 
+    # The bot's own account is never bot-admin. Its Discord Administrator role
+    # would otherwise pass the guild_permissions check below, letting a
+    # self-authored command (agent/MCP driving this bot) escalate.
+    bot = _bot_of(ctx)
+    bot_user = getattr(bot, "user", None)
+    if bot_user is not None and actor.id == bot_user.id:
+        return False
+
     if is_superadmin(config, actor.id):
         return True
 
