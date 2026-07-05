@@ -41,6 +41,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 import aiohttp
 import openai
 
+from pydantic_ai import Agent
 from pydantic_ai.direct import model_request, model_request_stream
 from pydantic_ai.messages import (
     ModelMessage,
@@ -61,8 +62,8 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.tools import ToolDefinition
-from pydantic_ai.usage import RequestUsage
+from pydantic_ai.tools import Tool, ToolDefinition
+from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from .usage import UsageRecord, estimate_cost
 
@@ -308,6 +309,60 @@ class LLMClient:
         usage = _usage_from_pai(response.usage, provider=provider, model=model)
 
         return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=response)
+
+    # ------------------------------------------------------------------
+    # Agent loop (multi-turn tool calling)
+    # ------------------------------------------------------------------
+
+    async def run_agent(
+        self,
+        provider_config: ProviderConfig,
+        messages: List[Dict],
+        tools: List[Tool],
+        metadata: Optional[Dict] = None,
+        user_prompt: Optional[str] = None,
+        max_tool_calls: int = 8,
+    ) -> LLMResponse:
+        """Run a multi-turn tool-calling agent loop via `pydantic_ai.Agent`.
+
+        Shares request assembly with `chat()` (`_build_model` /
+        `_build_settings` / `_to_pai_messages`), so provider/model/token-cap
+        /metadata behavior is identical to a plain chat call. `tools` are
+        pydantic-ai `Tool` instances (see core/agent_loop.py, which
+        generates them from the ops registry).
+
+        The loop is bounded: at most `max_tool_calls` tool executions
+        (pydantic-ai raises `UsageLimitExceeded` beyond that — callers
+        should catch it and degrade gracefully). Usage aggregates across
+        every request in the run, so cost tracking covers the whole loop.
+        """
+        provider = provider_config.provider
+        model = provider_config.model
+        provider_info = provider_config.provider_info
+
+        api_key = self._resolve_api_key(provider, provider_info)
+
+        pai_model = self._build_model(provider, model, provider_info, api_key)
+        settings = self._build_settings(provider_info, model, metadata)
+
+        agent = Agent(model=pai_model, tools=tools, model_settings=settings)
+        result = await agent.run(
+            user_prompt,
+            message_history=_to_pai_messages(messages),
+            usage_limits=UsageLimits(
+                tool_calls_limit=max_tool_calls,
+                # Belt-and-suspenders: also cap total model requests so a
+                # model that loops without tool calls can't spin either.
+                request_limit=max_tool_calls + 2,
+            ),
+        )
+
+        # RunUsage aggregates across every request in the loop; it is an
+        # attribute in pydantic-ai 2.x (not the v1 `.usage()` method) and
+        # duck-types RequestUsage's input/output token fields.
+        usage = _usage_from_pai(result.usage, provider=provider, model=model)
+        text = (result.output or "").strip()
+        return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=result)
 
     # Backwards-compatible alias matching the original cog method name.
     async def call_ai_api(self, provider_config: ProviderConfig, messages: List[Dict], metadata: Dict) -> str:
