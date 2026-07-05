@@ -36,16 +36,45 @@ That's it! Your bot is now running with all core features available.
 ## 🔧 Optional Integrations
 
 ### AI Chat (GPT)
-Store AI credentials in `configs/global.json`. Example keys:
+The AI layer lives in `core/llm/` (provider-agnostic client built on
+[pydantic-ai](https://ai.pydantic.dev/)) and supports multiple providers behind
+one interface: xAI (Grok), OpenAI, Anthropic (Claude), and any local
+OpenAI-compatible server such as [Ollama](https://ollama.com/). Store cloud
+credentials in `configs/global.json`:
 ```json
 "XAI_API_KEY": "xai-XXXX",
-"OPENAI_API_KEY": "sk-XXXX"
+"OPENAI_API_KEY": "sk-XXXX",
+"ANTHROPIC_API_KEY": "sk-ant-XXXX"
 ```
-Once the keys are present, use the GPT commands to manage behaviour:
+Provider/model lists live in `configs/global.json` under `ai_providers` and are
+managed at runtime with the commands below — no code change to add a model.
+
+Once keys are present:
 - `!aiinfo` – list available providers/models and confirm keys are detected
-- `!setprovider <provider>` – switch between configured providers (e.g., `xai`, `openai`, `anthropic`)
+- `!setprovider <provider>` – switch providers (`xai`, `openai`, `anthropic`, `ollama`)
 - `!setmodel <model>` – choose a model for the current provider
-- `!setpersonality` – update the bot’s response personality
+- `!addmodel <name> [provider] [multiplier] [max_tokens]` – register a new model
+- `!setpersonality <prompt>` – update the bot's response personality (per-server)
+
+**Local models (Ollama):** point a provider at a local server with
+`"base_url": "http://localhost:11434/v1"` and `"requires_api_key": false` in its
+`ai_providers` entry. Reasoning models (e.g. qwen3.5) that would otherwise spend
+their whole token budget "thinking" can be tamed with `"reasoning_effort": "none"`
+per model.
+
+### Agentic AI (experimental)
+When enabled, `!gpt` can **perform real Discord actions** — send/edit messages,
+add reactions, search history, list channels/members — instead of only
+describing them. It runs a tool-calling loop over a shared **ops registry**
+(`core/ops.py`), acting as the **invoking user** (never the bot), confined to the
+current guild, with mentions suppressed and a per-run tool-call cap.
+
+- `!setagentic on|off` – toggle agentic mode for the current server (superadmin;
+  default off). With it off, `!gpt` is plain chat and nothing changes.
+
+The same ops registry also backs an optional localhost-only **MCP server**
+(`mcp_ops/`, off unless `MCP_OPS_ENABLED=1`) so an external agent can drive the
+bot over an authenticated, guild-allowlisted channel. See `mcp_ops/` for setup.
 
 ### Image Search (Danbooru)
 Add to your `.env` file:
@@ -73,7 +102,8 @@ Press the button on your Hue Bridge, then run:
 - `!skip` / `!pause` / `!resume`
 
 **AI & Utilities:**
-- `!gpt <message>` - Chat with AI (if configured)
+- `!gpt <message>` - Chat with AI (if configured; agentic when enabled)
+- `!setagentic on|off` - Toggle agentic AI actions per server (superadmin)
 - `!roll <dice>` - Roll dice
 - `!remind <time> <message>` - Set reminders
 - `!setrole <role>` - Self-assign roles
