@@ -284,6 +284,9 @@ class Op:
         allowed, reason = _check_permission(ctx, self.permission)
         if not allowed:
             return OpResult(ok=False, error=reason)
+        vis_ok, vis_reason = _check_channel_visibility(ctx, kwargs)
+        if not vis_ok:
+            return OpResult(ok=False, error=vis_reason)
         try:
             value = await self.impl(ctx, **kwargs)
         except Exception as exc:  # noqa: BLE001 - ops surface failure, not raise
@@ -457,6 +460,41 @@ class Op:
         if self.serialize is None:
             return {}
         return self.serialize(value)
+
+
+def _check_channel_visibility(ctx: OpContext, kwargs: Dict[str, Any]) -> "tuple[bool, Optional[str]]":
+    """When the actor is a real guild Member, refuse ops whose resolved target
+    channel the actor cannot read — otherwise the bot (which sees more channels
+    than any single user) would leak history/members/presence from channels the
+    caller can't see, or post into them. A bare id-holder actor (MCP fallback)
+    has no reliable permissions to check and is governed by the frontend's own
+    trust boundary (the documented localhost accepted-risk), so it is skipped.
+    """
+    actor = getattr(ctx, "author", None)
+    # Only real Members carry channel-level permissions_for; skip otherwise.
+    if actor is None or not hasattr(actor, "guild_permissions"):
+        return True, None
+    for value in kwargs.values():
+        channel = value if _is_guild_channel(value) else getattr(value, "channel", None)
+        if channel is None or not hasattr(channel, "permissions_for"):
+            continue
+        try:
+            perms = channel.permissions_for(actor)
+        except Exception:  # noqa: BLE001 - be permissive on odd channel types
+            continue
+        if not getattr(perms, "read_messages", True):
+            return False, f"Actor cannot access channel {getattr(channel, 'id', '?')}."
+    return True, None
+
+
+def _is_guild_channel(value: Any) -> bool:
+    """True for a resolved Discord guild channel/thread (has permissions_for
+    and a guild), distinguishing it from messages/members/roles."""
+    return (
+        hasattr(value, "permissions_for")
+        and hasattr(value, "guild")
+        and not hasattr(value, "content")  # exclude Message
+    )
 
 
 def _check_permission(ctx: OpContext, level: PermissionLevel) -> "tuple[bool, Optional[str]]":

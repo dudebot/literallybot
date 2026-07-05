@@ -203,6 +203,10 @@ async def on_message(message):
                         f'Processing allowlisted bot-authored command from '
                         f'{message.author} (ID: {message.author.id}): {message.content[:100]}'
                     )
+                    # Escalation guard lives at the root: core.utils.is_admin /
+                    # is_superadmin never grant the bot's own account privileges
+                    # (its Discord Administrator role would otherwise pass the
+                    # admin gate), so a self-invoked admin command fails closed.
                     await bot.invoke(ctx)
         return
     if isinstance(message.channel, discord.DMChannel):
