@@ -21,23 +21,24 @@ import time
 # Deliberately coarse; update as pricing changes. Unmatched models fall
 # through to None (unknown cost) rather than guessing.
 _PRICING_USD_PER_MTOK: Dict[str, Dict[str, tuple]] = {
+    # Verified 2026-07-04 against developers.openai.com/api/docs/pricing,
+    # docs.x.ai/developers/models, and Anthropic's published pricing.
     "openai": {
-        "gpt-5": (1.25, 10.00),
-        "gpt-5-mini": (0.25, 2.00),
-        "gpt-4o": (2.50, 10.00),
-        "gpt-4o-mini": (0.15, 0.60),
-        "o3": (2.00, 8.00),
-        "o4-mini": (1.10, 4.40),
+        "gpt-5.5": (5.00, 30.00),
+        "gpt-5.4": (2.50, 15.00),
+        "gpt-5.4-mini": (0.75, 4.50),
+        "gpt-5.4-nano": (0.20, 1.25),
     },
     "anthropic": {
-        "claude-opus-4-20250514": (15.00, 75.00),
-        "claude-sonnet-4-20250514": (3.00, 15.00),
-        "claude-3-5-haiku-latest": (0.80, 4.00),
+        "claude-sonnet-5": (3.00, 15.00),
+        "claude-haiku-4-5": (1.00, 5.00),
+        "claude-opus-4-8": (5.00, 25.00),
     },
     "xai": {
-        "grok-4": (3.00, 15.00),
+        "grok-4.3": (1.25, 2.50),
+        "grok-4.20-0309-reasoning": (1.25, 2.50),
+        "grok-4.20-0309-non-reasoning": (1.25, 2.50),
         "grok-4-fast": (0.20, 0.50),
-        "grok-4-fast-non-reasoning": (0.20, 0.50),
     },
 }
 
