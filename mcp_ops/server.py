@@ -58,6 +58,11 @@ MAX_HISTORY_LIMIT = HISTORY_LIMIT_MAX
 
 # Ops exposed over MCP. delete/pin/role/thread ops stay unexposed until a
 # concrete need shows up (same surface as the original hand-written spike).
+# WARNING: all currently-exposed ops are EVERYONE-tier. Op.__call__ resolves
+# ids to objects BEFORE the permission gate runs, so exposing an ADMIN op here
+# (or in AGENT_OPS) would let a non-admin distinguish "invalid id" from
+# "requires admin" by the error text — an id-probing oracle. Move resolution
+# after the gate (core/ops.py Op.__call__) before exposing any ADMIN op.
 _EXPOSED_OPS = (
     "send_message",
     "search_history",

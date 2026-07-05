@@ -220,6 +220,21 @@ class LLMClient:
             )
 
         if base_url:
+            # Third-party OpenAI-compatible endpoints (xai/grok, and others
+            # reached via base_url) expect the plain `max_tokens` wire field;
+            # pydantic-ai defaults to `max_completion_tokens` (OpenAI's newer
+            # field), which xai currently tolerates but does not document. Force
+            # `max_tokens` unless the model's config explicitly opted into
+            # `max_completion_tokens` (an o-series/gpt-5-style cap). The old
+            # hand-rolled client sent `max_tokens` here and had a retry-swap
+            # fallback that this migration dropped; this restores the wire shape.
+            model_info = (provider_info.get("models", {}) or {}).get(model, {})
+            if "max_completion_tokens" not in model_info:
+                return OpenAIChatModel(
+                    model,
+                    provider=OpenAIProvider(base_url=base_url, api_key=api_key),
+                    profile=OpenAIModelProfile(openai_chat_supports_max_completion_tokens=False),
+                )
             return OpenAIChatModel(model, provider=OpenAIProvider(base_url=base_url, api_key=api_key))
         return OpenAIChatModel(model, provider=OpenAIProvider(api_key=api_key))
 
