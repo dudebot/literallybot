@@ -905,6 +905,36 @@ class Gpt(commands.Cog):
             self.logger.warning(f"Failed to add reaction to setpersonality message by {ctx.author}. Sending text confirmation.")
             await ctx.send("Personality updated! 👍")
 
+    @commands.command(name='setagentic')
+    async def setagentic(self, ctx, enabled: str = None):
+        """Enable/disable agentic tool use for !gpt in this guild (superadmin only).
+
+        Usage: !setagentic on|off  (no arg shows current state)
+        When on, !gpt can perform real Discord actions (send/edit messages,
+        react, search) via the ops registry instead of just describing them.
+        """
+        if not ctx.guild:
+            await ctx.send("This command can only be used in a server.")
+            return
+        if not is_superadmin(self.bot.config, ctx.author.id):
+            await ctx.send("You do not have permission to use this command.")
+            return
+
+        current = bool(self.bot.config.get(ctx, "gpt_agentic_enabled"))
+        if enabled is None:
+            await ctx.send(f"Agentic mode is currently **{'on' if current else 'off'}** for this server.")
+            return
+
+        val = enabled.strip().lower()
+        if val in ("on", "true", "yes", "enable", "enabled", "1"):
+            self.bot.config.set(ctx, "gpt_agentic_enabled", True)
+            await ctx.send("Agentic mode **enabled** — !gpt can now perform Discord actions.")
+        elif val in ("off", "false", "no", "disable", "disabled", "0"):
+            self.bot.config.set(ctx, "gpt_agentic_enabled", False)
+            await ctx.send("Agentic mode **disabled** — !gpt is back to plain chat.")
+        else:
+            await ctx.send("Usage: `!setagentic on` or `!setagentic off`")
+
     @commands.command(name='setbotnickname')
     async def setbotnickname(self, ctx, *, new_nickname: str):
         if not self.is_authorized(ctx):
