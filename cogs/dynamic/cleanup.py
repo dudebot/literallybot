@@ -236,16 +236,15 @@ class Cleanup(commands.Cog):
 
         summary = "\n".join(lines)
 
-        # Split if too long for Discord
+        # Split if too long for Discord (shared splitter — the blind slicing
+        # this replaces could cut mid-word/mid-line)
         if len(summary) <= 2000:
             await status.edit(content=summary)
         else:
-            await status.edit(content=summary[:2000])
-            # Send overflow as follow-up
-            remaining = summary[2000:]
-            while remaining:
-                chunk = remaining[:2000]
-                remaining = remaining[2000:]
+            from core.utils import recursive_split
+            chunks = recursive_split(summary, 2000)
+            await status.edit(content=chunks[0])
+            for chunk in chunks[1:]:
                 await ctx.send(chunk)
 
         self.logger.info(
