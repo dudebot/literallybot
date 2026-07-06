@@ -21,7 +21,7 @@ class Meme(commands.Cog):
         title = random.choice(["Someone Important","Chief Furry","Alcoholic",
                                "Literally Who","Basically Hitler","Mayor of Foofgens",
                                "Peta","Some random weeb", "Someone Mostly Literate"])
-        await ctx.send(f"> {display_text}\n{nickname}\n{title}, {datetime.today().year}")
+        await ctx.send(f"> {display_text}\n{nickname}\n{title}, {datetime.datetime.today().year}")
 
 async def setup(bot):
     """Every cog needs a setup function like this."""

@@ -18,15 +18,14 @@ class ErrorLoggingAdmin(commands.Cog):
         self.bot = bot
 
     def cog_check(self, ctx):
-        """Check if user has permission to use these commands."""
-        superadmins = self.bot.config.get_global("superadmins", [])
-        is_super = ctx.author.id in superadmins
-        is_guild_admin = (
-            ctx.guild is not None and (
-                ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner
-            )
-        )
-        return is_super or is_guild_admin
+        """Check if user has permission to use these commands.
+
+        Routes through the shared core.utils.is_admin gate (superadmins,
+        the per-guild `admins` config list, and Discord Administrator) —
+        the hand-rolled check this replaces silently excluded bot-admins
+        from the `admins` list.
+        """
+        return is_admin(self.bot.config, ctx)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         """Check if user has permission to use slash commands."""

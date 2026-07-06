@@ -98,9 +98,11 @@ class Media(commands.Cog):
           !addmedia <url> clip 2000      - first 2 seconds
           !addmedia <url> clip 200 1700  - from 200ms to 1700ms (1500ms clip)
         """
-        config = self.bot.config
-        admin_ids = config.get(ctx, "admins", [])
-        if not admin_ids or ctx.author.id not in admin_ids:
+        from core.utils import is_admin
+        if not is_admin(self.bot.config, ctx):
+            # Shared gate: superadmins, the per-guild admins list, and
+            # Discord Administrator — the raw admins-list check this
+            # replaces silently excluded superadmins.
             await ctx.send("You do not have permission to use this command.")
             return
 

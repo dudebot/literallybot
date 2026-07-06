@@ -20,13 +20,18 @@ class Tools(commands.Cog):
 
     @commands.command(name='echo')
     async def echo(self, ctx, *, message):
-        """This command outputs the string that is being passed as argument.
+        """Repost the given text as the bot (admin only — deleting the
+        invoking message makes this full impersonation of the bot).
 
         Args:
             self
-            ctx 
+            ctx
             *, message (this sets the 'consume rest' behaviour for arguments)
         """
+        from core.utils import is_admin
+        if not is_admin(self.bot.config, ctx):
+            await ctx.send("You do not have permission to use this command.")
+            return
         await ctx.message.delete()
         await ctx.send(message)
 
