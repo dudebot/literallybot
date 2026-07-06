@@ -28,16 +28,13 @@ class ErrorLoggingAdmin(commands.Cog):
         return is_admin(self.bot.config, ctx)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Check if user has permission to use slash commands."""
-        superadmins = self.bot.config.get_global("superadmins", [])
-        is_super = interaction.user.id in superadmins
-        is_guild_admin = (
-            interaction.guild is not None and (
-                interaction.user.guild_permissions.administrator or
-                interaction.user == interaction.guild.owner
-            )
-        )
-        return is_super or is_guild_admin
+        """Check if user has permission to use slash commands.
+
+        Same shared gate as cog_check — the hand-rolled version this
+        replaces omitted the per-guild `admins` config list, so slash and
+        prefix commands in this cog enforced different policies.
+        """
+        return is_admin(self.bot.config, interaction)
 
     def _get_guild_error_config(self, guild_id: int) -> dict:
         """Get error config for a specific guild only (no global fallback)."""
@@ -119,8 +116,7 @@ class ErrorLoggingAdmin(commands.Cog):
             )
 
         # Global config (show if superadmin)
-        superadmins = self.bot.config.get_global("superadmins", [])
-        if ctx.author.id in superadmins:
+        if is_superadmin(self.bot.config, ctx.author.id):
             global_channel_id = global_config.get("default_channel") if global_config else None
             if global_channel_id:
                 ch = self.bot.get_channel(global_channel_id)

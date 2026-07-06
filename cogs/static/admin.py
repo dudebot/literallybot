@@ -78,15 +78,10 @@ class Admin(commands.Cog):
             await ctx.send("Please specify a user to add as bot admin.")
             self.logger.warning(f"addadmin called without member by {ctx.author} (ID: {ctx.author.id})")
             return
+        # Authorization is fully handled by @commands.check(is_admin) on the
+        # decorator — the inline re-implementation this replaces was a second
+        # copy of the same gate that could drift.
         admins = self.bot.config.get(ctx, "admins", [])
-        superadmins = self.bot.config.get_global("superadmins", [])
-        if ctx.author.id not in superadmins and not (
-            ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner or
-            ctx.author.id in admins
-        ):
-            self.logger.warning(f"Unauthorized addadmin attempt by {ctx.author} (ID: {ctx.author.id}) to add {member} (ID: {member.id}) in guild {ctx.guild.id}")
-            await ctx.send("You don't have permission to add bot admins.")
-            return
         if member.id in admins:
             self.logger.info(f"{member} (ID: {member.id}) already admin in guild {ctx.guild.id}")
             await ctx.send(f"{member} is already a bot admin.")
