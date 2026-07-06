@@ -210,6 +210,13 @@ def recursive_split(text, max_size=2000):
                 if not right.startswith("`"):
                     right = "`" + right.lstrip("`")
 
+            # Progress guard: fence repair can grow a side back to (or past)
+            # the original length when a single fenced block exceeds max_size,
+            # which would recurse forever — fall through to the hard cut,
+            # which always shrinks the input.
+            if len(left) >= len(text) or len(right) >= len(text):
+                continue
+
             return recursive_split(left, max_size) + recursive_split(right, max_size)
 
     left = text[:max_size].rstrip()
