@@ -36,25 +36,19 @@ import inspect
 import logging
 from typing import Annotated, Any, Iterable, Optional
 
-import discord
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 
 from core.ops import (
-    HISTORY_LIMIT_MAX,
     Op,
     OpContext,
+    OpResult,
     ResolutionError,
-    GuildNotAllowedError,  # noqa: F401 - re-exported; raised via shared resolvers
     registry,
     resolve_context_guild,
 )
 
 logger = logging.getLogger("mcp_ops.server")
-
-# Kept for backwards compatibility with earlier imports/docs; the clamp
-# itself is declared on the search_history op in core/ops.py.
-MAX_HISTORY_LIMIT = HISTORY_LIMIT_MAX
 
 # Ops exposed over MCP. delete/pin/role/thread ops stay unexposed until a
 # concrete need shows up (same surface as the original hand-written spike).
@@ -69,6 +63,7 @@ _EXPOSED_OPS = (
     "add_reaction",
     "remove_reaction",
     "edit_message",
+    "delete_message",
     "list_guilds",
     "list_channels",
     "list_members",
@@ -147,22 +142,16 @@ def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
 
         ctx = _build_context(live_bot, actor_id, guild)
 
-        extra = {}
-        if op.name == "send_message":
-            # MCP policy: never ping. Mentions are always suppressed.
-            extra["allowed_mentions"] = discord.AllowedMentions.none()
-
+        # send_message never pings: enforced by the op itself (see
+        # core/ops.py send_message — never-ping is the registry default).
         result = await registry.call_ids(op.name, ctx, allowed_guild_ids=allowed,
-                                         **raw, **extra)
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-
-        value = result.value
-        if op.name == "list_guilds":
+                                         **raw)
+        if result.ok and op.name == "list_guilds":
             # MCP policy: guilds outside the allowlist are not disclosed.
-            value = [g for g in value if g["id"] in allowed]
+            result = OpResult(ok=True,
+                              value=[g for g in result.value if g["id"] in allowed])
 
-        return {"ok": True, **op.serialize_result(value)}
+        return op.result_payload(result)
 
     # Build the explicit signature FastMCP introspects.
     parameters = []
@@ -234,9 +223,7 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
     ))
 
     for op_name in _EXPOSED_OPS:
-        op = registry.get(op_name)
-        if op is None:  # registry drift — fail loudly at build time
-            raise ValueError(f"Op '{op_name}' not found in the ops registry.")
+        op = registry.require(op_name)  # raises on registry drift
         mcp.add_tool(_make_mcp_tool(bot, op, allowed),
                      name=op.name, description=op.description)
 
