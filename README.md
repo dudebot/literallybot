@@ -31,7 +31,7 @@ That's it! Your bot is now running with all core features available.
 - **🤖 AI Integration** - GPT chat with memory and personality system
 - **⚙️ Smart Configuration** - Per-server, per-user, and global settings with automatic persistence and modification through cogs
 - **🎲 Utilities & Fun** - Dice rolling, random choices, reminders, auto-responses
-- **🛠️ Developer Friendly** - Hot-reload cogs, built-in REPL, comprehensive logging
+- **🛠️ Developer Friendly** - Hot-reload cogs, comprehensive logging
 
 ## 🔧 Optional Integrations
 

@@ -173,10 +173,9 @@ admin/superadmin list.
   server-side (admin-gated); an admin could point it at internal/loopback or cloud
   metadata endpoints (SSRF). Consider an allowlist / private-IP block if the admin
   set is broad.
-- [ ] **The console REPL cog** (`cogs/static/repl.py`) reads from the host stdin
-  and can send messages as the bot to any channel with no auth — it is a
-  local-console god-mode surface (and blocks the event loop). Remove it in
-  production unless the host console is trusted and the bot is run interactively.
+- [x] **The console REPL cog was removed** (2026-07-05) — it read host stdin
+  and could send messages as the bot to any channel with no auth, and was dead
+  under systemd anyway (blocking `input()` on a non-tty).
 - [ ] **Review unauthenticated read commands** (`!aiinfo`, `!listmodels`,
   `!listmedia`, `!aistatus`) — they disclose configuration state (which providers
   have keys configured, model lists) to any user. Low impact; gate if that matters.

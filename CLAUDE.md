@@ -43,6 +43,27 @@ literallybot/
 - Use `!reload cogname` for hot-reload during development
 - See `docs/cog-development.md` for structure and examples
 
+## Architecture Seams (from the 2026-07 seam-machine pass)
+
+Where new code should land, so seams don't re-greed:
+
+- **Auth checks**: always `core.utils.is_admin` / `is_superadmin`. Never hand-roll
+  a gate — every hand-rolled copy found so far had drifted from policy.
+- **Message splitting**: `core.utils.recursive_split` is the one Discord
+  2000-char splitter. Don't write another accumulator/slicer.
+- **Discord actions for agents/frontends**: register an op in `core/ops.py`;
+  frontends (`core/agent_loop.py`, `mcp_ops/server.py`) generate their surface
+  from the registry and must stay thin. `call_ids` gates permissions before
+  resolving ids — keep that ordering.
+- **`cogs/dynamic/gpt.py` is the historical landing zone** and still carries two
+  parked seams (owner list): the ~700-line provider/model/key CRUD + `/ai` group
+  belongs in its own `ai_admin.py` cog, and memory capture could be its own cog.
+  New AI-admin features should NOT be added to gpt.py.
+- Other parked (real-but-leave-it): error-handler module globals -> instance on
+  bot; `LLMClient.has_api_key()` helper to dedupe key-presence checks; cooldown
+  display shows base×multiplier but enforcement is flat `BASE_COOLDOWN_SECONDS`
+  (product decision whether to enforce per-model).
+
 ## Related
 
 The `conditioner` bot (EcstasyEngineer/conditioner) uses a similar `core/config.py` derived from the same original implementation.
