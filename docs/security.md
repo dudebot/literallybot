@@ -154,17 +154,16 @@ admin/superadmin list.
 
 ## Hardening Checklist
 
-- [ ] **Set a global `allowed_mentions` default on the Bot** (or pass
-  `allowed_mentions=AllowedMentions.none()` on the `!gpt` reply `ctx.send`). The
-  ops/agentic send path already suppresses mentions, but the primary chat reply
-  path uses Discord's default, so a model reply containing `<@&ROLE_ID>` can ping a
-  role and `<@USER_ID>` can ping users — only `@everyone`/`@here` literals are
-  filtered.
-- [ ] **Reconsider unconditional memory capture.** Because capture runs on every
-  message and directives like `you're to always …` are injected into the shared
-  guild prompt, any member can plant a persistent instruction that steers `!gpt`
-  for everyone. Consider capturing only from `!gpt` invocations, or excluding the
-  `directive` type, or scoping memories to their author.
+- [x] **Mention suppression on the chat reply path** — `!gpt` replies pass
+  `AllowedMentions(users=True, roles=False, everyone=False)`: user pings are an
+  intended feature, but model output can no longer ping roles or everyone. The
+  ops `send_message` op additionally suppresses ALL mentions by default at the
+  registry level (a caller must pass an explicit `allowed_mentions` to ping).
+- [x] **Directive memory capture is admin-gated** — `you're to always …`
+  directives are only persisted when the author passes the shared `is_admin`
+  gate; other members' directive-shaped messages are ignored. Non-directive
+  memory types (names, preferences, reminders) are still captured from anyone,
+  which only affects how the bot talks *about* that user.
 - [ ] **Restrict filesystem access to `configs/`** so plaintext API keys and admin
   lists aren't world-readable.
 - [ ] **Keep the MCP server loopback-only.** Never front it with a reverse proxy or
@@ -179,5 +178,16 @@ admin/superadmin list.
   local-console god-mode surface (and blocks the event loop). Remove it in
   production unless the host console is trusted and the bot is run interactively.
 - [ ] **Review unauthenticated read commands** (`!aiinfo`, `!listmodels`,
-  `!listmedia`) — they disclose configuration state (which providers have keys
-  configured, model lists) to any user. Low impact; gate if that matters.
+  `!listmedia`, `!aistatus`) — they disclose configuration state (which providers
+  have keys configured, model lists) to any user. Low impact; gate if that matters.
+
+Fixed in the 2026-07-05 consistency sweep (see git history for details):
+`!echo` is admin-gated (was open bot-impersonation), `!sethuebridgeip` is
+superadmin-gated (was an ungated global-config write), `!addmedia` and the
+`!errorlog` group route through the shared `is_admin` gate (each previously
+used a divergent hand-rolled check), and the global-mutating provider commands
+(`setapikey`/`addmodel`/`removemodel`/`addprovider`, prefix and slash) are
+superadmin-only because they alter configuration shared by every guild.
+`delete_message` is exposed to the agent loop and MCP — it remains ADMIN-gated
+per-call, and `call_ids` now checks permissions *before* resolving any Discord
+targets.

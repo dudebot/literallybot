@@ -47,6 +47,12 @@ class Signal(commands.Cog):
         
     @commands.command(name='sethuebridgeip', hidden=True)
     async def sethuebridgeip(self, ctx, ip: str):
+        # Writes GLOBAL config and points the bot's HTTP client at an
+        # arbitrary host — superadmin only.
+        from core.utils import is_superadmin
+        if not is_superadmin(self.bot.config, ctx.author.id):
+            await ctx.send("You do not have permission to use this command.")
+            return
         # store global hue_bridge_ip
         self.bot.config.set(None, "hue_bridge_ip", ip)
         try:
