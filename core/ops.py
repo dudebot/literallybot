@@ -46,6 +46,8 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import discord
+
 from core.utils import is_admin, is_superadmin
 
 # Shared history-scan cap: search_history never scans more than this many
@@ -142,15 +144,14 @@ class OpContext:
 
     Duck-types the subset of `discord.ext.commands.Context` that
     `core.utils.is_admin` / `is_superadmin` and the op implementations
-    below actually touch: `.bot` (with `.config`), `.author`, `.guild`,
-    and `.channel`. A real `commands.Context` satisfies this directly —
+    below actually touch: `.bot` (with `.config`), `.author`, and
+    `.guild`. A real `commands.Context` satisfies this directly —
     pass it straight through. A non-cog frontend (agent loop, MCP server)
     builds one of these from whatever ids/objects it has on hand.
     """
     bot: Any
     author: Any
     guild: Optional[Any] = None
-    channel: Optional[Any] = None
 
 
 @dataclass
@@ -190,12 +191,6 @@ async def resolve_channel(bot: Any, channel_id: int, allowed_guild_ids: frozense
     check_guild_allowed(getattr(channel, "guild", None), allowed_guild_ids,
                         f"Channel {channel_id}")
     return channel
-
-
-async def resolve_message(bot: Any, channel_id: int, message_id: int,
-                          allowed_guild_ids: frozenset) -> Any:
-    channel = await resolve_channel(bot, channel_id, allowed_guild_ids)
-    return await fetch_message_in(channel, message_id)
 
 
 async def fetch_message_in(channel: Any, message_id: int) -> Any:
@@ -461,6 +456,13 @@ class Op:
             return {}
         return self.serialize(value)
 
+    def result_payload(self, result: OpResult) -> Dict[str, Any]:
+        """The uniform {"ok": ...} wire envelope every tool-calling frontend
+        returns for this op — one place, so payload shape can't drift."""
+        if not result.ok:
+            return {"ok": False, "error": result.error}
+        return {"ok": True, **self.serialize_result(result.value)}
+
 
 def _check_channel_visibility(ctx: OpContext, kwargs: Dict[str, Any]) -> "tuple[bool, Optional[str]]":
     """When the actor is a real guild Member, refuse ops whose resolved target
@@ -544,6 +546,15 @@ class OpsRegistry:
     def get(self, name: str) -> Optional[Op]:
         return self._ops.get(name)
 
+    def require(self, name: str) -> Op:
+        """Get an op or raise — for frontends generating their tool surface
+        from a static op-name list, where a miss means registry drift and
+        should fail loudly at build time."""
+        op = self._ops.get(name)
+        if op is None:
+            raise ValueError(f"Op '{name}' not found in the ops registry.")
+        return op
+
     def list_tools(self) -> List[Dict[str, Any]]:
         return [op.to_schema() for op in self._ops.values()]
 
@@ -576,6 +587,13 @@ class OpsRegistry:
                 frozenset({ctx.guild.id}) if getattr(ctx, "guild", None) is not None
                 else frozenset()
             )
+        # Gate BEFORE resolution: an unauthorized caller must not be able to
+        # trigger Discord fetches (channel/message/member lookups) as a side
+        # effect of a call it was never allowed to make. Op.__call__ checks
+        # again for the object-based `call()` path — cheap belt-and-suspenders.
+        allowed, reason = _check_permission(ctx, op.permission)
+        if not allowed:
+            return OpResult(ok=False, error=reason)
         try:
             kwargs = await op.resolve_kwargs(ctx.bot, getattr(ctx, "guild", None),
                                              raw, frozenset(allowed_guild_ids))
@@ -610,9 +628,12 @@ registry = OpsRegistry()
 async def send_message(ctx: OpContext, channel, content: str,
                        reference_message_id: Optional[int] = None,
                        allowed_mentions=None):
-    kwargs = {}
-    if allowed_mentions is not None:
-        kwargs["allowed_mentions"] = allowed_mentions
+    # Never-ping by default: model/tool-originated sends must not be able
+    # to ping anyone. An object-based caller that WANTS pings must pass an
+    # explicit allowed_mentions. (Policy hoisted here from the agent-loop
+    # and MCP frontends so no frontend can forget it.)
+    kwargs = {"allowed_mentions": allowed_mentions
+              if allowed_mentions is not None else discord.AllowedMentions.none()}
     if reference_message_id is not None:
         # Reply to a message in the same channel. mention_author is governed
         # by allowed_mentions (the frontends pass none), so a reply never pings.
@@ -900,7 +921,7 @@ def _smoke_test() -> None:
 
     # A no-actor context must fail closed on anything above EVERYONE, and
     # must never raise — permission failures surface as OpResult.error.
-    empty_ctx = OpContext(bot=None, author=None, guild=None, channel=None)
+    empty_ctx = OpContext(bot=None, author=None, guild=None)
     import asyncio
 
     result = asyncio.run(registry.call("delete_message", empty_ctx, message=None))
@@ -919,7 +940,7 @@ def _smoke_test() -> None:
         async def fetch_channel(self, cid):
             raise RuntimeError("no gateway in smoke test")
 
-    no_guild_ctx = OpContext(bot=_FakeBot(), author=None, guild=None, channel=None)
+    no_guild_ctx = OpContext(bot=_FakeBot(), author=None, guild=None)
     res = asyncio.run(registry.call_ids("send_message", no_guild_ctx,
                                         channel_id=123, content="hi"))
     assert res.ok is False and "Could not resolve channel" in res.error

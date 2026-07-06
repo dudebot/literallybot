@@ -23,16 +23,18 @@ from __future__ import annotations
 import logging
 from typing import Any, List
 
-import discord
 from pydantic_ai import Tool
 
 from core.ops import Op, registry
 
-# Tool surface for the v1 loop. Roles/pins/threads/delete stay out until
-# there's a concrete ask (YAGNI) — adding one later is one string here.
+# Tool surface for the loop. Roles/pins/threads stay out until there's a
+# concrete ask (YAGNI) — adding one later is one string here. delete_message
+# is ADMIN-gated in the registry, so only invoking users who pass is_admin
+# can actually use it (everyone else gets a tool error back in the loop).
 AGENT_OPS = (
     "send_message",
     "edit_message",
+    "delete_message",
     "add_reaction",
     "remove_reaction",
     "search_history",
@@ -51,33 +53,23 @@ def build_agent_tools(ctx: Any, logger: logging.Logger) -> List[Tool]:
     if ctx.guild is None:
         raise ValueError("The agent loop only runs inside a guild.")
     allowed = frozenset({ctx.guild.id})
-    tools = []
-    for op_name in AGENT_OPS:
-        op = registry.get(op_name)
-        if op is None:  # registry drift — fail loudly at build time
-            raise ValueError(f"Op '{op_name}' not found in the ops registry.")
-        tools.append(_make_agent_tool(op, ctx, allowed, logger))
-    return tools
+    return [_make_agent_tool(registry.require(op_name), ctx, allowed, logger)
+            for op_name in AGENT_OPS]
 
 
 def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
                      logger: logging.Logger) -> Tool:
     async def tool_fn(**raw) -> dict:
-        extra = {}
-        if op.name == "send_message":
-            # Loop policy: never ping. Mentions are always suppressed.
-            extra["allowed_mentions"] = discord.AllowedMentions.none()
-
+        # send_message never pings: enforced by the op itself (see
+        # core/ops.py send_message — never-ping is the registry default).
         result = await registry.call_ids(op.name, ctx, allowed_guild_ids=allowed,
-                                         **raw, **extra)
+                                         **raw)
         logger.info(
             "agent-op %s actor=%s params=%s -> %s",
             op.name, ctx.author.id, raw,
             "ok" if result.ok else f"error: {result.error}",
         )
-        if not result.ok:
-            return {"ok": False, "error": result.error}
-        return {"ok": True, **op.serialize_result(result.value)}
+        return op.result_payload(result)
 
     return Tool.from_schema(
         tool_fn,
