@@ -1,18 +1,17 @@
 """Provider-agnostic LLM client, backed by pydantic-ai.
 
 Owns provider config resolution, chat completions (OpenAI-compatible and
-Anthropic), streaming, model discovery, and usage/cost tracking. Callers
-(cogs) should not talk to provider SDKs directly for chat completions --
-go through `LLMClient`.
+Anthropic), the agent loop, model discovery, and usage/cost tracking.
+Callers (cogs) should not talk to provider SDKs directly for chat
+completions -- go through `LLMClient`.
 
-The public surface (LLMClient, LLMResponse, ProviderConfig, the
-call_ai_api/call_anthropic_api aliases) is unchanged from the pre-pydantic-ai
-implementation. Internally, requests are built as pydantic-ai messages and
-executed via `pydantic_ai.direct.model_request(_stream)`, which keeps this
-layer a thin client while leaving a clear upgrade path to tool-calling:
-`ModelRequestParameters.function_tools` already carries OpenAI-style tool
-schemas converted to `ToolDefinition`s, and a future agent loop can reuse
-`_build_model()` to construct `pydantic_ai.Agent(model, tools=...)` directly.
+Public surface: LLMClient (chat / run_agent / discover_models),
+LLMResponse, ProviderConfig. Requests are built as pydantic-ai messages
+and executed via `pydantic_ai.direct.model_request` (chat) or
+`pydantic_ai.Agent` (run_agent); both share `_build_model()` /
+`_build_settings()` so provider behavior is identical across paths. The
+raw openai SDK appears only in `discover_models` (pydantic-ai has no
+model-listing API).
 
 Notable behavior notes vs. the old implementation:
 - The o3/o4/gpt-5/o1 `max_completion_tokens` heuristics and the
@@ -36,25 +35,21 @@ from __future__ import annotations
 import os
 import asyncio
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
-import aiohttp
 import openai
 
 from pydantic_ai import Agent
-from pydantic_ai.direct import model_request, model_request_stream
+from pydantic_ai.direct import model_request
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest as PaiModelRequest,
     ModelResponse as PaiModelResponse,
-    PartDeltaEvent,
-    PartStartEvent,
     SystemPromptPart,
     TextPart,
-    TextPartDelta,
     UserPromptPart,
 )
-from pydantic_ai.models import Model, ModelRequestParameters
+from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.profiles.openai import OpenAIModelProfile
@@ -62,7 +57,7 @@ from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.tools import Tool, ToolDefinition
+from pydantic_ai.tools import Tool
 from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from .usage import UsageRecord, estimate_cost
@@ -75,9 +70,51 @@ PROVIDER_ALIASES: Dict[str, str] = {
 }
 
 DEFAULT_PROVIDER = "xai"
-ANTHROPIC_API_VERSION = "2023-06-01"
-ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
 DEFAULT_MAX_TOKENS = 3000
+
+# Seed skeleton used when no ai_providers config exists yet, so a fresh
+# install can go straight to `!setapikey <provider> <key>` instead of
+# hand-editing JSON. Persisted to config the first time a mutating command
+# (setapikey/addmodel/addprovider) touches it; model lists then grow via
+# discovery. Model ids current as of 2026-07.
+DEFAULT_PROVIDERS: Dict[str, Any] = {
+    "xai": {
+        "name": "xAI Grok",
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "grok-4-fast",
+        "models": {
+            "grok-4-fast": {"timeout_multiplier": 0.5},
+            "grok-4.3": {"timeout_multiplier": 1.0},
+        },
+    },
+    "openai": {
+        "name": "OpenAI",
+        "base_url": None,
+        "default_model": "gpt-5.4-mini",
+        "models": {
+            "gpt-5.4-mini": {"timeout_multiplier": 0.5},
+            "gpt-5.4": {"timeout_multiplier": 1.0},
+        },
+    },
+    "anthropic": {
+        "name": "Anthropic Claude",
+        "api_type": "anthropic",
+        "default_model": "claude-haiku-4-5",
+        "models": {
+            "claude-haiku-4-5": {"timeout_multiplier": 0.5},
+            "claude-sonnet-5": {"timeout_multiplier": 1.0},
+        },
+    },
+    "ollama": {
+        "name": "Ollama (local)",
+        "base_url": "http://localhost:11434/v1",
+        "requires_api_key": False,
+        "default_model": "qwen3.5:4b",
+        "models": {
+            "qwen3.5:4b": {"timeout_multiplier": 1.0, "reasoning_effort": "none"},
+        },
+    },
+}
 
 
 @dataclass
@@ -96,9 +133,6 @@ class ProviderConfig:
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
 
-    def get(self, key: str, default: Any = None) -> Any:
-        return getattr(self, key, default)
-
 
 @dataclass
 class LLMResponse:
@@ -113,9 +147,9 @@ class LLMResponse:
 class LLMClient:
     """Provider-agnostic async LLM client.
 
-    Tool-call capable: pass `tools` (OpenAI-style tool schema) through to
-    `chat()`. Streaming-capable: `chat_stream()` yields text deltas; it is
-    not currently wired into any Discord-facing command.
+    `chat()` for plain completions, `run_agent()` for the multi-turn
+    tool-calling loop (pydantic-ai `Tool`s), `discover_models()` for
+    provider model listing / key validation.
     """
 
     def __init__(self, config, logger=None):
@@ -133,11 +167,22 @@ class LLMClient:
     # Provider/model resolution
     # ------------------------------------------------------------------
 
+    def get_all_providers(self) -> Dict[str, Any]:
+        """The ai_providers config, or a deep copy of the built-in seed when
+        none exists yet (fresh install). Read-only — callers that mutate the
+        returned dict persist it themselves via config.set, which is what
+        turns the seed into real config."""
+        stored = self.config.get(None, "ai_providers", scope="global")
+        if stored:
+            return stored
+        import copy
+        return copy.deepcopy(DEFAULT_PROVIDERS)
+
     def get_provider_config(self, ctx) -> ProviderConfig:
         """Get the current provider configuration for a guild."""
         config = self.config
 
-        all_providers = config.get(None, "ai_providers", scope="global") or {}
+        all_providers = self.get_all_providers()
 
         current_provider = config.get(ctx, "current_ai_provider") or DEFAULT_PROVIDER
         current_provider = PROVIDER_ALIASES.get(current_provider, current_provider)
@@ -243,7 +288,6 @@ class LLMClient:
         provider_info: Dict[str, Any],
         model: str,
         metadata: Optional[Dict],
-        tool_choice: Optional[Any] = None,
     ) -> ModelSettings:
         """Build pydantic-ai model settings from per-model config.
 
@@ -275,11 +319,6 @@ class LLMClient:
                 settings["extra_body"] = {"metadata": metadata}
                 settings["openai_store"] = True
 
-        if tool_choice is not None:
-            mapped_choice = _map_tool_choice(tool_choice)
-            if mapped_choice is not None:
-                settings["tool_choice"] = mapped_choice
-
         return settings  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
@@ -291,8 +330,6 @@ class LLMClient:
         provider_config: ProviderConfig,
         messages: List[Dict],
         metadata: Optional[Dict] = None,
-        tools: Optional[List[Dict]] = None,
-        tool_choice: Optional[Any] = None,
     ) -> LLMResponse:
         """Call the appropriate AI API based on provider configuration.
 
@@ -308,14 +345,12 @@ class LLMClient:
         api_key = self._resolve_api_key(provider, provider_info)
 
         pai_model = self._build_model(provider, model, provider_info, api_key)
-        settings = self._build_settings(provider_info, model, metadata, tool_choice=tool_choice)
-        request_parameters = _build_request_parameters(tools)
+        settings = self._build_settings(provider_info, model, metadata)
 
         response = await model_request(
             pai_model,
             _to_pai_messages(messages),
             model_settings=settings,
-            model_request_parameters=request_parameters,
         )
 
         text = "".join(
@@ -384,79 +419,50 @@ class LLMClient:
     # ------------------------------------------------------------------
 
     async def discover_models(self, provider: str, api_key: str, provider_info: Dict) -> List[str]:
-        """Attempt to discover available models from provider API."""
+        """Attempt to discover available models from a provider's API.
+
+        OpenAI-compatible providers (openai, xai, anything with a base_url)
+        get a real `models.list` sweep — pydantic-ai has no listing API, so
+        the raw openai SDK is the one justified direct-SDK use in this file.
+        Anthropic has no public model listing; the key is instead validated
+        with a minimal live request through the same chat() path everything
+        else uses.
+        """
         discovered = []
 
         try:
-            if provider == "xai":
-                client = openai.OpenAI(api_key=api_key, base_url=provider_info.get("base_url"))
+            if provider == "anthropic":
+                pc = ProviderConfig(
+                    provider="anthropic",
+                    model=provider_info.get("default_model") or "claude-haiku-4-5",
+                    provider_info=provider_info,
+                    all_providers={},
+                )
+                # chat() resolves the key from config (the caller stores it
+                # before discovery) and raises on an invalid key.
+                await self.chat(pc, [{"role": "user", "content": "Hi"}],
+                                metadata={"service": "literallybot",
+                                          "purpose": "key-validation"})
+                self.logger.info("Anthropic API key validated successfully")
+            else:
+                client = openai.OpenAI(api_key=api_key,
+                                       base_url=provider_info.get("base_url"))
                 models = await asyncio.to_thread(client.models.list)
 
                 for model in models.data:
                     model_id = model.id
-                    discovered.append(model_id)
-
-                    if "fast" in model_id.lower() or "mini" in model_id.lower():
-                        multiplier = 0.5
-                    elif "reasoning" in model_id.lower():
-                        multiplier = 1.5
-                    else:
-                        multiplier = 1.0
-
-                    models_dict = provider_info.get("models", {})
-                    if model_id not in models_dict:
-                        models_dict[model_id] = {"timeout_multiplier": multiplier}
-                        provider_info["models"] = models_dict
-
-            elif provider == "openai":
-                client = openai.OpenAI(api_key=api_key)
-                models = await asyncio.to_thread(client.models.list)
-
-                for model in models.data:
-                    model_id = model.id
-                    if not (model_id.startswith("gpt-") or model_id.startswith("o") or model_id.startswith("chatgpt")):
+                    if provider == "openai" and not (
+                        model_id.startswith("gpt-") or model_id.startswith("o")
+                        or model_id.startswith("chatgpt")
+                    ):
                         continue
 
                     discovered.append(model_id)
-
-                    if "mini" in model_id.lower():
-                        multiplier = 0.5
-                    elif model_id.startswith("o3") or model_id.startswith("o4"):
-                        multiplier = 2.0
-                    elif "turbo" in model_id.lower():
-                        multiplier = 0.7
-                    else:
-                        multiplier = 1.0
-
-                    models_dict = provider_info.get("models", {})
+                    models_dict = provider_info.setdefault("models", {})
                     if model_id not in models_dict:
-                        model_cfg = {"timeout_multiplier": multiplier}
-                        if model_id.startswith("o"):
-                            model_cfg["max_completion_tokens"] = 16000
-                        models_dict[model_id] = model_cfg
-                        provider_info["models"] = models_dict
-
-            elif provider == "anthropic":
-                async with aiohttp.ClientSession() as session:
-                    headers = {
-                        "x-api-key": api_key,
-                        "anthropic-version": ANTHROPIC_API_VERSION,
-                        "content-type": "application/json",
-                    }
-                    data = {
-                        "model": "claude-haiku-4-5",
-                        "messages": [{"role": "user", "content": "Hi"}],
-                        "max_tokens": 1,
-                    }
-                    async with session.post(
-                        ANTHROPIC_MESSAGES_URL,
-                        headers=headers,
-                        json=data,
-                    ) as response:
-                        if response.status == 200:
-                            self.logger.info("Anthropic API key validated successfully")
-                        else:
-                            raise ValueError(f"API key validation failed: {await response.text()}")
+                        models_dict[model_id] = {
+                            "timeout_multiplier": _discovery_multiplier(provider, model_id)
+                        }
 
             if discovered:
                 all_providers = self.config.get(None, "ai_providers", scope="global") or {}
@@ -468,6 +474,25 @@ class LLMClient:
         except Exception as e:
             self.logger.error(f"Failed to discover models for {provider}: {e}", exc_info=True)
             raise
+
+
+def _discovery_multiplier(provider: str, model_id: str) -> float:
+    """Cooldown multiplier heuristic for newly discovered models."""
+    lowered = model_id.lower()
+    if provider == "openai":
+        if "mini" in lowered:
+            return 0.5
+        if model_id.startswith(("o3", "o4")):
+            return 2.0
+        if "turbo" in lowered:
+            return 0.7
+        return 1.0
+    # xai and other OpenAI-compatible providers
+    if "fast" in lowered or "mini" in lowered:
+        return 0.5
+    if "reasoning" in lowered:
+        return 1.5
+    return 1.0
 
 
 class _NullLogger:
@@ -505,37 +530,6 @@ def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
         pai_messages.append(PaiModelRequest(parts=request_parts))
 
     return pai_messages
-
-
-def _build_request_parameters(tools: Optional[List[Dict]]) -> Optional[ModelRequestParameters]:
-    """Convert OpenAI-style tool schemas to pydantic-ai request parameters."""
-    if not tools:
-        return None
-
-    function_tools = []
-    for tool in tools:
-        # Accept both {"type": "function", "function": {...}} and bare {...}.
-        fn = tool.get("function", tool)
-        function_tools.append(
-            ToolDefinition(
-                name=fn["name"],
-                description=fn.get("description"),
-                parameters_json_schema=fn.get("parameters") or {"type": "object", "properties": {}},
-            )
-        )
-    return ModelRequestParameters(function_tools=function_tools)
-
-
-def _map_tool_choice(tool_choice: Any) -> Optional[Any]:
-    """Map OpenAI-style tool_choice to pydantic-ai's ModelSettings.tool_choice."""
-    if isinstance(tool_choice, str) and tool_choice in ("none", "auto", "required"):
-        return tool_choice
-    if isinstance(tool_choice, dict):
-        # {"type": "function", "function": {"name": "x"}} -> ["x"]
-        name = (tool_choice.get("function") or {}).get("name")
-        if name:
-            return [name]
-    return None
 
 
 def _usage_from_pai(usage: Optional[RequestUsage], provider: str, model: str) -> Optional[UsageRecord]:
