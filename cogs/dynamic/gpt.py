@@ -15,6 +15,12 @@ from core.llm import LLMClient, PROVIDER_ALIASES
 # matches this is almost certainly the model narrating instead of acting
 # (observed repeatedly with grok-4.3). Deliberately generous — a false
 # positive costs one extra API call and the model just restates its reply.
+# Base cooldown for the gpt command bucket. The per-model
+# timeout_multiplier shown by !aiinfo/!listmodels scales DISPLAY only —
+# actual enforcement is the flat decorator bucket below. Making
+# enforcement honor the multiplier is an open product decision.
+BASE_COOLDOWN_SECONDS = 240
+
 NARRATED_ACTION_RE = re.compile(
     r"\b(add(?:ing|ed)?|react(?:ing|ed)?|edit(?:ing|ed)?|send(?:ing)?|sent|"
     r"repl(?:y(?:ing)?|ied)|remov(?:ing|ed)|delet(?:ing|ed)|search(?:ing|ed)?|"
@@ -465,7 +471,7 @@ class Gpt(commands.Cog):
         return True, message
         
     @commands.command(name='gpt')
-    @commands.cooldown(10, 240, commands.BucketType.guild)
+    @commands.cooldown(10, BASE_COOLDOWN_SECONDS, commands.BucketType.guild)
     async def askgpt(self, ctx, *, question: str):
         """Ask GPT a question."""
         # Restrict DM usage to superadmin only
@@ -540,7 +546,7 @@ class Gpt(commands.Cog):
         models_info = provider_info.get("models", {})
         model_info = models_info.get(model, {})
         timeout_mult = model_info.get("timeout_multiplier", 1.0)
-        cooldown_time = int(240 * timeout_mult)
+        cooldown_time = int(BASE_COOLDOWN_SECONDS * timeout_mult)
 
         info_lines = [
             f"**Current Provider:** {provider_info['name']} ({provider})",
@@ -565,7 +571,7 @@ class Gpt(commands.Cog):
             model_details = []
             for model_name, model_cfg in models_dict.items():
                 timeout = model_cfg.get("timeout_multiplier", 1.0)
-                cooldown = int(240 * timeout)
+                cooldown = int(BASE_COOLDOWN_SECONDS * timeout)
                 model_details.append(f"{model_name} ({cooldown}s)")
 
             info_lines.append(f"• **{prov_info['name']}** ({prov_id}): {status}")
@@ -625,7 +631,7 @@ class Gpt(commands.Cog):
         # Save back to global config
         config.set(None, "ai_providers", all_providers, scope="global")
 
-        cooldown = int(240 * multiplier)
+        cooldown = int(BASE_COOLDOWN_SECONDS * multiplier)
         return f"Added model '{model_name}' to {provider_info['name']} with {multiplier}x multiplier ({cooldown}s cooldown)"
 
     @commands.command(name='addmodel')
@@ -733,7 +739,7 @@ class Gpt(commands.Cog):
 
         for model_name, model_cfg in models_dict.items():
             multiplier = model_cfg.get("timeout_multiplier", 1.0)
-            cooldown = int(240 * multiplier)
+            cooldown = int(BASE_COOLDOWN_SECONDS * multiplier)
             max_tokens = model_cfg.get("max_completion_tokens", model_cfg.get("max_tokens", "default"))
 
             default_marker = " (default)" if model_name == default_model else ""
