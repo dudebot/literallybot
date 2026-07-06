@@ -53,6 +53,10 @@ class UsageRecord:
     total_tokens: int
     estimated_cost_usd: Optional[float] = None
     timestamp: float = field(default_factory=time.time)
+    # Number of tool executions in the call (only meaningful for agent-loop
+    # runs; 0 for plain chat). A zero here on an action request is the
+    # "model narrated instead of acting" failure signature.
+    tool_calls: int = 0
 
 
 def estimate_cost(record: UsageRecord) -> Optional[float]:

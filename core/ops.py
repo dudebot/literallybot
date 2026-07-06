@@ -664,6 +664,24 @@ async def add_reaction(ctx: OpContext, message, emoji: str):
 
 
 @registry.op(
+    "remove_reaction",
+    "Remove the bot's own emoji reaction from a message. Only reactions "
+    "the bot itself added can be removed — other users' reactions are "
+    "untouchable by design.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Discord message id to remove the bot's reaction from."),
+        OpParam("emoji", ParamKind.STRING,
+                "Emoji to remove (unicode emoji or `name:id` custom emoji)."),
+    ],
+)
+async def remove_reaction(ctx: OpContext, message, emoji: str):
+    await message.remove_reaction(emoji, ctx.bot.user)
+    return True
+
+
+@registry.op(
     "search_history",
     "Search a channel's message history, optionally filtered by author id "
     "and/or a substring match on content.",
@@ -840,7 +858,7 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
 def _smoke_test() -> None:
     expected = {
         "send_message", "edit_message", "delete_message", "add_reaction",
-        "search_history", "add_role", "remove_role", "pin_message",
+        "remove_reaction", "search_history", "add_role", "remove_role", "pin_message",
         "create_thread", "list_guilds", "list_channels", "list_members",
     }
     names = set(registry.names())

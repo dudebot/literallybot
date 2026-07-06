@@ -67,6 +67,7 @@ _EXPOSED_OPS = (
     "send_message",
     "search_history",
     "add_reaction",
+    "remove_reaction",
     "edit_message",
     "list_guilds",
     "list_channels",

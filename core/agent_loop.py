@@ -34,6 +34,7 @@ AGENT_OPS = (
     "send_message",
     "edit_message",
     "add_reaction",
+    "remove_reaction",
     "search_history",
     "list_channels",
     "list_members",

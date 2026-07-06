@@ -10,6 +10,18 @@ from typing import Dict, List, Optional, Any
 from core.utils import is_admin, is_superadmin
 from core.llm import LLMClient, PROVIDER_ALIASES
 
+# Reply text that claims or promises a Discord action. Drives the agentic
+# no-tool-call retry nudge: a run that executed zero tools but whose reply
+# matches this is almost certainly the model narrating instead of acting
+# (observed repeatedly with grok-4.3). Deliberately generous — a false
+# positive costs one extra API call and the model just restates its reply.
+NARRATED_ACTION_RE = re.compile(
+    r"\b(add(?:ing|ed)?|react(?:ing|ed)?|edit(?:ing|ed)?|send(?:ing)?|sent|"
+    r"repl(?:y(?:ing)?|ied)|remov(?:ing|ed)|delet(?:ing|ed)|search(?:ing|ed)?|"
+    r"done|right away|i[' ]?will|i'll|on it)\b",
+    re.IGNORECASE,
+)
+
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
     def __init__(self, bot):
@@ -55,10 +67,6 @@ class Gpt(commands.Cog):
                 f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd}"
             )
         return response.text
-
-    async def call_anthropic_api(self, api_key: str, model: str, messages: List[Dict], metadata: Dict) -> str:
-        """Call Anthropic's Claude API. Delegates to core.llm.LLMClient."""
-        return await self.llm.call_anthropic_api(api_key, model, messages, metadata)
 
     async def process_askgpt(self, ctx, question: str):
         async with ctx.typing():
@@ -193,8 +201,13 @@ class Gpt(commands.Cog):
                     if attachment_parts:
                         full_content = full_content + "\n" + "\n".join(attachment_parts) if full_content else "\n".join(attachment_parts)
                 
+                # In agentic mode every history line carries its Discord
+                # message id so the model can target reactions/edits/replies
+                # directly instead of guessing or searching for ids.
+                id_tag = f"[msg_id: {msg.id}] " if agentic and hasattr(msg, 'id') else ""
+
                 if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
-                    history.append({"role": "assistant", "content": full_content})
+                    history.append({"role": "assistant", "content": f"{id_tag}{full_content}"})
                 else:
                     # For user messages, add context about whether it's a reply
                     reply_context = ""
@@ -209,9 +222,9 @@ class Gpt(commands.Cog):
                     
                     # Mark if this is the most recent message
                     if hasattr(msg, 'id') and most_recent_msg_id and msg.id == most_recent_msg_id:
-                        history.append({"role": "user", "content": f"[MOST RECENT MESSAGE] {author_id}{reply_context}: {full_content}"})
+                        history.append({"role": "user", "content": f"[MOST RECENT MESSAGE] {id_tag}{author_id}{reply_context}: {full_content}"})
                     else:
-                        history.append({"role": "user", "content": f"{author_id}{reply_context}: {full_content}"})            
+                        history.append({"role": "user", "content": f"{id_tag}{author_id}{reply_context}: {full_content}"})
             
             # Retrieve personality data (prompt and version)
             personality_data = self.bot.config.get(ctx, "gpt_personality_data")
@@ -271,11 +284,25 @@ class Gpt(commands.Cog):
                     "",
                     "AGENTIC MODE: you have REAL Discord tools: " + ", ".join(AGENT_OPS) + ".",
                     f"- Current guild id: {ctx.guild.id}. Current channel id: {ctx.channel.id}.",
-                    f"- The invoking user's id is {ctx.author.id}.",
-                    "- Tool actions actually happen. When asked to send, edit, react, or search, "
-                    "USE the tools — never merely describe or narrate the action.",
+                    f"- The invoking user's id is {ctx.author.id}. Their message that triggered "
+                    f"you (\"my message\"/\"this message\") has message id {ctx.message.id}.",
+                    "- Every history line above is prefixed with [msg_id: ...]. Use those ids "
+                    "DIRECTLY when reacting, editing, or replying — no guessing, and no "
+                    "search_history when the target is already visible in the history. "
+                    "NEVER write a [msg_id: ...] marker in your own reply text.",
+                    "- ACTIONS HAPPEN ONLY THROUGH TOOL CALLS. The moment you produce a plain "
+                    "text reply, the run ENDS and nothing further executes. Never say 'adding', "
+                    "'done', 'I will...' unless the tool call already succeeded in THIS run. "
+                    "NEVER roleplay, narrate, or pretend a tool was used — perform the action "
+                    "first, then report what you actually did.",
+                    "- If you have no tool for what's asked, say you can't and name the missing "
+                    "capability. Do not invent excuses or claim success.",
+                    "- add_reaction/remove_reaction need a literal unicode emoji character "
+                    "(💩, 💨, ❤️) or name:id for custom emoji — never a word or description. "
+                    "('fart' and '-' are invalid; the fart/dash emoji is 💨.)",
+                    "- remove_reaction only removes reactions the bot itself added.",
                     "- send_message returns the new message's message_id; reuse it for follow-up "
-                    "edits or reactions.",
+                    "edits or reactions. Use its reference_message_id param to reply to a message.",
                     "- Your final text reply is posted to the channel automatically — do not "
                     "duplicate it with send_message.",
                 ])
@@ -409,8 +436,15 @@ class Gpt(commands.Cog):
                     return [left] + recursive_split(right, max_size)
                 
                 chunks = recursive_split(response, 2000)
+                # User pings are an intended feature ("tell @X he's cool"),
+                # but model output must never be able to ping roles or
+                # @everyone/@here — that's a mass-ping vector via prompt
+                # injection (see docs/security.md).
+                reply_mentions = discord.AllowedMentions(
+                    users=True, roles=False, everyone=False, replied_user=True
+                )
                 for chunk in chunks:
-                    await ctx.send(chunk)
+                    await ctx.send(chunk, allowed_mentions=reply_mentions)
                     
             except Exception as e:
                 self.logger.error(f"AI API error: {e}", exc_info=True)
@@ -438,6 +472,7 @@ class Gpt(commands.Cog):
             f"actor={ctx.author.id} provider={provider_config.provider} "
             f"model={provider_config.model} tools={[t.name for t in tools]}"
         )
+        command_turn = f"[COMMAND from user {ctx.author.id}] {question}"
         try:
             response = await self.llm.run_agent(
                 provider_config,
@@ -448,9 +483,38 @@ class Gpt(commands.Cog):
                 # actionable instruction is unambiguous even when the channel
                 # scrape attributed the invoking message oddly (e.g. a
                 # bot-authored `!gpt` landing in history as an assistant turn).
-                user_prompt=f"[COMMAND from user {ctx.author.id}] {question}",
+                user_prompt=command_turn,
                 max_tool_calls=8,
             )
+
+            # Narration guard: some models (grok-4.3 especially) answer an
+            # action request with "Adding the emoji desu!" and zero tool
+            # calls, which ends the run with nothing done. Nudge exactly once.
+            tool_calls = response.usage.tool_calls if response.usage else 0
+            if tool_calls == 0 and NARRATED_ACTION_RE.search(response.text or ""):
+                self.logger.info(
+                    "agentic run made no tool calls but the reply narrates an "
+                    "action — nudging once"
+                )
+                retry_messages = api_messages + [
+                    {"role": "user", "content": command_turn},
+                    {"role": "assistant", "content": response.text},
+                ]
+                response = await self.llm.run_agent(
+                    provider_config,
+                    retry_messages,
+                    tools=tools,
+                    metadata=metadata,
+                    user_prompt=(
+                        "[SYSTEM CHECK] You made ZERO tool calls, so nothing you "
+                        "described above actually happened — no reaction was added, "
+                        "no message was sent or edited. If your reply claims or "
+                        "promises an action, perform it NOW with real tool calls, "
+                        "then give a short final reply describing what you actually "
+                        "did. If your reply required no action, just restate it."
+                    ),
+                    max_tool_calls=8,
+                )
         except UsageLimitExceeded as e:
             self.logger.warning(f"agentic gpt run hit its tool budget: {e}")
             return "I hit my tool-call limit (8) before finishing that request."
@@ -459,7 +523,8 @@ class Gpt(commands.Cog):
             self.logger.info(
                 f"agentic usage: provider={response.usage.provider} model={response.usage.model} "
                 f"prompt={response.usage.prompt_tokens} completion={response.usage.completion_tokens} "
-                f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd}"
+                f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd} "
+                f"tool_calls={response.usage.tool_calls}"
             )
         return response.text
 

@@ -379,70 +379,6 @@ class LLMClient:
         text = (result.output or "").strip()
         return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=result)
 
-    # Backwards-compatible alias matching the original cog method name.
-    async def call_ai_api(self, provider_config: ProviderConfig, messages: List[Dict], metadata: Dict) -> str:
-        """Deprecated-shape helper: returns plain text like the original cog method."""
-        response = await self.chat(provider_config, messages, metadata)
-        return response.text
-
-    # Backwards-compatible alias matching the original cog method signature/behavior.
-    async def call_anthropic_api(self, api_key: str, model: str, messages: List[Dict], metadata: Dict) -> str:
-        """Call Anthropic's Claude API with an explicit key; returns plain text."""
-        pai_model = AnthropicModel(model, provider=AnthropicProvider(api_key=api_key))
-        response = await model_request(
-            pai_model,
-            _to_pai_messages(messages),
-            model_settings={"max_tokens": DEFAULT_MAX_TOKENS},
-        )
-        return "".join(
-            part.content for part in response.parts if isinstance(part, TextPart)
-        ).strip()
-
-    # ------------------------------------------------------------------
-    # Streaming
-    # ------------------------------------------------------------------
-
-    async def chat_stream(
-        self,
-        provider_config: ProviderConfig,
-        messages: List[Dict],
-        metadata: Optional[Dict] = None,
-        tools: Optional[List[Dict]] = None,
-        tool_choice: Optional[Any] = None,
-    ) -> AsyncIterator[str]:
-        """Stream text deltas for a chat call.
-
-        All providers stream natively through pydantic-ai (the old
-        implementation faked streaming for Anthropic and lacked keyless
-        support and metadata passthrough; those now share the exact same
-        request assembly as `chat()`). Not currently called from any
-        Discord command; provided so the client shape supports streaming
-        when a caller wires it up.
-        """
-        provider = provider_config.provider
-        model = provider_config.model
-        provider_info = provider_config.provider_info
-
-        api_key = self._resolve_api_key(provider, provider_info)
-
-        pai_model = self._build_model(provider, model, provider_info, api_key)
-        settings = self._build_settings(provider_info, model, metadata, tool_choice=tool_choice)
-        request_parameters = _build_request_parameters(tools)
-
-        async with model_request_stream(
-            pai_model,
-            _to_pai_messages(messages),
-            model_settings=settings,
-            model_request_parameters=request_parameters,
-        ) as stream:
-            async for event in stream:
-                if isinstance(event, PartStartEvent) and isinstance(event.part, TextPart):
-                    if event.part.content:
-                        yield event.part.content
-                elif isinstance(event, PartDeltaEvent) and isinstance(event.delta, TextPartDelta):
-                    if event.delta.content_delta:
-                        yield event.delta.content_delta
-
     # ------------------------------------------------------------------
     # Model discovery
     # ------------------------------------------------------------------
@@ -613,6 +549,9 @@ def _usage_from_pai(usage: Optional[RequestUsage], provider: str, model: str) ->
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
+        # RunUsage (agent loop) carries tool_calls; RequestUsage (plain
+        # chat) doesn't have the attribute — default to 0.
+        tool_calls=getattr(usage, "tool_calls", 0) or 0,
     )
     record.estimated_cost_usd = estimate_cost(record)
     return record
