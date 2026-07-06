@@ -50,13 +50,11 @@ from core.ops import (
 
 logger = logging.getLogger("mcp_ops.server")
 
-# Ops exposed over MCP. delete/pin/role/thread ops stay unexposed until a
-# concrete need shows up (same surface as the original hand-written spike).
-# WARNING: all currently-exposed ops are EVERYONE-tier. Op.__call__ resolves
-# ids to objects BEFORE the permission gate runs, so exposing an ADMIN op here
-# (or in AGENT_OPS) would let a non-admin distinguish "invalid id" from
-# "requires admin" by the error text — an id-probing oracle. Move resolution
-# after the gate (core/ops.py Op.__call__) before exposing any ADMIN op.
+# Ops exposed over MCP. pin/role/thread ops stay unexposed until a concrete
+# need shows up. ADMIN-tier ops (delete_message) are safe to expose:
+# registry.call_ids checks the permission gate BEFORE resolving any ids, so
+# a non-admin caller gets "Requires admin." without ever triggering Discord
+# lookups (no id-probing oracle).
 _EXPOSED_OPS = (
     "send_message",
     "search_history",

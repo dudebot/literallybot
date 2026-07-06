@@ -465,7 +465,10 @@ class LLMClient:
                         }
 
             if discovered:
-                all_providers = self.config.get(None, "ai_providers", scope="global") or {}
+                # Merge into the full provider set (seeded defaults included) —
+                # reading raw config here on a fresh install would persist ONLY
+                # the discovered provider and silently drop the other seeds.
+                all_providers = self.get_all_providers()
                 all_providers[provider] = provider_info
                 self.config.set(None, "ai_providers", all_providers, scope="global")
 
