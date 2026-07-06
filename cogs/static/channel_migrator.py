@@ -485,22 +485,12 @@ class ChannelMigrator(commands.Cog):
         return None
 
     def _chunk_text(self, text: str, limit: int) -> List[str]:
+        # Shared Discord-limit splitter (core.utils) — this method kept as a
+        # thin named seam so callers keep their 1900-char headroom limit.
         if not text:
             return []
-        chunks: List[str] = []
-        remaining = text
-        while remaining:
-            if len(remaining) <= limit:
-                chunks.append(remaining)
-                break
-            split_at = remaining.rfind("\n", 0, limit)
-            if split_at == -1:
-                split_at = remaining.rfind(" ", 0, limit)
-            if split_at == -1:
-                split_at = limit
-            chunks.append(remaining[:split_at])
-            remaining = remaining[split_at:].lstrip("\n ")
-        return chunks
+        from core.utils import recursive_split
+        return recursive_split(text, limit)
 
     def _collect_bundle_media_urls(self, bundle_path: Path) -> Set[str]:
         urls: Set[str] = set()

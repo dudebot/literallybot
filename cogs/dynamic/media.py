@@ -235,19 +235,13 @@ class Media(commands.Cog):
                 await ctx.send('No media files found.')
             return
 
-        # Chunk messages to avoid exceeding Discord limits
+        # Chunk messages to avoid exceeding Discord limits (shared splitter —
+        # the inline accumulator this replaces declared a 1900 limit but
+        # compared against 2000)
+        from core.utils import recursive_split
         header = f'Media files ({len(files)} total' + (f', filtered by "{prefix}"' if prefix else '') + '):\n'
-        chunk_limit = 1900  # leave room for header/formatting
-        current = header
-        lines = []
-        for name in files:
-            line = name + '\n'
-            if len(current) + len(line) > 2000:
-                await ctx.send(current.rstrip('\n'))
-                current = ''
-            current += line
-        if current:
-            await ctx.send(current.rstrip('\n'))
+        for chunk in recursive_split(header + '\n'.join(files), 2000):
+            await ctx.send(chunk)
 
 async def setup(bot):
     await bot.add_cog(Media(bot))

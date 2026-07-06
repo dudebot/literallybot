@@ -11,6 +11,7 @@ Normalization goals:
   discord.Interaction (slash commands) interchangeably. This is the single
   auth gate for both command surfaces - see _actor()/_bot_of() below.
 """
+import re
 from typing import List, Union, Any
 import discord
 
@@ -155,3 +156,83 @@ async def safe_delete(ctx, logger=None):
             channel_name = getattr(ctx.channel, "name", ctx.channel.id)
             logger.warning(f"Unable to delete command message in {channel_name}: {exc}")
         return False
+
+
+def recursive_split(text, max_size=2000):
+    """Split text into Discord-size chunks, preferring newline/sentence/space
+    boundaries and keeping fenced/inline code blocks intact across chunks.
+    The single shared implementation of Discord's 2000-char message limit —
+    moved here from cogs/dynamic/gpt.py (seam-machine claim 3)."""
+    if len(text) <= max_size:
+        return [text]
+    mid = len(text) // 2
+
+    # Updated pattern with optional language capture for code blocks.
+    code_block_pattern = r'(`{3,})(\w+)?\n[\s\S]*?\n\1'
+    inline_code_pattern = r'(`+)[^`]+?\1'
+
+    code_blocks = list(re.finditer(code_block_pattern, text))
+    inline_codes = list(re.finditer(inline_code_pattern, text))
+
+    for pattern in [r'\n+', r'\.\s+', r'\s+']:
+        matches = list(re.finditer(pattern, text))
+        if matches:
+            best_match = min(matches, key=lambda m: abs(m.start() - mid))
+            split_index = best_match.end()
+            if split_index <= 0 or split_index >= len(text):
+                continue
+
+            inside_code_block = False
+            code_delimiter = None
+            code_lang = ""
+            for block in code_blocks:
+                if block.start() < split_index < block.end():
+                    inside_code_block = True
+                    code_delimiter = block.group(1)  # e.g. "```"
+                    code_lang = block.group(2) if block.group(2) else ""
+                    break
+
+            inside_inline_code = any(code.start() < split_index < code.end() for code in inline_codes)
+
+            left = text[:split_index].rstrip()
+            right = text[split_index:].lstrip()
+
+            if inside_code_block and code_delimiter:
+                header = code_delimiter + code_lang  # Preserve language specifier.
+                if not left.endswith(header):
+                    left = left + "\n" + "```"
+                if not right.startswith(header):
+                    right = header + "\n" + right
+
+            if inside_inline_code:
+                if not left.endswith("`"):
+                    left = left.rstrip("`") + "`"
+                if not right.startswith("`"):
+                    right = "`" + right.lstrip("`")
+
+            return recursive_split(left, max_size) + recursive_split(right, max_size)
+
+    left = text[:max_size].rstrip()
+    right = text[max_size:].lstrip()
+    inside_code_block = False
+    code_delimiter = None
+    code_lang = ""
+    for block in code_blocks:
+        if block.start() < max_size < block.end():
+            inside_code_block = True
+            code_delimiter = block.group(1)
+            code_lang = block.group(2) if block.group(2) else ""
+            break
+    inside_inline_code = any(code.start() < max_size < code.end() for code in inline_codes)
+    if inside_code_block and code_delimiter:
+        header = code_delimiter + code_lang
+        if not left.endswith(header):
+            left = left + "\n" + header
+        if not right.startswith(header):
+            right = header + "\n" + right
+    elif inside_inline_code:
+        if not left.endswith("`"):
+            left = left.rstrip("`") + "`"
+        if not right.startswith("`"):
+            right = "`" + right.lstrip("`")
+    return [left] + recursive_split(right, max_size)
