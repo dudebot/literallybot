@@ -47,14 +47,16 @@ class Admin(commands.Cog):
             self.logger.warning(f"claimadmin attempted in DMs by {ctx.author} (ID: {ctx.author.id})")
             return
 
-        superadmins = self.bot.config.get_global("superadmins", [])
-        if not (ctx.author.id in superadmins or ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner):
+        # Route membership tests through the shared core.utils gate rather
+        # than a hand-rolled copy of the superadmin list lookup.
+        author_is_superadmin = is_superadmin(self.bot.config, ctx.author.id)
+        if not (author_is_superadmin or ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner):
             self.logger.warning(f"Unauthorized claimadmin attempt by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild.id}")
             await ctx.send("You lack admin privileges on this server.")
             return
         # use per-guild config for admins
         admins = self.bot.config.get(ctx, "admins", [])
-        if ctx.author.id not in superadmins and admins: # user is not a superadmin and there are already admins
+        if not author_is_superadmin and admins: # user is not a superadmin and there are already admins
             await ctx.send("There are already admins for this server. You must be added by one of the admins with !addadmin @you.")
             return
         if ctx.author.id in admins:
@@ -90,6 +92,74 @@ class Admin(commands.Cog):
             self.bot.config.set(ctx, "admins", admins)
             self.logger.info(f"{member} (ID: {member.id}) added as admin by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild.id}")
             await ctx.send(f"{member} has been added as a bot admin.")
+
+    @commands.command(name="removeadmin")
+    @commands.check(is_admin)
+    async def removeadmin(self, ctx, user: discord.User = None):
+        """Remove a user from this server's bot admins (same gate as !addadmin)."""
+        if ctx.guild is None:
+            await ctx.send("This command cannot be used in direct messages.")
+            self.logger.warning(f"removeadmin attempted in DMs by {ctx.author} (ID: {ctx.author.id})")
+            return
+        if not user:
+            await ctx.send("Please specify a user to remove as bot admin.")
+            self.logger.warning(f"removeadmin called without member by {ctx.author} (ID: {ctx.author.id})")
+            return
+        # discord.User (not Member) so admins who already left the guild can
+        # still be removed by mention or id.
+        admins = self.bot.config.get(ctx, "admins", [])
+        if user.id not in admins:
+            await ctx.send(f"{user} is not a bot admin.")
+            return
+        admins.remove(user.id)
+        self.bot.config.set(ctx, "admins", admins)
+        self.logger.info(f"{user} (ID: {user.id}) removed as admin by {ctx.author} (ID: {ctx.author.id}) in guild {ctx.guild.id}")
+        await ctx.send(f"{user} has been removed as a bot admin.")
+
+    @commands.command(name="removesuperadmin")
+    @commands.check(is_superadmin)
+    async def removesuperadmin(self, ctx, user: discord.User = None):
+        """Remove a user from the global bot superadmins (superadmin only)."""
+        if not user:
+            await ctx.send("Please specify a user to remove as bot superadmin.")
+            self.logger.warning(f"removesuperadmin called without member by {ctx.author} (ID: {ctx.author.id})")
+            return
+        superadmins = get_superadmins(self.bot.config)
+        if user.id not in superadmins:
+            await ctx.send(f"{user} is not a bot superadmin.")
+            return
+        if len(superadmins) == 1:
+            await ctx.send("Refusing to remove the last superadmin — add another with `!addsuperadmin` first.")
+            self.logger.warning(f"Refused removal of last superadmin {user} (ID: {user.id}) by {ctx.author} (ID: {ctx.author.id})")
+            return
+        superadmins.remove(user.id)
+        self.bot.config.set_global("superadmins", superadmins)
+        self.logger.info(f"{user} (ID: {user.id}) removed as superadmin by {ctx.author} (ID: {ctx.author.id})")
+        await ctx.send(f"{user} has been removed as a bot superadmin.")
+
+    @commands.command(name="listadmins")
+    @commands.check(is_admin)
+    async def listadmins(self, ctx):
+        """List this server's bot admins and the global superadmins."""
+        if ctx.guild is None:
+            await ctx.send("This command cannot be used in direct messages.")
+            return
+
+        def format_ids(ids):
+            if not ids:
+                return "None"
+            lines = []
+            for uid in ids:
+                user = self.bot.get_user(uid)
+                lines.append(f"- {user} (ID: {uid})" if user else f"- ID: {uid}")
+            return "\n".join(lines)
+
+        admins = self.bot.config.get(ctx, "admins", [])
+        superadmins = get_superadmins(self.bot.config)
+        await ctx.send(
+            f"**Server admins:**\n{format_ids(admins)}\n"
+            f"**Global superadmins:**\n{format_ids(superadmins)}"
+        )
 
 
 async def setup(bot):
