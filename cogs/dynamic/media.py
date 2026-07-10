@@ -7,6 +7,78 @@ from discord import File
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
+from core.utils import is_admin
+
+
+def _format_size(num_bytes):
+    """Human-readable file size for the delmedia confirmation embed."""
+    size = float(num_bytes)
+    for unit in ('B', 'KB', 'MB'):
+        if size < 1024:
+            return f'{num_bytes} B' if unit == 'B' else f'{size:.1f} {unit}'
+        size /= 1024
+    return f'{size:.1f} GB'
+
+
+class ConfirmDeleteView(discord.ui.View):
+    """Confirm/Cancel buttons for !delmedia. Invoker-only, 60s timeout.
+
+    Only the Confirm callback deletes anything, and it re-checks is_admin
+    server-side — the button gate alone is cosmetic.
+    """
+
+    def __init__(self, ctx, file_path):
+        super().__init__(timeout=60)
+        self.ctx = ctx
+        self.file_path = file_path
+        self.message = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message(
+                "These buttons aren't yours — run `!delmedia` yourself.",
+                ephemeral=True)
+            return False
+        return True
+
+    def _disable_all(self):
+        for child in self.children:
+            child.disabled = True
+
+    async def on_timeout(self):
+        self._disable_all()
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Delete confirmation expired — nothing was deleted.",
+                    view=self)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Confirm delete", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "You do not have permission to do this.", ephemeral=True)
+            return
+        file_name = os.path.basename(self.file_path)
+        self._disable_all()
+        self.stop()
+        try:
+            os.remove(self.file_path)
+        except OSError as e:
+            await interaction.response.edit_message(
+                content=f"Failed to delete `{file_name}`: {e}", embed=None, view=self)
+            return
+        await interaction.response.edit_message(
+            content=f"Deleted `{file_name}`.", embed=None, view=self)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self._disable_all()
+        self.stop()
+        await interaction.response.edit_message(
+            content="Deletion cancelled — nothing was deleted.", embed=None, view=self)
 
 class Media(commands.Cog):
     def __init__(self, bot):
@@ -34,7 +106,7 @@ class Media(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        if message.author == self.bot:
+        if message.author.bot:
             return
 
         if message.content.startswith('!'):
@@ -85,6 +157,7 @@ class Media(commands.Cog):
         return True
 
     @commands.command(name='addmedia')
+    @commands.check(is_admin)
     async def addmedia(self, ctx, link: str = None, file_name: str = None,
                        start_ms: int = None, end_ms: int = None):
         """Download and save YouTube videos or direct file links as media files.
@@ -98,14 +171,9 @@ class Media(commands.Cog):
           !addmedia <url> clip 2000      - first 2 seconds
           !addmedia <url> clip 200 1700  - from 200ms to 1700ms (1500ms clip)
         """
-        from core.utils import is_admin
-        if not is_admin(self.bot.config, ctx):
-            # Shared gate: superadmins, the per-guild admins list, and
-            # Discord Administrator — the raw admins-list check this
-            # replaces silently excluded superadmins.
-            await ctx.send("You do not have permission to use this command.")
-            return
-
+        # Authorization is handled by @commands.check(is_admin) on the
+        # decorator (shared gate: superadmins, per-guild admins list, and
+        # Discord Administrator).
         if not link or not file_name:
             await ctx.send("Missing required arguments.\nUsage: `!addmedia <link> <filename> [start_ms] [end_ms]`")
             return
@@ -203,6 +271,61 @@ class Media(commands.Cog):
             self._cleanup_media_files(file_name)
             await ctx.send(f'Unexpected error: {e}')
 
+    @commands.command(name='delmedia')
+    @commands.check(is_admin)
+    async def delmedia(self, ctx, name: str = None):
+        """Delete a media file after button confirmation.
+
+        Usage: !delmedia <name>
+        Matches the exact file name, with or without extension — never a
+        prefix or substring (a computed delete target must be exact).
+        """
+        if not name:
+            await ctx.send("Missing required argument.\nUsage: `!delmedia <name>`")
+            return
+
+        try:
+            entries = os.listdir(self._media_dir)
+        except OSError as e:
+            await ctx.send(f'Failed to read media directory: {e}')
+            return
+
+        query = name.lower()
+        matches = [f for f in entries
+                   if f.lower() == query or os.path.splitext(f)[0].lower() == query]
+
+        if not matches:
+            near = [f for f in sorted(entries, key=str.lower) if query in f.lower()][:5]
+            if near:
+                listing = '\n'.join(near)
+                await ctx.send(f'No exact match for `{name}`. Did you mean:\n{listing}\n'
+                               'Nothing was deleted.')
+            else:
+                await ctx.send(f'No media file named `{name}` found. Nothing was deleted.')
+            return
+
+        if len(matches) > 1:
+            listing = '\n'.join(sorted(matches, key=str.lower))
+            await ctx.send(f'`{name}` matches multiple files:\n{listing}\n'
+                           'Re-run with the full file name (including extension). '
+                           'Nothing was deleted.')
+            return
+
+        file_name = matches[0]
+        file_path = os.path.join(self._media_dir, file_name)
+        try:
+            size = _format_size(os.path.getsize(file_path))
+        except OSError:
+            size = 'unknown size'
+
+        embed = discord.Embed(
+            title='Delete media file?',
+            description=f'`{file_name}` ({size})',
+            color=discord.Color.red(),
+        )
+        view = ConfirmDeleteView(ctx, file_path)
+        view.message = await ctx.send(embed=embed, view=view)
+
     @commands.command(name='listmedia')
     async def listmedia(self, ctx, prefix: str = None):
         """List available media files. Optionally filter by a starting prefix.
@@ -217,18 +340,25 @@ class Media(commands.Cog):
             return
 
         try:
-            files = [f for f in os.listdir(media_dir) if f.lower().endswith(allowed)]
+            entries = os.listdir(media_dir)
         except OSError as e:
             await ctx.send(f'Failed to read media directory: {e}')
             return
 
+        files = [f for f in entries if f.lower().endswith(allowed)]
+        # The !<name> trigger serves EVERY file in media/, not just the
+        # allowlisted extensions — surface the rest so the two views agree.
+        others = [f for f in entries if not f.lower().endswith(allowed)]
+
         if prefix:
             p = prefix.lower()
             files = [f for f in files if f.lower().startswith(p)]
+            others = [f for f in others if f.lower().startswith(p)]
 
         files.sort(key=str.lower)
+        others.sort(key=str.lower)
 
-        if not files:
+        if not files and not others:
             if prefix:
                 await ctx.send(f'No media files found starting with "{prefix}".')
             else:
@@ -240,7 +370,11 @@ class Media(commands.Cog):
         # compared against 2000)
         from core.utils import recursive_split
         header = f'Media files ({len(files)} total' + (f', filtered by "{prefix}"' if prefix else '') + '):\n'
-        for chunk in recursive_split(header + '\n'.join(files), 2000):
+        body = header + '\n'.join(files)
+        if others:
+            body += (f'\n\nOther files ({len(others)} — non-standard extension, '
+                     'still served by `!<name>`):\n' + '\n'.join(others))
+        for chunk in recursive_split(body, 2000):
             await ctx.send(chunk)
 
 async def setup(bot):
