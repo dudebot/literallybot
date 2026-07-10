@@ -39,10 +39,10 @@ def _clip(text: str, limit: int = 1024) -> str:
 
 
 class _WhitelistRoleSelect(discord.ui.RoleSelect):
-    """RoleSelect that REPLACES the whitelist with the selection on change.
+    """RoleSelect editing the whitelist in place: the selection IS the list.
 
-    Save-on-change, same semantics as ai_admin's _ToolSelect. Stores role
-    NAME strings under the existing `whitelist_roles` key — no migration.
+    Save-on-change, same semantics as ai_admin's _ToolSelect. Same data model
+    as always — role NAME strings under `whitelist_roles` in the guild json.
     """
 
     def __init__(self, panel: "RoleSettingsView"):
@@ -50,7 +50,7 @@ class _WhitelistRoleSelect(discord.ui.RoleSelect):
         whitelist = panel.bot.config.get(panel.guild.id, "whitelist_roles", []) or []
         current = [role for _, role in _resolve_whitelist(panel.guild, whitelist) if role]
         super().__init__(
-            placeholder="Select claimable roles (replaces the whitelist)",
+            placeholder="Claimable roles — what's selected here is the whitelist",
             min_values=0,
             max_values=25,
             default_values=current[:25],
@@ -126,7 +126,7 @@ class RoleSettingsView(discord.ui.View):
             inline=False,
         )
         e.set_footer(
-            text="Select saves on change and REPLACES the whitelist. "
+            text="Edits save instantly — the selection above is the whitelist. "
                  "Discord selects cap at 25 roles. Panel expires after 3 minutes."
         )
         return e
