@@ -1,6 +1,6 @@
 # LiterallyBot
 
-A modular Discord bot built with discord.py that's designed to be a "jack of all trades" - from music playback and AI chat to utilities and entertainment. Built with developer experience in mind, featuring a flexible cog system and comprehensive configuration management.
+A modular Discord bot built with discord.py that's designed to be a "jack of all trades" - from AI chat to utilities and entertainment. Built with developer experience in mind, featuring a flexible cog system and comprehensive configuration management.
 
 ## 🚀 Quick Start
 
@@ -27,7 +27,6 @@ That's it! Your bot is now running with all core features available.
 ## ✨ Key Features
 
 - **🧩 Modular Cog System** - Load/unload features dynamically without restarts
-- **🎵 Music Player** - YouTube, Spotify support with queue management  
 - **🤖 AI Integration** - GPT chat with memory and personality system
 - **⚙️ Smart Configuration** - Per-server, per-user, and global settings with automatic persistence and modification through cogs
 - **🎲 Utilities & Fun** - Dice rolling, random choices, reminders, auto-responses
@@ -47,14 +46,14 @@ credentials in `configs/global.json`:
 "ANTHROPIC_API_KEY": "sk-ant-XXXX"
 ```
 Provider/model lists live in `configs/global.json` under `ai_providers` and are
-managed at runtime with the commands below — no code change to add a model.
+managed at runtime through the slash commands below — no code change to add a
+model.
 
 Once keys are present:
-- `!aiinfo` – list available providers/models and confirm keys are detected
-- `!setprovider <provider>` – switch providers (`xai`, `openai`, `anthropic`, `ollama`)
-- `!setmodel <model>` – choose a model for the current provider
-- `!addmodel <name> [provider] [multiplier] [max_tokens]` – register a new model
-- `!setpersonality <prompt>` – update the bot's response personality (per-server)
+- `/ai status` – show the active provider/model and confirm keys are detected
+- `/ai settings` – interactive settings panel: pick provider/model, manage
+  per-tool agentic allowlists, and (Providers tab) add/remove providers and models
+- `/ai setapikey` – store a provider API key (replies ephemerally)
 
 **Local models (Ollama):** point a provider at a local server with
 `"base_url": "http://localhost:11434/v1"` and `"requires_api_key": false` in its
@@ -69,8 +68,9 @@ describing them. It runs a tool-calling loop over a shared **ops registry**
 (`core/ops.py`), acting as the **invoking user** (never the bot), confined to the
 current guild, with mentions suppressed and a per-run tool-call cap.
 
-- `!setagentic on|off` – toggle agentic mode for the current server (superadmin;
-  default off). With it off, `!gpt` is plain chat and nothing changes.
+- Agentic mode is per-tool: each guild has a tool allowlist (default empty, so
+  `!gpt` is plain chat and nothing changes) managed from the `/ai settings`
+  panel.
 
 The same ops registry also backs an optional localhost-only **MCP server**
 (`mcp_ops/`, off unless `MCP_OPS_ENABLED=1`) so an external agent can drive the
@@ -92,21 +92,18 @@ Press the button on your Hue Bridge, then run:
 ## 📋 Available Commands
 
 **Core Features:**
-- `!help` - Show all commands
+- `/help` - Browse all commands
 - `!load <cog>` / `!unload <cog>` - Manage bot features
 - `!update` - Pull latest code changes
 
-**Music Player:**
-- `!play <song>` - Play from YouTube/Spotify
-- `!queue` - Show music queue
-- `!skip` / `!pause` / `!resume`
-
 **AI & Utilities:**
-- `!gpt <message>` - Chat with AI (if configured; agentic when enabled)
-- `!setagentic on|off` - Toggle agentic AI actions per server (superadmin)
-- `!roll <dice>` - Roll dice
-- `!remind <time> <message>` - Set reminders
-- `!setrole <role>` - Self-assign roles
+- `!gpt <message>` - Chat with AI (if configured; agentic when tools are allowlisted)
+- `/ai settings` / `/ai status` - Configure and inspect the AI layer
+- `!dice <NdX>` (or `/roll_dice`) - Roll dice, e.g. `!dice 2d20`
+- `!remindme <number> <unit> <message>` - Set reminders
+- `!setrole <role>` (or `/roles claim`) - Self-assign roles; admins manage the
+  allowlist with `/roles settings`
+- `!addmedia` / `!delmedia` / `!listmedia` - Manage playable media clips (admin)
 
 ## 🏗️ Development & Extension
 
@@ -158,7 +155,9 @@ For deeper walkthroughs, see:
 
 ### Administrative Commands
 - `!claimsuper` - Become a bot superadmin (first time only)
-- `!addsuperadmin @user` - Promote an additional bot superadmin
+- `!addsuperadmin @user` / `!removesuperadmin @user` - Manage bot superadmins
+- `!claimadmin` / `!addadmin @user` / `!removeadmin @user` - Manage per-server bot admins
+- `!listadmins` - Show this server's bot admins and the global superadmins
 - `!load <cog>` / `!unload <cog>` - Manage features
 - `!reload <cog>` - Hot-reload code changes
 - `!update` - Pull latest changes from git

@@ -17,7 +17,8 @@ class Meme(commands.Cog):
             toggled.append(c.upper() if i % 2 else c.lower())
 
         display_text = "".join(toggled).replace('  ', ' ')
-        nickname = ctx.author.nick or ctx.author.name
+        # display_name works for both Member (nick) and User (DMs, no .nick)
+        nickname = ctx.author.display_name
         title = random.choice(["Someone Important","Chief Furry","Alcoholic",
                                "Literally Who","Basically Hitler","Mayor of Foofgens",
                                "Peta","Some random weeb", "Someone Mostly Literate"])

@@ -5,6 +5,7 @@ import time
 class Reminders(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.logger = bot.logger
         self.check_reminders.start()
     
     def cog_unload(self):
@@ -52,7 +53,7 @@ class Reminders(commands.Cog):
         reminders = config.get(None, "reminders", [])
         reminders.append({"user_id": ctx.author.id, "timestamp": remind_time, "text": text})
         config.set(None, "reminders", reminders)
-        await ctx.send(f"Reminder set for {number} {unit_lower} from now.")
+        await ctx.send(f"Reminder set for {number} {unit_lower} from now — <t:{remind_time}:R>.")
 
     @tasks.loop(seconds=10)
     async def check_reminders(self):
@@ -67,12 +68,12 @@ class Reminders(commands.Cog):
                     try:
                         user = await self.bot.fetch_user(reminder["user_id"])
                     except Exception as e:
-                        print(f"Failed to fetch user {reminder['user_id']}: {e}")
+                        self.logger.warning(f"Failed to fetch user {reminder['user_id']}: {e}")
                         continue
                 try:
                     await user.send(f"Reminder: {reminder['text']}")
                 except Exception as e:
-                    print(f"Failed to send DM to {reminder['user_id']}: {e}")
+                    self.logger.warning(f"Failed to send DM to {reminder['user_id']}: {e}")
             else:
                 updated_reminders.append(reminder)
         if len(updated_reminders) != len(reminders):

@@ -138,6 +138,21 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
     return False
 
 
+def smart_split(options):
+    """Split a user-supplied options string on 'or', commas, or whitespace.
+
+    Moved here from the root-level utils.py so all shared helpers live in
+    core.utils.
+    """
+    if re.search(r',? ?\bor\b ?|, ?', options.lower()) is not None:
+        values = re.split(r',? ?\bor\b ?|, ?', options.lower())
+    elif ' ' in options:
+        values = options.split(' ')
+    else:
+        values = re.split(r'\W', options)
+    return [value for value in values if value != ""]
+
+
 async def safe_delete(ctx, logger=None):
     """Safely attempt to delete a command message without raising exceptions.
 
