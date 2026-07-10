@@ -1,23 +1,8 @@
-"""
-This example bot is structured in multiple files and is made with the goal of showcasing commands, events and cogs.
-Although this example is not intended as a complete bot, but as a reference aimed to give you a basic understanding for 
-creating your bot, feel free to use these examples and point out any issue.
-+ These examples are made with educational purpose and there are plenty of docstrings and explanation about most of the code.
-+ This example is made with Python 3.8.5 and Discord.py 1.4.0a (rewrite).
-Documentation:
-+    Discord.py latest:    https://discordpy.readthedocs.io/en/latest/
-+    Migration to rewrite:    https://discordpy.readthedocs.io/en/latest/migrating.html
-+    Commands documentation:        https://discordpy.readthedocs.io/en/latest/ext/commands/commands.html
-+    Cogs documentation:        https://discordpy.readthedocs.io/en/latest/ext/commands/cogs.html
-+    Tasks documentation:    https://discordpy.readthedocs.io/en/latest/ext/tasks/index.html
-The example files are organized in this directory structure:
-...
-    /discord
-        -bot.py
-        /cogs
-            -dev.py
-            -tools.py
-            -quote.py
+"""literallybot — a general-purpose Discord bot built on discord.py.
+
+Entry point: creates the bot, loads cogs from cogs/static (always-on) and
+cogs/dynamic (hot-reloadable), and wires logging, error handling, and the
+optional MCP ops server. Runtime configuration lives in configs/ as JSON.
 """
 from itertools import cycle
 from discord.ext import commands, tasks
@@ -110,27 +95,22 @@ async def load_cogs():
     bot.failed_cogs = failed_cogs if failed_cogs else []
 
 @bot.event
-#This is the decorator for events (outside of cogs).
 async def on_ready():
-    """This coroutine is called when the bot is connected to Discord.
-    Note:
-        `on_ready` doesn't take any arguments.
-    
-    Documentation:
-    https://discordpy.readthedocs.io/en/latest/api.html#discord.on_ready
-    """
+    """Called on connect (and reconnect): loads cogs, starts the status
+    rotation, and syncs application commands once per process."""
 
     await load_cogs()
-    
+
     logger.info(f'{bot.user.name} is online and ready!')
-    #Prints a message with the bot name.
 
     if not change_status.is_running():
         change_status.start()
-    #Starts the task `change_status`_.
 
-    await bot.tree.sync()
-    # Sync application commands with Discord
+    # on_ready refires on reconnect — only sync the command tree once per
+    # process (Dev's !sync command handles manual re-syncs).
+    if not getattr(bot, "_synced", False):
+        await bot.tree.sync()
+        bot._synced = True
 
     # MCP ops server — OFF unless MCP_OPS_ENABLED=1 in the environment
     # (plus MCP_OPS_TOKEN and MCP_OPS_GUILD_ALLOWLIST; all gates fail
