@@ -55,14 +55,21 @@ Where new code should land, so seams don't re-greed:
   frontends (`core/agent_loop.py`, `mcp_ops/server.py`) generate their surface
   from the registry and must stay thin. `call_ids` gates permissions before
   resolving ids — keep that ordering.
-- **`cogs/dynamic/gpt.py` is the historical landing zone** and still carries two
-  parked seams (owner list): the ~700-line provider/model/key CRUD + `/ai` group
-  belongs in its own `ai_admin.py` cog, and memory capture could be its own cog.
-  New AI-admin features should NOT be added to gpt.py.
+- **`cogs/dynamic/gpt.py` is the historical landing zone.** The AI-admin UX
+  (the `/ai settings` panel and all provider/model CRUD surfaces) lives in
+  `ai_admin.py`; gpt.py keeps the `_do_*` core-logic helpers, the chat paths,
+  and the slim `/ai` group (settings/setapikey/status). New AI-admin features
+  land in ai_admin.py, not gpt.py. Remaining parked seam: memory capture
+  could be its own cog.
 - Other parked (real-but-leave-it): error-handler module globals -> instance on
-  bot; `LLMClient.has_api_key()` helper to dedupe key-presence checks; cooldown
-  display shows base×multiplier but enforcement is flat `BASE_COOLDOWN_SECONDS`
-  (product decision whether to enforce per-model).
+  bot; `LLMClient.has_api_key()` helper to dedupe key-presence checks.
+- **Config keys**: every real key in `configs/*.json` is inventoried in the
+  Key Registry section of `docs/config-system.md` — keep it current when
+  adding keys. One data model per concept: never add a parallel key for an
+  existing concept (the role whitelist is `whitelist_roles`, full stop).
+- **Rate limiting** is the nested-window ladder in gpt.py
+  (`cooldown_config`/`_check_cooldown`, tunable via `/ai settings` →
+  Cooldowns). Don't reintroduce flat per-message cooldowns.
 
 ## Related
 
