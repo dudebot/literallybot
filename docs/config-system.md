@@ -78,6 +78,53 @@ config.set(guild_id, "setting", value)
 config.set_user(user_id, "preference", value)
 ```
 
+## Key Registry
+
+Every key the codebase actually reads or writes, by scope. Keep this current
+when adding keys — it is the schema documentation for `configs/*.json`.
+(The code examples elsewhere in this doc use invented keys like `prefix` for
+illustration; they are not real.)
+
+### Global scope (`global.json`)
+
+| Key | Shape | Written by | Notes |
+|-----|-------|-----------|-------|
+| `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin` | Read through `core.utils.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes" |
+| `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?}}}}` | `/ai settings` → Providers tab, `/ai setapikey` discovery | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
+| `<PROVIDER>_API_KEY` | `str` (e.g. `XAI_API_KEY`) | `/ai setapikey`, Providers-tab key modal | Env var of the same name is the fallback; removed with its provider |
+| `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
+| `cooldown_tier_bases` | `{tier: seconds}` | `/ai settings` → Cooldowns | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS` |
+| `cooldown_windows` | `list[[count, period_mult]]` | `/ai settings` → Cooldowns | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
+| `mcp_tools_enabled` | `list[str]` op names | `/ai settings` → MCP tools | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
+| `error_logging` | `{default_channel?, category_channels?, severity_channels?, rate_limit_minutes?}` | `!errorlog` subcommands | Same shape also exists per-guild (guild overrides global) |
+| `reminders` | `list[{user_id, timestamp, text}]` | `!remindme` | Deliberately ONE global list across all guilds/DMs, filtered by `user_id` on read |
+| `hue_bridge_ip` | `str` | `!sethuebridgeip` | signal cog |
+| `command_author_allowlist` | `list[int]` | *no command surface* | bot.py bot-authored-command dispatch; hand-edit only |
+
+### Guild scope (`<guild_id>.json`)
+
+| Key | Shape | Written by | Notes |
+|-----|-------|-----------|-------|
+| `admins` | `list[int]` user ids | `!addadmin` / `!removeadmin` / `!claimadmin` | Read via `core.utils.is_admin` |
+| `current_ai_provider` | `str` provider id | `/ai settings` → Server tab | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
+| `current_ai_model` | `str` or absent | `/ai settings` → Server tab | Absent ⇒ provider's `default_model` |
+| `gpt_personality_data` | `{prompt: str, version: int}` | `/ai settings` → Personality modal | version = unix ts, tags memories |
+| `gpt_memories` | `list[{text, expires, type, sender, personality_version, stored_at}]` | gpt.py memory capture | TTL-purged on read/write |
+| `bot_tools_enabled` | `list[str]` ⊆ `AGENT_OPS` | `/ai settings` → Bot tools | Empty/absent ⇒ plain chat (no agent loop) |
+| `whitelist_roles` | `list[str]` role NAMES | `/roles settings` panel | The single whitelist data model — `!setrole`, `/roles claim`, and the panel all share it. Names, not ids: survives nothing being renamed; unresolvable entries are flagged in the panel, never auto-dropped |
+| `emoji_role_toggles` | `{message_id_str: {emoji_key_str: role_id_int}}` | `/setemojiroletoggle` / `/removeemojiroletoggle` | emoji_key is custom-emoji id as str, or the unicode emoji itself |
+| `error_logging` | as global | `!errorlog` in-guild | |
+
+### User scope (`user_<id>.json`)
+
+Currently **unused** — the API supports it but no live code writes user files.
+
+### Conventions
+
+- Bare-int ctx is the idiom for context-free access: `config.set(guild_id, key, value)` resolves guild scope from the int (used by panels, migrations, raw-reaction handlers).
+- `config.set(None, key, value, scope="global")` (or `set_global`) is the global-write idiom.
+- A few call sites in `ai_admin.py`/`gpt.py` scan `config._configs` directly (provider-in-use check, one-shot migrations). They rely on the file-id convention: guild configs are `"<digits>"`, the global config is `"global"`, user configs are `"user_<digits>"`. If you add a new file-id class, update those scans.
+
 ## Gotchas
 
 ### `get()` Is Read-Only
@@ -133,7 +180,8 @@ This enables patterns like:
 
 ### Inter-Cog Communication Example
 
-Two cogs can coordinate by writing to shared config keys:
+Two cogs can coordinate by writing to shared config keys (illustrative
+pattern — nothing in the current codebase uses it):
 
 ```python
 # Cog A: Producer
