@@ -4,43 +4,55 @@ import discord
 import os
 import time
 import re
+from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from core.utils import is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 
-# Per-message cooldown tiers, driven by a model's declared cost per million
-# OUTPUT tokens (`cost_per_mtok_output` on the model config). Enforcement is a
-# manual per-guild min-interval check (_check_cooldown) — the old flat
-# @commands.cooldown decorator couldn't read per-model config. Tiers, not a
-# continuous curve, because no model clusters near a boundary today.
-#
-# Sizing (measured: median prompt ~4.7k tok, output ~63 tok; grok-4.5 at
-# $2/$6 per Mtok in/out ~= $0.0097/msg median, ~$0.066/msg at max context):
-# pricy=300s gives 6 msgs / 30min, so even a max-context spam spree stays
-# under ~$0.40 / 30min. cheap=10s is the "free/local model" floor.
+# Rate limiting is a nested-window ladder, not a flat per-message cooldown.
+# A model's declared cost per million OUTPUT tokens (`cost_per_mtok_output`)
+# classifies it into a tier; each tier maps to a BASE period x (seconds), and
+# the shared window ladder allows `count` messages per `period_mult * x`
+# seconds — a message must have room in EVERY window. Default ladder
+# 1/x · 10/15x · 100/150x means bursts are spaced only x apart while the
+# outer windows carry the sustained-cost control (pricy x=30: a quick
+# follow-up costs 30s, but sustained use converges to ~1 msg/45s and a
+# 100-message spree needs 75 minutes). The old flat 300s pricy cooldown
+# blocked conversational follow-ups — the exact failure this replaces.
+# Both the per-tier bases and the ladder are superadmin-tunable in
+# /ai settings → Cooldowns (global config: cooldown_tier_bases,
+# cooldown_windows).
 COOLDOWN_TIERS = (
-    # (label, max_cost_exclusive, seconds) — first bucket whose bound the
-    # cost falls under wins; the last (inf) is the catch-all "pricy" tier.
-    ("cheap", 1.0, 10),
-    ("standard", 5.0, 45),
-    ("pricy", float("inf"), 300),
+    # (label, max_cost_exclusive, default_base_seconds) — first bucket whose
+    # bound the cost falls under wins; (inf) is the catch-all "pricy" tier.
+    ("cheap", 1.0, 2),
+    ("standard", 5.0, 8),
+    ("pricy", float("inf"), 30),
 )
 # Cost is UNSET on a model => treat as pricy (safe default: expensive models
-# enter via !addmodel unannotated; defaulting unlabeled to cheap is a wallet
-# footgun). A known-free local model is opted into cheap with explicit 0.0.
-_UNSET_COST_SECONDS = 300
+# enter unannotated; defaulting unlabeled to cheap is a wallet footgun). A
+# known-free local model is opted into cheap with explicit 0.0.
+_UNSET_COST_SECONDS = 30
+# (count, period_mult) pairs: count messages allowed per period_mult * base.
+DEFAULT_COOLDOWN_WINDOWS = ((1, 1), (10, 15), (100, 150))
 
 
-def cooldown_tier_for_cost(cost_per_mtok_output):
-    """(label, seconds) for a model's output-token cost. None => pricy."""
+def cooldown_tier_for_cost(cost_per_mtok_output, tier_bases=None):
+    """(label, base_seconds) for a model's output-token cost. None => pricy.
+
+    `tier_bases` optionally overrides the default per-tier base periods with
+    the operator-configured ones (Gpt.cooldown_config()[0])."""
+    def base_for(label, default):
+        return (tier_bases or {}).get(label, default)
+
     if cost_per_mtok_output is None:
-        return ("pricy", _UNSET_COST_SECONDS)
+        return ("pricy", base_for("pricy", _UNSET_COST_SECONDS))
     for label, bound, seconds in COOLDOWN_TIERS:
         if cost_per_mtok_output < bound:
-            return (label, seconds)
-    return ("pricy", _UNSET_COST_SECONDS)
+            return (label, base_for(label, seconds))
+    return ("pricy", base_for("pricy", _UNSET_COST_SECONDS))
 
 
 class Gpt(commands.Cog):
@@ -53,10 +65,11 @@ class Gpt(commands.Cog):
         # Provider-agnostic LLM client: provider/model resolution, API calls,
         # model discovery, and usage/cost tracking now live in core.llm.
         self.llm = LLMClient(self.bot.config, logger=self.logger)
-        # Per-guild timestamp of the last accepted LLM call (monotonic).
-        # Backs the per-model cooldown (see _check_cooldown). In-memory, so it
-        # resets on restart — same durability as the old decorator bucket.
-        self._last_call_ts: Dict[int, float] = {}
+        # Per-guild monotonic timestamps of accepted LLM calls, newest last.
+        # Backs the nested-window rate limit (see _check_cooldown). In-memory,
+        # so it resets on restart — acceptable: this is cost shaping, not
+        # billing, and restarts are rare.
+        self._call_history: Dict[int, deque] = {}
 
     def _current_model_info(self, ctx) -> Dict[str, Any]:
         """The stored config dict for the guild's current model (may be {})."""
@@ -77,24 +90,79 @@ class Gpt(commands.Cog):
         raw = self.bot.config.get(ctx, "bot_tools_enabled") or []
         return [n for n in raw if n in AGENT_OPS]
 
-    def _check_cooldown(self, ctx):
-        """Per-guild min-interval gate keyed by the current model's cost tier.
+    def cooldown_config(self):
+        """(tier_bases, windows) — operator overrides merged over defaults.
 
-        Returns remaining seconds if still cooling down (call refused), or
-        None if the call is allowed — in which case it RECORDS the call so the
-        next one is spaced by the tier interval. DMs are never rate-limited.
+        tier_bases: {tier_label: base_seconds}. windows: sorted list of
+        (count, period_mult) meaning `count` messages allowed per
+        `period_mult * base` seconds. Malformed config falls back whole-sale
+        to the defaults rather than half-applying."""
+        raw_bases = self.bot.config.get(None, "cooldown_tier_bases", scope="global") or {}
+        bases = {}
+        for label, _bound, default in COOLDOWN_TIERS:
+            try:
+                bases[label] = max(0.0, float(raw_bases.get(label, default)))
+            except (TypeError, ValueError):
+                bases[label] = default
+
+        raw_windows = self.bot.config.get(None, "cooldown_windows", scope="global")
+        windows = []
+        if isinstance(raw_windows, list):
+            try:
+                windows = sorted((int(c), float(m)) for c, m in raw_windows)
+                if not windows or any(c < 1 or m <= 0 for c, m in windows):
+                    windows = []
+            except (TypeError, ValueError):
+                windows = []
+        if not windows:
+            windows = list(DEFAULT_COOLDOWN_WINDOWS)
+        return bases, windows
+
+    def _check_cooldown(self, ctx):
+        """Per-guild nested-window gate keyed by the current model's cost tier.
+
+        Every configured window must have room (1/x AND 10/15x AND 100/150x by
+        default — stacked quotas, so bursts are cheap but sustained spam hits
+        the outer windows). Returns remaining seconds until the tightest
+        violated window frees up, or None if allowed — in which case the call
+        is RECORDED (see _refund_last_call for the API-failure refund). DMs
+        are never rate-limited, and superadmins are always immune.
         """
         if getattr(ctx, "guild", None) is None:
             return None
+        if is_superadmin(self.bot.config, ctx.author.id):
+            return None
         cost = self._current_model_info(ctx).get("cost_per_mtok_output")
-        _label, cd = cooldown_tier_for_cost(cost)
+        bases, windows = self.cooldown_config()
+        label, base = cooldown_tier_for_cost(cost, bases)
+        if base <= 0:
+            return None
         now = time.monotonic()
-        last = self._last_call_ts.get(ctx.guild.id, 0.0)
-        remaining = cd - (now - last)
-        if remaining > 0:
-            return remaining
-        self._last_call_ts[ctx.guild.id] = now
+        hist = self._call_history.setdefault(ctx.guild.id, deque())
+        horizon = max(m for _c, m in windows) * base
+        while hist and now - hist[0] > horizon:
+            hist.popleft()
+        worst = 0.0
+        for count, mult in windows:
+            period = mult * base
+            recent = [t for t in hist if now - t <= period]
+            if len(recent) >= count:
+                # The count-th most recent call exits this window at t+period.
+                worst = max(worst, recent[-count] + period - now)
+        if worst > 0:
+            return worst
+        hist.append(now)
         return None
+
+    def _refund_last_call(self, ctx):
+        """Un-record the most recent call after an API failure — an errored
+        request costs (almost) nothing and must not burn the window (a 429
+        used to lock a guild out for the full pricy cooldown)."""
+        if getattr(ctx, "guild", None) is None:
+            return
+        hist = self._call_history.get(ctx.guild.id)
+        if hist:
+            hist.pop()
 
     def get_provider_config(self, ctx) -> Dict[str, Any]:
         """Get the current provider configuration for a guild.
@@ -466,6 +534,7 @@ class Gpt(commands.Cog):
                     
             except Exception as e:
                 self.logger.error(f"AI API error: {e}", exc_info=True)
+                self._refund_last_call(ctx)
                 await ctx.send(f"Error calling {provider_config['provider']} API: {str(e)}")
                 return
 
@@ -631,9 +700,9 @@ class Gpt(commands.Cog):
         # Save back to global config
         config.set(None, "ai_providers", all_providers, scope="global")
 
-        tier, cooldown = cooldown_tier_for_cost(cost)
+        tier, base = cooldown_tier_for_cost(cost, self.cooldown_config()[0])
         cost_str = "unset → pricy" if cost is None else f"${cost:g}/Mtok out"
-        return f"Added model '{model_name}' to {provider_info['name']} ({cost_str}, {tier} tier: {cooldown}s cooldown)"
+        return f"Added model '{model_name}' to {provider_info['name']} ({cost_str}, {tier} tier: {base:g}s burst spacing)"
 
     def _do_removemodel(self, ctx, model_name: str, provider: Optional[str]) -> str:
         """Core logic for removing a model from a provider. Returns the response text."""
@@ -712,9 +781,10 @@ class Gpt(commands.Cog):
         models_dict[model_name] = mcfg
         self.bot.config.set(None, "ai_providers", all_providers, scope="global")
 
-        tier, cooldown = cooldown_tier_for_cost(mcfg.get("cost_per_mtok_output"))
+        tier, base = cooldown_tier_for_cost(mcfg.get("cost_per_mtok_output"),
+                                            self.cooldown_config()[0])
         cost_str = "unset → pricy" if cost is None else f"${cost:g}/Mtok out"
-        return f"Updated '{model_name}' ({cost_str}, {tier} tier: {cooldown}s cooldown)"
+        return f"Updated '{model_name}' ({cost_str}, {tier} tier: {base:g}s burst spacing)"
 
     async def _do_setapikey(self, provider: str, api_key: str, key_usage_hint: str = "/ai settings → Providers") -> List[str]:
         """Core logic for storing a provider API key and attempting model discovery.

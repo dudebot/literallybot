@@ -33,7 +33,7 @@ from core.utils import is_admin, is_superadmin
 from core.agent_loop import AGENT_OPS
 from mcp_ops.server import _EXPOSED_OPS
 from core.llm.usage import _PRICING_USD_PER_MTOK
-from cogs.dynamic.gpt import cooldown_tier_for_cost
+from cogs.dynamic.gpt import cooldown_tier_for_cost, COOLDOWN_TIERS
 
 # Output-token prices ($/Mtok) for models the usage.py table doesn't cover, so
 # the one-time cost-seed can tier them correctly instead of defaulting to
@@ -355,6 +355,102 @@ class _RemoveProviderModal(discord.ui.Modal, title="Remove provider"):
         await self._panel.rerender(interaction)
 
 
+def _clip_1024(text: str) -> str:
+    """Keep an embed field value under Discord's 1024-char cap."""
+    return text if len(text) <= 1024 else text[:1010] + "\n… (more)"
+
+
+def _fmt_secs(s: float) -> str:
+    """Humanize a period: 45s, 7.5min, 2.1h."""
+    if s < 120:
+        return f"{s:g}s"
+    if s < 7200:
+        return f"{s / 60:g}min"
+    return f"{s / 3600:.1f}h"
+
+
+class _TierBasesModal(discord.ui.Modal, title="Cooldown tier base periods"):
+    """One base period x per cost tier; the window ladder scales off it."""
+
+    def __init__(self, view: "AiSettingsView"):
+        super().__init__()
+        self._panel = view
+        bases, _ = view.gpt.cooldown_config()
+        self.inputs = {}
+        for label, _bound, _default in COOLDOWN_TIERS:
+            ti = discord.ui.TextInput(
+                label=f"{label} tier base seconds (x)",
+                required=True, max_length=10, default=f"{bases[label]:g}")
+            self.inputs[label] = ti
+            self.add_item(ti)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message("Requires superadmin.", ephemeral=True)
+            return
+        try:
+            new_bases = {label: float(str(ti.value).strip())
+                         for label, ti in self.inputs.items()}
+        except ValueError:
+            self._panel.flash("⚠ Base periods must be numbers — nothing saved.")
+            await self._panel.rerender(interaction)
+            return
+        if any(v < 0 for v in new_bases.values()):
+            self._panel.flash("⚠ Base periods can't be negative — nothing saved.")
+            await self._panel.rerender(interaction)
+            return
+        self._panel.bot.config.set(None, "cooldown_tier_bases", new_bases, scope="global")
+        self._panel.flash("Tier base periods updated (0 disables rate limiting for a tier).")
+        await self._panel.rerender(interaction)
+
+
+class _WindowsModal(discord.ui.Modal, title="Cooldown window ladder"):
+    """The stacked quotas, as `count:period_mult` pairs relative to the tier
+    base x — e.g. `1:1, 10:15, 100:150` = 1 msg per x AND 10 per 15x AND
+    100 per 150x. Every window must have room for a message to pass."""
+
+    def __init__(self, view: "AiSettingsView"):
+        super().__init__()
+        self._panel = view
+        _, windows = view.gpt.cooldown_config()
+        self.spec = discord.ui.TextInput(
+            label="count:mult pairs, comma-separated",
+            required=True, max_length=100,
+            default=", ".join(f"{c}:{m:g}" for c, m in windows))
+        self.add_item(self.spec)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message("Requires superadmin.", ephemeral=True)
+            return
+        try:
+            pairs = []
+            for chunk in str(self.spec.value).split(","):
+                c, m = chunk.strip().split(":")
+                pairs.append((int(c), float(m)))
+            pairs.sort()
+        except ValueError:
+            self._panel.flash("⚠ Couldn't parse — use `count:mult, count:mult` (e.g. `1:1, 10:15, 100:150`).")
+            await self._panel.rerender(interaction)
+            return
+        if not (1 <= len(pairs) <= 5):
+            self._panel.flash("⚠ 1–5 windows, please.")
+            await self._panel.rerender(interaction)
+            return
+        counts = [c for c, _ in pairs]
+        mults = [m for _, m in pairs]
+        if (any(c < 1 for c in counts) or any(m <= 0 for m in mults)
+                or len(set(counts)) != len(counts)
+                or sorted(mults) != mults or len(set(mults)) != len(mults)):
+            self._panel.flash("⚠ Counts and periods must both be strictly increasing and positive.")
+            await self._panel.rerender(interaction)
+            return
+        self._panel.bot.config.set(None, "cooldown_windows",
+                                   [[c, m] for c, m in pairs], scope="global")
+        self._panel.flash("Window ladder updated.")
+        await self._panel.rerender(interaction)
+
+
 class _PersonalityModal(discord.ui.Modal, title="Set AI personality"):
     def __init__(self, view: "AiSettingsView"):
         super().__init__()
@@ -473,6 +569,7 @@ class AiSettingsView(discord.ui.View):
         self.clear_items()
         self.add_item(self._tab_button("⚙ Server", "server"))
         self.add_item(self._tab_button("🧩 Providers", "providers"))
+        self.add_item(self._tab_button("⏱ Cooldowns", "cooldowns"))
         self.add_item(self._tab_button("🤖 Bot tools", "bot"))
         self.add_item(self._tab_button("🌐 MCP tools", "mcp"))
 
@@ -507,6 +604,14 @@ class AiSettingsView(discord.ui.View):
                 "🗑 Remove provider", row=4,
                 style=discord.ButtonStyle.danger,
                 opener=lambda: _RemoveProviderModal(self)))
+        elif self.page == "cooldowns":
+            self.add_item(self._crud_button(
+                "✏ Tier base periods", row=1,
+                opener=lambda: _TierBasesModal(self)))
+            self.add_item(self._crud_button(
+                "✏ Window ladder", row=1,
+                opener=lambda: _WindowsModal(self)))
+            self.add_item(self._reset_cooldowns_button())
         elif self.page == "bot":
             self.add_item(_ToolSelect(list(AGENT_OPS), self._bot_tools(),
                                       self._save_bot_tools, row=1))
@@ -604,6 +709,24 @@ class AiSettingsView(discord.ui.View):
         btn.callback = cb
         return btn
 
+    def _reset_cooldowns_button(self):
+        btn = discord.ui.Button(label="↺ Reset to defaults",
+                                style=discord.ButtonStyle.secondary, row=1)
+
+        async def cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message(
+                    "Requires superadmin (this edits global bot config).",
+                    ephemeral=True)
+                return
+            self.bot.config.rem(None, "cooldown_tier_bases", scope="global")
+            self.bot.config.rem(None, "cooldown_windows", scope="global")
+            self.flash("Cooldown config reset to built-in defaults.")
+            await self.rerender(interaction)
+
+        btn.callback = cb
+        return btn
+
     def _default_model_button(self, *, disabled):
         btn = discord.ui.Button(label="⭐ Make default",
                                 style=discord.ButtonStyle.secondary, row=3,
@@ -654,6 +777,8 @@ class AiSettingsView(discord.ui.View):
     def _embed(self, mcp_note=False):
         if self.page == "providers":
             e = self._providers_embed()
+        elif self.page == "cooldowns":
+            e = self._cooldowns_embed()
         else:
             e = self._overview_embed()
         if self._flash:
@@ -667,7 +792,9 @@ class AiSettingsView(discord.ui.View):
 
     def _overview_embed(self):
         model_info = self.gpt._current_model_info(self._cfg_ctx())
-        tier, cd = cooldown_tier_for_cost(model_info.get("cost_per_mtok_output"))
+        bases, windows = self.gpt.cooldown_config()
+        tier, base = cooldown_tier_for_cost(
+            model_info.get("cost_per_mtok_output"), bases)
         bot_tools = self._bot_tools()
         mcp_tools = self._mcp_tools()
         e = discord.Embed(
@@ -677,7 +804,10 @@ class AiSettingsView(discord.ui.View):
         )
         e.add_field(name="Provider / Model",
                     value=f"{self.provider} / **{self.model}**", inline=True)
-        e.add_field(name="Cooldown", value=f"{cd}s per msg ({tier})", inline=True)
+        e.add_field(name="Rate limit",
+                    value=" · ".join(f"{c}/{_fmt_secs(m * base)}"
+                                     for c, m in windows) + f" ({tier})",
+                    inline=True)
         e.add_field(
             name="Bot tools (this server)",
             value=(", ".join(bot_tools) if bot_tools else "*none — plain chat*"),
@@ -688,6 +818,49 @@ class AiSettingsView(discord.ui.View):
             value=(", ".join(mcp_tools) if mcp_tools else "*none*"),
             inline=False,
         )
+        return e
+
+    def _cooldowns_embed(self):
+        """The rate-limit picture: the window ladder, and every configured
+        model bucketed into its cost tier with the resulting allowances."""
+        bases, windows = self.gpt.cooldown_config()
+        all_providers = self.gpt.llm.get_all_providers()
+        e = discord.Embed(
+            title="AI settings — Cooldowns",
+            description="Stacked windows: a message needs room in EVERY "
+                        "window (bursts are cheap, sustained spam hits the "
+                        "outer quotas). Superadmins are immune; failed API "
+                        "calls are refunded. Global config (superadmin).",
+            color=discord.Color.blurple(),
+        )
+        e.add_field(
+            name="Window ladder (per tier base x)",
+            value=" · ".join(f"{c} msg{'s' if c > 1 else ''} / {m:g}x"
+                             for c, m in windows),
+            inline=False,
+        )
+        # Bucket every configured model into its tier.
+        buckets = {label: [] for label, _b, _d in COOLDOWN_TIERS}
+        for pid, pinfo in all_providers.items():
+            for m, mcfg in pinfo.get("models", {}).items():
+                cost = mcfg.get("cost_per_mtok_output") if isinstance(mcfg, dict) else None
+                label, _ = cooldown_tier_for_cost(cost, bases)
+                buckets[label].append(f"{pid}/{m}")
+        for label, bound, _default in COOLDOWN_TIERS:
+            base = bases[label]
+            bound_str = "≥ $5" if bound == float("inf") else f"< ${bound:g}"
+            if base <= 0:
+                ladder = "*rate limiting disabled*"
+            else:
+                ladder = " · ".join(
+                    f"{c}/{_fmt_secs(m * base)}" for c, m in windows)
+            models = buckets[label]
+            e.add_field(
+                name=f"{label} ({bound_str}/Mtok out) — x = {base:g}s",
+                value=f"{ladder}\n" + (_clip_1024(", ".join(models))
+                                       if models else "*no models in this bucket*"),
+                inline=False,
+            )
         return e
 
     def _providers_embed(self):
@@ -710,17 +883,18 @@ class AiSettingsView(discord.ui.View):
             inline=False,
         )
         default_model = info.get("default_model")
+        bases, _windows = self.gpt.cooldown_config()
         lines = []
         for m, mcfg in info.get("models", {}).items():
             if not isinstance(mcfg, dict):
                 mcfg = {}
             cost = mcfg.get("cost_per_mtok_output")
-            tier, cd = cooldown_tier_for_cost(cost)
+            tier, base = cooldown_tier_for_cost(cost, bases)
             cost_str = "cost unset" if cost is None else f"${cost:g}/Mtok"
             extras = f", max_tokens {mcfg['max_completion_tokens']}" \
                 if "max_completion_tokens" in mcfg else ""
             marker = " ⭐" if m == default_model else ""
-            lines.append(f"• **{m}**{marker} — {cost_str} → {tier} ({cd}s){extras}")
+            lines.append(f"• **{m}**{marker} — {cost_str} → {tier} (x={base:g}s){extras}")
         models_text = "\n".join(lines) if lines else "*no models*"
         if len(models_text) > 1024:
             models_text = models_text[:1010] + "\n… (more)"
