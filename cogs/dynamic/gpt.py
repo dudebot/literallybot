@@ -15,28 +15,36 @@ from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 # A model's declared cost per million OUTPUT tokens (`cost_per_mtok_output`)
 # classifies it into a tier; each tier maps to a BASE period x (seconds), and
 # the shared window ladder allows `count` messages per `period_mult * x`
-# seconds — a message must have room in EVERY window. Default ladder
-# 1/x · 10/15x · 100/150x means bursts are spaced only x apart while the
-# outer windows carry the sustained-cost control (pricy x=30: a quick
-# follow-up costs 30s, but sustained use converges to ~1 msg/45s and a
-# 100-message spree needs 75 minutes). The old flat 300s pricy cooldown
+# seconds — a message must have room in EVERY window. The levels decompose:
+# innermost = turn-taking pace, middle two = session quotas, outermost =
+# the actual spend cap (only the LAST window bounds worst-case daily cost;
+# the inner ones just shape burstiness). The old flat 300s pricy cooldown
 # blocked conversational follow-ups — the exact failure this replaces.
-# Both the per-tier bases and the ladder are superadmin-tunable in
-# /ai settings → Cooldowns (global config: cooldown_tier_bases,
-# cooldown_windows).
+#
+# Defaults sized by simulation over 10 ladder shapes x 5 usage patterns
+# (correction retry, 8-msg chat, 15-msg burst, 40-msg afternoon, 150-msg
+# heavy day) at grok-4.5 pricing (median $0.0097/msg, worst $0.066/msg):
+# pricy x=20 with 1/x · 10/15x · 100/150x · 300/4320x passes every pattern
+# with zero blocks while capping worst-case spend at 300 msgs/day ≈ $20/day
+# (the same cap the flat 300s gave, minus the broken UX). 2^n-style ladders
+# decay allowed rate too fast (block everything); ladders without a
+# day-scale outer window leak to ~$127/day sustained. Both knobs are
+# superadmin-tunable in /ai settings → Cooldowns (global config:
+# cooldown_tier_bases, cooldown_windows).
 COOLDOWN_TIERS = (
     # (label, max_cost_exclusive, default_base_seconds) — first bucket whose
     # bound the cost falls under wins; (inf) is the catch-all "pricy" tier.
     ("cheap", 1.0, 2),
     ("standard", 5.0, 8),
-    ("pricy", float("inf"), 30),
+    ("pricy", float("inf"), 20),
 )
 # Cost is UNSET on a model => treat as pricy (safe default: expensive models
 # enter unannotated; defaulting unlabeled to cheap is a wallet footgun). A
 # known-free local model is opted into cheap with explicit 0.0.
-_UNSET_COST_SECONDS = 30
+_UNSET_COST_SECONDS = 20
 # (count, period_mult) pairs: count messages allowed per period_mult * base.
-DEFAULT_COOLDOWN_WINDOWS = ((1, 1), (10, 15), (100, 150))
+# The 300/4320x outer window is 24h at pricy's x=20 — the daily spend cap.
+DEFAULT_COOLDOWN_WINDOWS = ((1, 1), (10, 15), (100, 150), (300, 4320))
 
 
 def cooldown_tier_for_cost(cost_per_mtok_output, tier_bases=None):
