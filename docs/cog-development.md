@@ -151,14 +151,15 @@ async def list_favorites(self, ctx):
 
 ### Basic Permission Checks
 ```python
+from core.utils import is_admin
+
 @commands.command()
 async def admin_only(self, ctx):
     """Command only admins can use"""
-    admins = self.bot.config.get(ctx, "admins", [])
-    if ctx.author.id not in admins:
+    if not is_admin(self.bot.config, ctx):
         await ctx.send("You don't have permission to use this command.")
         return
-    
+
     await ctx.send("Admin command executed!")
 
 @commands.command()
