@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from core.utils import is_admin, is_superadmin, recursive_split
-from core.llm import LLMClient, PROVIDER_ALIASES
+from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 
 # Per-message cooldown tiers, driven by a model's declared cost per million
 # OUTPUT tokens (`cost_per_mtok_output` on the model config). Enforcement is a
@@ -95,15 +95,6 @@ class Gpt(commands.Cog):
             return remaining
         self._last_call_ts[ctx.guild.id] = now
         return None
-
-    def is_authorized(self, ctx_or_interaction) -> bool:
-        """Check if the invoking user is authorized to use admin commands.
-
-        Single auth gate shared by prefix commands (ctx) and slash commands
-        (discord.Interaction) - see core.utils.is_admin for the ctx/interaction
-        normalization. Superadmins and per-guild admins are both authorized.
-        """
-        return is_admin(self.bot.config, ctx_or_interaction)
 
     def get_provider_config(self, ctx) -> Dict[str, Any]:
         """Get the current provider configuration for a guild.
@@ -570,14 +561,6 @@ class Gpt(commands.Cog):
         provider_info = all_providers[provider]
         return f"Switched to {provider_info['name']} (default model: {provider_info['default_model']})"
 
-    @commands.command(name='setprovider')
-    async def setprovider(self, ctx, provider: str):
-        """Change the AI provider (admin only)"""
-        if not self.is_authorized(ctx):
-            await ctx.send("You do not have permission to use this command.")
-            return
-        await ctx.send(self._do_setprovider(ctx, provider))
-
     def _do_setmodel(self, ctx, model: str) -> str:
         """Core logic for changing the AI model. Returns the response text."""
         provider_config = self.get_provider_config(ctx)
@@ -591,69 +574,14 @@ class Gpt(commands.Cog):
         self.bot.config.set(ctx, "current_ai_model", model)
         return f"Switched to model: {model}"
 
-    @commands.command(name='setmodel')
-    async def setmodel(self, ctx, model: str):
-        """Change the AI model for current provider (admin only)"""
-        if not self.is_authorized(ctx):
-            await ctx.send("You do not have permission to use this command.")
-            return
-        await ctx.send(self._do_setmodel(ctx, model))
-
-    def _do_aiinfo(self, ctx, key_usage_hint: str = "!setapikey <provider> <key>") -> str:
-        """Core logic for the AI info summary. Returns the response text."""
-        provider_config = self.get_provider_config(ctx)
-        provider = provider_config["provider"]
-        model = provider_config["model"]
-        provider_info = provider_config["provider_info"]
-        all_providers = provider_config["all_providers"]
-
-        # Cooldown for the current model, from its cost tier.
-        models_info = provider_info.get("models", {})
-        model_info = models_info.get(model, {})
-        tier, cooldown_time = cooldown_tier_for_cost(model_info.get("cost_per_mtok_output"))
-
-        info_lines = [
-            f"**Current Provider:** {provider_info['name']} ({provider})",
-            f"**Current Model:** {model}",
-            f"**Available Models:** {', '.join(models_info.keys())}",
-            f"**Cooldown:** {cooldown_time}s per message ({tier})",
-            "",
-            "**All Providers:**"
-        ]
-
-        # Check which providers have API keys configured
-        for prov_id, prov_info in all_providers.items():
-            api_key_name = f"{prov_id.upper()}_API_KEY"
-            has_key = bool(self.bot.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name))
-            if not prov_info.get("requires_api_key", True):
-                status = "✅ No key required (local)"
-            else:
-                status = "✅ Configured" if has_key else "❌ No API key"
-            models_dict = prov_info.get("models", {})
-
-            # Format models with their cooldown (from cost tier)
-            model_details = []
-            for model_name, model_cfg in models_dict.items():
-                _tier, cooldown = cooldown_tier_for_cost(model_cfg.get("cost_per_mtok_output"))
-                model_details.append(f"{model_name} ({cooldown}s)")
-
-            info_lines.append(f"• **{prov_info['name']}** ({prov_id}): {status}")
-            info_lines.append(f"  Models: {', '.join(model_details)}")
-
-            # Show aliases if this provider has any
-            aliases = [alias for alias, target in self.provider_aliases.items() if target == prov_id]
-            if aliases:
-                info_lines.append(f"  Aliases: {', '.join(aliases)}")
-
-        info_lines.append("")
-        info_lines.append(f"To add API keys, use {key_usage_hint}")
-
-        return "\n".join(info_lines)
-
-    @commands.command(name='aiinfo')
-    async def aiinfo(self, ctx):
-        """Show current AI provider and model information"""
-        await ctx.send(self._do_aiinfo(ctx))
+    def provider_key_status(self, prov_id: str, prov_info: dict) -> str:
+        """Key-configured status line for a provider (shared by /ai status and
+        the settings panel's Providers tab)."""
+        api_key_name = f"{prov_id.upper()}_API_KEY"
+        has_key = bool(self.bot.config.get(None, api_key_name, scope="global") or os.environ.get(api_key_name))
+        if not prov_info.get("requires_api_key", True):
+            return "✅ No key required (local)"
+        return "✅ Key configured" if has_key else "❌ No API key"
 
     def _do_addmodel(self, ctx, model_name: str, provider: Optional[str], cost: Optional[float], max_tokens: Optional[int]) -> str:
         """Core logic for adding a model to a provider. Returns the response text.
@@ -707,24 +635,6 @@ class Gpt(commands.Cog):
         cost_str = "unset → pricy" if cost is None else f"${cost:g}/Mtok out"
         return f"Added model '{model_name}' to {provider_info['name']} ({cost_str}, {tier} tier: {cooldown}s cooldown)"
 
-    @commands.command(name='addmodel')
-    async def addmodel(self, ctx, model_name: str, provider: str = None, cost: float = None, max_tokens: int = None):
-        """Add a model to a provider (superadmin only)
-        Usage: !addmodel <model_name> [provider] [cost_per_million_output_tokens] [max_tokens]
-        Example: !addmodel grok-5-fast xai 0.50
-        Example: !addmodel gpt-6-mini openai 4.50 12000
-        Example: !addmodel qwen-local ollama 0        (free -> cheap tier)
-        Cost is USD per million OUTPUT tokens and sets the cooldown tier
-        (cheap <$1 = 10s, standard <$5 = 45s, pricy = 300s). Omit it and the
-        model defaults to the pricy tier.
-        """
-        if not is_superadmin(self.bot.config, ctx.author.id):
-            # Global-config mutation: keys/models are shared by EVERY guild
-            # this bot is in, so guild admins don't get to change them.
-            await ctx.send("This changes global bot config — superadmin only.")
-            return
-        await ctx.send(self._do_addmodel(ctx, model_name, provider, cost, max_tokens))
-
     def _do_removemodel(self, ctx, model_name: str, provider: Optional[str]) -> str:
         """Core logic for removing a model from a provider. Returns the response text."""
         config = self.bot.config
@@ -775,64 +685,38 @@ class Gpt(commands.Cog):
         response_lines.append(f"Removed model '{model_name}' from {provider}")
         return "\n".join(response_lines)
 
-    @commands.command(name='removemodel')
-    async def removemodel(self, ctx, model_name: str, provider: str = None):
-        """Remove a model from a provider (admin only)
-        Usage: !removemodel <model_name> [provider]
-        """
-        if not is_superadmin(self.bot.config, ctx.author.id):
-            # Global-config mutation: keys/models are shared by EVERY guild
-            # this bot is in, so guild admins don't get to change them.
-            await ctx.send("This changes global bot config — superadmin only.")
-            return
-        await ctx.send(self._do_removemodel(ctx, model_name, provider))
-
-    def _do_listmodels(self, ctx, provider: Optional[str]) -> str:
-        """Core logic for listing models for a provider. Returns the response text."""
-        config = self.bot.config
-
-        # If no provider specified, use current provider
-        if provider is None:
-            provider_config = self.get_provider_config(ctx)
-            provider = provider_config["provider"]
-        else:
-            # Apply alias if needed
-            provider = self.provider_aliases.get(provider.lower(), provider.lower())
-
-        # Get all providers
+    def _do_editmodel(self, model_name: str, provider: str,
+                      cost: Optional[float], max_tokens: Optional[int]) -> str:
+        """Update cost/max_tokens on an existing model (the only fields a model
+        config carries). Passing None clears the field — cost falls back to the
+        pricy-tier default, max_tokens to the provider default. This is the
+        edit path _do_addmodel deliberately refuses (it hard-rejects existing
+        models), and the only way to fix a default model's cost without
+        removing it first (which the default-model guard forbids)."""
         all_providers = self.llm.get_all_providers()
-
         if provider not in all_providers:
-            return f"Unknown provider '{provider}'. Available: {', '.join(all_providers.keys())}"
+            return f"Unknown provider '{provider}'"
+        models_dict = all_providers[provider].get("models", {})
+        if model_name not in models_dict:
+            return f"Model '{model_name}' not found in {provider}"
 
-        provider_info = all_providers[provider]
-        models_dict = provider_info.get("models", {})
-        default_model = provider_info.get("default_model")
+        mcfg = models_dict[model_name] if isinstance(models_dict[model_name], dict) else {}
+        if cost is None:
+            mcfg.pop("cost_per_mtok_output", None)
+        else:
+            mcfg["cost_per_mtok_output"] = cost
+        if max_tokens is None:
+            mcfg.pop("max_completion_tokens", None)
+        else:
+            mcfg["max_completion_tokens"] = max_tokens
+        models_dict[model_name] = mcfg
+        self.bot.config.set(None, "ai_providers", all_providers, scope="global")
 
-        if not models_dict:
-            return f"No models configured for {provider_info['name']}"
+        tier, cooldown = cooldown_tier_for_cost(mcfg.get("cost_per_mtok_output"))
+        cost_str = "unset → pricy" if cost is None else f"${cost:g}/Mtok out"
+        return f"Updated '{model_name}' ({cost_str}, {tier} tier: {cooldown}s cooldown)"
 
-        info_lines = [f"**Models for {provider_info['name']}:**"]
-
-        for model_name, model_cfg in models_dict.items():
-            cost = model_cfg.get("cost_per_mtok_output")
-            tier, cooldown = cooldown_tier_for_cost(cost)
-            cost_str = "cost unset" if cost is None else f"${cost:g}/Mtok out"
-            max_tokens = model_cfg.get("max_completion_tokens", model_cfg.get("max_tokens", "default"))
-
-            default_marker = " (default)" if model_name == default_model else ""
-            info_lines.append(f"• {model_name}{default_marker}: {cost_str} → {tier} ({cooldown}s), max_tokens: {max_tokens}")
-
-        return "\n".join(info_lines)
-
-    @commands.command(name='listmodels')
-    async def listmodels(self, ctx, provider: str = None):
-        """List all models for a provider
-        Usage: !listmodels [provider]
-        """
-        await ctx.send(self._do_listmodels(ctx, provider))
-
-    async def _do_setapikey(self, provider: str, api_key: str, key_usage_hint: str = "!addmodel") -> List[str]:
+    async def _do_setapikey(self, provider: str, api_key: str, key_usage_hint: str = "/ai settings → Providers") -> List[str]:
         """Core logic for storing a provider API key and attempting model discovery.
 
         Returns a list of response lines the caller can send (kept as multiple
@@ -863,7 +747,7 @@ class Gpt(commands.Cog):
             discovered_models = await self.discover_models(provider, api_key, provider_info)
 
             if discovered_models:
-                lines.append(f"Discovered {len(discovered_models)} models. Use !listmodels {provider} to see them.")
+                lines.append(f"Discovered {len(discovered_models)} models. See them in /ai settings → Providers.")
             else:
                 lines.append(f"Could not auto-discover models. You can add them manually with {key_usage_hint}")
         except Exception as e:
@@ -871,33 +755,6 @@ class Gpt(commands.Cog):
             lines.append(f"API key saved, but model discovery failed: {str(e)}")
 
         return lines
-
-    @commands.command(name='setapikey')
-    async def setapikey(self, ctx, provider: str, api_key: str):
-        """Set API key for a provider (admin only, deletes your message for security)
-        Usage: !setapikey <provider> <key>
-        """
-        if not is_superadmin(self.bot.config, ctx.author.id):
-            # Global-config mutation: keys/models are shared by EVERY guild
-            # this bot is in, so guild admins don't get to change them.
-            await ctx.send("This changes global bot config — superadmin only.")
-            return
-
-        # Delete the user's message immediately for security
-        try:
-            await ctx.message.delete()
-        except Exception as e:
-            self.logger.warning(f"Failed to delete setapikey message: {e}")
-            await ctx.send("Warning: Could not delete your message. Please delete it manually!")
-
-        try:
-            lines = await self._do_setapikey(provider, api_key)
-        except ValueError as e:
-            await ctx.send(str(e))
-            return
-
-        for line in lines:
-            await ctx.send(line)
 
     async def discover_models(self, provider: str, api_key: str, provider_info: Dict) -> List[str]:
         """Attempt to discover available models from provider API.
@@ -962,37 +819,7 @@ class Gpt(commands.Cog):
         personality_version = int(time.time())  # Use timestamp as version
         config.set(ctx, "gpt_personality_data", {"prompt": personality, "version": personality_version})
 
-    @commands.command(name='setpersonality')
-    async def setpersonality(self, ctx, *, personality: str):
-        """Set the GPT personality prompt."""
-        if not self.is_authorized(ctx):
-            await ctx.send("You do not have permission to use this command.")
-            return
-
-        self._do_setpersonality(ctx, personality)
-
-        try:
-            await ctx.message.add_reaction("👍")
-        except Exception: # Catch a broader range of exceptions like discord.HTTPException, discord.Forbidden
-            self.logger.warning(f"Failed to add reaction to setpersonality message by {ctx.author}. Sending text confirmation.")
-            await ctx.send("Personality updated! 👍")
-
-    @commands.command(name='setagentic')
-    async def setagentic(self, ctx, enabled: str = None):
-        """Deprecated — agentic mode is now controlled per-tool.
-
-        The old on/off flag is gone: the bot's Discord tools are enabled
-        individually per server. Enabling any tool turns on the agent loop;
-        with none enabled the bot is plain chat. Configure them in the panel.
-        """
-        await ctx.send(
-            "Agentic mode is no longer a single on/off toggle — you now pick "
-            "which Discord tools the bot can use, per server. Run "
-            "`/ai settings` → **Bot tools** to enable/disable them "
-            "(enable none = plain chat). Superadmin only."
-        )
-
-    def _do_aistatus(self, ctx, prefix_style: bool = True) -> str:
+    def _do_aistatus(self, ctx) -> str:
         """Configured-vs-missing checklist with the exact next command for
         each gap — the anti-"5-step setup I will forget" command."""
         config = self.bot.config
@@ -1002,9 +829,6 @@ class Gpt(commands.Cog):
         provider, model = pc["provider"], pc["model"]
         info = pc["provider_info"]
 
-        def cmd(prefix_form: str, slash_form: str) -> str:
-            return prefix_form if prefix_style else slash_form
-
         lines = ["**AI setup status:**"]
 
         if stored:
@@ -1012,8 +836,8 @@ class Gpt(commands.Cog):
         else:
             lines.append(
                 "▫️ No provider config saved yet — running on built-in defaults. "
-                f"It persists automatically on your first `{cmd('!setapikey', '/ai setapikey')}` / "
-                f"`{cmd('!addmodel', '/ai addmodel')}`."
+                "It persists automatically on your first `/ai setapikey` or "
+                "model change in `/ai settings` → Providers."
             )
 
         lines.append(f"✅ Current provider/model: **{provider}** / **{model}**")
@@ -1029,7 +853,7 @@ class Gpt(commands.Cog):
             key_ok = False
             lines.append(
                 f"❌ API key missing for {provider} → "
-                f"`{cmd(f'!setapikey {provider} <key>', f'/ai setapikey provider:{provider}')}` (admin)"
+                f"`/ai setapikey provider:{provider}` (superadmin)"
             )
 
         bot_tools = self._resolve_bot_tools(ctx)
@@ -1037,8 +861,8 @@ class Gpt(commands.Cog):
             lines.append(f"✅ Bot tools: **{len(bot_tools)} enabled** ({', '.join(bot_tools)})")
         else:
             lines.append(
-                f"▫️ Bot tools: none (plain chat) → "
-                f"`{cmd('/ai settings', '/ai settings')}` → Bot tools (superadmin)"
+                "▫️ Bot tools: none (plain chat) → "
+                "`/ai settings` → Bot tools (superadmin)"
             )
 
         personality_data = config.get(ctx, "gpt_personality_data")
@@ -1046,8 +870,8 @@ class Gpt(commands.Cog):
             lines.append("✅ Personality: custom prompt set")
         else:
             lines.append(
-                f"▫️ Personality: default → "
-                f"`{cmd('!setpersonality <text>', '/ai setpersonality')}` (admin)"
+                "▫️ Personality: default → "
+                "`/ai settings` → ✏ Personality (admin)"
             )
 
         lines.append("")
@@ -1061,7 +885,7 @@ class Gpt(commands.Cog):
     async def aistatus(self, ctx):
         """Show what's configured and what's missing for the AI features,
         with the exact next command for each gap."""
-        await ctx.send(self._do_aistatus(ctx, prefix_style=True))
+        await ctx.send(self._do_aistatus(ctx))
 
     def _do_addprovider(self, ctx, provider_id: str, base_url: str,
                         default_model: str, name: Optional[str]) -> str:
@@ -1071,7 +895,7 @@ class Gpt(commands.Cog):
         provider_id = provider_id.lower()
         all_providers = self.llm.get_all_providers()
         if provider_id in all_providers:
-            return f"Provider '{provider_id}' already exists. Use !setapikey/!addmodel to configure it."
+            return f"Provider '{provider_id}' already exists. Configure it in /ai settings → Providers."
 
         all_providers[provider_id] = {
             "name": name or provider_id,
@@ -1084,34 +908,53 @@ class Gpt(commands.Cog):
         self.bot.config.set(None, "ai_providers", all_providers, scope="global")
         return (
             f"Added OpenAI-compatible provider '{provider_id}' (base_url: {base_url}, "
-            f"default model: {default_model}). Next: `!setapikey {provider_id} <key>`."
+            f"default model: {default_model}). Next: `/ai setapikey provider:{provider_id}`."
         )
 
-    @commands.command(name='addprovider')
-    async def addprovider(self, ctx, provider_id: str, base_url: str,
-                          default_model: str, *, name: str = None):
-        """Register a new OpenAI-compatible provider (superadmin only).
-        Usage: !addprovider <id> <base_url> <default_model> [display name]
-        Example: !addprovider groq https://api.groq.com/openai/v1 llama-4-70b Groq
-        """
-        if not is_superadmin(self.bot.config, ctx.author.id):
-            await ctx.send("You do not have permission to use this command.")
-            return
-        await ctx.send(self._do_addprovider(ctx, provider_id, base_url, default_model, name))
+    def _do_removeprovider(self, ctx, provider_id: str) -> str:
+        """Remove a provider and its stored API key from global config.
+        Caller enforces the superadmin gate AND a typed confirmation (this is
+        the most destructive AI-config op — it drops every model under the
+        provider). Refuses when any guild is actively pointed at the provider
+        or when it's the last one left."""
+        all_providers = self.llm.get_all_providers()
+        if provider_id not in all_providers:
+            return f"Unknown provider '{provider_id}'"
+        if len(all_providers) <= 1:
+            return "Refusing to remove the last remaining provider."
+        if provider_id == DEFAULT_PROVIDER:
+            # Every guild WITHOUT an explicit current_ai_provider implicitly
+            # runs on the default — removing it would break them all silently.
+            return (
+                f"Refusing to remove '{provider_id}' — it is the built-in "
+                "default every unconfigured server falls back to."
+            )
 
-    @commands.command(name='setbotnickname')
-    async def setbotnickname(self, ctx, *, new_nickname: str):
-        if not self.is_authorized(ctx):
-            await ctx.send("You do not have permission to use this command.")
-            return
+        config = self.bot.config
+        in_use = 0
+        for cfg_id in list(config._configs.keys()):
+            # Guild files are "<id>"; DM-scope settings land in "global".
+            if not (cfg_id.isdigit() or cfg_id == "global"):
+                continue
+            if config._configs[cfg_id].get("current_ai_provider") == provider_id:
+                in_use += 1
+        if in_use:
+            return (
+                f"Refusing to remove '{provider_id}' — {in_use} server(s) "
+                "currently use it. Switch their provider first."
+            )
 
-        if not ctx.guild:
-            await ctx.send("This command can only be used in a server.")
-            return
-        bot_member = ctx.guild.get_member(self.bot.user.id)
-        await bot_member.edit(nick=new_nickname)
-        await ctx.send(f"Bot nickname changed to {new_nickname}")
-        
+        del all_providers[provider_id]
+        config.set(None, "ai_providers", all_providers, scope="global")
+        key_name = f"{provider_id.upper()}_API_KEY"
+        had_key = config.get(None, key_name, scope="global") is not None
+        if had_key:
+            config.rem(None, key_name, scope="global")
+        return (
+            f"Removed provider '{provider_id}'"
+            + (" and its stored API key." if had_key else ".")
+        )
+
     @askgpt.error
     async def askgpt_error(self, ctx, error):
         # Cooldown is now enforced inside process_askgpt (per-model), not by a
@@ -1223,10 +1066,11 @@ class Gpt(commands.Cog):
 
     # ==================== SLASH COMMANDS (/ai ...) ====================
     #
-    # Equivalents of the prefix commands above, sharing the same core logic
-    # (_do_* helpers) and the same unified auth gate (self.is_authorized,
-    # which routes through core.utils.is_admin for both ctx and Interaction).
-    # The prefix commands above are left in place unchanged for muscle memory.
+    # The admin surface lives in the /ai settings panel (ai_admin.py), which
+    # consumes the _do_* helpers above. Only three subcommands remain:
+    # settings (the panel), setapikey (secret entry with provider
+    # autocomplete), and status (the onboarding checklist, also available as
+    # !aistatus for when slash sync is broken).
 
     ai_group = app_commands.Group(name="ai", description="Manage the AI provider/model configuration")
 
@@ -1248,108 +1092,6 @@ class Gpt(commands.Cog):
                 choices.append(app_commands.Choice(name=label[:100], value=prov_id))
         return choices[:25]
 
-    async def _model_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        """Autocomplete for model names. Scoped to the `provider` option if the
-        user has already filled it in; otherwise falls back to the guild's
-        current provider so results are still relevant."""
-        all_providers = self.llm.get_all_providers()
-
-        provider = getattr(interaction.namespace, "provider", None)
-        if provider:
-            provider = self.provider_aliases.get(provider.lower(), provider.lower())
-        else:
-            provider = self.get_provider_config(interaction)["provider"]
-
-        provider_info = all_providers.get(provider, {})
-        models_dict = provider_info.get("models", {})
-        current_lower = current.lower()
-        choices = [
-            app_commands.Choice(name=model_name[:100], value=model_name)
-            for model_name in models_dict.keys()
-            if current_lower in model_name.lower()
-        ]
-        return choices[:25]
-
-    @ai_group.command(name="setprovider", description="Change the AI provider for this server")
-    @app_commands.describe(provider="The provider to switch to")
-    async def ai_setprovider(self, interaction: discord.Interaction, provider: str):
-        if not self.is_authorized(interaction):
-            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-            return
-        await interaction.response.send_message(self._do_setprovider(interaction, provider))
-
-    @ai_setprovider.autocomplete("provider")
-    async def ai_setprovider_provider_autocomplete(self, interaction: discord.Interaction, current: str):
-        return await self._provider_autocomplete(interaction, current)
-
-    @ai_group.command(name="setmodel", description="Change the AI model for the current provider")
-    @app_commands.describe(model="The model to switch to")
-    async def ai_setmodel(self, interaction: discord.Interaction, model: str):
-        if not self.is_authorized(interaction):
-            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-            return
-        await interaction.response.send_message(self._do_setmodel(interaction, model))
-
-    @ai_setmodel.autocomplete("model")
-    async def ai_setmodel_model_autocomplete(self, interaction: discord.Interaction, current: str):
-        return await self._model_autocomplete(interaction, current)
-
-    @ai_group.command(name="info", description="Show current AI provider and model information")
-    async def ai_info(self, interaction: discord.Interaction):
-        await interaction.response.send_message(self._do_aiinfo(interaction, key_usage_hint="/ai setapikey"))
-
-    @ai_group.command(name="addmodel", description="Add a model to a provider")
-    @app_commands.describe(
-        model_name="The model identifier as the provider's API expects it",
-        provider="Provider to add the model to (defaults to the current provider)",
-        cost="USD per million OUTPUT tokens — sets cooldown tier. Omit for pricy; 0 for free/local.",
-        max_tokens="Optional max completion tokens override",
-    )
-    async def ai_addmodel(
-        self,
-        interaction: discord.Interaction,
-        model_name: str,
-        provider: Optional[str] = None,
-        cost: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-    ):
-        if not is_superadmin(self.bot.config, interaction.user.id):
-            await interaction.response.send_message("This changes global bot config — superadmin only.", ephemeral=True)
-            return
-        await interaction.response.send_message(self._do_addmodel(interaction, model_name, provider, cost, max_tokens))
-
-    @ai_addmodel.autocomplete("provider")
-    async def ai_addmodel_provider_autocomplete(self, interaction: discord.Interaction, current: str):
-        return await self._provider_autocomplete(interaction, current)
-
-    @ai_group.command(name="removemodel", description="Remove a model from a provider")
-    @app_commands.describe(
-        model_name="The model to remove",
-        provider="Provider to remove the model from (defaults to the current provider)",
-    )
-    async def ai_removemodel(self, interaction: discord.Interaction, model_name: str, provider: Optional[str] = None):
-        if not is_superadmin(self.bot.config, interaction.user.id):
-            await interaction.response.send_message("This changes global bot config — superadmin only.", ephemeral=True)
-            return
-        await interaction.response.send_message(self._do_removemodel(interaction, model_name, provider))
-
-    @ai_removemodel.autocomplete("provider")
-    async def ai_removemodel_provider_autocomplete(self, interaction: discord.Interaction, current: str):
-        return await self._provider_autocomplete(interaction, current)
-
-    @ai_removemodel.autocomplete("model_name")
-    async def ai_removemodel_model_autocomplete(self, interaction: discord.Interaction, current: str):
-        return await self._model_autocomplete(interaction, current)
-
-    @ai_group.command(name="listmodels", description="List all models for a provider")
-    @app_commands.describe(provider="Provider to list models for (defaults to the current provider)")
-    async def ai_listmodels(self, interaction: discord.Interaction, provider: Optional[str] = None):
-        await interaction.response.send_message(self._do_listmodels(interaction, provider))
-
-    @ai_listmodels.autocomplete("provider")
-    async def ai_listmodels_provider_autocomplete(self, interaction: discord.Interaction, current: str):
-        return await self._provider_autocomplete(interaction, current)
-
     @ai_group.command(name="setapikey", description="Set the API key for a provider (response is private)")
     @app_commands.describe(provider="The provider this key belongs to", api_key="The API key value")
     async def ai_setapikey(self, interaction: discord.Interaction, provider: str, api_key: str):
@@ -1362,7 +1104,7 @@ class Gpt(commands.Cog):
         # the response is still kept ephemeral so the key doesn't linger in-channel.
         await interaction.response.defer(ephemeral=True)
         try:
-            lines = await self._do_setapikey(provider, api_key, key_usage_hint="/ai addmodel")
+            lines = await self._do_setapikey(provider, api_key)
         except ValueError as e:
             await interaction.followup.send(str(e), ephemeral=True)
             return
@@ -1372,50 +1114,11 @@ class Gpt(commands.Cog):
     async def ai_setapikey_provider_autocomplete(self, interaction: discord.Interaction, current: str):
         return await self._provider_autocomplete(interaction, current)
 
-    @ai_group.command(name="setpersonality", description="Set the GPT personality prompt")
-    @app_commands.describe(personality="The new personality/system prompt text")
-    async def ai_setpersonality(self, interaction: discord.Interaction, personality: str):
-        if not self.is_authorized(interaction):
-            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-            return
-        self._do_setpersonality(interaction, personality)
-        await interaction.response.send_message("Personality updated! 👍")
-
-    @ai_group.command(name="setbotnickname", description="Change the bot's nickname in this server")
-    @app_commands.describe(new_nickname="The new nickname")
-    async def ai_setbotnickname(self, interaction: discord.Interaction, new_nickname: str):
-        if not self.is_authorized(interaction):
-            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-            return
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        bot_member = interaction.guild.get_member(self.bot.user.id)
-        await bot_member.edit(nick=new_nickname)
-        await interaction.response.send_message(f"Bot nickname changed to {new_nickname}")
-
     @ai_group.command(name="status", description="Show what's configured and what's missing for the AI features")
     async def ai_status(self, interaction: discord.Interaction):
         await interaction.response.send_message(
-            self._do_aistatus(interaction, prefix_style=False), ephemeral=True
+            self._do_aistatus(interaction), ephemeral=True
         )
-
-    # /ai setagentic removed — agentic mode is now per-tool. Configure the
-    # bot's Discord tools in /ai settings → Bot tools (ai_admin.py cog).
-
-    @ai_group.command(name="addprovider", description="Register a new OpenAI-compatible provider (superadmin)")
-    @app_commands.describe(
-        provider_id="Short id for the provider (e.g. groq)",
-        base_url="OpenAI-compatible API base URL (e.g. https://api.groq.com/openai/v1)",
-        default_model="Model id to use by default",
-        name="Optional display name",
-    )
-    async def ai_addprovider(self, interaction: discord.Interaction, provider_id: str,
-                             base_url: str, default_model: str, name: Optional[str] = None):
-        if not is_superadmin(self.bot.config, interaction.user.id):
-            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-            return
-        await interaction.response.send_message(self._do_addprovider(interaction, provider_id, base_url, default_model, name))
 
 async def setup(bot):
     """Every cog needs a setup function like this."""
