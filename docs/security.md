@@ -62,9 +62,10 @@ Security properties enforced centrally, so no frontend can skip them:
   `send_message`, so tool-driven sends never ping.
 - **Tool budget.** The agentic `!gpt` loop is capped at 8 tool calls per run
   (`max_tool_calls=8`); exceeding it returns a fixed message rather than looping.
-- **Agentic mode is opt-in and superadmin-gated.** `!setagentic on|off` is
-  superadmin-only and per-guild (`gpt_agentic_enabled`, default off). With the flag
-  off, `!gpt` is plain chat with no tools.
+- **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
+  allowlist (default empty, meaning `!gpt` is plain chat with no tools), managed
+  from the `/ai settings` panel. The MCP server consumes its own global
+  `mcp_tools_enabled` allowlist at build time.
 - **Every executed op is logged** at INFO (op name, params, actor id, ok/error).
 
 ### Ordering caveat (exposed-op selection)
@@ -109,16 +110,16 @@ admin/superadmin list.
 
 - **Discord token** comes from `.env` (`DISCORD_TOKEN`), loaded via `dotenv`.
   `.env` and `.env.*` are gitignored.
-- **Provider API keys** are set with `!setapikey <provider> <key>` (admin-gated) or
-  `/ai setapikey` (ephemeral response), and stored in `global.json` under
-  `<PROVIDER>_API_KEY` — **plaintext on disk**. Environment variables of the same
-  name are also honored as a fallback. Protect the `configs/` directory's
+- **Provider API keys** are set with `/ai setapikey` (superadmin-gated, ephemeral
+  response) or from the `/ai settings` Providers tab, and stored in `global.json`
+  under `<PROVIDER>_API_KEY` — **plaintext on disk**. Environment variables of the
+  same name are also honored as a fallback. Protect the `configs/` directory's
   filesystem permissions accordingly.
 - **`configs/` is gitignored in full**, so no per-guild data, memories, admin
   lists, or stored keys are committed. Verified: `git ls-files configs/` is empty.
-- **Prefix `!setapikey` deletes the invoking message** immediately so the key
-  doesn't linger in-channel; if deletion fails it warns the user to delete manually.
-  The slash variant never posts the key as a visible message and replies ephemerally.
+- **Keys never appear in-channel.** `/ai setapikey` takes the key as a slash
+  argument and replies ephemerally; the old prefix `!setapikey` (which posted the
+  key into chat and then raced to delete it) has been removed.
 
 ## Prompt-Injection and Data Surfaces (`!gpt`)
 
@@ -128,9 +129,9 @@ admin/superadmin list.
   visible in the channel can leave to the provider. Choose providers accordingly;
   a local provider (`requires_api_key: false`, e.g. a self-hosted model) keeps data
   on-box.
-- **Persona is guild-admin-settable.** `!setpersonality` (admin-gated) sets the
-  system persona for that guild's `!gpt`. Any guild admin can rewrite the bot's
-  system prompt.
+- **Persona is guild-admin-settable.** The personality editor in the
+  `/ai settings` panel (admin-gated) sets the system persona for that guild's
+  `!gpt`. Any guild admin can rewrite the bot's system prompt.
 - **Output mention filter is narrow.** `check_message_compliance` blocks only the
   literal substrings `@everyone` / `@here` in the model's reply. It does **not**
   block role mentions (`<@&ROLE_ID>`) or user mentions, and the primary chat reply
@@ -176,17 +177,19 @@ admin/superadmin list.
 - [x] **The console REPL cog was removed** (2026-07-05) — it read host stdin
   and could send messages as the bot to any channel with no auth, and was dead
   under systemd anyway (blocking `input()` on a non-tty).
-- [ ] **Review unauthenticated read commands** (`!aiinfo`, `!listmodels`,
-  `!listmedia`, `!aistatus`) — they disclose configuration state (which providers
-  have keys configured, model lists) to any user. Low impact; gate if that matters.
+- [ ] **Review unauthenticated read commands** (`/ai status`, `!listmedia`) —
+  they disclose configuration state (which providers have keys configured, model
+  lists) to any user. Low impact; gate if that matters.
 
 Fixed in the 2026-07-05 consistency sweep (see git history for details):
 `!echo` is admin-gated (was open bot-impersonation), `!sethuebridgeip` is
 superadmin-gated (was an ungated global-config write), `!addmedia` and the
 `!errorlog` group route through the shared `is_admin` gate (each previously
 used a divergent hand-rolled check), and the global-mutating provider commands
-(`setapikey`/`addmodel`/`removemodel`/`addprovider`, prefix and slash) are
-superadmin-only because they alter configuration shared by every guild.
+(`setapikey`/`addmodel`/`removemodel`/`addprovider`) were made superadmin-only
+because they alter configuration shared by every guild — their prefix variants
+have since been removed entirely in favor of the `/ai` surfaces, which keep the
+superadmin gate.
 `delete_message` is exposed to the agent loop and MCP — it remains ADMIN-gated
 per-call, and `call_ids` now checks permissions *before* resolving any Discord
 targets.

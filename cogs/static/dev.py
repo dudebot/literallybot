@@ -8,15 +8,8 @@ import sys
 from core.utils import is_superadmin, safe_delete
 
 class Dev(commands.Cog):
-    """This is a cog with owner-only commands.
-    Note:
-        All cogs inherits from `commands.Cog`_.
-        All cogs are classes, so they need self as first argument in their methods.
-        All cogs use different decorators for commands and events (see example below).
-        All cogs needs a setup function (see below).
-    Documentation:
-        https://discordpy.readthedocs.io/en/latest/ext/commands/cogs.html
-    """
+    """Superadmin-only maintenance commands: cog load/unload/reload, git
+    update, restart, and slash-command sync."""
     def __init__(self, bot):
         self.bot = bot
         self.logger = bot.logger
@@ -106,7 +99,8 @@ class Dev(commands.Cog):
 
         if cog is None:
             cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.dynamic.")]
-            cogs_to_load = [f'cogs.dynamic.{filename[:-3]}' for filename in listdir('./cogs/dynamic') if filename.endswith('.py')]
+            cogs_to_load = [f'cogs.dynamic.{filename[:-3]}' for filename in listdir('./cogs/dynamic')
+                            if filename.endswith('.py') and not filename.startswith('_')]
         else:
             cogs_to_unload = [self.check_cog(cog)]
             cogs_to_load = [self.check_cog(cog)]
@@ -238,7 +232,8 @@ class Dev(commands.Cog):
         message = await ctx.send('Listing all cogs...')
         await safe_delete(ctx, self.logger)
         try:
-            cogs = [cog[:-3] for cog in listdir('./cogs/dynamic') if cog.endswith('.py')]
+            cogs = [cog[:-3] for cog in listdir('./cogs/dynamic')
+                    if cog.endswith('.py') and not cog.startswith('_')]
             await message.edit(content=f'Available cogs: {", ".join(cogs)}', delete_after=20)
         except Exception as exc:
             self.logger.error("Error listing cogs", exc_info=True)

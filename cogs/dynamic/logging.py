@@ -26,9 +26,11 @@ class Logging(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_update(self, before, after):
+        # on_member_update fires for guild nickname changes (username changes
+        # are on_user_update, so the old before.name comparison never fired).
         channel = self.get_log_channel(before.guild)
-        if channel and before.name and after.name and before.name != after.name:
-            await channel.send(f"{before.name} changed their name to {after.name}")
+        if channel and before.nick != after.nick:
+            await channel.send(f"{before.display_name} changed their nickname to {after.display_name}")
             
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):

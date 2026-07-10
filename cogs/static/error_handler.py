@@ -1,14 +1,12 @@
 """
-Enhanced admin commands for error logging configuration.
-Supports both text commands and slash commands.
+Admin commands for configuring the error logging system (the `!errorlog`
+prefix command group).
 """
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 from core.error_handler import ErrorCategory, ErrorSeverity
 from core.utils import is_admin, is_superadmin
-from typing import Optional
 
 
 class ErrorLoggingAdmin(commands.Cog):
@@ -384,21 +382,6 @@ class ErrorLoggingAdmin(commands.Cog):
         # Send confirmation to command channel (unless it's the same channel)
         if ctx.channel.id != text_channel.id:
             await ctx.send(f"✅ Global error logging enabled → {text_channel.mention}")
-
-    # ==================== LEGACY SUPPORT ====================
-
-    @commands.command(name="seterrorlog", hidden=True)
-    async def seterrorlog_legacy(self, ctx, channel: discord.TextChannel = None):
-        """
-        Legacy command for setting error log channel.
-        Redirects to new command structure.
-        """
-        if not channel:
-            # Show current config
-            await self.errorlog_status(ctx)
-        else:
-            # Set channel
-            await self.errorlog_setchannel(ctx, channel)
 
 
 async def setup(bot):

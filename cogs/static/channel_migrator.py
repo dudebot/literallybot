@@ -36,7 +36,9 @@ class ChannelMigrator(commands.Cog):
         self.storage_dir = self.STORAGE_DIR
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self._no_mentions = discord.AllowedMentions.none()
-        self._http_session = aiohttp.ClientSession()
+        # Created lazily in _session(): __init__ runs in a sync context where
+        # aiohttp.ClientSession() may not have a running event loop.
+        self._http_session: Optional[aiohttp.ClientSession] = None
 
     @commands.command(name="backupchannel")
     @commands.check(is_superadmin)
@@ -174,9 +176,15 @@ class ChannelMigrator(commands.Cog):
             f"({failed} failed)."
         )
 
-    def cog_unload(self):
-        if not self._http_session.closed:
-            self.bot.loop.create_task(self._http_session.close())
+    async def cog_unload(self):
+        if self._http_session is not None and not self._http_session.closed:
+            await self._http_session.close()
+
+    def _session(self) -> aiohttp.ClientSession:
+        """Return the shared HTTP session, creating it on first use."""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
 
     def _is_text_channel(self, channel: Any) -> bool:
         return isinstance(channel, (discord.TextChannel, discord.Thread))
@@ -466,7 +474,7 @@ class ChannelMigrator(commands.Cog):
     async def _download_with_retry(self, url: str, filename: str, attempts: int = 3) -> Optional[bytes]:
         for attempt in range(1, attempts + 1):
             try:
-                async with self._http_session.get(url) as resp:
+                async with self._session().get(url) as resp:
                     if resp.status != 200:
                         raise RuntimeError(f"HTTP {resp.status}")
                     return await resp.read()
