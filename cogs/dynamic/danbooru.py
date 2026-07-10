@@ -1,3 +1,4 @@
+import asyncio
 import requests
 import bs4
 import discord
@@ -7,8 +8,9 @@ import os
 class Danbooru(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.logger = bot.logger
         self.posted_danbooru = set()
-        self.danbooru_base = "http://danbooru.donmai.us"
+        self.danbooru_base = "https://danbooru.donmai.us"
         #self.danbooru_base = "https://testbooru.donmai.us"
 
     @commands.command(name="danbooru", aliases=["db"])
@@ -19,13 +21,15 @@ class Danbooru(commands.Cog):
             await ctx.send("Usage: !danbooru (or !db) tag1 tag2 ...")
             return
         
-        # Check if channel is NSFW and add rating filter if not
+        # In non-NSFW channels (and DMs, which have no NSFW flag), FORCE
+        # rating:safe — strip any user-supplied rating: tag so it can't be
+        # overridden with e.g. rating:explicit.
         tags = list(tags)
-        if ctx.channel and not ctx.channel.is_nsfw():
-            # Only add rating:safe if no rating tag is already specified
-            has_rating = any(tag.startswith('rating:') for tag in tags)
-            if not has_rating:
-                tags.append('rating:safe')
+        is_nsfw = getattr(ctx.channel, "is_nsfw", None)
+        channel_nsfw = bool(is_nsfw()) if callable(is_nsfw) else False
+        if not channel_nsfw:
+            tags = [tag for tag in tags if not tag.lower().startswith('rating:')]
+            tags.append('rating:safe')
         
         # Retrieve API key and login from global config, fallback to environment
         config = self.bot.config
@@ -37,9 +41,11 @@ class Danbooru(commands.Cog):
         if api_key and login:
             url += f"&login={login}&api_key={api_key}"
         try:
-            response = requests.get(url)
+            # requests is blocking; run it off the event loop
+            response = await asyncio.to_thread(requests.get, url)
             data = response.json()
-        except Exception as e:
+        except Exception:
+            self.logger.exception("Danbooru posts.json request failed")
             await ctx.send("Error fetching from Danbooru API.")
             return
         # Get the first unposted image
@@ -55,12 +61,13 @@ class Danbooru(commands.Cog):
         first_tag = tags[0]
         autocomplete_url = f"{self.danbooru_base}/autocomplete?search[query]={first_tag}&search[type]=tag_query"
         try:
-            auto_resp = requests.get(autocomplete_url)
+            auto_resp = await asyncio.to_thread(requests.get, autocomplete_url)
             html_content = auto_resp.text
             soup = bs4.BeautifulSoup(html_content, "html.parser")
             li_tags = soup.find_all("li", class_="ui-menu-item")
             suggestions = [li.get("data-autocomplete-value") for li in li_tags][:5]
-        except Exception as e:
+        except Exception:
+            self.logger.exception("Danbooru autocomplete request failed")
             suggestions = []
         if suggestions:
             suggestion_text = ", ".join(suggestions)
