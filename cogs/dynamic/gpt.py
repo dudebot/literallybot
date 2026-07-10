@@ -10,23 +10,38 @@ from typing import Dict, List, Optional, Any
 from core.utils import is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES
 
-# Reply text that claims or promises a Discord action. Drives the agentic
-# no-tool-call retry nudge: a run that executed zero tools but whose reply
-# matches this is almost certainly the model narrating instead of acting
-# (observed repeatedly with grok-4.3). Deliberately generous — a false
-# positive costs one extra API call and the model just restates its reply.
-# Base cooldown for the gpt command bucket. The per-model
-# timeout_multiplier shown by !aiinfo/!listmodels scales DISPLAY only —
-# actual enforcement is the flat decorator bucket below. Making
-# enforcement honor the multiplier is an open product decision.
-BASE_COOLDOWN_SECONDS = 240
-
-NARRATED_ACTION_RE = re.compile(
-    r"\b(add(?:ing|ed)?|react(?:ing|ed)?|edit(?:ing|ed)?|send(?:ing)?|sent|"
-    r"repl(?:y(?:ing)?|ied)|remov(?:ing|ed)|delet(?:ing|ed)|search(?:ing|ed)?|"
-    r"done|right away|i[' ]?will|i'll|on it)\b",
-    re.IGNORECASE,
+# Per-message cooldown tiers, driven by a model's declared cost per million
+# OUTPUT tokens (`cost_per_mtok_output` on the model config). Enforcement is a
+# manual per-guild min-interval check (_check_cooldown) — the old flat
+# @commands.cooldown decorator couldn't read per-model config. Tiers, not a
+# continuous curve, because no model clusters near a boundary today.
+#
+# Sizing (measured: median prompt ~4.7k tok, output ~63 tok; grok-4.5 at
+# $2/$6 per Mtok in/out ~= $0.0097/msg median, ~$0.066/msg at max context):
+# pricy=300s gives 6 msgs / 30min, so even a max-context spam spree stays
+# under ~$0.40 / 30min. cheap=10s is the "free/local model" floor.
+COOLDOWN_TIERS = (
+    # (label, max_cost_exclusive, seconds) — first bucket whose bound the
+    # cost falls under wins; the last (inf) is the catch-all "pricy" tier.
+    ("cheap", 1.0, 10),
+    ("standard", 5.0, 45),
+    ("pricy", float("inf"), 300),
 )
+# Cost is UNSET on a model => treat as pricy (safe default: expensive models
+# enter via !addmodel unannotated; defaulting unlabeled to cheap is a wallet
+# footgun). A known-free local model is opted into cheap with explicit 0.0.
+_UNSET_COST_SECONDS = 300
+
+
+def cooldown_tier_for_cost(cost_per_mtok_output):
+    """(label, seconds) for a model's output-token cost. None => pricy."""
+    if cost_per_mtok_output is None:
+        return ("pricy", _UNSET_COST_SECONDS)
+    for label, bound, seconds in COOLDOWN_TIERS:
+        if cost_per_mtok_output < bound:
+            return (label, seconds)
+    return ("pricy", _UNSET_COST_SECONDS)
+
 
 class Gpt(commands.Cog):
     """This is a cog with a GPT question command."""
@@ -38,6 +53,48 @@ class Gpt(commands.Cog):
         # Provider-agnostic LLM client: provider/model resolution, API calls,
         # model discovery, and usage/cost tracking now live in core.llm.
         self.llm = LLMClient(self.bot.config, logger=self.logger)
+        # Per-guild timestamp of the last accepted LLM call (monotonic).
+        # Backs the per-model cooldown (see _check_cooldown). In-memory, so it
+        # resets on restart — same durability as the old decorator bucket.
+        self._last_call_ts: Dict[int, float] = {}
+
+    def _current_model_info(self, ctx) -> Dict[str, Any]:
+        """The stored config dict for the guild's current model (may be {})."""
+        pc = self.get_provider_config(ctx)
+        models = pc["provider_info"].get("models", {})
+        return models.get(pc["model"], {}) or {}
+
+    def _resolve_bot_tools(self, ctx) -> List[str]:
+        """The guild's enabled bot-agent tools — a subset of AGENT_OPS.
+
+        Empty (the default) means the plain-chat path runs: no tools, no
+        agent loop. Stale op names left over from an older AGENT_OPS are
+        dropped by intersecting with the current universe.
+        """
+        if not getattr(ctx, "guild", None):
+            return []
+        from core.agent_loop import AGENT_OPS
+        raw = self.bot.config.get(ctx, "bot_tools_enabled") or []
+        return [n for n in raw if n in AGENT_OPS]
+
+    def _check_cooldown(self, ctx):
+        """Per-guild min-interval gate keyed by the current model's cost tier.
+
+        Returns remaining seconds if still cooling down (call refused), or
+        None if the call is allowed — in which case it RECORDS the call so the
+        next one is spaced by the tier interval. DMs are never rate-limited.
+        """
+        if getattr(ctx, "guild", None) is None:
+            return None
+        cost = self._current_model_info(ctx).get("cost_per_mtok_output")
+        _label, cd = cooldown_tier_for_cost(cost)
+        now = time.monotonic()
+        last = self._last_call_ts.get(ctx.guild.id, 0.0)
+        remaining = cd - (now - last)
+        if remaining > 0:
+            return remaining
+        self._last_call_ts[ctx.guild.id] = now
+        return None
 
     def is_authorized(self, ctx_or_interaction) -> bool:
         """Check if the invoking user is authorized to use admin commands.
@@ -228,10 +285,14 @@ class Gpt(commands.Cog):
                     history.append({"role": "user", "content": f"{id_tag}{author_id}{reply_context}: {full_content}"})
         return history, user_mapping
 
-    def _build_system_prompt(self, ctx, agentic, user_mapping):
+    def _build_system_prompt(self, ctx, tool_names, user_mapping):
         """Assemble the system prompt: persona, situational instructions,
         agentic tool guidance, and active user memories.
+
+        `tool_names` is the guild's resolved bot-tool allowlist. When empty
+        the agentic guidance block is omitted (plain-chat behavior).
         Moved verbatim out of process_askgpt (seam-machine claim 1)."""
+        agentic = bool(tool_names)
         # Retrieve personality data (prompt and version)
         personality_data = self.bot.config.get(ctx, "gpt_personality_data")
         current_personality_prompt = None
@@ -285,10 +346,9 @@ class Gpt(commands.Cog):
         ])
 
         if agentic:
-            from core.agent_loop import AGENT_OPS
             prompt_parts.extend([
                 "",
-                "AGENTIC MODE: you have REAL Discord tools: " + ", ".join(AGENT_OPS) + ".",
+                "You have REAL Discord tools available: " + ", ".join(tool_names) + ".",
                 f"- Current guild id: {ctx.guild.id}. Current channel id: {ctx.channel.id}.",
                 f"- The invoking user's id is {ctx.author.id}. Their message that triggered "
                 f"you (\"my message\"/\"this message\") has message id {ctx.message.id}.",
@@ -296,24 +356,36 @@ class Gpt(commands.Cog):
                 "DIRECTLY when reacting, editing, or replying — no guessing, and no "
                 "search_history when the target is already visible in the history. "
                 "NEVER write a [msg_id: ...] marker in your own reply text.",
-                "- ACTIONS HAPPEN ONLY THROUGH TOOL CALLS. The moment you produce a plain "
-                "text reply, the run ENDS and nothing further executes. Never say 'adding', "
-                "'done', 'I will...' unless the tool call already succeeded in THIS run. "
-                "NEVER roleplay, narrate, or pretend a tool was used — perform the action "
-                "first, then report what you actually did.",
-                "- If you have no tool for what's asked, say you can't and name the missing "
-                "capability. Do not invent excuses or claim success.",
-                "- add_reaction/remove_reaction need a literal unicode emoji character "
-                "(💩, 💨, ❤️) or name:id for custom emoji — never a word or description. "
-                "('fart' and '-' are invalid; the fart/dash emoji is 💨.)",
-                "- remove_reaction only removes reactions the bot itself added.",
-                "- delete_message requires the invoking user to be a bot admin; if the "
-                "tool returns a permission error, relay that plainly.",
-                "- send_message returns the new message's message_id; reuse it for follow-up "
-                "edits or reactions. Use its reference_message_id param to reply to a message.",
-                "- Your final text reply is posted to the channel automatically — do not "
-                "duplicate it with send_message.",
+                "- When an action would genuinely help (react, reply elsewhere, edit, "
+                "search, list), use the matching tool. Prefer doing over describing.",
+                "- If no tool fits the request, just reply normally in text — a plain "
+                "conversational answer is a perfectly good response, and most messages "
+                "only need one. Don't reach for a tool when the user just wants an answer.",
+                "- Only claim you did something if you ACTUALLY called the tool for it in "
+                "this turn. Never say a reaction was added, a message sent/edited/deleted, "
+                "or history searched unless you invoked that tool — don't pretend or "
+                "role-play a tool result. If you couldn't do it, say so plainly.",
             ])
+            if "add_reaction" in tool_names or "remove_reaction" in tool_names:
+                prompt_parts.append(
+                    "- add_reaction/remove_reaction need a literal unicode emoji character "
+                    "(💩, 💨, ❤️) or name:id for custom emoji — never a word or description. "
+                    "('fart' and '-' are invalid; the fart/dash emoji is 💨.)")
+            if "remove_reaction" in tool_names:
+                prompt_parts.append(
+                    "- remove_reaction only removes reactions the bot itself added.")
+            if "delete_message" in tool_names:
+                prompt_parts.append(
+                    "- delete_message requires the invoking user to be a bot admin; if the "
+                    "tool returns a permission error, relay that plainly.")
+            if "send_message" in tool_names:
+                prompt_parts.extend([
+                    "- send_message returns the new message's message_id; reuse it for "
+                    "follow-up edits or reactions. Use its reference_message_id param to "
+                    "reply to a message.",
+                    "- Your final text reply is posted to the channel automatically — do "
+                    "not duplicate it with send_message.",
+                ])
 
         # 4) Dynamic User Memories (if any)
         if active_memories_for_prompt:
@@ -333,17 +405,27 @@ class Gpt(commands.Cog):
         return "\n".join(prompt_parts)
 
     async def process_askgpt(self, ctx, question: str):
+        # Per-model cooldown, enforced here so BOTH entry points (the !gpt
+        # command and the mention/reply path in on_message) share one gate.
+        remaining = self._check_cooldown(ctx)
+        if remaining is not None:
+            await ctx.send(f"You are on cooldown. Try again in {remaining:.1f}s")
+            return
+
         async with ctx.typing():
             # Get provider configuration
             provider_config = self.get_provider_config(ctx)
 
-            # Agentic mode: guild-scoped opt-in flag. Default False — with
-            # the flag unset, the plain chat path below runs untouched.
-            agentic = bool(ctx.guild) and bool(self.bot.config.get(ctx, "gpt_agentic_enabled"))
+            # Agentic vs plain chat is decided by the guild's enabled bot
+            # tools: a non-empty allowlist runs the agent loop; empty (the
+            # default) runs the plain-chat path — which is byte-identical to
+            # the old non-agentic behavior (one request, no tool loop).
+            tool_names = self._resolve_bot_tools(ctx)
+            agentic = bool(ctx.guild) and bool(tool_names)
 
             history, user_mapping = await self._build_history(ctx, agentic)
-            prompt = self._build_system_prompt(ctx, agentic, user_mapping)
-            
+            prompt = self._build_system_prompt(ctx, tool_names, user_mapping)
+
             # Prepare messages for API
             api_messages = [
                 {
@@ -352,17 +434,17 @@ class Gpt(commands.Cog):
                 },
                 *history
             ]
-            
+
             metadata = {
                 "service": "literallybot",
                 "sender": str(ctx.author.id),
                 "channel": str(ctx.channel.id),
                 "guild": str(ctx.guild.id) if ctx.guild else "DM"
             }
-            
+
             try:
                 if agentic:
-                    response = await self._run_agentic(ctx, provider_config, api_messages, metadata, question)
+                    response = await self._run_agentic(ctx, provider_config, api_messages, metadata, question, tool_names)
                 else:
                     response = await self.call_ai_api(provider_config, api_messages, metadata)
                 response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
@@ -396,19 +478,20 @@ class Gpt(commands.Cog):
                 await ctx.send(f"Error calling {provider_config['provider']} API: {str(e)}")
                 return
 
-    async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question) -> str:
+    async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question, tool_names) -> str:
         """Run the request through the in-bot agent loop (ops-registry tools).
 
         The actor for every tool call is the INVOKING USER's Member (ctx
         passes through as the OpContext), targets are confined to ctx.guild,
-        and the loop is capped at 8 tool calls. The model's final text comes
-        back to the caller and flows through the normal compliance/split/send
-        path, exactly like a plain chat response.
+        and the loop is capped at 8 tool calls. `tool_names` is the guild's
+        resolved bot-tool allowlist. The model's final text comes back to the
+        caller and flows through the normal compliance/split/send path,
+        exactly like a plain chat response.
         """
         from pydantic_ai.exceptions import UsageLimitExceeded
         from core.agent_loop import build_agent_tools
 
-        tools = build_agent_tools(ctx, self.logger)
+        tools = build_agent_tools(ctx, self.logger, tool_names)
         self.logger.info(
             f"agentic gpt run: guild={ctx.guild.id} channel={ctx.channel.id} "
             f"actor={ctx.author.id} provider={provider_config.provider} "
@@ -428,35 +511,6 @@ class Gpt(commands.Cog):
                 user_prompt=command_turn,
                 max_tool_calls=8,
             )
-
-            # Narration guard: some models (grok-4.3 especially) answer an
-            # action request with "Adding the emoji desu!" and zero tool
-            # calls, which ends the run with nothing done. Nudge exactly once.
-            tool_calls = response.usage.tool_calls if response.usage else 0
-            if tool_calls == 0 and NARRATED_ACTION_RE.search(response.text or ""):
-                self.logger.info(
-                    "agentic run made no tool calls but the reply narrates an "
-                    "action — nudging once"
-                )
-                retry_messages = api_messages + [
-                    {"role": "user", "content": command_turn},
-                    {"role": "assistant", "content": response.text},
-                ]
-                response = await self.llm.run_agent(
-                    provider_config,
-                    retry_messages,
-                    tools=tools,
-                    metadata=metadata,
-                    user_prompt=(
-                        "[SYSTEM CHECK] You made ZERO tool calls, so nothing you "
-                        "described above actually happened — no reaction was added, "
-                        "no message was sent or edited. If your reply claims or "
-                        "promises an action, perform it NOW with real tool calls, "
-                        "then give a short final reply describing what you actually "
-                        "did. If your reply required no action, just restate it."
-                    ),
-                    max_tool_calls=8,
-                )
         except UsageLimitExceeded as e:
             self.logger.warning(f"agentic gpt run hit its tool budget: {e}")
             return "I hit my tool-call limit (8) before finishing that request."
@@ -483,7 +537,6 @@ class Gpt(commands.Cog):
         return True, message
         
     @commands.command(name='gpt')
-    @commands.cooldown(10, BASE_COOLDOWN_SECONDS, commands.BucketType.guild)
     async def askgpt(self, ctx, *, question: str):
         """Ask GPT a question."""
         # Restrict DM usage to superadmin only
@@ -554,17 +607,16 @@ class Gpt(commands.Cog):
         provider_info = provider_config["provider_info"]
         all_providers = provider_config["all_providers"]
 
-        # Get timeout multiplier for current model
+        # Cooldown for the current model, from its cost tier.
         models_info = provider_info.get("models", {})
         model_info = models_info.get(model, {})
-        timeout_mult = model_info.get("timeout_multiplier", 1.0)
-        cooldown_time = int(BASE_COOLDOWN_SECONDS * timeout_mult)
+        tier, cooldown_time = cooldown_tier_for_cost(model_info.get("cost_per_mtok_output"))
 
         info_lines = [
             f"**Current Provider:** {provider_info['name']} ({provider})",
             f"**Current Model:** {model}",
             f"**Available Models:** {', '.join(models_info.keys())}",
-            f"**Cooldown:** {cooldown_time} seconds",
+            f"**Cooldown:** {cooldown_time}s per message ({tier})",
             "",
             "**All Providers:**"
         ]
@@ -579,11 +631,10 @@ class Gpt(commands.Cog):
                 status = "✅ Configured" if has_key else "❌ No API key"
             models_dict = prov_info.get("models", {})
 
-            # Format models with their timeout info
+            # Format models with their cooldown (from cost tier)
             model_details = []
             for model_name, model_cfg in models_dict.items():
-                timeout = model_cfg.get("timeout_multiplier", 1.0)
-                cooldown = int(BASE_COOLDOWN_SECONDS * timeout)
+                _tier, cooldown = cooldown_tier_for_cost(model_cfg.get("cost_per_mtok_output"))
                 model_details.append(f"{model_name} ({cooldown}s)")
 
             info_lines.append(f"• **{prov_info['name']}** ({prov_id}): {status}")
@@ -604,8 +655,14 @@ class Gpt(commands.Cog):
         """Show current AI provider and model information"""
         await ctx.send(self._do_aiinfo(ctx))
 
-    def _do_addmodel(self, ctx, model_name: str, provider: Optional[str], multiplier: float, max_tokens: Optional[int]) -> str:
-        """Core logic for adding a model to a provider. Returns the response text."""
+    def _do_addmodel(self, ctx, model_name: str, provider: Optional[str], cost: Optional[float], max_tokens: Optional[int]) -> str:
+        """Core logic for adding a model to a provider. Returns the response text.
+
+        `cost` is USD per million OUTPUT tokens — it sets the model's cooldown
+        tier (see cooldown_tier_for_cost). Omit it for pricy models you're
+        unsure about (unset defaults to the pricy tier); pass 0.0 for a
+        free/local model to opt it into the cheap tier.
+        """
         config = self.bot.config
 
         # If no provider specified, use current provider
@@ -630,8 +687,11 @@ class Gpt(commands.Cog):
         if model_name in models_dict:
             return f"Model '{model_name}' already exists for {provider}. Remove it first if you want to update it."
 
-        # Build model config
-        model_config = {"timeout_multiplier": multiplier}
+        # Build model config. cost_per_mtok_output is optional — omit the key
+        # when unset so the pricy-tier default applies.
+        model_config = {}
+        if cost is not None:
+            model_config["cost_per_mtok_output"] = cost
         if max_tokens:
             model_config["max_completion_tokens"] = max_tokens
 
@@ -643,22 +703,27 @@ class Gpt(commands.Cog):
         # Save back to global config
         config.set(None, "ai_providers", all_providers, scope="global")
 
-        cooldown = int(BASE_COOLDOWN_SECONDS * multiplier)
-        return f"Added model '{model_name}' to {provider_info['name']} with {multiplier}x multiplier ({cooldown}s cooldown)"
+        tier, cooldown = cooldown_tier_for_cost(cost)
+        cost_str = "unset → pricy" if cost is None else f"${cost:g}/Mtok out"
+        return f"Added model '{model_name}' to {provider_info['name']} ({cost_str}, {tier} tier: {cooldown}s cooldown)"
 
     @commands.command(name='addmodel')
-    async def addmodel(self, ctx, model_name: str, provider: str = None, multiplier: float = 1.0, max_tokens: int = None):
-        """Add a model to a provider (admin only)
-        Usage: !addmodel <model_name> [provider] [multiplier] [max_tokens]
-        Example: !addmodel grok-5-fast xai 0.5
-        Example: !addmodel gpt-6-mini openai 0.5 12000
+    async def addmodel(self, ctx, model_name: str, provider: str = None, cost: float = None, max_tokens: int = None):
+        """Add a model to a provider (superadmin only)
+        Usage: !addmodel <model_name> [provider] [cost_per_million_output_tokens] [max_tokens]
+        Example: !addmodel grok-5-fast xai 0.50
+        Example: !addmodel gpt-6-mini openai 4.50 12000
+        Example: !addmodel qwen-local ollama 0        (free -> cheap tier)
+        Cost is USD per million OUTPUT tokens and sets the cooldown tier
+        (cheap <$1 = 10s, standard <$5 = 45s, pricy = 300s). Omit it and the
+        model defaults to the pricy tier.
         """
         if not is_superadmin(self.bot.config, ctx.author.id):
             # Global-config mutation: keys/models are shared by EVERY guild
             # this bot is in, so guild admins don't get to change them.
             await ctx.send("This changes global bot config — superadmin only.")
             return
-        await ctx.send(self._do_addmodel(ctx, model_name, provider, multiplier, max_tokens))
+        await ctx.send(self._do_addmodel(ctx, model_name, provider, cost, max_tokens))
 
     def _do_removemodel(self, ctx, model_name: str, provider: Optional[str]) -> str:
         """Core logic for removing a model from a provider. Returns the response text."""
@@ -750,12 +815,13 @@ class Gpt(commands.Cog):
         info_lines = [f"**Models for {provider_info['name']}:**"]
 
         for model_name, model_cfg in models_dict.items():
-            multiplier = model_cfg.get("timeout_multiplier", 1.0)
-            cooldown = int(BASE_COOLDOWN_SECONDS * multiplier)
+            cost = model_cfg.get("cost_per_mtok_output")
+            tier, cooldown = cooldown_tier_for_cost(cost)
+            cost_str = "cost unset" if cost is None else f"${cost:g}/Mtok out"
             max_tokens = model_cfg.get("max_completion_tokens", model_cfg.get("max_tokens", "default"))
 
             default_marker = " (default)" if model_name == default_model else ""
-            info_lines.append(f"• {model_name}{default_marker}: {multiplier}x ({cooldown}s), max_tokens: {max_tokens}")
+            info_lines.append(f"• {model_name}{default_marker}: {cost_str} → {tier} ({cooldown}s), max_tokens: {max_tokens}")
 
         return "\n".join(info_lines)
 
@@ -886,15 +952,8 @@ class Gpt(commands.Cog):
                 if not ctx.guild and not is_superadmin(self.bot.config, ctx.author.id):
                     return
 
-                # Share the prefix command's cooldown bucket so mention/reply
-                # invocations and !gpt draw from one rate limit.
-                bucket = self.askgpt._buckets.get_bucket(ctx.message)
-                retry_after = bucket.update_rate_limit()
-
-                if retry_after:
-                    await ctx.send(f"You are on cooldown. Try again in {retry_after:.2f}s")
-                    return
-
+                # Cooldown is enforced inside process_askgpt (per-model,
+                # per-guild) so mention/reply and !gpt share one rate limit.
                 await self.process_askgpt(ctx, question)
                 
     def _do_setpersonality(self, ctx, personality: str) -> None:
@@ -918,38 +977,20 @@ class Gpt(commands.Cog):
             self.logger.warning(f"Failed to add reaction to setpersonality message by {ctx.author}. Sending text confirmation.")
             await ctx.send("Personality updated! 👍")
 
-    def _do_setagentic(self, ctx, enabled: Optional[str]) -> str:
-        """Core logic for toggling agentic mode. Returns the response text.
-        Caller is responsible for the guild + superadmin gates."""
-        current = bool(self.bot.config.get(ctx, "gpt_agentic_enabled"))
-        if enabled is None:
-            return f"Agentic mode is currently **{'on' if current else 'off'}** for this server."
-
-        val = enabled.strip().lower()
-        if val in ("on", "true", "yes", "enable", "enabled", "1"):
-            self.bot.config.set(ctx, "gpt_agentic_enabled", True)
-            return "Agentic mode **enabled** — !gpt can now perform Discord actions."
-        if val in ("off", "false", "no", "disable", "disabled", "0"):
-            self.bot.config.set(ctx, "gpt_agentic_enabled", False)
-            return "Agentic mode **disabled** — !gpt is back to plain chat."
-        return "Usage: `setagentic on` or `setagentic off`"
-
     @commands.command(name='setagentic')
     async def setagentic(self, ctx, enabled: str = None):
-        """Enable/disable agentic tool use for !gpt in this guild (superadmin only).
+        """Deprecated — agentic mode is now controlled per-tool.
 
-        Usage: !setagentic on|off  (no arg shows current state)
-        When on, !gpt can perform real Discord actions (send/edit/delete
-        messages, react, search) via the ops registry instead of just
-        describing them.
+        The old on/off flag is gone: the bot's Discord tools are enabled
+        individually per server. Enabling any tool turns on the agent loop;
+        with none enabled the bot is plain chat. Configure them in the panel.
         """
-        if not ctx.guild:
-            await ctx.send("This command can only be used in a server.")
-            return
-        if not is_superadmin(self.bot.config, ctx.author.id):
-            await ctx.send("You do not have permission to use this command.")
-            return
-        await ctx.send(self._do_setagentic(ctx, enabled))
+        await ctx.send(
+            "Agentic mode is no longer a single on/off toggle — you now pick "
+            "which Discord tools the bot can use, per server. Run "
+            "`/ai settings` → **Bot tools** to enable/disable them "
+            "(enable none = plain chat). Superadmin only."
+        )
 
     def _do_aistatus(self, ctx, prefix_style: bool = True) -> str:
         """Configured-vs-missing checklist with the exact next command for
@@ -991,12 +1032,13 @@ class Gpt(commands.Cog):
                 f"`{cmd(f'!setapikey {provider} <key>', f'/ai setapikey provider:{provider}')}` (admin)"
             )
 
-        if bool(ctx.guild) and bool(config.get(ctx, "gpt_agentic_enabled")):
-            lines.append("✅ Agentic mode: **on** — the bot can send/edit/delete/react/search for real")
+        bot_tools = self._resolve_bot_tools(ctx)
+        if bot_tools:
+            lines.append(f"✅ Bot tools: **{len(bot_tools)} enabled** ({', '.join(bot_tools)})")
         else:
             lines.append(
-                f"▫️ Agentic mode: off (plain chat) → "
-                f"`{cmd('!setagentic on', '/ai setagentic enabled:on')}` (superadmin)"
+                f"▫️ Bot tools: none (plain chat) → "
+                f"`{cmd('/ai settings', '/ai settings')}` → Bot tools (superadmin)"
             )
 
         personality_data = config.get(ctx, "gpt_personality_data")
@@ -1035,7 +1077,9 @@ class Gpt(commands.Cog):
             "name": name or provider_id,
             "base_url": base_url,
             "default_model": default_model,
-            "models": {default_model: {"timeout_multiplier": 1.0}},
+            # Empty model config => pricy-tier cooldown until a cost is set
+            # via !addmodel/!ai settings (safe default for a new provider).
+            "models": {default_model: {}},
         }
         self.bot.config.set(None, "ai_providers", all_providers, scope="global")
         return (
@@ -1070,11 +1114,10 @@ class Gpt(commands.Cog):
         
     @askgpt.error
     async def askgpt_error(self, ctx, error):
-        if isinstance(error, commands.CommandOnCooldown):
-            await ctx.send(f"You are on cooldown. Try again in {error.retry_after:.2f}s")
-        else:
-            self.logger.error(f"An error occurred in askgpt: {error}", exc_info=True) # Log other errors
-            await ctx.send("An unexpected error occurred while processing your request.")    
+        # Cooldown is now enforced inside process_askgpt (per-model), not by a
+        # command decorator, so CommandOnCooldown can no longer arrive here.
+        self.logger.error(f"An error occurred in askgpt: {error}", exc_info=True)
+        await ctx.send("An unexpected error occurred while processing your request.")
     
     async def capture_and_store_memories(self, ctx, messages, current_personality_version):
         config = self.bot.config
@@ -1187,6 +1230,13 @@ class Gpt(commands.Cog):
 
     ai_group = app_commands.Group(name="ai", description="Manage the AI provider/model configuration")
 
+    @ai_group.command(name="settings", description="Open the AI settings panel for this server (admin)")
+    async def ai_settings(self, interaction: discord.Interaction):
+        # Panel UX + tool-allowlist logic lives in the ai_admin cog (CLAUDE.md:
+        # new AI-admin features land there, not in this parked-seam file).
+        from cogs.dynamic.ai_admin import open_ai_settings
+        await open_ai_settings(self, interaction)
+
     async def _provider_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
         """Autocomplete for provider names, sourced from the live ai_providers config."""
         all_providers = self.llm.get_all_providers()
@@ -1252,7 +1302,7 @@ class Gpt(commands.Cog):
     @app_commands.describe(
         model_name="The model identifier as the provider's API expects it",
         provider="Provider to add the model to (defaults to the current provider)",
-        multiplier="Cooldown timeout multiplier (default 1.0)",
+        cost="USD per million OUTPUT tokens — sets cooldown tier. Omit for pricy; 0 for free/local.",
         max_tokens="Optional max completion tokens override",
     )
     async def ai_addmodel(
@@ -1260,13 +1310,13 @@ class Gpt(commands.Cog):
         interaction: discord.Interaction,
         model_name: str,
         provider: Optional[str] = None,
-        multiplier: float = 1.0,
+        cost: Optional[float] = None,
         max_tokens: Optional[int] = None,
     ):
         if not is_superadmin(self.bot.config, interaction.user.id):
             await interaction.response.send_message("This changes global bot config — superadmin only.", ephemeral=True)
             return
-        await interaction.response.send_message(self._do_addmodel(interaction, model_name, provider, multiplier, max_tokens))
+        await interaction.response.send_message(self._do_addmodel(interaction, model_name, provider, cost, max_tokens))
 
     @ai_addmodel.autocomplete("provider")
     async def ai_addmodel_provider_autocomplete(self, interaction: discord.Interaction, current: str):
@@ -1350,16 +1400,8 @@ class Gpt(commands.Cog):
             self._do_aistatus(interaction, prefix_style=False), ephemeral=True
         )
 
-    @ai_group.command(name="setagentic", description="Enable/disable real Discord actions for the AI (superadmin)")
-    @app_commands.describe(enabled="on or off (omit to show the current state)")
-    async def ai_setagentic(self, interaction: discord.Interaction, enabled: Optional[str] = None):
-        if not interaction.guild:
-            await interaction.response.send_message("This command can only be used in a server.", ephemeral=True)
-            return
-        if not is_superadmin(self.bot.config, interaction.user.id):
-            await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-            return
-        await interaction.response.send_message(self._do_setagentic(interaction, enabled))
+    # /ai setagentic removed — agentic mode is now per-tool. Configure the
+    # bot's Discord tools in /ai settings → Bot tools (ai_admin.py cog).
 
     @ai_group.command(name="addprovider", description="Register a new OpenAI-compatible provider (superadmin)")
     @app_commands.describe(

@@ -15,8 +15,9 @@ from core/ops.py; the only policy here is the loop's:
 - send_message always uses allowed_mentions=none.
 - Every executed op is logged at INFO (op, params, actor, ok/error).
 
-Wired up by cogs/dynamic/gpt.py when the guild config flag
-`gpt_agentic_enabled` is true; nothing imports this module otherwise.
+Wired up by cogs/dynamic/gpt.py when a guild has at least one tool enabled in
+its `bot_tools_enabled` allowlist (the empty default routes to plain chat);
+nothing imports this module otherwise.
 """
 from __future__ import annotations
 
@@ -27,7 +28,9 @@ from pydantic_ai import Tool
 
 from core.ops import Op, registry
 
-# Tool surface for the loop. Roles/pins/threads stay out until there's a
+# The bot agent's tool UNIVERSE — the ceiling of what a guild's
+# `bot_tools_enabled` allowlist may contain (per-guild subsets are chosen in
+# the /ai settings panel). Roles/pins/threads stay out until there's a
 # concrete ask (YAGNI) — adding one later is one string here. delete_message
 # is ADMIN-gated in the registry, so only invoking users who pass is_admin
 # can actually use it (everyone else gets a tool error back in the loop).
@@ -43,18 +46,23 @@ AGENT_OPS = (
 )
 
 
-def build_agent_tools(ctx: Any, logger: logging.Logger) -> List[Tool]:
+def build_agent_tools(ctx: Any, logger: logging.Logger,
+                      op_names: List[str]) -> List[Tool]:
     """Build the pydantic-ai tool list for one agentic `!gpt` run.
 
     `ctx` is the live commands.Context of the invoking user — it IS the
     OpContext (duck-typed), so permission gates evaluate the invoking
     user's real Member, in their real guild.
+
+    `op_names` is the guild's resolved bot-tool allowlist (a subset of
+    AGENT_OPS). An empty list yields no tools — callers should route those
+    runs through the plain-chat path instead (see gpt.py process_askgpt).
     """
     if ctx.guild is None:
         raise ValueError("The agent loop only runs inside a guild.")
     allowed = frozenset({ctx.guild.id})
     return [_make_agent_tool(registry.require(op_name), ctx, allowed, logger)
-            for op_name in AGENT_OPS]
+            for op_name in op_names]
 
 
 def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,

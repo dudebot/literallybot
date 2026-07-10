@@ -212,15 +212,27 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
             "unrestricted server."
         )
 
+    # Which ops to expose is a global-config allowlist edited live from the
+    # /ai settings panel (MCP tab). Unset => the full _EXPOSED_OPS universe
+    # (back-compat default); an explicit [] exposes nothing. Read once at
+    # build time — like MCP_OPS_GUILD_ALLOWLIST, changes take effect on the
+    # next server (bot) restart. Names outside the _EXPOSED_OPS universe are
+    # dropped: the MCP surface never grows past what this module vets.
+    op_names = list(_EXPOSED_OPS)
+    if bot is not None and getattr(bot, "config", None) is not None:
+        configured = bot.config.get_global("mcp_tools_enabled")
+        if configured is not None:
+            op_names = [n for n in configured if n in _EXPOSED_OPS]
+
     mcp = FastMCP(name=name, instructions=(
         "Ops-registry bridge for literallybot. Exposes a subset of the "
-        "bot's ops registry as MCP tools: " + ", ".join(_EXPOSED_OPS) + ". "
+        "bot's ops registry as MCP tools: " + ", ".join(op_names) + ". "
         "Every call is permission-checked the same way an in-bot command "
         "would be, via the shared ops registry, and is restricted to a "
         "server-side guild allowlist."
     ))
 
-    for op_name in _EXPOSED_OPS:
+    for op_name in op_names:
         op = registry.require(op_name)  # raises on registry drift
         mcp.add_tool(_make_mcp_tool(bot, op, allowed),
                      name=op.name, description=op.description)
