@@ -78,13 +78,16 @@ DEFAULT_MAX_TOKENS = 3000
 # (setapikey/addmodel/addprovider) touches it; model lists then grow via
 # discovery. Model ids current as of 2026-07.
 DEFAULT_PROVIDERS: Dict[str, Any] = {
+    # cost_per_mtok_output ($/1M output tokens) drives the per-message cooldown
+    # tier (see cogs/dynamic/gpt.py cooldown_tier_for_cost). timeout_multiplier
+    # is kept for back-compat but no longer affects cooldown.
     "xai": {
         "name": "xAI Grok",
         "base_url": "https://api.x.ai/v1",
         "default_model": "grok-4-fast",
         "models": {
-            "grok-4-fast": {"timeout_multiplier": 0.5},
-            "grok-4.3": {"timeout_multiplier": 1.0},
+            "grok-4-fast": {"timeout_multiplier": 0.5, "cost_per_mtok_output": 0.5},
+            "grok-4.3": {"timeout_multiplier": 1.0, "cost_per_mtok_output": 2.5},
         },
     },
     "openai": {
@@ -92,8 +95,8 @@ DEFAULT_PROVIDERS: Dict[str, Any] = {
         "base_url": None,
         "default_model": "gpt-5.4-mini",
         "models": {
-            "gpt-5.4-mini": {"timeout_multiplier": 0.5},
-            "gpt-5.4": {"timeout_multiplier": 1.0},
+            "gpt-5.4-mini": {"timeout_multiplier": 0.5, "cost_per_mtok_output": 4.5},
+            "gpt-5.4": {"timeout_multiplier": 1.0, "cost_per_mtok_output": 15.0},
         },
     },
     "anthropic": {
@@ -101,8 +104,8 @@ DEFAULT_PROVIDERS: Dict[str, Any] = {
         "api_type": "anthropic",
         "default_model": "claude-haiku-4-5",
         "models": {
-            "claude-haiku-4-5": {"timeout_multiplier": 0.5},
-            "claude-sonnet-5": {"timeout_multiplier": 1.0},
+            "claude-haiku-4-5": {"timeout_multiplier": 0.5, "cost_per_mtok_output": 5.0},
+            "claude-sonnet-5": {"timeout_multiplier": 1.0, "cost_per_mtok_output": 15.0},
         },
     },
     "ollama": {
@@ -111,7 +114,9 @@ DEFAULT_PROVIDERS: Dict[str, Any] = {
         "requires_api_key": False,
         "default_model": "qwen3.5:4b",
         "models": {
-            "qwen3.5:4b": {"timeout_multiplier": 1.0, "reasoning_effort": "none"},
+            # Local/free -> cheap tier (10s cooldown).
+            "qwen3.5:4b": {"timeout_multiplier": 1.0, "reasoning_effort": "none",
+                           "cost_per_mtok_output": 0.0},
         },
     },
 }
@@ -460,6 +465,11 @@ class LLMClient:
                     discovered.append(model_id)
                     models_dict = provider_info.setdefault("models", {})
                     if model_id not in models_dict:
+                        # Discovery can't know pricing, so cost_per_mtok_output
+                        # is left unset -> the pricy (300s) cooldown tier until
+                        # an operator annotates it with `!addmodel <name>
+                        # <provider> <cost>`. Safe default: over-throttle an
+                        # unknown model rather than under-throttle it.
                         models_dict[model_id] = {
                             "timeout_multiplier": _discovery_multiplier(provider, model_id)
                         }
