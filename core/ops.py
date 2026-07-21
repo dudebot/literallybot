@@ -740,11 +740,8 @@ async def search_history(ctx: OpContext, channel, limit: int = 100,
 
 @registry.op(
     "add_role",
-    "Add a role to a member. Requires admin when targeting someone other "
-    "than the invoking actor — mirrors cogs/dynamic/setrole.py's own-vs-"
-    "other-member permission split. The registry-level gate here is a "
-    "simpler admin-only rule; callers that need the whitelist-role / "
-    "self-service behavior of !setrole should keep using that cog for now.",
+    "Add a role to a member. Requires admin — self-service role assignment "
+    "is the reaction-role system's job (cogs/dynamic/setrole.py), not this op's.",
     PermissionLevel.ADMIN,
     params=[
         OpParam("member", ParamKind.MEMBER, "Discord user id to grant the role to."),
