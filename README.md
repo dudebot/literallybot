@@ -101,8 +101,8 @@ Press the button on your Hue Bridge, then run:
 - `/ai settings` / `/ai status` - Configure and inspect the AI layer
 - `!dice <NdX>` (or `/roll_dice`) - Roll dice, e.g. `!dice 2d20`
 - `!remindme <number> <unit> <message>` - Set reminders
-- `!setrole <role>` (or `/roles claim`) - Self-assign roles; admins manage the
-  allowlist with `/roles settings`
+- Reaction roles - react to a configured message to toggle a role; admins
+  set mappings with `/setemojiroletoggle` / `/removeemojiroletoggle`
 - `!addmedia` / `!delmedia` / `!listmedia` - Manage playable media clips (admin)
 
 ## 🏗️ Development & Extension

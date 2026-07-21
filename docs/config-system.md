@@ -111,7 +111,7 @@ illustration; they are not real.)
 | `gpt_personality_data` | `{prompt: str, version: int}` | `/ai settings` → Personality modal | version = unix ts, tags memories |
 | `gpt_memories` | `list[{text, expires, type, sender, personality_version, stored_at}]` | gpt.py memory capture | TTL-purged on read/write |
 | `bot_tools_enabled` | `list[str]` ⊆ `AGENT_OPS` | `/ai settings` → Bot tools | Empty/absent ⇒ plain chat (no agent loop) |
-| `whitelist_roles` | `list[str]` role NAMES | `/roles settings` panel | The single whitelist data model — `!setrole`, `/roles claim`, and the panel all share it. Names, not ids: survives nothing being renamed; unresolvable entries are flagged in the panel, never auto-dropped |
+| `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
 | `emoji_role_toggles` | `{message_id_str: {emoji_key_str: role_id_int}}` | `/setemojiroletoggle` / `/removeemojiroletoggle` | emoji_key is custom-emoji id as str, or the unicode emoji itself |
 | `error_logging` | as global | `!errorlog` in-guild | |
 

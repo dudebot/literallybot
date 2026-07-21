@@ -66,7 +66,7 @@ Where new code should land, so seams don't re-greed:
 - **Config keys**: every real key in `configs/*.json` is inventoried in the
   Key Registry section of `docs/config-system.md` — keep it current when
   adding keys. One data model per concept: never add a parallel key for an
-  existing concept (the role whitelist is `whitelist_roles`, full stop).
+  existing concept (reaction-role mappings are `emoji_role_toggles`, full stop).
 - **Rate limiting** is the nested-window ladder in gpt.py
   (`cooldown_config`/`_check_cooldown`, tunable via `/ai settings` →
   Cooldowns). Don't reintroduce flat per-message cooldowns.
