@@ -1,11 +1,10 @@
 from discord.ext import commands
 import discord
 from sys import version_info as sysv
-from os import listdir
 import subprocess
 from datetime import datetime
 import sys
-from core.utils import is_superadmin, safe_delete
+from core.utils import is_superadmin, safe_delete, list_cog_modules
 
 class Dev(commands.Cog):
     """Superadmin-only maintenance commands: cog load/unload/reload, git
@@ -99,8 +98,7 @@ class Dev(commands.Cog):
 
         if cog is None:
             cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.dynamic.")]
-            cogs_to_load = [f'cogs.dynamic.{filename[:-3]}' for filename in listdir('./cogs/dynamic')
-                            if filename.endswith('.py') and not filename.startswith('_')]
+            cogs_to_load = list_cog_modules('dynamic')
         else:
             cogs_to_unload = [self.check_cog(cog)]
             cogs_to_load = [self.check_cog(cog)]
@@ -232,8 +230,8 @@ class Dev(commands.Cog):
         message = await ctx.send('Listing all cogs...')
         await safe_delete(ctx, self.logger)
         try:
-            cogs = [cog[:-3] for cog in listdir('./cogs/dynamic')
-                    if cog.endswith('.py') and not cog.startswith('_')]
+            # Display keeps the bare cog names (module path stripped).
+            cogs = [mod.rsplit('.', 1)[-1] for mod in list_cog_modules('dynamic')]
             await message.edit(content=f'Available cogs: {", ".join(cogs)}', delete_after=20)
         except Exception as exc:
             self.logger.error("Error listing cogs", exc_info=True)

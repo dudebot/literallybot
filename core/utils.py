@@ -11,6 +11,7 @@ Normalization goals:
   discord.Interaction (slash commands) interchangeably. This is the single
   auth gate for both command surfaces - see _actor()/_bot_of() below.
 """
+import os
 import re
 from typing import List, Union, Any
 import discord
@@ -136,6 +137,21 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
         return True
 
     return False
+
+
+def list_cog_modules(group: str) -> List[str]:
+    """Loadable cog modules for a cogs/ group, as dotted module paths
+    (['cogs.dynamic.gpt', ...]). THE one owner of the loadable-cog rule
+    (*.py, not underscore/dunder-prefixed) — startup load, !reload-all,
+    and !list_cogs must all resolve the cog set through this so they can
+    never disagree about what counts as loadable. Missing directory
+    yields [] (mirrors the startup skip)."""
+    dir_path = f"./cogs/{group}"
+    if not os.path.isdir(dir_path):
+        return []
+    return [f"cogs.{group}.{filename[:-3]}"
+            for filename in os.listdir(dir_path)
+            if filename.endswith('.py') and not filename.startswith('_')]
 
 
 def smart_split(options):
