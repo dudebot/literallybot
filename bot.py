@@ -229,14 +229,27 @@ statuslist = load_status_messages()
 
 @tasks.loop(seconds=300)
 async def change_status():
-    """This is a background task that loops every 16 seconds.
-    The coroutine looped with this task will change status over time.
-    The statuses used are in the cycle list called `statuslist`_.
-    
-    Documentation:
-        https://discordpy.readthedocs.io/en/latest/ext/tasks/index.html
-    """
+    """Background task cycling the bot's presence through `statuslist`."""
     await bot.change_presence(activity=discord.Game(next(statuslist)))
+
+
+# Must be registered BEFORE the blocking __main__ guard: bot.run() doesn't
+# return until shutdown, so anything below it never executes on a live run
+# (this handler previously sat there, dead — loop failures silently killed
+# status rotation with no Discord report).
+@change_status.error
+async def change_status_error(error):
+    """Handle errors in the change_status task loop."""
+    logger.error(f"Error in change_status task: {error}", exc_info=True)
+    try:
+        import asyncio as _asyncio
+        _asyncio.create_task(log_error_to_discord(
+            bot, error, 'task_change_status',
+            category=ErrorCategory.TASK_ERROR,
+            severity=ErrorSeverity.WARNING
+        ))
+    except Exception as log_error:
+        logger.error(f"Failed to log error to Discord: {log_error}", exc_info=True)
 
 
 if __name__ == "__main__":
@@ -253,18 +266,3 @@ if __name__ == "__main__":
         bot.config.shutdown()
         logger.info('Config system shutdown complete')
     #Runs the bot with its token. Don't put code below this command.
-
-
-@change_status.error
-async def change_status_error(error):
-    """Handle errors in the change_status task loop."""
-    logger.error(f"Error in change_status task: {error}", exc_info=True)
-    try:
-        import asyncio as _asyncio
-        _asyncio.create_task(log_error_to_discord(
-            bot, error, 'task_change_status',
-            category=ErrorCategory.TASK_ERROR,
-            severity=ErrorSeverity.WARNING
-        ))
-    except Exception as log_error:
-        logger.error(f"Failed to log error to Discord: {log_error}", exc_info=True)
