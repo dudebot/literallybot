@@ -8,7 +8,6 @@ from itertools import cycle
 from discord.ext import commands, tasks
 import discord
 from discord import app_commands
-from os import listdir
 from dotenv import load_dotenv
 import os
 from core.config import Config
@@ -62,18 +61,10 @@ bot.config = Config()
 async def load_cogs():
     failed_cogs = []  # Track failed cogs for reporting
 
+    from core.utils import list_cog_modules
+
     for group in ("static", "dynamic"):
-        dir_path = f"./cogs/{group}"
-        if not os.path.isdir(dir_path):
-            logger.debug(f"Cog directory missing, skipping: {dir_path}")
-            continue
-
-        for filename in listdir(dir_path):
-            # Skip non-python & dunder/hidden modules like __init__.py
-            if not filename.endswith('.py') or filename.startswith('_'):
-                continue
-
-            cog_name = f"cogs.{group}.{filename[:-3]}"
+        for cog_name in list_cog_modules(group):
             try:
                 # Skip if already loaded (handles reconnection scenarios)
                 if cog_name in bot.extensions:
