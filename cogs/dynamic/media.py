@@ -120,7 +120,8 @@ class Media(commands.Cog):
 
     def _cleanup_media_files(self, file_name):
         """Remove any media files matching the given base name, including temp files."""
-        for pattern in [f'media/{file_name}.*', f'media/{file_name}_tmp.*']:
+        for pattern in [os.path.join(self._media_dir, f'{file_name}.*'),
+                        os.path.join(self._media_dir, f'{file_name}_tmp.*')]:
             for f in glob.glob(pattern):
                 try:
                     os.remove(f)
@@ -220,7 +221,7 @@ class Media(commands.Cog):
             if clean_url.lower().endswith(direct_extensions):
                 # Direct file download - extract extension from URL
                 file_extension = clean_url.split('.')[-1].lower()
-                file_path = f'media/{file_name}.{file_extension}'
+                file_path = os.path.join(self._media_dir, f'{file_name}.{file_extension}')
 
                 with requests.get(link, stream=True) as response:
                     response.raise_for_status()
@@ -231,7 +232,7 @@ class Media(commands.Cog):
                 # yt-dlp download - let it determine extension
                 ydl_opts = {
                     'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'outtmpl': f'media/{file_name}.%(ext)s',
+                    'outtmpl': os.path.join(self._media_dir, f'{file_name}.%(ext)s'),
                     'merge_output_format': 'mp4',
                 }
 
@@ -239,7 +240,7 @@ class Media(commands.Cog):
                     ydl.download([link])
 
                 # Find what yt-dlp created (exclude temp files)
-                matches = [f for f in glob.glob(f'media/{file_name}.*')
+                matches = [f for f in glob.glob(os.path.join(self._media_dir, f'{file_name}.*'))
                            if '_tmp.' not in f]
                 if not matches:
                     await ctx.send('Download appeared to succeed but no file was created.')
@@ -332,15 +333,14 @@ class Media(commands.Cog):
 
         Usage: !listmedia [prefix]
         """
-        media_dir = 'media/'
         allowed = ('.mp4', '.ogg', '.webm', '.mp3')
 
-        if not os.path.isdir(media_dir):
+        if not os.path.isdir(self._media_dir):
             await ctx.send('Media directory not found.')
             return
 
         try:
-            entries = os.listdir(media_dir)
+            entries = os.listdir(self._media_dir)
         except OSError as e:
             await ctx.send(f'Failed to read media directory: {e}')
             return
