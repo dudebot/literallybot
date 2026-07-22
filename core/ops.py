@@ -69,6 +69,7 @@ class ParamKind(str, Enum):
     resolution. Discord entities travel as ids on the wire and are resolved
     to live objects before the op impl runs; scalars pass through."""
     CHANNEL = "channel"    # wire: channel_id (int) -> discord channel object
+    CHANNEL_LIST = "channel_list"  # wire: channel_ids (int array) -> list of channels
     MESSAGE = "message"    # wire: channel_id + message_id (int) -> discord.Message
     MEMBER = "member"      # wire: user_id (int) -> discord.Member (of ctx.guild)
     ROLE = "role"          # wire: role_id (int) -> discord.Role (of ctx.guild)
@@ -240,6 +241,12 @@ async def resolve_context_guild(bot: Any, raw: Dict[str, Any],
         channel = await resolve_channel(bot, _as_int(raw["channel_id"], "channel_id"),
                                         allowed_guild_ids)
         return channel.guild
+    channel_ids = raw.get("channel_ids")
+    if channel_ids:
+        first = channel_ids[0] if isinstance(channel_ids, (list, tuple)) else channel_ids
+        channel = await resolve_channel(bot, _as_int(first, "channel_ids"),
+                                        allowed_guild_ids)
+        return channel.guild
     if raw.get("guild_id") is not None:
         return resolve_guild(bot, _as_int(raw["guild_id"], "guild_id"), allowed_guild_ids)
     return None
@@ -260,6 +267,7 @@ def _as_int(value: Any, wire_name: str) -> int:
 def serialize_message(message: Any) -> Dict[str, Any]:
     return {
         "id": message.id,
+        "channel_id": message.channel.id,
         "author_id": message.author.id,
         "content": message.content,
         "created_at": message.created_at.isoformat() if getattr(message, "created_at", None) else None,
@@ -274,6 +282,12 @@ class Op:
     impl: Callable[..., Any]
     params: List[OpParam] = field(default_factory=list)
     serialize: Optional[Callable[[Any], Dict[str, Any]]] = None
+    # Behavioral guidance injected into the agent system prompt when this op
+    # is on a guild's enabled-tool list (see gpt.py build_agentic_guidance).
+    # Lives here, not in the prompt builder, so guidance travels with the op
+    # and can't drift out of sync with the enabled-tool set. Distinct from
+    # `description`, which rides inside the function schema itself.
+    agent_guidance: Optional[str] = None
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
         allowed, reason = _check_permission(ctx, self.permission)
@@ -312,6 +326,10 @@ class Op:
                 add(WireParam("message_id", "integer",
                               p.description or f"Discord message id of the {p.name}.",
                               p.required, p.default))
+            elif p.kind == ParamKind.CHANNEL_LIST:
+                add(WireParam("channel_ids", "array",
+                              p.description or "List of Discord channel ids.",
+                              p.required, p.default))
             elif p.kind in _ENTITY_WIRE_NAMES:
                 add(WireParam(_ENTITY_WIRE_NAMES[p.kind], "integer",
                               p.description or f"Discord {p.kind.value} id.",
@@ -328,6 +346,11 @@ class Op:
         required: List[str] = []
         for wp in self.wire_params():
             prop: Dict[str, Any] = {"type": wp.json_type}
+            if wp.json_type == "array":
+                # The only array wire kind is CHANNEL_LIST (integer ids).
+                # A second array kind must also update mcp_ops/server.py's
+                # _JSON_TYPE_TO_PY (or grow an items-type facet on WireParam).
+                prop["items"] = {"type": "integer"}
             if wp.description:
                 prop["description"] = wp.description
             if wp.default is not None:
@@ -376,10 +399,28 @@ class Op:
             if p.kind == ParamKind.CHANNEL:
                 channel_id = raw.pop("channel_id", None)
                 if channel_id is None:
-                    raise ResolutionError(f"Missing required parameter 'channel_id' for op '{self.name}'.")
+                    if p.required:
+                        raise ResolutionError(f"Missing required parameter 'channel_id' for op '{self.name}'.")
+                    kwargs[p.name] = None
+                    continue
                 resolved_channel = await resolve_channel(
                     bot, _as_int(channel_id, "channel_id"), allowed_guild_ids)
                 kwargs[p.name] = resolved_channel
+
+            elif p.kind == ParamKind.CHANNEL_LIST:
+                channel_ids = raw.pop("channel_ids", None)
+                if channel_ids is None:
+                    if p.required:
+                        raise ResolutionError(f"Missing required parameter 'channel_ids' for op '{self.name}'.")
+                    kwargs[p.name] = None
+                    continue
+                if not isinstance(channel_ids, (list, tuple)):
+                    channel_ids = [channel_ids]
+                kwargs[p.name] = [
+                    await resolve_channel(bot, _as_int(cid, "channel_ids"),
+                                          allowed_guild_ids)
+                    for cid in channel_ids
+                ]
 
             elif p.kind == ParamKind.MESSAGE:
                 message_id = raw.pop("message_id", None)
@@ -477,15 +518,18 @@ def _check_channel_visibility(ctx: OpContext, kwargs: Dict[str, Any]) -> "tuple[
     if actor is None or not hasattr(actor, "guild_permissions"):
         return True, None
     for value in kwargs.values():
-        channel = value if _is_guild_channel(value) else getattr(value, "channel", None)
-        if channel is None or not hasattr(channel, "permissions_for"):
-            continue
-        try:
-            perms = channel.permissions_for(actor)
-        except Exception:  # noqa: BLE001 - be permissive on odd channel types
-            continue
-        if not getattr(perms, "read_messages", True):
-            return False, f"Actor cannot access channel {getattr(channel, 'id', '?')}."
+        # CHANNEL_LIST params resolve to lists — gate every element.
+        items = value if isinstance(value, (list, tuple)) else [value]
+        for item in items:
+            channel = item if _is_guild_channel(item) else getattr(item, "channel", None)
+            if channel is None or not hasattr(channel, "permissions_for"):
+                continue
+            try:
+                perms = channel.permissions_for(actor)
+            except Exception:  # noqa: BLE001 - be permissive on odd channel types
+                continue
+            if not getattr(perms, "read_messages", True):
+                return False, f"Actor cannot access channel {getattr(channel, 'id', '?')}."
     return True, None
 
 
@@ -528,7 +572,8 @@ class OpsRegistry:
 
     def op(self, name: str, description: str, permission: PermissionLevel,
            params: Optional[List[OpParam]] = None,
-           serialize: Optional[Callable[[Any], Dict[str, Any]]] = None):
+           serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
+           agent_guidance: Optional[str] = None):
         """Decorator: `@registry.op("name", "...", PermissionLevel.ADMIN)`
         registers an `async def impl(ctx, **kwargs)` under `name`."""
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -539,6 +584,7 @@ class OpsRegistry:
             self._ops[name] = Op(
                 name=name, description=description, permission=permission,
                 impl=func, params=params or [], serialize=serialize,
+                agent_guidance=agent_guidance,
             )
             return func
         return decorator
@@ -624,6 +670,11 @@ registry = OpsRegistry()
         OpParam("allowed_mentions", ParamKind.INTERNAL),
     ],
     serialize=lambda m: {"message_id": m.id},
+    agent_guidance=(
+        "send_message returns the new message's message_id; reuse it for "
+        "follow-up edits or reactions, and use reference_message_id to reply "
+        "to a message. Your final text reply is posted to the current channel "
+        "automatically — never duplicate it with send_message."),
 )
 async def send_message(ctx: OpContext, channel, content: str,
                        reference_message_id: Optional[int] = None,
@@ -663,6 +714,9 @@ async def edit_message(ctx: OpContext, message, content: str):
     "bulk-delete gate, which restricts message deletion to superadmin/admin.",
     PermissionLevel.ADMIN,
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to delete.")],
+    agent_guidance=(
+        "delete_message requires the invoking user to be a bot admin; if the "
+        "tool returns a permission error, relay that plainly."),
 )
 async def delete_message(ctx: OpContext, message):
     await message.delete()
@@ -678,6 +732,10 @@ async def delete_message(ctx: OpContext, message):
         OpParam("emoji", ParamKind.STRING,
                 "Emoji to react with (unicode emoji or `name:id` custom emoji)."),
     ],
+    agent_guidance=(
+        "add_reaction needs a literal unicode emoji character (💩, 💨, ❤️) or "
+        "name:id for custom emoji — never a word or description. ('fart' and "
+        "'-' are invalid; the fart/dash emoji is 💨.)"),
 )
 async def add_reaction(ctx: OpContext, message, emoji: str):
     await message.add_reaction(emoji)
@@ -696,46 +754,170 @@ async def add_reaction(ctx: OpContext, message, emoji: str):
         OpParam("emoji", ParamKind.STRING,
                 "Emoji to remove (unicode emoji or `name:id` custom emoji)."),
     ],
+    agent_guidance=(
+        "remove_reaction only removes reactions the bot itself added, and "
+        "takes the same literal-emoji form as add_reaction."),
 )
 async def remove_reaction(ctx: OpContext, message, emoji: str):
     await message.remove_reaction(emoji, ctx.bot.user)
     return True
 
 
+async def _index_search(bot, guild_id, channel_ids, limit, author_id, contains):
+    """Query Discord's guild message-search index, newest first — guild-wide
+    when channel_ids is empty, else scoped to those channels (the endpoint
+    accepts repeated channel_id params and unions them; verified live
+    2026-07-21). Documented endpoint (GET /guilds/{guild.id}/messages/search;
+    needs READ_MESSAGE_HISTORY + the MESSAGE_CONTENT intent) — full-history
+    keyword search. include_nsfw is always sent because actor visibility is
+    enforced by our own gates (and this endpoint excludes age-restricted
+    channels by default, which silently hides most of an NSFW-flagged
+    guild). The API pages 25 at a time; raises on any error so the caller
+    can fall back / degrade.
+    """
+    from discord.http import Route
+    hits = []
+    total = None
+    while len(hits) < limit:
+        # List-of-tuples so channel_id can repeat; str values for aiohttp.
+        params = [
+            ("include_nsfw", "true"),
+            ("sort_by", "timestamp"),
+            ("sort_order", "desc"),
+            ("limit", str(min(25, limit - len(hits)))),
+            ("offset", str(len(hits))),
+        ]
+        params.extend(("channel_id", str(cid)) for cid in channel_ids)
+        if author_id is not None:
+            params.append(("author_id", str(author_id)))
+        if contains is not None:
+            params.append(("content", contains))
+        data = await bot.http.request(
+            Route("GET", "/guilds/{guild_id}/messages/search",
+                  guild_id=guild_id),
+            params=params)
+        total = data.get("total_results")
+        # Each result is a group of messages with the actual match flagged
+        # `hit`; the rest is surrounding context we don't want.
+        page = [next((m for m in group if m.get("hit")), group[0])
+                for group in data.get("messages", []) if group]
+        if not page:
+            break
+        # Same row shape as serialize_message — the fallback scan path uses
+        # it, and consumers must not see two shapes for one op.
+        hits.extend({
+            "id": int(m["id"]),
+            "channel_id": int(m["channel_id"]),
+            "author_id": int(m["author"]["id"]),
+            "content": m.get("content", ""),
+            "created_at": m.get("timestamp"),
+        } for m in page)
+        if total is not None and len(hits) >= int(total):
+            break
+    return hits[:limit], total
+
+
+def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
+    """Guild-wide search can surface channels the invoking user can't read;
+    apply the same actor-visibility policy as _check_channel_visibility
+    (real Members are filtered, bare id-holder actors are the MCP frontend's
+    documented accepted risk and pass through). Hits in channels the bot no
+    longer resolves are dropped as unverifiable."""
+    actor = getattr(ctx, "author", None)
+    if actor is None or not hasattr(actor, "guild_permissions"):
+        return hits
+    visible = []
+    for hit in hits:
+        channel = guild.get_channel(hit["channel_id"]) if guild else None
+        if channel is None or not hasattr(channel, "permissions_for"):
+            continue
+        try:
+            if channel.permissions_for(actor).read_messages:
+                visible.append(hit)
+        except Exception:  # noqa: BLE001 - odd channel types err to hidden
+            continue
+    return visible
+
+
 @registry.op(
     "search_history",
-    "Search a channel's message history, optionally filtered by author id "
-    "and/or a substring match on content.",
+    "Search FULL message history via Discord's search index (keyword "
+    "matching like the Discord search bar) — the whole server at once, or "
+    "one channel — optionally filtered by author id and/or a content keyword.",
     PermissionLevel.EVERYONE,
     params=[
-        OpParam("channel", ParamKind.CHANNEL, "Discord channel id to search."),
+        OpParam("channels", ParamKind.CHANNEL_LIST,
+                "Discord channel ids to search, unioned in one call — "
+                "[id] for a single channel, [id1, id2, ...] for a subset. "
+                "OMIT entirely to search every channel in the server.",
+                required=False),
         OpParam("limit", ParamKind.INTEGER,
-                f"Max number of messages to scan, most recent first "
-                f"(clamped to {HISTORY_LIMIT_MAX}).",
+                f"Max number of matching messages to return, most recent "
+                f"first (clamped to {HISTORY_LIMIT_MAX}).",
                 required=False, default=100, minimum=1, maximum=HISTORY_LIMIT_MAX),
         OpParam("author_id", ParamKind.INTEGER,
                 "Optional filter — only messages from this user id.",
                 required=False),
         OpParam("contains", ParamKind.STRING,
-                "Optional filter — substring match on message content.",
+                "Optional filter — keyword(s) to match in message content "
+                "(whole-word matching, like Discord's search bar; also "
+                "matches text inside embeds/links).",
                 required=False),
     ],
-    serialize=lambda msgs: {
-        "messages": [serialize_message(m) for m in msgs],
-        "count": len(msgs),
-    },
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "search_history searches FULL history via Discord's search index, "
+        "in ONE call however it's scoped: OMIT channel_ids for server-wide "
+        "questions ('has anyone ever...', 'how many times did X get said in "
+        "this server'); channel_ids: [id] for one channel; channel_ids: "
+        "[id1, id2] for a subset. Filter with `contains` (keyword) and/or "
+        "`author_id`. Results come back to YOU as data, newest first, each "
+        "hit tagged with its channel_id; `total_matches` is how many exist "
+        "in all — report that number honestly when it exceeds what was "
+        "returned. Read the results and answer in plain text — never paste "
+        "them raw. If the result carries a `note` about a fallback scan, "
+        "only the most recent messages were checked — say so instead of "
+        "claiming 'never'."),
 )
-async def search_history(ctx: OpContext, channel, limit: int = 100,
+async def search_history(ctx: OpContext, channels=None,
+                          limit: int = 100,
                           author_id: Optional[int] = None,
                           contains: Optional[str] = None):
-    results = []
-    async for message in channel.history(limit=limit):
-        if author_id is not None and message.author.id != author_id:
-            continue
-        if contains is not None and contains.lower() not in message.content.lower():
-            continue
-        results.append(message)
-    return results
+    scoped = list(channels or [])
+    guild = scoped[0].guild if scoped else ctx.guild
+    if guild is None:
+        raise ValueError("search_history needs a channel or a guild context.")
+    try:
+        hits, total = await _index_search(
+            ctx.bot, guild.id, [c.id for c in scoped],
+            limit, author_id, contains)
+        hits = _drop_hits_actor_cannot_see(ctx, guild, hits)
+        return {"messages": hits, "count": len(hits), "total_matches": total}
+    except Exception as exc:
+        # Index cold, endpoint withdrawn, or intent missing — degrade rather
+        # than failing the tool outright, and SAY so in the payload so the
+        # model doesn't overclaim "never said".
+        logger = getattr(ctx.bot, "logger", None)
+        if logger:
+            logger.warning(
+                f"search_history index query failed ({type(exc).__name__}: "
+                f"{exc}); falling back to recent-window scan")
+        if len(scoped) != 1:
+            return {"messages": [], "count": 0,
+                    "note": ("search index unavailable; guild-wide and "
+                             "multi-channel search require it — retry with "
+                             "channel_ids: [one channel id] to scan that "
+                             "channel's recent messages")}
+        results = []
+        async for message in scoped[0].history(limit=limit):
+            if author_id is not None and message.author.id != author_id:
+                continue
+            if contains is not None and contains.lower() not in message.content.lower():
+                continue
+            results.append(serialize_message(message))
+        return {"messages": results, "count": len(results),
+                "note": (f"search index unavailable; scanned only the "
+                         f"{limit} most recent messages")}
 
 
 @registry.op(
@@ -817,6 +999,10 @@ async def list_guilds(ctx: OpContext):
     PermissionLevel.EVERYONE,
     params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
     serialize=lambda cs: {"channels": cs, "count": len(cs)},
+    agent_guidance=(
+        "Channel ids must come from list_channels or the visible context — "
+        "NEVER guess or invent an id. When the user names channels (e.g. "
+        "'check #memes'), call list_channels first to resolve names to ids."),
 )
 async def list_channels(ctx: OpContext, guild):
     return [
@@ -905,8 +1091,11 @@ def _smoke_test() -> None:
     assert set(edit["properties"]) == {"channel_id", "message_id", "content"}, edit
 
     search = registry.get("search_history").to_json_schema()
-    assert set(search["properties"]) == {"channel_id", "limit", "author_id", "contains"}
-    assert search["required"] == ["channel_id"]
+    assert set(search["properties"]) == {"channel_ids", "limit",
+                                         "author_id", "contains"}
+    assert search["required"] == []  # no channel scope => guild-wide search
+    assert search["properties"]["channel_ids"]["type"] == "array"
+    assert search["properties"]["channel_ids"]["items"] == {"type": "integer"}
     assert search["properties"]["limit"]["maximum"] == HISTORY_LIMIT_MAX
 
     thread = registry.get("create_thread").to_json_schema()

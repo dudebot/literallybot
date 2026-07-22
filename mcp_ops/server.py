@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Annotated, Any, Iterable, Optional
+from typing import Annotated, Any, Iterable, List, Optional
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -53,8 +53,11 @@ logger = logging.getLogger("mcp_ops.server")
 # Ops exposed over MCP. pin/role/thread ops stay unexposed until a concrete
 # need shows up. ADMIN-tier ops (delete_message) are safe to expose:
 # registry.call_ids checks the permission gate BEFORE resolving any ids, so
-# a non-admin caller gets "Requires admin." without ever triggering Discord
-# lookups (no id-probing oracle).
+# permission failures never trigger target lookups. Caveat: THIS frontend
+# pre-resolves the context guild/channel (tool_fn must build the actor
+# Member from the target guild before the gate can run), so guild/channel
+# id EXISTENCE is observable to any token-holder — accepted under the
+# loopback + bearer-token trust model, same as caller-supplied actor_id.
 _EXPOSED_OPS = (
     "send_message",
     "search_history",
@@ -67,7 +70,10 @@ _EXPOSED_OPS = (
     "list_members",
 )
 
-_JSON_TYPE_TO_PY = {"integer": int, "string": str, "boolean": bool}
+# "array" is always a list of integer ids (ops.py CHANNEL_LIST is the only
+# array wire kind; see Op.to_json_schema).
+_JSON_TYPE_TO_PY = {"integer": int, "string": str, "boolean": bool,
+                    "array": List[int]}
 
 
 class BotUnavailableError(RuntimeError):
@@ -137,6 +143,14 @@ def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
             guild = await resolve_context_guild(live_bot, raw, allowed)
         except ResolutionError as exc:
             raise BotUnavailableError(str(exc)) from exc
+
+        # Guild-less calls (e.g. guild-wide search_history with channel_ids
+        # omitted) default to the sole allowlisted guild — the allowlist is
+        # this frontend's trust boundary, and both deployments are pinned to
+        # exactly one guild. With multiple allowlisted guilds there is no
+        # safe default, so the op's own "needs a guild context" error stands.
+        if guild is None and len(allowed) == 1:
+            guild = live_bot.get_guild(next(iter(allowed)))
 
         ctx = _build_context(live_bot, actor_id, guild)
 

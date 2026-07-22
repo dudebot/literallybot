@@ -60,22 +60,28 @@ Security properties enforced centrally, so no frontend can skip them:
   leaking history/members from channels the caller can't see, or posting into them.
 - **Mentions suppressed.** Both frontends force `allowed_mentions=none` on
   `send_message`, so tool-driven sends never ping.
-- **Tool budget.** The agentic `!gpt` loop is capped at 8 tool calls per run
-  (`max_tool_calls=8`); exceeding it returns a fixed message rather than looping.
+- **Tool budget.** The agentic `!gpt` loop has a SOFT budget of 8 tool calls per
+  run (`core/agent_loop.AGENT_TOOL_BUDGET`), shared across the run and any
+  narration-nudge retry: the last 3 results carry a `tool_calls_remaining`
+  countdown, and calls past the budget are refused with an answer-now error so
+  the model always authors its own final reply. pydantic-ai's hard cap sits at
+  2x (16) as a runaway backstop; even that path degrades to a model-authored
+  plain-chat answer, never a canned failure string.
 - **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
   allowlist (default empty, meaning `!gpt` is plain chat with no tools), managed
   from the `/ai settings` panel. The MCP server consumes its own global
   `mcp_tools_enabled` allowlist at build time.
 - **Every executed op is logged** at INFO (op name, params, actor id, ok/error).
 
-### Ordering caveat (exposed-op selection)
+### Ordering (exposed-op selection)
 
-`Op.__call__` resolves ids to live objects **before** the permission gate runs.
-The agent loop and MCP server therefore only expose EVERYONE-tier ops on purpose:
-exposing an ADMIN op would let a non-admin distinguish "invalid id" from "requires
-admin" by the error text — an id-probing oracle. To expose an ADMIN op, move
-resolution to *after* the gate first. This constraint is documented at the
-`_EXPOSED_OPS` / `AGENT_OPS` lists.
+`registry.call_ids` checks the permission gate **before** resolving any ids to
+live Discord objects, so a caller who fails the gate learns nothing about
+whether a guessed id exists — no id-probing oracle. That is what makes
+ADMIN-tier ops (e.g. `delete_message`) safely exposable on both frontends: a
+non-admin gets the same permission error regardless of target validity.
+`Op.__call__`'s own permission check is belt-and-suspenders for object-based
+callers that bypass `call_ids` and resolved nothing through the registry.
 
 ## MCP Ops Server
 
@@ -132,10 +138,12 @@ admin/superadmin list.
 - **Persona is guild-admin-settable.** The personality editor in the
   `/ai settings` panel (admin-gated) sets the system persona for that guild's
   `!gpt`. Any guild admin can rewrite the bot's system prompt.
-- **Output mention filter is narrow.** `check_message_compliance` blocks only the
-  literal substrings `@everyone` / `@here` in the model's reply. It does **not**
-  block role mentions (`<@&ROLE_ID>`) or user mentions, and the primary chat reply
-  is sent with default `allowed_mentions` (see hardening checklist).
+- **Output mention filter is narrow, backed by AllowedMentions.**
+  `check_message_compliance` blocks only the literal substrings `@everyone` /
+  `@here` in the model's reply, but every reply chunk is sent with
+  `AllowedMentions(users=True, roles=False, everyone=False)` — user pings are an
+  intended feature; role/everyone pings cannot fire even if the substring filter
+  is bypassed.
 - **Memory capture runs on every message.** Regexes in
   `capture_and_store_memories` extract statements ("my name is …", "you're to
   always …", etc.) from *all* messages — not just `!gpt` invocations — and persist
