@@ -466,13 +466,11 @@ class LLMClient:
                     models_dict = provider_info.setdefault("models", {})
                     if model_id not in models_dict:
                         # Discovery can't know pricing, so cost_per_mtok_output
-                        # is left unset -> the pricy (300s) cooldown tier until
-                        # an operator annotates it with `!addmodel <name>
-                        # <provider> <cost>`. Safe default: over-throttle an
-                        # unknown model rather than under-throttle it.
-                        models_dict[model_id] = {
-                            "timeout_multiplier": _discovery_multiplier(provider, model_id)
-                        }
+                        # is left unset -> the pricy cooldown tier until an
+                        # operator annotates a cost via /ai settings. Safe
+                        # default: over-throttle an unknown model rather than
+                        # under-throttle it.
+                        models_dict[model_id] = {}
 
             if discovered:
                 # Merge into the full provider set (seeded defaults included) —
@@ -487,25 +485,6 @@ class LLMClient:
         except Exception as e:
             self.logger.error(f"Failed to discover models for {provider}: {e}", exc_info=True)
             raise
-
-
-def _discovery_multiplier(provider: str, model_id: str) -> float:
-    """Cooldown multiplier heuristic for newly discovered models."""
-    lowered = model_id.lower()
-    if provider == "openai":
-        if "mini" in lowered:
-            return 0.5
-        if model_id.startswith(("o3", "o4")):
-            return 2.0
-        if "turbo" in lowered:
-            return 0.7
-        return 1.0
-    # xai and other OpenAI-compatible providers
-    if "fast" in lowered or "mini" in lowered:
-        return 0.5
-    if "reasoning" in lowered:
-        return 1.5
-    return 1.0
 
 
 class _NullLogger:
