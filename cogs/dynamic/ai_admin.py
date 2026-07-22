@@ -32,35 +32,8 @@ from discord.ext import commands
 from core.utils import is_admin, is_superadmin
 from core.agent_loop import AGENT_OPS, resolve_bot_tools
 from mcp_ops.server import _EXPOSED_OPS, resolve_mcp_tools
-from core.llm.usage import _PRICING_USD_PER_MTOK
+from core.llm.usage import known_output_price
 from cogs.dynamic.gpt import cooldown_tier_for_cost, COOLDOWN_TIERS
-
-# Output-token prices ($/Mtok) for models the usage.py table doesn't cover, so
-# the one-time cost-seed can tier them correctly instead of defaulting to
-# pricy. Local models are free -> cheap tier.
-_EXTRA_OUTPUT_PRICES = {
-    "xai": {"grok-4.5": 6.0},            # verified 2026-07 (x.ai): $2 in / $6 out
-    "ollama": {"__all__": 0.0},          # local, free -> cheap tier
-}
-
-
-def _known_output_price(provider_id, model_name):
-    """Best-effort $/Mtok output for a model, or None if unknown.
-
-    Prefers an explicit extras entry, then a longest-prefix match in the
-    shared usage.py pricing table (same matching estimate_cost uses)."""
-    extras = _EXTRA_OUTPUT_PRICES.get(provider_id, {})
-    if "__all__" in extras:
-        return extras["__all__"]
-    if model_name in extras:
-        return extras[model_name]
-    table = _PRICING_USD_PER_MTOK.get(provider_id, {})
-    if model_name in table:
-        return table[model_name][1]
-    matches = [(k, v) for k, v in table.items() if model_name.startswith(k)]
-    if matches:
-        return max(matches, key=lambda kv: len(kv[0]))[1][1]
-    return None
 
 # send_message is deliberately NOT default-on for the in-bot agent (it can post
 # into arbitrary channels); it stays available to the MCP surface. This only
@@ -1005,7 +978,7 @@ class AiAdmin(commands.Cog):
             for model_name, mcfg in pinfo.get("models", {}).items():
                 if not isinstance(mcfg, dict) or "cost_per_mtok_output" in mcfg:
                     continue
-                price = _known_output_price(pid, model_name)
+                price = known_output_price(pid, model_name)
                 if price is not None:
                     mcfg["cost_per_mtok_output"] = price
                     seeded += 1
