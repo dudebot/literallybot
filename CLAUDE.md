@@ -62,7 +62,26 @@ Where new code should land, so seams don't re-greed:
   land in ai_admin.py, not gpt.py. Remaining parked seam: memory capture
   could be its own cog.
 - Other parked (real-but-leave-it): error-handler module globals -> instance on
-  bot; `LLMClient.has_api_key()` helper to dedupe key-presence checks.
+  bot; `LLMClient.has_api_key()` helper to dedupe key-presence checks (must
+  count `requires_api_key: false` providers as satisfied, or ollama's ✅
+  regresses).
+- Parked from the 2026-07-21 seam audit — fold in on the NEXT REAL TOUCH of
+  the named file, not as standalone work:
+  - `bot.py` cog-load-failure reporting in `on_ready` -> a fourth `handle_*`
+    sibling in `core/error_handler.py` (when error_handler is next open).
+  - `ai_admin.py` `_default_model_button` inline catalog mutation -> a
+    `gpt._do_setdefaultmodel` helper, matching the other `_do_*` seams.
+  - `core/utils.py` `smart_split` placement-by-provenance docstring clause ->
+    delete when rng.py is next touched.
+  - `core/ops.py` `_smoke_test` asserts -> `tests/test_ops_registry.py` when
+    the queued pytest+CI lane ships (keep a slim `python -m core.ops` printer).
+  - `send_message`'s agent_guidance sentence states a gpt-loop fact in the ops
+    layer — acceptable while gpt.py is the sole consumer; revisit only if a
+    second agent_guidance consumer appears.
+  - usage.py config-backed `estimate_cost` leg — only if per-call cost
+    reporting ever grows a real consumer beyond the two debug log lines.
+  - Multi-prefix support: not a goal. If it ever becomes one, use
+    `bot.get_prefix`/`ctx.prefix` (discord.py's API), no new helper.
 - **Config keys**: every real key in `configs/*.json` is inventoried in the
   Key Registry section of `docs/config-system.md` — keep it current when
   adding keys. One data model per concept: never add a parallel key for an
