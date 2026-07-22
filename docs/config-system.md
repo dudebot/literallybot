@@ -123,7 +123,7 @@ Currently **unused** — the API supports it but no live code writes user files.
 
 - Bare-int ctx is the idiom for context-free access: `config.set(guild_id, key, value)` resolves guild scope from the int (used by panels, migrations, raw-reaction handlers).
 - `config.set(None, key, value, scope="global")` (or `set_global`) is the global-write idiom.
-- A few call sites in `ai_admin.py`/`gpt.py` scan `config._configs` directly (provider-in-use check, one-shot migrations). They rely on the file-id convention: guild configs are `"<digits>"`, the global config is `"global"`, user configs are `"user_<digits>"`. If you add a new file-id class, update those scans.
+- Iterating all guilds goes through `config.guild_ids()` — the public enumeration API (guild configs are the digit-named files; the global config is `"global"`, user configs are `"user_<digits>"`). Never scan `config._configs` directly; the layout is private to `core/config.py`.
 
 ## Gotchas
 
