@@ -235,12 +235,14 @@ python3 -m mcp_ops.run_mcp_server
 }
 ```
 
-**Exposed tools:**
-| Tool | Permission | Args |
-|------|-----------|------|
-| `send_message` | EVERYONE | `channel_id`, `content`, `actor_id` |
-| `search_history` | EVERYONE | `channel_id`, `actor_id`, `limit?`, `author_id?`, `contains?` |
-| `add_reaction` | EVERYONE | `channel_id`, `message_id`, `emoji`, `actor_id` |
+**Exposed tools** (the `_EXPOSED_OPS` set in `mcp_ops/server.py`):
+`send_message`, `search_history`, `add_reaction`, `remove_reaction`,
+`edit_message`, `delete_message` (admin-gated per call), `list_guilds`,
+`list_channels`, `list_members`.
+
+Exact per-tool schemas are served live via MCP `tools/list`; offline, run
+`python3 -m core.ops` to print the full ops registry (a superset — MCP
+exposes the subset above).
 
 `actor_id` is the Discord user id the call is made on behalf of — the
 registry runs the same permission check it would for an in-bot command,

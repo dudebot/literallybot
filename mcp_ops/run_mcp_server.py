@@ -91,10 +91,21 @@ def maybe_start_in_bot(bot: Any) -> Optional[asyncio.Task]:
     except RuntimeError as exc:
         logger.error("MCP ops server NOT started: %s", exc)
         return None
-    return asyncio.get_running_loop().create_task(
+    task = asyncio.get_running_loop().create_task(
         serve(bot, port=port, token=token, allowed_guild_ids=allowlist),
         name="mcp-ops-server",
     )
+
+    # A background task's exception is otherwise only reported at GC time,
+    # if ever — a schema-generation bug once killed the server with zero log
+    # output. Fail LOUDLY instead.
+    def _report_death(t: asyncio.Task) -> None:
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("MCP ops server task DIED: %r", t.exception(),
+                         exc_info=t.exception())
+
+    task.add_done_callback(_report_death)
+    return task
 
 
 async def _make_discord_client(token: str) -> discord.Client:

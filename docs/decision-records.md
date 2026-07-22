@@ -69,3 +69,22 @@ conflict, this entry wins:
   branch `fix/post-sprint-seams` wiring that revived it was NOT merged; only
   its tracker-independent keyless tests were salvaged into `tests/`. Per-call
   cost visibility is the INFO-level `est_cost_usd` log line on agentic runs.
+
+### Amendment: narrated-call backstop returns, redesigned (2026-07-21)
+
+Supersedes the 2026-07-10 sentence "the narration-guard regex + retry nudge
+was removed" — a narrated-call backstop exists again, but it is NOT the
+word-list regex (that stays dead). Trigger: a live incident where grok-4.5
+posted "run tool search_history with channel_id is ..." verbatim with zero
+tool calls. The redesign (`cogs/dynamic/gpt.py`):
+
+- Detector fires ONLY on a verbatim enabled-tool snake_case name or explicit
+  "run tool" phrasing in a zero-tool-call reply — never a generic word list.
+- One corrective re-run max (`NUDGE_PROMPT`). A false alarm is self-cleared
+  by the model answering with the bare `OK` sentinel, in which case the
+  ORIGINAL reply posts unchanged — the channel sees exactly one message in
+  every path, so false positives are invisible (the 2026-07-10 duplicate-
+  answer failure cannot recur).
+- The primary defense is prompt-side: `build_agentic_guidance` states the
+  function-calling loop contract explicitly (text-only response ends the
+  run and is posted verbatim); the backstop exists for the residual case.

@@ -40,6 +40,9 @@ class Signal(commands.Cog):
 
     @commands.command(name='annoydudebot', hidden=True)
     async def annoydudebot(self, ctx):
+        # Deliberate allowlist-of-one for a specific third party who is NOT
+        # a superadmin — do not route through is_admin/is_superadmin (that
+        # would silently revoke the sole intended caller).
         if ctx.author.id != 219309814856024064:
             return
         self.flash_lights(3, 3)

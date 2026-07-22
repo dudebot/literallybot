@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Any
 
 from core.utils import is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
+from core.ops import registry
 
 # Rate limiting is a nested-window ladder, not a flat per-message cooldown.
 # A model's declared cost per million OUTPUT tokens (`cost_per_mtok_output`)
@@ -61,6 +62,128 @@ def cooldown_tier_for_cost(cost_per_mtok_output, tier_bases=None):
         if cost_per_mtok_output < bound:
             return (label, base_for(label, seconds))
     return ("pricy", base_for("pricy", _UNSET_COST_SECONDS))
+
+
+# Single-token sentinel a nudged model uses to say "false alarm, my reply
+# was fine" — the original reply is then posted unchanged, so a false flag
+# costs one silent API call and the channel never sees a second message.
+NUDGE_FALSE_ALARM_SENTINEL = "OK"
+
+# Corrective user turn for a run whose reply NAMES a tool but executed zero
+# tool calls (the narrated-call signature). Option 2 is what keeps false
+# positives invisible: the model self-clears with the sentinel instead of
+# restating (or arguing with) its own reply in public.
+NUDGE_PROMPT = (
+    "[SYSTEM CHECK — automated, not from a user] Your reply above names a "
+    "tool, but ZERO tool calls were made, so nothing was executed and your "
+    "reply has NOT been posted yet. Choose one:\n"
+    "1. If you meant to perform an action: emit the real function call(s) "
+    "through the native tool-call channel NOW, then finish with the final "
+    "reply text for the channel. Do not describe the calls in text.\n"
+    "2. If your reply was already a complete answer that needed no tool: "
+    f"respond with exactly {NUDGE_FALSE_ALARM_SENTINEL} (nothing else) and "
+    "your original reply will be posted unchanged."
+)
+
+
+def looks_like_narrated_call(text, tool_names):
+    """True when a zero-tool-call reply reads as a verbalized tool invocation.
+
+    Deliberately narrow: fires only on an ENABLED tool's snake_case name
+    appearing verbatim, or explicit "run tool" phrasing — strings that don't
+    occur in genuine chat prose. (The 2026-07-05 attempt matched everyday
+    words like "search"/"done"/"I'll" and flagged normal answers constantly;
+    that regex is the cautionary tale, not the template.) False positives
+    that remain (e.g. the user asks "what tools do you have?" and the reply
+    honestly lists them) are absorbed by the sentinel path in _run_agentic.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    if "run tool" in lowered or "run the tool" in lowered:
+        return True
+    return any(name in lowered for name in tool_names)
+
+
+def is_nudge_false_alarm(text):
+    """Did the nudged re-run answer with the bare false-alarm sentinel?"""
+    return (text or "").strip().strip(".!").upper() == NUDGE_FALSE_ALARM_SENTINEL
+
+
+def build_agentic_guidance(tool_names, guild_id, channel_id, author_id,
+                           message_id):
+    """System-prompt lines for agentic runs: available tools, target ids,
+    and — critically — the MECHANICS of tool invocation.
+
+    The mechanics block exists because models (observed live: grok narrating
+    "run tool search_history with channel_id is ..." as plain text) sometimes
+    verbalize an intended call instead of emitting it. The loop is a
+    pydantic-ai Agent over the OpenAI-compatible function-calling API: a real
+    call rides the structured tool_calls channel of the response; a text-only
+    response ends the run and is posted to Discord verbatim. The guidance
+    states that contract explicitly instead of hoping the model infers it.
+
+    Module-level (not a cog method) so a test harness can import and
+    exercise the exact shipped text without constructing a bot.
+    """
+    lines = [
+        "",
+        "You have REAL Discord tools available: " + ", ".join(tool_names) + ".",
+        f"- Current guild id: {guild_id}. Current channel id: {channel_id}.",
+        f"- The invoking user's id is {author_id}. Their message that triggered "
+        f"you (\"my message\"/\"this message\") has message id {message_id}.",
+        "- Every history line above is prefixed with [msg_id: ...]. Use those ids "
+        "DIRECTLY when reacting, editing, or replying — no guessing, and no "
+        "search_history when the target is already visible in the history. "
+        "NEVER write a [msg_id: ...] marker in your own reply text.",
+        "",
+        "HOW TOOL CALLS WORK (mechanics — this part is exact, not stylistic):",
+        "- You are in an agent loop over the chat-completions API with function "
+        "calling enabled. The ONLY way to run a tool is to emit a native "
+        "function call — the tool's name plus a JSON arguments object — through "
+        "the API's structured tool-call channel. A tool call is NOT text; "
+        "nothing you write in your visible reply can execute anything.",
+        "- Every response you produce is one of exactly two things: (a) one or "
+        "more function calls — they execute for real and their results come "
+        "back for you to continue with; or (b) plain text — the run ENDS "
+        "immediately and that text is posted to the channel as your reply. "
+        "There is no third option. Decide which one BEFORE responding.",
+        "- Because of (b), writing out an intended call as words — e.g. "
+        "\"run tool search_history with channel_id is 1234 contains is pizza\" "
+        "— executes nothing: the run just ends and that sentence gets posted "
+        "to the channel verbatim, where everyone sees a malfunction. If you "
+        "intend a tool call, EMIT the function call instead of describing it.",
+        "- Worked example: someone asks \"do i play factorio\" and the answer "
+        "isn't in the visible history. Correct: emit the function call "
+        "search_history with arguments {\"channel_ids\": [" + str(channel_id) +
+        "], \"author_id\": " + str(author_id) + ", \"contains\": \"factorio\", "
+        "\"limit\": 100}, wait for the results, then answer in plain text. "
+        "Wrong: any reply that merely talks about searching.",
+        "",
+        "- When an action would genuinely help (react, reply elsewhere, edit, "
+        "search, list), use the matching tool. Prefer doing over describing.",
+        "- If no tool fits the request, just reply normally in text — a plain "
+        "conversational answer is a perfectly good response, and most messages "
+        "only need one. Don't reach for a tool when the user just wants an answer.",
+        "- Only claim you did something if you ACTUALLY called the tool for it in "
+        "this turn and saw its result. Never say a reaction was added, a message "
+        "sent/edited/deleted, or history searched unless that tool ran — don't "
+        "pretend or role-play a tool result. If you couldn't do it, say so plainly.",
+    ]
+    # Per-tool behavioral notes ride on the op declarations themselves
+    # (core/ops.py `agent_guidance`), so guidance stays in lockstep with
+    # whatever set of tools a guild has enabled — no hand-maintained
+    # if-ladder here to drift out of sync with the registry.
+    per_tool = []
+    for name in tool_names:
+        op = registry.get(name)
+        if op is not None and op.agent_guidance:
+            per_tool.append(f"- {op.agent_guidance}")
+    if per_tool:
+        lines.append("")
+        lines.append("Per-tool notes:")
+        lines.extend(per_tool)
+    return lines
 
 
 class Gpt(commands.Cog):
@@ -413,46 +536,9 @@ class Gpt(commands.Cog):
         ])
 
         if agentic:
-            prompt_parts.extend([
-                "",
-                "You have REAL Discord tools available: " + ", ".join(tool_names) + ".",
-                f"- Current guild id: {ctx.guild.id}. Current channel id: {ctx.channel.id}.",
-                f"- The invoking user's id is {ctx.author.id}. Their message that triggered "
-                f"you (\"my message\"/\"this message\") has message id {ctx.message.id}.",
-                "- Every history line above is prefixed with [msg_id: ...]. Use those ids "
-                "DIRECTLY when reacting, editing, or replying — no guessing, and no "
-                "search_history when the target is already visible in the history. "
-                "NEVER write a [msg_id: ...] marker in your own reply text.",
-                "- When an action would genuinely help (react, reply elsewhere, edit, "
-                "search, list), use the matching tool. Prefer doing over describing.",
-                "- If no tool fits the request, just reply normally in text — a plain "
-                "conversational answer is a perfectly good response, and most messages "
-                "only need one. Don't reach for a tool when the user just wants an answer.",
-                "- Only claim you did something if you ACTUALLY called the tool for it in "
-                "this turn. Never say a reaction was added, a message sent/edited/deleted, "
-                "or history searched unless you invoked that tool — don't pretend or "
-                "role-play a tool result. If you couldn't do it, say so plainly.",
-            ])
-            if "add_reaction" in tool_names or "remove_reaction" in tool_names:
-                prompt_parts.append(
-                    "- add_reaction/remove_reaction need a literal unicode emoji character "
-                    "(💩, 💨, ❤️) or name:id for custom emoji — never a word or description. "
-                    "('fart' and '-' are invalid; the fart/dash emoji is 💨.)")
-            if "remove_reaction" in tool_names:
-                prompt_parts.append(
-                    "- remove_reaction only removes reactions the bot itself added.")
-            if "delete_message" in tool_names:
-                prompt_parts.append(
-                    "- delete_message requires the invoking user to be a bot admin; if the "
-                    "tool returns a permission error, relay that plainly.")
-            if "send_message" in tool_names:
-                prompt_parts.extend([
-                    "- send_message returns the new message's message_id; reuse it for "
-                    "follow-up edits or reactions. Use its reference_message_id param to "
-                    "reply to a message.",
-                    "- Your final text reply is posted to the channel automatically — do "
-                    "not duplicate it with send_message.",
-                ])
+            prompt_parts.extend(build_agentic_guidance(
+                tool_names, ctx.guild.id, ctx.channel.id, ctx.author.id,
+                ctx.message.id))
 
         # 4) Dynamic User Memories (if any)
         if active_memories_for_prompt:
@@ -557,8 +643,12 @@ class Gpt(commands.Cog):
         exactly like a plain chat response.
         """
         from pydantic_ai.exceptions import UsageLimitExceeded
-        from core.agent_loop import build_agent_tools
+        from core.agent_loop import build_agent_tools, AGENT_TOOL_BUDGET
 
+        # Soft tool budget (countdown + refusals) lives inside the tools
+        # themselves — see core/agent_loop.py. The pydantic-ai limit below is
+        # set to 2x as a runaway backstop only; in the normal exhaustion path
+        # the model authors its own final reply and no exception fires.
         tools = build_agent_tools(ctx, self.logger, tool_names)
         self.logger.info(
             f"agentic gpt run: guild={ctx.guild.id} channel={ctx.channel.id} "
@@ -577,12 +667,54 @@ class Gpt(commands.Cog):
                 # scrape attributed the invoking message oddly (e.g. a
                 # bot-authored `!gpt` landing in history as an assistant turn).
                 user_prompt=command_turn,
-                max_tool_calls=8,
+                max_tool_calls=AGENT_TOOL_BUDGET * 2,
             )
-        except UsageLimitExceeded as e:
-            self.logger.warning(f"agentic gpt run hit its tool budget: {e}")
-            return "I hit my tool-call limit (8) before finishing that request."
+            self._log_agentic_usage(response)
 
+            # Narrated-call backstop: the reply names an enabled tool but zero
+            # tools ran — almost certainly a verbalized invocation (observed
+            # live 2026-07-21: "run tool search_history with channel_id is
+            # ..."). One corrective re-run; the sentinel path keeps false
+            # positives invisible (original reply posts unchanged), so the
+            # channel sees exactly one message either way.
+            tool_calls = response.usage.tool_calls if response.usage else 0
+            if tool_calls == 0 and looks_like_narrated_call(response.text, tool_names):
+                self.logger.info(
+                    "agentic reply names a tool but made no tool calls — nudging once")
+                retry = await self.llm.run_agent(
+                    provider_config,
+                    api_messages + [
+                        {"role": "user", "content": command_turn},
+                        {"role": "assistant", "content": response.text},
+                    ],
+                    tools=tools,
+                    metadata=metadata,
+                    user_prompt=NUDGE_PROMPT,
+                    max_tool_calls=AGENT_TOOL_BUDGET * 2,
+                )
+                self._log_agentic_usage(retry)
+                if is_nudge_false_alarm(retry.text):
+                    self.logger.info("nudge was a false alarm — keeping the original reply")
+                else:
+                    response = retry
+        except UsageLimitExceeded as e:
+            # Only reachable if the model ignores 2x the soft budget worth of
+            # refusals (pathological). Even then: a model-authored best-effort
+            # answer, never a canned failure string.
+            self.logger.warning(f"agentic gpt run blew the hard tool cap: {e}")
+            fallback = await self.llm.chat(provider_config, api_messages + [
+                {"role": "user", "content": command_turn},
+                {"role": "user", "content": (
+                    "[SYSTEM] The tool budget ran out before this request "
+                    "finished. Answer in plain text with your best effort "
+                    "from what you know, and say briefly what you could not "
+                    "verify.")},
+            ], metadata)
+            return fallback.text
+
+        return response.text
+
+    def _log_agentic_usage(self, response):
         if response.usage:
             self.logger.info(
                 f"agentic usage: provider={response.usage.provider} model={response.usage.model} "
@@ -590,7 +722,6 @@ class Gpt(commands.Cog):
                 f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd} "
                 f"tool_calls={response.usage.tool_calls}"
             )
-        return response.text
 
     def check_message_compliance(self, ctx, message):
         """
