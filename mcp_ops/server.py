@@ -76,6 +76,22 @@ _JSON_TYPE_TO_PY = {"integer": int, "string": str, "boolean": bool,
                     "array": List[int]}
 
 
+def resolve_mcp_tools(config) -> List[str]:
+    """Effective MCP tool set from global config (`mcp_tools_enabled`):
+    unset => the full _EXPOSED_OPS universe (back-compat default); an
+    explicit [] exposes nothing; names outside the universe are dropped —
+    the MCP surface never grows past what this module vets. config=None
+    (schema-only builds with no bot attached) => full universe. THE one
+    owner of this rule — the server build and the /ai settings panel both
+    resolve through it, so what the panel shows is what gets served."""
+    if config is None:
+        return list(_EXPOSED_OPS)
+    configured = config.get_global("mcp_tools_enabled")
+    if configured is None:
+        return list(_EXPOSED_OPS)
+    return [n for n in configured if n in _EXPOSED_OPS]
+
+
 class BotUnavailableError(RuntimeError):
     """Raised when the MCP server needs a live discord.py bot/channel/message
     and doesn't have one (e.g. bot not passed in, or the id doesn't resolve)."""
@@ -227,16 +243,11 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
         )
 
     # Which ops to expose is a global-config allowlist edited live from the
-    # /ai settings panel (MCP tab). Unset => the full _EXPOSED_OPS universe
-    # (back-compat default); an explicit [] exposes nothing. Read once at
-    # build time — like MCP_OPS_GUILD_ALLOWLIST, changes take effect on the
-    # next server (bot) restart. Names outside the _EXPOSED_OPS universe are
-    # dropped: the MCP surface never grows past what this module vets.
-    op_names = list(_EXPOSED_OPS)
-    if bot is not None and getattr(bot, "config", None) is not None:
-        configured = bot.config.get_global("mcp_tools_enabled")
-        if configured is not None:
-            op_names = [n for n in configured if n in _EXPOSED_OPS]
+    # /ai settings panel (MCP tab). Read once at build time — like
+    # MCP_OPS_GUILD_ALLOWLIST, changes take effect on the next server (bot)
+    # restart.
+    op_names = resolve_mcp_tools(
+        getattr(bot, "config", None) if bot is not None else None)
 
     mcp = FastMCP(name=name, instructions=(
         "Ops-registry bridge for literallybot. Exposes a subset of the "

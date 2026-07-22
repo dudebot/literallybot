@@ -45,6 +45,16 @@ AGENT_OPS = (
     "list_members",
 )
 
+def resolve_bot_tools(raw) -> List[str]:
+    """Effective bot-agent tool allowlist from the raw per-guild config
+    value (`bot_tools_enabled`): None/empty means no tools (the plain-chat
+    path); stale names from an older AGENT_OPS are dropped by intersecting
+    with the current universe. THE one owner of this rule — gpt.py and the
+    /ai settings panel both resolve through it, so what the panel shows is
+    what the loop gets."""
+    return [n for n in (raw or []) if n in AGENT_OPS]
+
+
 # Soft tool budget per agentic run, enforced HERE (not via pydantic-ai's
 # UsageLimits) so exhaustion degrades into a model-authored answer instead
 # of an exception. pydantic-ai's limiter is preemptive about parallel

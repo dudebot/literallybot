@@ -30,8 +30,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from core.utils import is_admin, is_superadmin
-from core.agent_loop import AGENT_OPS
-from mcp_ops.server import _EXPOSED_OPS
+from core.agent_loop import AGENT_OPS, resolve_bot_tools
+from mcp_ops.server import _EXPOSED_OPS, resolve_mcp_tools
 from core.llm.usage import _PRICING_USD_PER_MTOK
 from cogs.dynamic.gpt import cooldown_tier_for_cost, COOLDOWN_TIERS
 
@@ -542,14 +542,15 @@ class AiSettingsView(discord.ui.View):
         return None
 
     def _bot_tools(self):
-        raw = self.bot.config.get(self._cfg_ctx(), "bot_tools_enabled") or []
-        return [n for n in raw if n in AGENT_OPS]
+        # Same resolver the agent loop uses — the panel must show exactly
+        # the effective set, never a private re-derivation of it.
+        return resolve_bot_tools(
+            self.bot.config.get(self._cfg_ctx(), "bot_tools_enabled"))
 
     def _mcp_tools(self):
-        raw = self.bot.config.get_global("mcp_tools_enabled")
-        if raw is None:
-            return list(_EXPOSED_OPS)
-        return [n for n in raw if n in _EXPOSED_OPS]
+        # Same resolver the MCP server build uses (incl. unset => full
+        # universe default).
+        return resolve_mcp_tools(self.bot.config)
 
     # --- rendering -------------------------------------------------------
     def _tab_button(self, label, page):
