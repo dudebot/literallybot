@@ -217,9 +217,8 @@ class Gpt(commands.Cog):
         """
         if not getattr(ctx, "guild", None):
             return []
-        from core.agent_loop import AGENT_OPS
-        raw = self.bot.config.get(ctx, "bot_tools_enabled") or []
-        return [n for n in raw if n in AGENT_OPS]
+        from core.agent_loop import resolve_bot_tools
+        return resolve_bot_tools(self.bot.config.get(ctx, "bot_tools_enabled"))
 
     def cooldown_config(self):
         """(tier_bases, windows) — operator overrides merged over defaults.
