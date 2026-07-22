@@ -1140,13 +1140,12 @@ class Gpt(commands.Cog):
             )
 
         config = self.bot.config
-        in_use = 0
-        for cfg_id in list(config._configs.keys()):
-            # Guild files are "<id>"; DM-scope settings land in "global".
-            if not (cfg_id.isdigit() or cfg_id == "global"):
-                continue
-            if config._configs[cfg_id].get("current_ai_provider") == provider_id:
-                in_use += 1
+        in_use = sum(1 for gid in config.guild_ids()
+                     if config.get(gid, "current_ai_provider") == provider_id)
+        # DM-scope settings land in the global file (intentional scope
+        # policy, not a guild) — check it explicitly.
+        if config.get(None, "current_ai_provider", scope="global") == provider_id:
+            in_use += 1
         if in_use:
             return (
                 f"Refusing to remove '{provider_id}' — {in_use} server(s) "

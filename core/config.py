@@ -121,6 +121,12 @@ class Config:
                 self._save_timer = None
             self._flush_all()
 
+    def guild_ids(self):
+        """All guild ids with a loaded config (guild configs are the
+        digit-named files). The public enumeration API — callers must use
+        this rather than reaching into the private storage dicts."""
+        return [int(cid) for cid in self._configs if cid.isdigit()]
+
     def get(self, ctx, key, default=None, scope='guild'):
         """Get a config value from guild, user, or global scope. Read-only - does not persist defaults."""
         config_id = self._resolve_config_id(ctx, scope)

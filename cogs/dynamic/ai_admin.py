@@ -972,20 +972,17 @@ class AiAdmin(commands.Cog):
         old key is removed either way, so a second run is a no-op.
         """
         config = self.bot.config
+        _missing = object()
         migrated = 0
-        for cfg_id in list(config._configs.keys()):
-            if not cfg_id.isdigit():          # guild files are "<id>.json"
+        for gid in config.guild_ids():
+            flag = config.get(gid, "gpt_agentic_enabled", _missing)
+            if flag is _missing:
                 continue
-            cfg = config._configs[cfg_id]
-            if "gpt_agentic_enabled" not in cfg:
-                continue
-            gid = int(cfg_id)
-            if "bot_tools_enabled" not in cfg and cfg.get("gpt_agentic_enabled"):
+            if flag and config.get(gid, "bot_tools_enabled", _missing) is _missing:
                 config.set(gid, "bot_tools_enabled", list(AGENT_OPS_DEFAULT_ON))
                 migrated += 1
             config.rem(gid, "gpt_agentic_enabled")
-        if migrated or config._dirty_configs:
-            config.flush()                    # beat the delayed-save timer
+        config.flush()                        # beat the delayed-save timer (no-op when clean)
         if migrated:
             self.logger.info(
                 "ai_admin: migrated %d guild(s) from gpt_agentic_enabled to "
