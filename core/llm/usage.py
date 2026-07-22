@@ -35,12 +35,41 @@ _PRICING_USD_PER_MTOK: Dict[str, Dict[str, tuple]] = {
         "claude-opus-4-8": (5.00, 25.00),
     },
     "xai": {
+        "grok-4.5": (2.00, 6.00),   # verified 2026-07 (x.ai)
         "grok-4.3": (1.25, 2.50),
         "grok-4.20-0309-reasoning": (1.25, 2.50),
         "grok-4.20-0309-non-reasoning": (1.25, 2.50),
         "grok-4-fast": (0.20, 0.50),
     },
 }
+
+
+def _match_prices(provider: str, model: str) -> Optional[tuple]:
+    """(prompt_price, completion_price) per Mtok for a model — exact match,
+    then longest-prefix (so specific variants win over broader parents).
+    None if the model isn't in the table (unknown, not zero)."""
+    provider_prices = _PRICING_USD_PER_MTOK.get(provider)
+    if not provider_prices:
+        return None
+    prices = provider_prices.get(model)
+    if prices is None:
+        matches = [(known, p) for known, p in provider_prices.items()
+                   if model.startswith(known)]
+        if matches:
+            prices = max(matches, key=lambda kv: len(kv[0]))[1]
+    return prices
+
+
+def known_output_price(provider: str, model: str) -> Optional[float]:
+    """Best-effort $/Mtok OUTPUT price, or None if unknown. The public seam
+    for cost-tier seeding (/ai settings cooldown tiers) — same matching
+    rules as estimate_cost, so the seeded tier and the usage estimate can
+    never disagree about a model's price. Local providers bill no tokens:
+    free by definition, which maps to the cheap tier."""
+    if provider == "ollama":
+        return 0.0
+    prices = _match_prices(provider, model)
+    return prices[1] if prices else None
 
 
 @dataclass
@@ -62,23 +91,7 @@ class UsageRecord:
 def estimate_cost(record: UsageRecord) -> Optional[float]:
     """Best-effort USD cost estimate for a UsageRecord. None if the model
     isn't in the pricing table (unknown, not zero)."""
-    provider_prices = _PRICING_USD_PER_MTOK.get(record.provider)
-    if not provider_prices:
-        return None
-
-    prices = provider_prices.get(record.model)
-    if prices is None:
-        # Try prefix match (e.g. "gpt-5-mini-2026-01-01" -> "gpt-5-mini").
-        # Longest-prefix-first so specific variants (gpt-5-mini) win over
-        # their broader parents (gpt-5) instead of being shadowed by them.
-        matches = [
-            (known_model, known_prices)
-            for known_model, known_prices in provider_prices.items()
-            if record.model.startswith(known_model)
-        ]
-        if matches:
-            prices = max(matches, key=lambda pair: len(pair[0]))[1]
-
+    prices = _match_prices(record.provider, record.model)
     if prices is None:
         return None
 
