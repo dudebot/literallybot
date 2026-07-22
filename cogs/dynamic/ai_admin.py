@@ -33,6 +33,7 @@ from core.utils import is_admin, is_superadmin
 from core.agent_loop import AGENT_OPS, resolve_bot_tools
 from mcp_ops.server import _EXPOSED_OPS, resolve_mcp_tools
 from core.llm.usage import known_output_price
+from core.llm.client import set_all_providers
 from cogs.dynamic.gpt import cooldown_tier_for_cost, COOLDOWN_TIERS
 
 # send_message is deliberately NOT default-on for the in-bot agent (it can post
@@ -717,7 +718,7 @@ class AiSettingsView(discord.ui.View):
                 self.flash("That model no longer exists.")
             else:
                 all_providers[self.mgmt_provider]["default_model"] = self.mgmt_model
-                self.bot.config.set(None, "ai_providers", all_providers, scope="global")
+                self.gpt.llm.set_all_providers(all_providers)
                 self.flash(f"Default model for {self.mgmt_provider} is now {self.mgmt_model}.")
             await self.rerender(interaction)
 
@@ -983,7 +984,7 @@ class AiAdmin(commands.Cog):
                     mcfg["cost_per_mtok_output"] = price
                     seeded += 1
         if seeded:
-            config.set_global("ai_providers", providers)
+            set_all_providers(config, providers)
             config.flush()
             self.logger.info("ai_admin: seeded cost_per_mtok_output on %d model(s)",
                              seeded)

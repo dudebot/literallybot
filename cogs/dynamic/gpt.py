@@ -836,7 +836,7 @@ class Gpt(commands.Cog):
         all_providers[provider] = provider_info
 
         # Save back to global config
-        config.set(None, "ai_providers", all_providers, scope="global")
+        self.llm.set_all_providers(all_providers)
 
         tier, base = cooldown_tier_for_cost(cost, self.cooldown_config()[0])
         cost_str = "unset → pricy" if cost is None else f"${cost:g}/Mtok out"
@@ -887,7 +887,7 @@ class Gpt(commands.Cog):
         all_providers[provider] = provider_info
 
         # Save back to global config
-        config.set(None, "ai_providers", all_providers, scope="global")
+        self.llm.set_all_providers(all_providers)
 
         response_lines.append(f"Removed model '{model_name}' from {provider}")
         return "\n".join(response_lines)
@@ -917,7 +917,7 @@ class Gpt(commands.Cog):
         else:
             mcfg["max_completion_tokens"] = max_tokens
         models_dict[model_name] = mcfg
-        self.bot.config.set(None, "ai_providers", all_providers, scope="global")
+        self.llm.set_all_providers(all_providers)
 
         tier, base = cooldown_tier_for_cost(mcfg.get("cost_per_mtok_output"),
                                             self.cooldown_config()[0])
@@ -1113,7 +1113,7 @@ class Gpt(commands.Cog):
             # via !addmodel/!ai settings (safe default for a new provider).
             "models": {default_model: {}},
         }
-        self.bot.config.set(None, "ai_providers", all_providers, scope="global")
+        self.llm.set_all_providers(all_providers)
         return (
             f"Added OpenAI-compatible provider '{provider_id}' (base_url: {base_url}, "
             f"default model: {default_model}). Next: `/ai setapikey provider:{provider_id}`."
@@ -1152,7 +1152,7 @@ class Gpt(commands.Cog):
             )
 
         del all_providers[provider_id]
-        config.set(None, "ai_providers", all_providers, scope="global")
+        self.llm.set_all_providers(all_providers)
         key_name = f"{provider_id.upper()}_API_KEY"
         had_key = config.get(None, key_name, scope="global") is not None
         if had_key:

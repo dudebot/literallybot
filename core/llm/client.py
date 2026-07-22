@@ -122,6 +122,23 @@ DEFAULT_PROVIDERS: Dict[str, Any] = {
 }
 
 
+def set_all_providers(config, all_providers: Dict[str, Any]) -> None:
+    """Persist the ai_providers catalog. THE one write-back for catalog
+    mutations, in every surface (LLMClient, cogs, panels, seeders).
+
+    Always pass the FULL provider set — normally the dict that
+    get_all_providers returned, mutated in place. Persisting a partial dict
+    on a fresh install would silently drop the built-in seeds for every
+    other provider (a failure invisible in any environment that already has
+    ai_providers persisted). When config already exists, get_all_providers
+    returns the live stored dict, so this call is effectively dirty-marking;
+    on a fresh install it materializes the seed into real config.
+
+    Module-level (with an LLMClient method wrapper) because seeding runs at
+    cog-load time when no LLMClient may exist yet."""
+    config.set(None, "ai_providers", all_providers, scope="global")
+
+
 @dataclass
 class ProviderConfig:
     """Resolved provider/model configuration for a single call site.
@@ -175,13 +192,18 @@ class LLMClient:
     def get_all_providers(self) -> Dict[str, Any]:
         """The ai_providers config, or a deep copy of the built-in seed when
         none exists yet (fresh install). Read-only — callers that mutate the
-        returned dict persist it themselves via config.set, which is what
-        turns the seed into real config."""
+        returned dict persist it via set_all_providers, which is what turns
+        the seed into real config."""
         stored = self.config.get(None, "ai_providers", scope="global")
         if stored:
             return stored
         import copy
         return copy.deepcopy(DEFAULT_PROVIDERS)
+
+    def set_all_providers(self, all_providers: Dict[str, Any]) -> None:
+        """Persist the provider catalog — THE one write-back for every
+        catalog mutation (see module-level set_all_providers)."""
+        set_all_providers(self.config, all_providers)
 
     def get_provider_config(self, ctx) -> ProviderConfig:
         """Get the current provider configuration for a guild."""
@@ -473,12 +495,9 @@ class LLMClient:
                         models_dict[model_id] = {}
 
             if discovered:
-                # Merge into the full provider set (seeded defaults included) —
-                # reading raw config here on a fresh install would persist ONLY
-                # the discovered provider and silently drop the other seeds.
                 all_providers = self.get_all_providers()
                 all_providers[provider] = provider_info
-                self.config.set(None, "ai_providers", all_providers, scope="global")
+                self.set_all_providers(all_providers)
 
             return discovered
 
