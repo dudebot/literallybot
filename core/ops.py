@@ -1128,8 +1128,8 @@ async def create_role(ctx: OpContext, guild, name: str, color: Optional[str] = N
 
 @registry.op(
     "edit_role",
-    "Edit a role's name, color, hoist, or mentionable flags. Requires "
-    "admin. Managed roles and @everyone are refused.",
+    "Edit a role's name, color, hoist/mentionable flags, or hierarchy "
+    "position. Requires admin. Managed roles and @everyone are refused.",
     PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id the role belongs to."),
@@ -1141,12 +1141,22 @@ async def create_role(ctx: OpContext, guild, name: str, color: Optional[str] = N
                 "Show members separately in the sidebar.", required=False),
         OpParam("mentionable", ParamKind.BOOLEAN,
                 "Allow anyone to @mention the role.", required=False),
+        OpParam("position", ParamKind.INTEGER,
+                "New hierarchy position (1 = just above @everyone; higher = "
+                "higher in the list; other roles shift around it). The bot "
+                "cannot move a role above its own top role.",
+                required=False, minimum=1),
     ],
     serialize=serialize_role,
+    agent_guidance=(
+        "edit_role position values shift the whole hierarchy — after a batch "
+        "of moves, call list_roles once to see the settled order instead of "
+        "assuming each move landed exactly where requested."),
 )
 async def edit_role(ctx: OpContext, guild, role, name: Optional[str] = None,
                     color: Optional[str] = None, hoist: Optional[bool] = None,
-                    mentionable: Optional[bool] = None):
+                    mentionable: Optional[bool] = None,
+                    position: Optional[int] = None):
     _guard_editable(role)
     kwargs = {}
     if name is not None:
@@ -1157,8 +1167,10 @@ async def edit_role(ctx: OpContext, guild, role, name: Optional[str] = None,
         kwargs["hoist"] = hoist
     if mentionable is not None:
         kwargs["mentionable"] = mentionable
+    if position is not None:
+        kwargs["position"] = position
     if not kwargs:
-        raise ValueError("Nothing to edit: pass at least one of name/color/hoist/mentionable.")
+        raise ValueError("Nothing to edit: pass at least one of name/color/hoist/mentionable/position.")
     await role.edit(**kwargs)
     return role
 
