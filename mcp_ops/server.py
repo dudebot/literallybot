@@ -73,6 +73,10 @@ _EXPOSED_OPS = (
     "edit_role",
     "delete_role",
     "list_channel_overwrites",
+    "add_role",
+    "remove_role",
+    "pin_message",
+    "create_thread",
 )
 
 # "array" is always a list of integer ids (ops.py CHANNEL_LIST is the only
