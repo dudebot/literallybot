@@ -1053,6 +1053,138 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
     return results
 
 
+def _parse_color(color: str):
+    value = color.lstrip("#")
+    try:
+        return discord.Colour(int(value, 16))
+    except ValueError as exc:
+        raise ValueError(f"Color must be a hex string like '#5865F2', got {color!r}.") from exc
+
+
+def serialize_role(role: Any) -> Dict[str, Any]:
+    return {
+        "id": role.id,
+        "name": role.name,
+        "color": f"#{role.colour.value:06X}",
+        "position": role.position,
+        "hoist": role.hoist,
+        "mentionable": role.mentionable,
+        "managed": role.managed,
+        "member_count": len(role.members),
+    }
+
+
+def _guard_editable(role: Any):
+    """Managed (integration) roles and @everyone are not editable/deletable."""
+    if role.managed:
+        raise ValueError(f"Role '{role.name}' is managed by an integration and cannot be modified.")
+    if role.is_default():
+        raise ValueError("The @everyone role cannot be modified.")
+
+
+@registry.op(
+    "list_roles",
+    "List a guild's roles (id, name, color, position, member count), "
+    "top of the hierarchy first.",
+    PermissionLevel.EVERYONE,
+    params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
+    serialize=lambda rs: {"roles": rs, "count": len(rs)},
+)
+async def list_roles(ctx: OpContext, guild):
+    return [serialize_role(r) for r in
+            sorted(guild.roles, key=lambda r: r.position, reverse=True)]
+
+
+@registry.op(
+    "create_role",
+    "Create a new role in a guild. Requires admin. The role is created "
+    "unassigned; use add_role to grant it to members.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to create the role in."),
+        OpParam("name", ParamKind.STRING, "Role name."),
+        OpParam("color", ParamKind.STRING,
+                "Optional hex color like '#5865F2'.", required=False),
+        OpParam("hoist", ParamKind.BOOLEAN,
+                "Show members separately in the sidebar (default false).",
+                required=False, default=False),
+        OpParam("mentionable", ParamKind.BOOLEAN,
+                "Allow anyone to @mention the role (default false).",
+                required=False, default=False),
+    ],
+    serialize=serialize_role,
+    agent_guidance=(
+        "create_role returns the new role's id; reuse it for add_role or "
+        "edit_role instead of calling list_roles again. Check list_roles "
+        "first rather than creating near-duplicate names."),
+)
+async def create_role(ctx: OpContext, guild, name: str, color: Optional[str] = None,
+                      hoist: bool = False, mentionable: bool = False):
+    kwargs = {"name": name, "hoist": hoist, "mentionable": mentionable}
+    if color is not None:
+        kwargs["colour"] = _parse_color(color)
+    return await guild.create_role(**kwargs)
+
+
+@registry.op(
+    "edit_role",
+    "Edit a role's name, color, hoist, or mentionable flags. Requires "
+    "admin. Managed roles and @everyone are refused.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id the role belongs to."),
+        OpParam("role", ParamKind.ROLE, "Discord role id to edit."),
+        OpParam("name", ParamKind.STRING, "New role name.", required=False),
+        OpParam("color", ParamKind.STRING,
+                "New hex color like '#5865F2'.", required=False),
+        OpParam("hoist", ParamKind.BOOLEAN,
+                "Show members separately in the sidebar.", required=False),
+        OpParam("mentionable", ParamKind.BOOLEAN,
+                "Allow anyone to @mention the role.", required=False),
+    ],
+    serialize=serialize_role,
+)
+async def edit_role(ctx: OpContext, guild, role, name: Optional[str] = None,
+                    color: Optional[str] = None, hoist: Optional[bool] = None,
+                    mentionable: Optional[bool] = None):
+    _guard_editable(role)
+    kwargs = {}
+    if name is not None:
+        kwargs["name"] = name
+    if color is not None:
+        kwargs["colour"] = _parse_color(color)
+    if hoist is not None:
+        kwargs["hoist"] = hoist
+    if mentionable is not None:
+        kwargs["mentionable"] = mentionable
+    if not kwargs:
+        raise ValueError("Nothing to edit: pass at least one of name/color/hoist/mentionable.")
+    await role.edit(**kwargs)
+    return role
+
+
+@registry.op(
+    "delete_role",
+    "Delete a role from a guild. Requires admin. Managed roles and "
+    "@everyone are refused.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id the role belongs to."),
+        OpParam("role", ParamKind.ROLE, "Discord role id to delete."),
+    ],
+    serialize=lambda info: info,
+    agent_guidance=(
+        "delete_role is irreversible and detaches the role from every member "
+        "holding it — confirm intent before calling it on a role with a "
+        "nonzero member_count."),
+)
+async def delete_role(ctx: OpContext, guild, role):
+    _guard_editable(role)
+    info = {"deleted_role_id": role.id, "name": role.name}
+    await role.delete()
+    return info
+
+
 # ---------------------------------------------------------------------------
 # In-file smoke test — instantiates the module-level registry and lists
 # tools WITHOUT a live bot/Discord connection. Run directly:
@@ -1064,6 +1196,7 @@ def _smoke_test() -> None:
         "send_message", "edit_message", "delete_message", "add_reaction",
         "remove_reaction", "search_history", "add_role", "remove_role", "pin_message",
         "create_thread", "list_guilds", "list_channels", "list_members",
+        "list_roles", "create_role", "edit_role", "delete_role",
     }
     names = set(registry.names())
     missing = expected - names

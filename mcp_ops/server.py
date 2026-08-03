@@ -68,6 +68,10 @@ _EXPOSED_OPS = (
     "list_guilds",
     "list_channels",
     "list_members",
+    "list_roles",
+    "create_role",
+    "edit_role",
+    "delete_role",
 )
 
 # "array" is always a list of integer ids (ops.py CHANNEL_LIST is the only
