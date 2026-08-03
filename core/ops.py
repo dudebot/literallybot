@@ -1071,6 +1071,8 @@ def serialize_role(role: Any) -> Dict[str, Any]:
         "mentionable": role.mentionable,
         "managed": role.managed,
         "member_count": len(role.members),
+        # Guild-level grants only; channel ACLs live in list_channel_overwrites.
+        "permissions": [name for name, value in role.permissions if value],
     }
 
 
