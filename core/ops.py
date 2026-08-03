@@ -1197,6 +1197,49 @@ async def delete_role(ctx: OpContext, guild, role):
     return info
 
 
+@registry.op(
+    "list_channel_overwrites",
+    "List permission overwrites (channel ACLs): which roles/members are "
+    "explicitly allowed or denied what, per channel. Requires admin — this "
+    "enumerates ACLs of channels hidden from ordinary members.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to inspect."),
+        OpParam("channel", ParamKind.CHANNEL,
+                "Optional channel id to restrict to one channel.",
+                required=False),
+        OpParam("role", ParamKind.ROLE,
+                "Optional role id to restrict to one role's overwrites.",
+                required=False),
+    ],
+    serialize=lambda os: {"overwrites": os, "count": len(os)},
+    agent_guidance=(
+        "list_channel_overwrites returns explicit per-channel ACL entries "
+        "only — a role with no overwrites simply grants its guild-level "
+        "permissions. Filter by role_id when auditing what one role "
+        "unlocks; the unfiltered guild-wide dump can be large."),
+)
+async def list_channel_overwrites(ctx: OpContext, guild, channel=None, role=None):
+    channels = [channel] if channel is not None else guild.channels
+    out = []
+    for ch in channels:
+        for target, overwrite in ch.overwrites.items():
+            if role is not None and target.id != role.id:
+                continue
+            allow, deny = overwrite.pair()
+            out.append({
+                "channel_id": ch.id,
+                "channel_name": ch.name,
+                "channel_type": str(ch.type),
+                "target_type": "role" if isinstance(target, discord.Role) else "member",
+                "target_id": target.id,
+                "target_name": getattr(target, "name", str(target)),
+                "allow": [name for name, value in allow if value],
+                "deny": [name for name, value in deny if value],
+            })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # In-file smoke test — instantiates the module-level registry and lists
 # tools WITHOUT a live bot/Discord connection. Run directly:
@@ -1209,6 +1252,7 @@ def _smoke_test() -> None:
         "remove_reaction", "search_history", "add_role", "remove_role", "pin_message",
         "create_thread", "list_guilds", "list_channels", "list_members",
         "list_roles", "create_role", "edit_role", "delete_role",
+        "list_channel_overwrites",
     }
     names = set(registry.names())
     missing = expected - names
