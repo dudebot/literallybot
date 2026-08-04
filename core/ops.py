@@ -68,22 +68,35 @@ class ParamKind(str, Enum):
     """What an op parameter IS, driving both schema generation and id
     resolution. Discord entities travel as ids on the wire and are resolved
     to live objects before the op impl runs; scalars pass through."""
-    CHANNEL = "channel"    # wire: channel_id (int) -> discord channel object
-    CHANNEL_LIST = "channel_list"  # wire: channel_ids (int array) -> list of channels
-    MESSAGE = "message"    # wire: channel_id + message_id (int) -> discord.Message
-    MEMBER = "member"      # wire: user_id (int) -> discord.Member (of ctx.guild)
-    ROLE = "role"          # wire: role_id (int) -> discord.Role (of ctx.guild)
-    GUILD = "guild"        # wire: guild_id (int) -> discord.Guild
+    CHANNEL = "channel"    # wire: channel_id (str) -> discord channel object
+    CHANNEL_LIST = "channel_list"  # wire: channel_ids (str array) -> list of channels
+    MESSAGE = "message"    # wire: channel_id + message_id (str) -> discord.Message
+    MEMBER = "member"      # wire: user_id (str) -> discord.Member (of ctx.guild)
+    ROLE = "role"          # wire: role_id (str) -> discord.Role (of ctx.guild)
+    GUILD = "guild"        # wire: guild_id (str) -> discord.Guild
     STRING = "string"
     INTEGER = "integer"
+    SNOWFLAKE = "snowflake"  # a Discord id used as a scalar (filter/reference),
+                             # NOT resolved to an object; wire type is string
+                             # for the same 2**53 reason as entity ids.
     BOOLEAN = "boolean"
     INTERNAL = "internal"  # never on the wire; frontends may pass a live object
 
+
+# Discord snowflakes are 64-bit and routinely exceed 2**53, the largest
+# integer a JSON/JavaScript double represents exactly. Declared as "integer"
+# they silently round in transit (1208839321801465886 -> ...900) and resolve
+# to the wrong entity or fail outright, so they travel as decimal STRINGS.
+# Every consumer already funnels ids through _as_int(), which accepts both —
+# do not "simplify" this back to "integer". Genuine scalar ints (limit,
+# position) stay ParamKind.INTEGER: they're small and unaffected.
+_SNOWFLAKE_JSON_TYPE = "string"
 
 # JSON-schema type for each scalar kind.
 _SCALAR_JSON_TYPES = {
     ParamKind.STRING: "string",
     ParamKind.INTEGER: "integer",
+    ParamKind.SNOWFLAKE: _SNOWFLAKE_JSON_TYPE,
     ParamKind.BOOLEAN: "boolean",
 }
 
@@ -321,9 +334,9 @@ class Op:
             if p.kind == ParamKind.INTERNAL:
                 continue
             if p.kind == ParamKind.MESSAGE:
-                add(WireParam("channel_id", "integer",
+                add(WireParam("channel_id", _SNOWFLAKE_JSON_TYPE,
                               f"Discord channel id containing the {p.name}.", True))
-                add(WireParam("message_id", "integer",
+                add(WireParam("message_id", _SNOWFLAKE_JSON_TYPE,
                               p.description or f"Discord message id of the {p.name}.",
                               p.required, p.default))
             elif p.kind == ParamKind.CHANNEL_LIST:
@@ -331,7 +344,7 @@ class Op:
                               p.description or "List of Discord channel ids.",
                               p.required, p.default))
             elif p.kind in _ENTITY_WIRE_NAMES:
-                add(WireParam(_ENTITY_WIRE_NAMES[p.kind], "integer",
+                add(WireParam(_ENTITY_WIRE_NAMES[p.kind], _SNOWFLAKE_JSON_TYPE,
                               p.description or f"Discord {p.kind.value} id.",
                               p.required, p.default))
             else:
@@ -347,10 +360,11 @@ class Op:
         for wp in self.wire_params():
             prop: Dict[str, Any] = {"type": wp.json_type}
             if wp.json_type == "array":
-                # The only array wire kind is CHANNEL_LIST (integer ids).
-                # A second array kind must also update mcp_ops/server.py's
-                # _JSON_TYPE_TO_PY (or grow an items-type facet on WireParam).
-                prop["items"] = {"type": "integer"}
+                # The only array wire kind is CHANNEL_LIST (snowflake ids, so
+                # string items — see _SNOWFLAKE_JSON_TYPE). A second array kind
+                # must also update mcp_ops/server.py's _JSON_TYPE_TO_PY (or
+                # grow an items-type facet on WireParam).
+                prop["items"] = {"type": _SNOWFLAKE_JSON_TYPE}
             if wp.description:
                 prop["description"] = wp.description
             if wp.default is not None:
@@ -664,7 +678,7 @@ registry = OpsRegistry()
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to send into."),
         OpParam("content", ParamKind.STRING, "Message text to send."),
-        OpParam("reference_message_id", ParamKind.INTEGER,
+        OpParam("reference_message_id", ParamKind.SNOWFLAKE,
                 "Optional message id in the same channel to reply to.",
                 required=False),
         OpParam("allowed_mentions", ParamKind.INTERNAL),
@@ -855,7 +869,7 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
                 f"Max number of matching messages to return, most recent "
                 f"first (clamped to {HISTORY_LIMIT_MAX}).",
                 required=False, default=100, minimum=1, maximum=HISTORY_LIMIT_MAX),
-        OpParam("author_id", ParamKind.INTEGER,
+        OpParam("author_id", ParamKind.SNOWFLAKE,
                 "Optional filter — only messages from this user id.",
                 required=False),
         OpParam("contains", ParamKind.STRING,
@@ -887,6 +901,9 @@ async def search_history(ctx: OpContext, channels=None,
     guild = scoped[0].guild if scoped else ctx.guild
     if guild is None:
         raise ValueError("search_history needs a channel or a guild context.")
+    # Snowflake scalars arrive as strings on the wire; compare as ints.
+    if author_id is not None:
+        author_id = _as_int(author_id, "author_id")
     try:
         hits, total = await _index_search(
             ctx.bot, guild.id, [c.id for c in scoped],
@@ -1286,7 +1303,7 @@ def _smoke_test() -> None:
                                          "author_id", "contains"}
     assert search["required"] == []  # no channel scope => guild-wide search
     assert search["properties"]["channel_ids"]["type"] == "array"
-    assert search["properties"]["channel_ids"]["items"] == {"type": "integer"}
+    assert search["properties"]["channel_ids"]["items"] == {"type": "string"}
     assert search["properties"]["limit"]["maximum"] == HISTORY_LIMIT_MAX
 
     thread = registry.get("create_thread").to_json_schema()
@@ -1295,6 +1312,13 @@ def _smoke_test() -> None:
 
     roles = registry.get("add_role").to_json_schema()
     assert set(roles["properties"]) == {"user_id", "role_id"}
+
+    # Snowflakes travel as strings (2**53 — see _SNOWFLAKE_JSON_TYPE); real
+    # scalar ints keep "integer" so clamping still applies.
+    assert roles["properties"]["user_id"]["type"] == "string", roles
+    assert send["properties"]["reference_message_id"]["type"] == "string", send
+    assert search["properties"]["author_id"]["type"] == "string", search
+    assert search["properties"]["limit"]["type"] == "integer", search
 
     # A no-actor context must fail closed on anything above EVERYONE, and
     # must never raise — permission failures surface as OpResult.error.
