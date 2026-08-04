@@ -44,6 +44,7 @@ from core.ops import (
     OpContext,
     OpResult,
     ResolutionError,
+    _as_int,
     registry,
     resolve_context_guild,
 )
@@ -79,10 +80,10 @@ _EXPOSED_OPS = (
     "create_thread",
 )
 
-# "array" is always a list of integer ids (ops.py CHANNEL_LIST is the only
-# array wire kind; see Op.to_json_schema).
+# "array" is always a list of snowflake ids, carried as strings (ops.py
+# CHANNEL_LIST is the only array wire kind; see Op.to_json_schema).
 _JSON_TYPE_TO_PY = {"integer": int, "string": str, "boolean": bool,
-                    "array": List[int]}
+                    "array": List[str]}
 
 
 def resolve_mcp_tools(config) -> List[str]:
@@ -159,7 +160,9 @@ def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
 
     async def tool_fn(**raw) -> dict:
         live_bot = _require_bot(bot)
-        actor_id = raw.pop("actor_id")
+        # Snowflake-as-string on the wire (see _SNOWFLAKE_JSON_TYPE in
+        # core/ops.py); coerce before it reaches guild.get_member().
+        actor_id = _as_int(raw.pop("actor_id"), "actor_id")
 
         # Resolve the target guild first (raises on unknown ids and on
         # allowlist violations — surfaced as MCP tool errors) so the actor
@@ -211,9 +214,9 @@ def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
         ))
         annotations[wp.name] = annotation
 
-    actor_annotation = Annotated[int, Field(
+    actor_annotation = Annotated[str, Field(
         description="Discord user id on whose behalf this call is made "
-                    "(used for permission checks)."
+                    "(used for permission checks). Decimal string."
     )]
     parameters.append(inspect.Parameter(
         "actor_id", inspect.Parameter.KEYWORD_ONLY, annotation=actor_annotation,
