@@ -11,6 +11,7 @@ from discord import app_commands
 from dotenv import load_dotenv
 import os
 from core.config import Config
+from core.dm_log import log_dm, row_from_message
 from core.error_handler import (
     log_error_to_discord, ErrorCategory, ErrorSeverity,
     handle_command_error, handle_app_command_error, handle_event_error
@@ -182,6 +183,13 @@ async def on_message(message):
         return
     if isinstance(message.channel, discord.DMChannel):
         logger.info(f'Received DM from {message.author} (ID: {message.author.id}): {message.content}')
+        # Persist inbound DMs so read_dms can serve them back. Never let a
+        # storage failure swallow the message — logging and command
+        # processing must still happen.
+        try:
+            log_dm(message.author.id, row_from_message(message, message.author.id))
+        except Exception as dm_log_error:
+            logger.error(f"Failed to persist inbound DM: {dm_log_error}")
     await bot.process_commands(message)
 
 @bot.event

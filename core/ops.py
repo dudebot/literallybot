@@ -41,19 +41,30 @@ bottom-of-file smoke test for a no-bot-required sanity check.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import discord
 
+from core.dm_log import load_dms, log_dm, row_from_message
 from core.utils import is_admin, is_superadmin
 
 # Shared history-scan cap: search_history never scans more than this many
 # messages regardless of the requested limit (silently clamped, matching
 # the original MCP frontend's behavior).
 HISTORY_LIMIT_MAX = 200
+
+# Discord upload hard cap (bytes). Free-tier bots are fine under 10MB for
+# typical image drops; reject above 25MB so we fail closed before the API.
+ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
+ATTACHMENT_EXTENSIONS = frozenset({
+    ".gif", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm",
+    ".mov", ".pdf", ".txt", ".opus", ".ogg", ".mp3", ".wav",
+})
 
 
 class PermissionLevel(IntEnum):
@@ -70,6 +81,7 @@ class ParamKind(str, Enum):
     to live objects before the op impl runs; scalars pass through."""
     CHANNEL = "channel"    # wire: channel_id (str) -> discord channel object
     CHANNEL_LIST = "channel_list"  # wire: channel_ids (str array) -> list of channels
+    STRING_LIST = "string_list"    # wire: <name> (str array) -> list of strings
     MESSAGE = "message"    # wire: channel_id + message_id (str) -> discord.Message
     MEMBER = "member"      # wire: user_id (str) -> discord.Member (of ctx.guild)
     ROLE = "role"          # wire: role_id (str) -> discord.Role (of ctx.guild)
@@ -343,6 +355,9 @@ class Op:
                 add(WireParam("channel_ids", "array",
                               p.description or "List of Discord channel ids.",
                               p.required, p.default))
+            elif p.kind == ParamKind.STRING_LIST:
+                add(WireParam(p.name, "array", p.description,
+                              p.required, p.default))
             elif p.kind in _ENTITY_WIRE_NAMES:
                 add(WireParam(_ENTITY_WIRE_NAMES[p.kind], _SNOWFLAKE_JSON_TYPE,
                               p.description or f"Discord {p.kind.value} id.",
@@ -360,11 +375,12 @@ class Op:
         for wp in self.wire_params():
             prop: Dict[str, Any] = {"type": wp.json_type}
             if wp.json_type == "array":
-                # The only array wire kind is CHANNEL_LIST (snowflake ids, so
-                # string items — see _SNOWFLAKE_JSON_TYPE). A second array kind
-                # must also update mcp_ops/server.py's _JSON_TYPE_TO_PY (or
-                # grow an items-type facet on WireParam).
-                prop["items"] = {"type": _SNOWFLAKE_JSON_TYPE}
+                # Both array wire kinds (CHANNEL_LIST snowflake ids, plain
+                # STRING_LIST) carry string items, so one items type serves —
+                # and mcp_ops/server.py's _JSON_TYPE_TO_PY "array" -> List[str]
+                # stays a single mapping. An array kind with NON-string items
+                # must grow an items-type facet on WireParam.
+                prop["items"] = {"type": "string"}
             if wp.description:
                 prop["description"] = wp.description
             if wp.default is not None:
@@ -436,6 +452,17 @@ class Op:
                     for cid in channel_ids
                 ]
 
+            elif p.kind == ParamKind.STRING_LIST:
+                values = raw.pop(p.name, None)
+                if values is None:
+                    if p.required:
+                        raise ResolutionError(f"Missing required parameter '{p.name}' for op '{self.name}'.")
+                    kwargs[p.name] = None
+                    continue
+                if not isinstance(values, (list, tuple)):
+                    values = [values]
+                kwargs[p.name] = [str(v) for v in values]
+
             elif p.kind == ParamKind.MESSAGE:
                 message_id = raw.pop("message_id", None)
                 channel_id = raw.pop("channel_id", None)
@@ -487,12 +514,18 @@ class Op:
                 value = raw.pop(p.name)
                 if value is None:
                     continue
-                if p.kind == ParamKind.INTEGER:
+                if p.kind in (ParamKind.INTEGER, ParamKind.SNOWFLAKE):
+                    # SNOWFLAKE arrives as a decimal string (see
+                    # _SNOWFLAKE_JSON_TYPE); both become real ints here, so
+                    # op impls receive an int either way and never have to
+                    # remember to coerce their own id scalars. Clamping
+                    # applies to INTEGER only — ids have no meaningful range.
                     value = _as_int(value, p.name)
-                    if p.minimum is not None:
-                        value = max(p.minimum, value)
-                    if p.maximum is not None:
-                        value = min(p.maximum, value)
+                    if p.kind == ParamKind.INTEGER:
+                        if p.minimum is not None:
+                            value = max(p.minimum, value)
+                        if p.maximum is not None:
+                            value = min(p.maximum, value)
                 kwargs[p.name] = value
 
         if raw:
@@ -669,42 +702,137 @@ class OpsRegistry:
 registry = OpsRegistry()
 
 
+def load_discord_attachments(
+    file_paths: Optional[List[str]] = None,
+) -> List[discord.File]:
+    """Open local files as discord.File for send_message / send_dm.
+
+    Validates ALL paths (existence, regular-file, extension allowlist,
+    size) before opening ANY, so a rejected path never leaves earlier
+    files dangling open. Files are constructed from paths so discord.py
+    owns the handles — its HTTP layer closes them after the send attempt;
+    a caller that fails BEFORE sending must close them itself.
+
+    Paths are resolved (symlink-followed). Raises ValueError on rejection.
+    """
+    paths: List[str] = []
+    for raw in (file_paths or []):
+        s = str(raw).strip()
+        if s and s not in paths:
+            paths.append(s)
+    if not paths:
+        return []
+    if len(paths) > 10:
+        raise ValueError("Discord allows at most 10 attachments per message")
+
+    resolved: List[Path] = []
+    for raw in paths:
+        path = Path(raw).expanduser()
+        try:
+            path = path.resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError(f"attachment not found: {raw}") from exc
+        if not path.is_file():
+            raise ValueError(f"attachment is not a file: {path}")
+        ext = path.suffix.lower()
+        if ext not in ATTACHMENT_EXTENSIONS:
+            raise ValueError(
+                f"attachment extension not allowed: {ext or '(none)'} "
+                f"(allowed: {', '.join(sorted(ATTACHMENT_EXTENSIONS))})"
+            )
+        size = path.stat().st_size
+        if size <= 0:
+            raise ValueError(f"attachment is empty: {path}")
+        if size > ATTACHMENT_MAX_BYTES:
+            raise ValueError(
+                f"attachment too large ({size} bytes > {ATTACHMENT_MAX_BYTES}): {path}"
+            )
+        resolved.append(path)
+    return [discord.File(path, filename=path.name) for path in resolved]
+
+
+def _require_admin_for_attachments(ctx: OpContext, file_paths) -> None:
+    """Attachments read the HOST filesystem, so they are admin-gated even on
+    ops whose text path is open to everyone — otherwise any user with the
+    agentic chat tools could exfiltrate server files into a channel."""
+    if not file_paths:
+        return
+    allowed, reason = _check_permission(ctx, PermissionLevel.ADMIN)
+    if not allowed:
+        raise ValueError(f"file attachments require admin: {reason}")
+
+
+def _serialize_sent_message(m) -> Dict[str, Any]:
+    return {
+        "message_id": m.id,
+        "attachments": [
+            {"filename": a.filename, "url": a.url, "size": a.size}
+            for a in (m.attachments or [])
+        ],
+    }
+
+
 @registry.op(
     "send_message",
     "Send a text message to a channel, optionally as a reply to an existing "
-    "message in that channel.",
+    "message in that channel. Optional local file attachment(s) via "
+    "file_paths (server filesystem paths the bot can read; admin-only).",
     PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to send into."),
-        OpParam("content", ParamKind.STRING, "Message text to send."),
+        OpParam("content", ParamKind.STRING,
+                "Message text to send (may be empty if attaching a file).",
+                required=False, default=""),
         OpParam("reference_message_id", ParamKind.SNOWFLAKE,
                 "Optional message id in the same channel to reply to.",
                 required=False),
+        OpParam("file_paths", ParamKind.STRING_LIST,
+                "Optional attachments: absolute server-side file paths "
+                "(gif/png/jpg/webp/mp4/…), max 10. Requires admin.",
+                required=False),
         OpParam("allowed_mentions", ParamKind.INTERNAL),
     ],
-    serialize=lambda m: {"message_id": m.id},
+    serialize=_serialize_sent_message,
     agent_guidance=(
         "send_message returns the new message's message_id; reuse it for "
         "follow-up edits or reactions, and use reference_message_id to reply "
         "to a message. Your final text reply is posted to the current channel "
         "automatically — never duplicate it with send_message."),
 )
-async def send_message(ctx: OpContext, channel, content: str,
+async def send_message(ctx: OpContext, channel, content: str = "",
                        reference_message_id: Optional[int] = None,
+                       file_paths: Optional[List[str]] = None,
                        allowed_mentions=None):
     # Never-ping by default: model/tool-originated sends must not be able
     # to ping anyone. An object-based caller that WANTS pings must pass an
     # explicit allowed_mentions. (Policy hoisted here from the agent-loop
     # and MCP frontends so no frontend can forget it.)
-    kwargs = {"allowed_mentions": allowed_mentions
-              if allowed_mentions is not None else discord.AllowedMentions.none()}
-    if reference_message_id is not None:
-        # Reply to a message in the same channel. mention_author is governed
-        # by allowed_mentions (the frontends pass none), so a reply never pings.
-        ref = await fetch_message_in(channel, int(reference_message_id))
-        kwargs["reference"] = ref
-    return await channel.send(content, **kwargs)
+    _require_admin_for_attachments(ctx, file_paths)
+    text = content if content is not None else ""
+    if not str(text).strip() and not file_paths:
+        raise ValueError("send_message requires non-empty content and/or a file attachment")
+    files = load_discord_attachments(file_paths)
+    kwargs: Dict[str, Any] = {
+        "allowed_mentions": allowed_mentions
+        if allowed_mentions is not None else discord.AllowedMentions.none(),
+    }
+    if files:
+        kwargs["files"] = files
+    try:
+        if reference_message_id is not None:
+            # Reply to a message in the same channel. mention_author is governed
+            # by allowed_mentions (the frontends pass none), so a reply never pings.
+            ref = await fetch_message_in(channel, int(reference_message_id))
+            kwargs["reference"] = ref
+        return await channel.send(text if str(text).strip() else None, **kwargs)
+    except BaseException:
+        # discord.py closes files it was handed once a send is ATTEMPTED;
+        # failures before that point (reference fetch, arg validation)
+        # leave the handles ours to close.
+        for f in files:
+            f.close()
+        raise
 
 
 @registry.op(
@@ -1070,6 +1198,170 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
     return results
 
 
+# ---------------------------------------------------------------------------
+# Direct messages.
+#
+# DM channels belong to no guild, so they cannot travel through the CHANNEL
+# param kind (which is guild-confined by design). These ops instead resolve a
+# MEMBER — the target must be a member of an allowlisted guild — and open the
+# DM channel from that member. The confinement therefore still holds: the DM
+# surface reaches exactly the people the bot already serves, and a raw DM
+# channel id is never accepted from the wire.
+#
+# The GUILD param is declared explicitly rather than leaning on the MCP
+# frontend's single-allowlisted-guild fallback: MEMBER resolution needs a
+# guild, and an op that only works when exactly one guild is allowlisted
+# would be a silent trap for every other frontend (agent loop, future
+# multi-guild MCP deployments).
+#
+# CONSENT IS DELIBERATELY NOT ENFORCED HERE. Whether a given user has opted in
+# is a per-deployment convention (one guild's opt-in role id is meaningless in
+# another, and some deployments use none), so authorization belongs to the
+# caller — typically by calling list_role_members for whatever role that
+# deployment treats as consent, and DMing only that set. Do not add a role
+# check to this op; it would be wrong for every other deployment.
+# ---------------------------------------------------------------------------
+
+@registry.op(
+    "send_dm",
+    "Send a direct message to a member. The member must belong to a guild "
+    "the bot serves. Never pings. Optional local file attachment(s) via "
+    "file_paths. NOTE: this op does not check whether the "
+    "user consented to DMs — the caller owns that decision.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to."),
+        OpParam("member", ParamKind.MEMBER, "Discord user id to DM."),
+        OpParam("content", ParamKind.STRING,
+                "Message text to send (may be empty if attaching a file).",
+                required=False, default=""),
+        OpParam("file_paths", ParamKind.STRING_LIST,
+                "Optional attachments: absolute server-side file paths "
+                "(gif/png/jpg/webp/mp4/…), max 10.",
+                required=False),
+        OpParam("allowed_mentions", ParamKind.INTERNAL),
+    ],
+    serialize=_serialize_sent_message,
+    agent_guidance=(
+        "send_dm messages one member privately and does NOT check whether "
+        "they opted in — establish that first (list_role_members over the "
+        "role this server treats as consent) before DMing anyone. A DM "
+        "cannot be seen by the channel, so never use it to answer a question "
+        "asked in public."),
+)
+async def send_dm(ctx: OpContext, guild, member, content: str = "",
+                  file_paths: Optional[List[str]] = None,
+                  allowed_mentions=None):
+    # Same never-ping default as send_message; a DM notifies on its own.
+    text = content if content is not None else ""
+    if not str(text).strip() and not file_paths:
+        raise ValueError("send_dm requires non-empty content and/or a file attachment")
+    files = load_discord_attachments(file_paths)
+    mentions = (allowed_mentions if allowed_mentions is not None
+                else discord.AllowedMentions.none())
+    kwargs: Dict[str, Any] = {"allowed_mentions": mentions}
+    if files:
+        kwargs["files"] = files
+    try:
+        message = await member.send(text if str(text).strip() else None, **kwargs)
+    except BaseException:
+        # Same pre-send handle ownership rule as send_message.
+        for f in files:
+            f.close()
+        raise
+    # Store our own side too, so read_dms returns a conversation rather than
+    # a one-sided mailbox.
+    try:
+        log_dm(member.id, row_from_message(message, member.id))
+    except Exception:  # noqa: BLE001 - a storage failure must not undo a sent DM
+        logger = getattr(ctx.bot, "logger", None)
+        if logger:
+            logger.warning("send_dm: failed to persist outbound DM", exc_info=True)
+    return message
+
+
+@registry.op(
+    "read_dms",
+    "Read the stored DM transcript with a member, oldest first. Covers DMs "
+    "exchanged since transcript storage was enabled — use fetch_dms for "
+    "older history straight from Discord.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to."),
+        OpParam("member", ParamKind.MEMBER, "Discord user id whose DMs to read."),
+        OpParam("since", ParamKind.STRING,
+                "Optional ISO timestamp — only rows strictly after it. "
+                "Coarse filter; can drop a message sharing the cursor row's "
+                "timestamp. Prefer after_message_id for polling.",
+                required=False),
+        OpParam("after_message_id", ParamKind.SNOWFLAKE,
+                "Optional poll cursor: only rows with a strictly greater "
+                "message id. Monotonic and tie-proof.",
+                required=False),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max rows to return, most recent kept (default 50).",
+                required=False, default=50, minimum=1, maximum=500),
+    ],
+    serialize=lambda rows: {"messages": rows, "count": len(rows)},
+    agent_guidance=(
+        "read_dms returns only DMs recorded since transcript storage was "
+        "enabled, each tagged direction 'in' (from the user) or 'out' (from "
+        "the bot) — an empty result means nothing was recorded, not that "
+        "nothing was ever said (fetch_dms reads real Discord history). To "
+        "poll for new replies, pass the last row's message_id as "
+        "after_message_id — it never skips or repeats a message."),
+)
+async def read_dms(ctx: OpContext, guild, member, since: Optional[str] = None,
+                   after_message_id: Optional[int] = None, limit: int = 50):
+    # File I/O off the event loop: a large transcript must not stall the bot.
+    return await asyncio.to_thread(load_dms, member.id, limit=limit,
+                                   since=since, after_id=after_message_id)
+
+
+@registry.op(
+    "fetch_dms",
+    "Fetch DM history with a member directly from Discord, oldest first. "
+    "Unlike read_dms this covers the full conversation history, including "
+    "messages that predate transcript storage. Paginate backwards with "
+    "before_message_id.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to."),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id whose DM history to fetch."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max messages to fetch (default 50, clamped to 100 — one "
+                "Discord history page).",
+                required=False, default=50, minimum=1, maximum=100),
+        OpParam("before_message_id", ParamKind.SNOWFLAKE,
+                "Optional pagination cursor: only messages older than this "
+                "id. Pass the previous page's oldest message_id to walk "
+                "further back.",
+                required=False),
+    ],
+    serialize=lambda rows: {"messages": rows, "count": len(rows)},
+    agent_guidance=(
+        "fetch_dms reads live Discord DM history (rows match read_dms: "
+        "direction in/out, attachments with filename+url). Results are "
+        "oldest-first within the page; to page backwards through history, "
+        "call again with before_message_id set to the first row's "
+        "message_id, until a page comes back empty."),
+)
+async def fetch_dms(ctx: OpContext, guild, member, limit: int = 50,
+                    before_message_id: Optional[int] = None):
+    channel = member.dm_channel or await member.create_dm()
+    before = (discord.Object(id=before_message_id)
+              if before_message_id is not None else None)
+    rows = []
+    async for msg in channel.history(limit=limit, before=before):
+        rows.append(row_from_message(msg, member.id))
+    rows.reverse()  # history() yields newest-first; present oldest-first
+    return rows
+
+
 def _parse_color(color: str):
     value = color.lstrip("#")
     try:
@@ -1112,6 +1404,52 @@ def _guard_editable(role: Any):
 async def list_roles(ctx: OpContext, guild):
     return [serialize_role(r) for r in
             sorted(guild.roles, key=lambda r: r.position, reverse=True)]
+
+
+@registry.op(
+    "list_role_members",
+    "List the members who hold a given role. Use list_roles first to find "
+    "the role id. Bots are excluded unless include_bots is set.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id the role belongs to."),
+        OpParam("role", ParamKind.ROLE, "Discord role id whose holders to list."),
+        OpParam("include_bots", ParamKind.BOOLEAN,
+                "Include bot accounts (default false).",
+                required=False, default=False),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max members to return (default 100, clamped to 1000).",
+                required=False, default=100, minimum=1, maximum=1000),
+    ],
+    serialize=lambda ms: {"members": ms, "count": len(ms)},
+    agent_guidance=(
+        "Role ids for list_role_members must come from list_roles — never "
+        "guess one. It answers 'who has role X'; list_members answers 'who "
+        "can see channel Y'. The two are not interchangeable."),
+)
+async def list_role_members(ctx: OpContext, guild, role,
+                            include_bots: bool = False, limit: int = 100):
+    # role.members reads the member CACHE — silently short on a guild that
+    # hasn't finished chunking. This op is the documented way to select who
+    # an agent may contact, so under-reporting means silently skipping
+    # people: chunk first if the cache is incomplete.
+    if not guild.chunked:
+        try:
+            await guild.chunk()
+        except discord.ClientException:
+            pass  # members intent unavailable; cache is the best we have
+    results = []
+    for m in role.members:
+        if not include_bots and getattr(m, "bot", False):
+            continue
+        results.append({
+            "id": m.id,
+            "display_name": m.display_name,
+            "status": str(getattr(m, "status", "offline")),
+        })
+        if len(results) >= limit:
+            break
+    return results
 
 
 @registry.op(
@@ -1270,8 +1608,9 @@ def _smoke_test() -> None:
         "send_message", "edit_message", "delete_message", "add_reaction",
         "remove_reaction", "search_history", "add_role", "remove_role", "pin_message",
         "create_thread", "list_guilds", "list_channels", "list_members",
-        "list_roles", "create_role", "edit_role", "delete_role",
-        "list_channel_overwrites",
+        "list_roles", "list_role_members", "create_role", "edit_role",
+        "delete_role", "list_channel_overwrites", "send_dm", "read_dms",
+        "fetch_dms",
     }
     names = set(registry.names())
     missing = expected - names
@@ -1292,8 +1631,12 @@ def _smoke_test() -> None:
     # Generated wire schemas: entity params travel as ids; MESSAGE implies
     # channel_id; INTERNAL params (allowed_mentions) never hit the wire.
     send = registry.get("send_message").to_json_schema()
-    assert set(send["properties"]) == {"channel_id", "content", "reference_message_id"}, send
-    assert send["required"] == ["channel_id", "content"]  # reference is optional
+    assert set(send["properties"]) == {
+        "channel_id", "content", "reference_message_id", "file_paths",
+    }, send
+    assert send["required"] == ["channel_id"]  # content optional when attaching
+    assert send["properties"]["file_paths"]["type"] == "array", send
+    assert send["properties"]["file_paths"]["items"] == {"type": "string"}, send
 
     edit = registry.get("edit_message").to_json_schema()
     assert set(edit["properties"]) == {"channel_id", "message_id", "content"}, edit
@@ -1319,6 +1662,42 @@ def _smoke_test() -> None:
     assert send["properties"]["reference_message_id"]["type"] == "string", send
     assert search["properties"]["author_id"]["type"] == "string", search
     assert search["properties"]["limit"]["type"] == "integer", search
+
+    # DM ops resolve a MEMBER inside a GUILD — never a raw DM channel id.
+    dm = registry.get("send_dm").to_json_schema()
+    assert set(dm["properties"]) == {
+        "guild_id", "user_id", "content", "file_paths",
+    }, dm
+    assert dm["properties"]["user_id"]["type"] == "string", dm
+    assert "channel_id" not in dm["properties"], dm
+    assert set(dm["required"]) == {"guild_id", "user_id"}
+
+    read = registry.get("read_dms").to_json_schema()
+    assert set(read["properties"]) == {"guild_id", "user_id", "since",
+                                       "after_message_id", "limit"}
+    assert set(read["required"]) == {"guild_id", "user_id"}
+    assert read["properties"]["after_message_id"]["type"] == "string", read
+
+    fetch = registry.get("fetch_dms").to_json_schema()
+    assert set(fetch["properties"]) == {"guild_id", "user_id", "limit",
+                                        "before_message_id"}
+    assert set(fetch["required"]) == {"guild_id", "user_id"}
+    assert fetch["properties"]["before_message_id"]["type"] == "string", fetch
+
+    rolemem = registry.get("list_role_members").to_json_schema()
+    assert set(rolemem["properties"]) == {"guild_id", "role_id",
+                                          "include_bots", "limit"}
+    assert rolemem["properties"]["role_id"]["type"] == "string", rolemem
+
+    # SNOWFLAKE scalars are coerced centrally in resolve_kwargs (op impls
+    # never have to remember); INTEGER scalars are additionally clamped.
+    import asyncio as _asyncio
+    coerced = _asyncio.run(registry.get("search_history").resolve_kwargs(
+        bot=None, guild=None,
+        raw={"author_id": "1208839321801465886", "limit": 9999},
+        allowed_guild_ids=frozenset()))
+    assert coerced["author_id"] == 1208839321801465886, coerced
+    assert coerced["limit"] == HISTORY_LIMIT_MAX, coerced
 
     # A no-actor context must fail closed on anything above EVERYONE, and
     # must never raise — permission failures surface as OpResult.error.
@@ -1348,6 +1727,43 @@ def _smoke_test() -> None:
 
     res = asyncio.run(registry.call_ids("list_guilds", no_guild_ctx, bogus=1))
     assert res.ok is False and "Unexpected parameter" in res.error
+
+    # Attachment path validation (no Discord needed): good file loads,
+    # missing path and disallowed extension both raise.
+    import os
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
+        tmp.write(b"GIF89a-fake")
+        tmp_path = tmp.name
+    try:
+        files = load_discord_attachments([tmp_path])
+        assert len(files) == 1
+        files[0].close()
+        try:
+            load_discord_attachments(["/no/such/file.gif"])
+            assert False, "expected missing file to raise"
+        except ValueError as exc:
+            assert "not found" in str(exc).lower()
+        # One bad path in a batch must reject BEFORE any file is opened —
+        # a good path listed first must not leave a dangling handle.
+        try:
+            load_discord_attachments([tmp_path, "/no/such/file.gif"])
+            assert False, "expected batch with missing file to raise"
+        except ValueError:
+            pass
+        bad = tmp_path + ".exe"
+        os.rename(tmp_path, bad)
+        tmp_path = bad
+        try:
+            load_discord_attachments([tmp_path])
+            assert False, "expected bad extension to raise"
+        except ValueError as exc:
+            assert "extension" in str(exc).lower()
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
     print(f"core.ops smoke test OK — {len(names)} ops registered:")
     for tool in tools:

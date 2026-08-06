@@ -39,3 +39,6 @@ settings.local.json
 
 # Legacy - keeping for safety
 cogs/vibes/*
+
+# Folder-level MCP registration (carries the ops bearer token)
+.mcp.json
