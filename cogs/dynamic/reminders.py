@@ -61,8 +61,11 @@ class SnoozeButton(discord.ui.DynamicItem[discord.ui.Button],
     def __init__(self, secs: int):
         secs = int(secs)
         self.secs = secs
+        # 💤 instead of the word "Snooze": three buttons must fit one row on
+        # a small phone screen, and the word alone blew the width budget.
         super().__init__(discord.ui.Button(
-            label=f"Snooze {format_duration(secs)}",
+            label=format_duration(secs),
+            emoji="\N{SLEEPING SYMBOL}",
             style=discord.ButtonStyle.secondary,
             custom_id=f"remsnooze:{secs}",
         ))
