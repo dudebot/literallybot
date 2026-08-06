@@ -97,7 +97,7 @@ illustration; they are not real.)
 | `cooldown_windows` | `list[[count, period_mult]]` | `/ai settings` → Cooldowns | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
 | `mcp_tools_enabled` | `list[str]` op names | `/ai settings` → MCP tools | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
 | `error_logging` | `{default_channel?, category_channels?, severity_channels?, rate_limit_minutes?}` | `!errorlog` subcommands | Same shape also exists per-guild (guild overrides global) |
-| `reminders` | `list[{user_id, timestamp, text}]` | `!remindme` | Deliberately ONE global list across all guilds/DMs, filtered by `user_id` on read |
+| `reminders` | `list[{user_id, timestamp, text, delay}]` | `!remindme` + snooze buttons | Deliberately ONE global list across all guilds/DMs, filtered by `user_id` on read. `delay` (original duration, seconds) scales the snooze options; legacy rows without it get static 10m/1h/1d |
 | `hue_bridge_ip` | `str` | `!sethuebridgeip` | signal cog |
 | `command_author_allowlist` | `list[int]` | *no command surface* | bot.py bot-authored-command dispatch; hand-edit only |
 

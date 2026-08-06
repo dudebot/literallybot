@@ -3,6 +3,92 @@ from discord.ext import commands, tasks
 import re
 import time
 
+# Snooze bounds: below 10 minutes a snooze races the 10s delivery loop and
+# reads as noise; above 30 days it outlives the reminder's relevance.
+SNOOZE_MIN_SECONDS = 10 * 60
+SNOOZE_MAX_SECONDS = 30 * 86400
+# Multipliers of the ORIGINAL duration. Real usage spans 1 minute to 300
+# days (log-derived, 2026-08), so static offsets can't serve the
+# distribution — options scale with the reminder instead, clamped to the
+# bounds above. Legacy reminders stored without a duration fall back to
+# these static offsets.
+SNOOZE_MULTIPLIERS = (0.5, 1.0, 2.0)
+SNOOZE_STATIC_FALLBACK = (600, 3600, 86400)  # 10m / 1h / 1d
+
+
+def format_duration(seconds: int) -> str:
+    """Compact human duration: 90 -> '1m', 5400 -> '1h30m', 129600 -> '1d12h'."""
+    seconds = max(int(seconds), 60)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    parts = [(days, "d"), (hours, "h"), (minutes, "m")]
+    out = "".join(f"{n}{u}" for n, u in parts if n)
+    return out or "1m"
+
+
+def snooze_offsets(original_delay=None):
+    """The snooze durations offered for a reminder, ascending, deduped."""
+    if not original_delay:
+        return list(SNOOZE_STATIC_FALLBACK)
+    offsets = []
+    for mult in SNOOZE_MULTIPLIERS:
+        secs = int(original_delay * mult)
+        secs = max(SNOOZE_MIN_SECONDS, min(SNOOZE_MAX_SECONDS, secs))
+        if secs not in offsets:
+            offsets.append(secs)
+    return offsets
+
+
+class SnoozeButton(discord.ui.DynamicItem[discord.ui.Button],
+                   template=r"remsnooze:(?P<secs>\d+)"):
+    """A snooze button whose entire state is its custom_id.
+
+    The final snooze duration rides in the custom_id and the reminder text
+    is recovered from the message it is attached to, so the button needs no
+    server-side state and keeps working across bot restarts (registered via
+    bot.add_dynamic_items in setup).
+    """
+
+    def __init__(self, secs: int):
+        secs = int(secs)
+        self.secs = secs
+        super().__init__(discord.ui.Button(
+            label=f"Snooze {format_duration(secs)}",
+            style=discord.ButtonStyle.secondary,
+            custom_id=f"remsnooze:{secs}",
+        ))
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match["secs"]))
+
+    async def callback(self, interaction: discord.Interaction):
+        text = interaction.message.content
+        if text.startswith("Reminder: "):
+            text = text[len("Reminder: "):]
+        remind_time = int(time.time()) + self.secs
+        config = interaction.client.config
+        reminders = config.get(None, "reminders", [])
+        reminders.append({
+            "user_id": interaction.user.id,
+            "timestamp": remind_time,
+            "text": text,
+            "delay": self.secs,
+        })
+        config.set(None, "reminders", reminders)
+        # Strip the buttons so one delivery can't be snoozed twice, then
+        # confirm on the same message.
+        await interaction.response.edit_message(view=None)
+        await interaction.followup.send(f"Snoozed — <t:{remind_time}:R>.")
+
+
+def snooze_view(original_delay=None) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    for secs in snooze_offsets(original_delay):
+        view.add_item(SnoozeButton(secs))
+    return view
+
 # Longest units first within each duration bucket so the alternation doesn't
 # stop early (e.g. "hr" must be tried before "h").
 _UNIT_SECONDS = {
@@ -90,7 +176,10 @@ class Reminders(commands.Cog):
         remind_time = current_time + delay
         config = self.bot.config
         reminders = config.get(None, "reminders", [])
-        reminders.append({"user_id": ctx.author.id, "timestamp": remind_time, "text": text})
+        # "delay" feeds the snooze buttons at delivery (0.5x/1x/2x of the
+        # original duration); legacy rows without it get static offsets.
+        reminders.append({"user_id": ctx.author.id, "timestamp": remind_time,
+                          "text": text, "delay": delay})
         config.set(None, "reminders", reminders)
         await ctx.send(f"Reminder set — <t:{remind_time}:R>.")
 
@@ -110,7 +199,8 @@ class Reminders(commands.Cog):
                         self.logger.warning(f"Failed to fetch user {reminder['user_id']}: {e}")
                         continue
                 try:
-                    await user.send(f"Reminder: {reminder['text']}")
+                    await user.send(f"Reminder: {reminder['text']}",
+                                    view=snooze_view(reminder.get("delay")))
                 except Exception as e:
                     self.logger.warning(f"Failed to send DM to {reminder['user_id']}: {e}")
             else:
@@ -123,4 +213,7 @@ class Reminders(commands.Cog):
         await self.bot.wait_until_ready()
 
 async def setup(bot):
+    # DynamicItem registration is what routes remsnooze:* interactions after
+    # a restart, when the delivering view object no longer exists.
+    bot.add_dynamic_items(SnoozeButton)
     await bot.add_cog(Reminders(bot))
