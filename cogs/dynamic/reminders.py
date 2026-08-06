@@ -2,6 +2,7 @@ import discord
 from discord.ext import commands, tasks
 import re
 import time
+from typing import Optional
 
 # Snooze bounds: below 10 minutes a snooze races the 10s delivery loop and
 # reads as noise; above 30 days it outlives the reminder's relevance.
@@ -49,44 +50,59 @@ def snooze_offsets(original_delay=None):
 
 
 class SnoozeButton(discord.ui.DynamicItem[discord.ui.Button],
-                   template=r"remsnooze:(?P<secs>\d+)"):
+                   template=r"remsnooze:(?P<secs>\d+)(?::(?P<orig>\d+))?"):
     """A snooze button whose entire state is its custom_id.
 
-    The final snooze duration rides in the custom_id and the reminder text
-    is recovered from the message it is attached to, so the button needs no
-    server-side state and keeps working across bot restarts (registered via
-    bot.add_dynamic_items in setup).
+    custom_id is `remsnooze:<snooze_secs>:<original_delay>`. The snooze
+    seconds decide when the reminder re-fires (from CLICK time — snoozing a
+    3-day-old delivery by 1h means 1h from now); the original delay is the
+    duration the USER invoked with, carried through every snooze so the
+    proportional options stay anchored to it — snoozing a 5-day reminder by
+    10m must not shrink its next menu to 10-minute scale. `orig` 0 marks a
+    legacy reminder (static menu); an absent `orig` is a button minted
+    before this field existed and falls back to the snooze amount.
+
+    The reminder text is recovered from the message the button rides on, so
+    it needs no server-side state and keeps working across bot restarts
+    (registered via bot.add_dynamic_items in setup).
     """
 
-    def __init__(self, secs: int):
+    def __init__(self, secs: int, orig: Optional[int] = None):
         secs = int(secs)
         self.secs = secs
+        self.orig = orig if orig is None else int(orig)
+        custom_id = (f"remsnooze:{secs}" if self.orig is None
+                     else f"remsnooze:{secs}:{self.orig}")
         # 💤 instead of the word "Snooze": three buttons must fit one row on
         # a small phone screen, and the word alone blew the width budget.
         super().__init__(discord.ui.Button(
             label=format_duration(secs),
             emoji="\N{SLEEPING SYMBOL}",
             style=discord.ButtonStyle.secondary,
-            custom_id=f"remsnooze:{secs}",
+            custom_id=custom_id,
         ))
 
     @classmethod
     async def from_custom_id(cls, interaction, item, match):
-        return cls(int(match["secs"]))
+        orig = match["orig"]
+        return cls(int(match["secs"]), int(orig) if orig is not None else None)
 
     async def callback(self, interaction: discord.Interaction):
         text = interaction.message.content
         if text.startswith("Reminder: "):
             text = text[len("Reminder: "):]
         remind_time = int(time.time()) + self.secs
-        config = interaction.client.config
-        reminders = config.get(None, "reminders", [])
-        reminders.append({
+        row = {
             "user_id": interaction.user.id,
             "timestamp": remind_time,
             "text": text,
-            "delay": self.secs,
-        })
+        }
+        base = self.orig if self.orig is not None else self.secs
+        if base:
+            row["delay"] = base
+        config = interaction.client.config
+        reminders = config.get(None, "reminders", [])
+        reminders.append(row)
         config.set(None, "reminders", reminders)
         # Strip the buttons so one delivery can't be snoozed twice, then
         # confirm on the same message.
@@ -96,8 +112,9 @@ class SnoozeButton(discord.ui.DynamicItem[discord.ui.Button],
 
 def snooze_view(original_delay=None) -> discord.ui.View:
     view = discord.ui.View(timeout=None)
+    orig = int(original_delay or 0)
     for secs in snooze_offsets(original_delay):
-        view.add_item(SnoozeButton(secs))
+        view.add_item(SnoozeButton(secs, orig=orig))
     return view
 
 # Longest units first within each duration bucket so the alternation doesn't
