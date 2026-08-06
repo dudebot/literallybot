@@ -7,12 +7,20 @@ import time
 # reads as noise; above 30 days it outlives the reminder's relevance.
 SNOOZE_MIN_SECONDS = 10 * 60
 SNOOZE_MAX_SECONDS = 30 * 86400
-# Multipliers of the ORIGINAL duration. Real usage spans 1 minute to 300
-# days (log-derived, 2026-08), so static offsets can't serve the
-# distribution — options scale with the reminder instead, clamped to the
-# bounds above. Legacy reminders stored without a duration fall back to
-# these static offsets.
-SNOOZE_MULTIPLIERS = (0.5, 1.0, 2.0)
+# Hybrid scheme, chosen by USE CASE (labeled from real invocations,
+# 2026-08), not just the duration distribution. Two real categories:
+#   - deadline-anchored ("stream in 36h", "boost in february"): the event
+#     time is fixed, so proportional re-offsets are meaningless — the only
+#     useful snooze is a short "ping me again soon" refresh.
+#   - fuzzy-future todos (most usage): "push it by the same again / by
+#     double" is exactly right, so proportional options scale with the
+#     reminder (durations span 1min–300days; no static set serves that).
+# The text can't tell us which category a reminder is, so every delivery
+# offers the static floor PLUS the proportional pair, deduped after
+# clamping. Legacy reminders stored without a duration fall back to
+# static offsets.
+SNOOZE_STATIC_FLOOR = 600  # 10m — always offered
+SNOOZE_MULTIPLIERS = (1.0, 2.0)
 SNOOZE_STATIC_FALLBACK = (600, 3600, 86400)  # 10m / 1h / 1d
 
 
@@ -31,7 +39,7 @@ def snooze_offsets(original_delay=None):
     """The snooze durations offered for a reminder, ascending, deduped."""
     if not original_delay:
         return list(SNOOZE_STATIC_FALLBACK)
-    offsets = []
+    offsets = [SNOOZE_STATIC_FLOOR]
     for mult in SNOOZE_MULTIPLIERS:
         secs = int(original_delay * mult)
         secs = max(SNOOZE_MIN_SECONDS, min(SNOOZE_MAX_SECONDS, secs))

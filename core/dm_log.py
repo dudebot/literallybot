@@ -68,8 +68,11 @@ def load_dms(user_id: int, limit: Optional[int] = None,
     is kept for coarse human-readable filtering but can drop a message that
     shares its timestamp with the cursor row.
 
-    `limit` keeps the most recent N rows (applied after filtering), so the
-    common "what did they say lately" read stays cheap to express.
+    `limit` semantics depend on the read mode: with `after_id` set the
+    OLDEST N surviving rows are kept, so repeated polls walk forward
+    losslessly even when the backlog exceeds one page (advance the cursor
+    to the last returned row's id). Without it, the most recent N are
+    kept — the "what did they say lately" tail read.
 
     A corrupt line is skipped rather than failing the whole read — a
     half-written row must not make an entire conversation unreadable. A
@@ -102,7 +105,7 @@ def load_dms(user_id: int, limit: Optional[int] = None,
             rows.append(row)
 
     if limit is not None and len(rows) > limit:
-        rows = rows[-limit:]
+        rows = rows[:limit] if after_id is not None else rows[-limit:]
     return rows
 
 

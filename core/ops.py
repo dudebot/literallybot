@@ -1301,7 +1301,9 @@ async def send_dm(ctx: OpContext, guild, member, content: str = "",
                 "message id. Monotonic and tie-proof.",
                 required=False),
         OpParam("limit", ParamKind.INTEGER,
-                "Max rows to return, most recent kept (default 50).",
+                "Max rows to return (default 50). With after_message_id the "
+                "OLDEST matching rows are kept (lossless forward paging); "
+                "otherwise the most recent.",
                 required=False, default=50, minimum=1, maximum=500),
     ],
     serialize=lambda rows: {"messages": rows, "count": len(rows)},
@@ -1311,7 +1313,8 @@ async def send_dm(ctx: OpContext, guild, member, content: str = "",
         "the bot) — an empty result means nothing was recorded, not that "
         "nothing was ever said (fetch_dms reads real Discord history). To "
         "poll for new replies, pass the last row's message_id as "
-        "after_message_id — it never skips or repeats a message."),
+        "after_message_id and repeat while pages come back full — it never "
+        "skips or repeats a message."),
 )
 async def read_dms(ctx: OpContext, guild, member, since: Optional[str] = None,
                    after_message_id: Optional[int] = None, limit: int = 50):
