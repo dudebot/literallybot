@@ -4,26 +4,30 @@
     python3 -m mcp_ops.run_mcp_server
 
 The MCP server can run two ways, sharing the same mcp_ops.server.serve()
-guardrails (loopback-only bind, mandatory bearer auth, guild allowlist):
+guardrails (loopback-only bind, mandatory bearer auth):
 
   1. In-process with the bot: bot.py starts it automatically when
-     MCP_OPS_ENABLED=1 (see maybe_start_in_bot below). This is the normal
-     path for a dev instance — the MCP tools then act through the live bot.
+     the `mcp_ops_enabled` global config bool is true (see maybe_start_in_bot
+     below). The MCP tools then act through the live bot.
   2. Standalone via this entrypoint: logs into Discord with the same
      DISCORD_TOKEN as the bot but registers NO cogs, NO command prefix
      handling, and NO event handlers beyond becoming ready.
 
 Security model (fail-closed, all gates independently required):
-  - Off by default: refuses to start unless MCP_OPS_ENABLED=1.
+  - Off by default: refuses to start unless the global config boolean
+    `mcp_ops_enabled` is true (toggled from /ai settings -> MCP tab;
+    takes effect on the next bot restart, like `mcp_tools_enabled`).
   - Auth required: refuses to start unless MCP_OPS_TOKEN is a non-empty
     shared secret; every MCP request must present it as
     `Authorization: Bearer <token>`.
-  - Guild allowlist required: refuses to start unless
-    MCP_OPS_GUILD_ALLOWLIST names at least one guild id; tool calls
-    targeting channels outside those guilds are refused.
   - Binds to 127.0.0.1 ONLY. There is no host override; if the legacy
     MCP_OPS_HOST var is set to anything non-loopback, startup is refused
     rather than silently rebinding.
+
+Guild reach is deliberately unrestricted (owner decision 2026-08): a
+host-side MCP caller has full control — every guild the bot account is
+in is addressable. Access control belongs upstream in the caller; the
+only guild-confined surface in the system is the in-bot !gpt agent loop.
 
 See README.md's "MCP Ops Server" section for the run/connect walkthrough.
 """
@@ -39,24 +43,26 @@ import discord
 from dotenv import load_dotenv
 
 from mcp_ops.auth import load_token_from_env
-from mcp_ops.server import parse_guild_allowlist, serve
+from mcp_ops.server import serve
 
 logger = logging.getLogger("mcp_ops.run_mcp_server")
 
-ENABLE_ENV_VAR = "MCP_OPS_ENABLED"
+ENABLE_CONFIG_KEY = "mcp_ops_enabled"  # global config boolean, NOT env
 HOST_ENV_VAR = "MCP_OPS_HOST"  # legacy; only loopback values are accepted
 PORT_ENV_VAR = "MCP_OPS_PORT"
-ALLOWLIST_ENV_VAR = "MCP_OPS_GUILD_ALLOWLIST"
 
 _LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
 
 
-def is_enabled() -> bool:
-    return os.environ.get(ENABLE_ENV_VAR, "").strip() == "1"
+def is_enabled(config: Any) -> bool:
+    """The on/off switch lives in global config (surfaced in /ai settings ->
+    MCP tab) so it's operable without shell access. Read at startup; a
+    toggle takes effect on the next bot restart."""
+    return bool(config.get_global(ENABLE_CONFIG_KEY, False))
 
 
-def _load_settings() -> "tuple[str, int, frozenset]":
-    """Read and validate token/port/allowlist from the environment.
+def _load_settings() -> "tuple[str, int]":
+    """Read and validate token/port from the environment.
     Raises RuntimeError on any missing/invalid gate (fail closed)."""
     token = load_token_from_env()  # raises RuntimeError if unset
 
@@ -67,32 +73,25 @@ def _load_settings() -> "tuple[str, int, frozenset]":
             f"127.0.0.1 ONLY; unset {HOST_ENV_VAR}."
         )
 
-    allowlist = parse_guild_allowlist(os.environ.get(ALLOWLIST_ENV_VAR))
-    if not allowlist:
-        raise RuntimeError(
-            f"{ALLOWLIST_ENV_VAR} is not set (comma-separated guild ids). "
-            f"The MCP ops server requires an explicit guild allowlist and "
-            f"refuses to start without one."
-        )
-
     port = int(os.environ.get(PORT_ENV_VAR, "8765"))
-    return token, port, allowlist
+    return token, port
 
 
 def maybe_start_in_bot(bot: Any) -> Optional[asyncio.Task]:
     """Called by bot.py once the bot is ready. Starts the MCP ops server as
-    a background task on the bot's event loop IF MCP_OPS_ENABLED=1 and all
-    fail-closed gates pass; returns None (and changes nothing) otherwise.
+    a background task on the bot's event loop IF the `mcp_ops_enabled`
+    global config boolean is set and all fail-closed gates pass; returns
+    None (and changes nothing) otherwise.
     """
-    if not is_enabled():
+    if not is_enabled(bot.config):
         return None
     try:
-        token, port, allowlist = _load_settings()
+        token, port = _load_settings()
     except RuntimeError as exc:
         logger.error("MCP ops server NOT started: %s", exc)
         return None
     task = asyncio.get_running_loop().create_task(
-        serve(bot, port=port, token=token, allowed_guild_ids=allowlist),
+        serve(bot, port=port, token=token),
         name="mcp-ops-server",
     )
 
@@ -150,15 +149,17 @@ async def _make_discord_client(token: str) -> discord.Client:
 async def _run() -> None:
     load_dotenv()
 
-    if not is_enabled():
+    from core.config import Config
+    if not is_enabled(Config()):
         logger.error(
-            "%s is not set to '1'. This MCP server is OFF by default and will "
-            "not start. Set %s=1 in the environment to run it explicitly.",
-            ENABLE_ENV_VAR, ENABLE_ENV_VAR,
+            "Global config key '%s' is not true. This MCP server is OFF by "
+            "default and will not start. Enable it from /ai settings -> MCP "
+            "tab (or set it true in configs/global.json).",
+            ENABLE_CONFIG_KEY,
         )
         sys.exit(1)
 
-    token, port, allowlist = _load_settings()
+    token, port = _load_settings()
 
     discord_token = os.getenv("DISCORD_TOKEN")
     if not discord_token:
@@ -167,7 +168,7 @@ async def _run() -> None:
 
     client = await _make_discord_client(discord_token)
     try:
-        await serve(client, port=port, token=token, allowed_guild_ids=allowlist)
+        await serve(client, port=port, token=token)
     finally:
         await client.close()
 

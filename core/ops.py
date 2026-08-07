@@ -84,6 +84,7 @@ class ParamKind(str, Enum):
     STRING_LIST = "string_list"    # wire: <name> (str array) -> list of strings
     MESSAGE = "message"    # wire: channel_id + message_id (str) -> discord.Message
     MEMBER = "member"      # wire: user_id (str) -> discord.Member (of ctx.guild)
+    USER = "user"          # wire: user_id (str) -> discord.User (guild-independent)
     ROLE = "role"          # wire: role_id (str) -> discord.Role (of ctx.guild)
     GUILD = "guild"        # wire: guild_id (str) -> discord.Guild
     STRING = "string"
@@ -118,6 +119,7 @@ _ENTITY_WIRE_NAMES = {
     ParamKind.CHANNEL: "channel_id",
     ParamKind.MESSAGE: "message_id",
     ParamKind.MEMBER: "user_id",
+    ParamKind.USER: "user_id",
     ParamKind.ROLE: "role_id",
     ParamKind.GUILD: "guild_id",
 }
@@ -160,8 +162,9 @@ class ResolutionError(RuntimeError):
 
 
 class GuildNotAllowedError(ResolutionError):
-    """The resolved target belongs to a guild outside the caller's allowed
-    guild set (guild confinement / allowlist violation)."""
+    """The resolved target violates the caller's guild confinement (a
+    frontend-supplied allowed_guild_ids set), or is a guild-less DM target
+    on an id-based call."""
 
 
 @dataclass
@@ -195,19 +198,25 @@ class OpResult:
 # mcp_ops/server.py so every id-based frontend resolves identically.
 # ---------------------------------------------------------------------------
 
-def check_guild_allowed(guild: Any, allowed_guild_ids: frozenset, what: str) -> None:
+def check_guild_allowed(guild: Any, allowed_guild_ids: Optional[frozenset],
+                        what: str) -> None:
+    """Guild confinement is CALLER policy: `allowed_guild_ids=None` means no
+    confinement — the target may live in any guild the bot is in (the MCP
+    frontend: primitives, access control upstream). A frozenset confines to
+    those guilds (the in-bot agent loop passes exactly {ctx.guild.id})."""
     if guild is None:
         raise GuildNotAllowedError(
             f"{what} has no guild (DMs are not allowed through id-based calls)."
         )
-    if guild.id not in allowed_guild_ids:
+    if allowed_guild_ids is not None and guild.id not in allowed_guild_ids:
         raise GuildNotAllowedError(
             f"{what} belongs to guild {guild.id}, which is not in the "
             f"caller's allowed guild set."
         )
 
 
-async def resolve_channel(bot: Any, channel_id: int, allowed_guild_ids: frozenset) -> Any:
+async def resolve_channel(bot: Any, channel_id: int,
+                          allowed_guild_ids: Optional[frozenset]) -> Any:
     channel = bot.get_channel(channel_id)
     if channel is None:
         try:
@@ -229,6 +238,21 @@ async def fetch_message_in(channel: Any, message_id: int) -> Any:
         ) from exc
 
 
+async def resolve_user(bot: Any, user_id: int) -> Any:
+    """Resolve a user id to a discord.User, guild-independent (cache then
+    GET /users/{user_id}). Used by the DM ops: DMs are user-keyed at the
+    API level, and Discord itself refuses bot DMs to users who share no
+    guild — no membership pre-check needed here."""
+    user = bot.get_user(user_id)
+    if user is None:
+        try:
+            user = await bot.fetch_user(user_id)
+        except Exception as exc:  # noqa: BLE001
+            raise ResolutionError(
+                f"Could not resolve user {user_id}: {exc}") from exc
+    return user
+
+
 async def resolve_member(guild: Any, user_id: int) -> Any:
     member = guild.get_member(user_id)
     if member is None:
@@ -248,7 +272,8 @@ def resolve_role(guild: Any, role_id: int) -> Any:
     return role
 
 
-def resolve_guild(bot: Any, guild_id: int, allowed_guild_ids: frozenset) -> Any:
+def resolve_guild(bot: Any, guild_id: int,
+                  allowed_guild_ids: Optional[frozenset]) -> Any:
     guild = bot.get_guild(guild_id)
     if guild is None:
         raise ResolutionError(f"Could not resolve guild {guild_id}.")
@@ -257,7 +282,8 @@ def resolve_guild(bot: Any, guild_id: int, allowed_guild_ids: frozenset) -> Any:
 
 
 async def resolve_context_guild(bot: Any, raw: Dict[str, Any],
-                                allowed_guild_ids: frozenset) -> Optional[Any]:
+                                allowed_guild_ids: Optional[frozenset],
+                                ) -> Optional[Any]:
     """Resolve the guild an id-based call targets, from its raw wire params,
     BEFORE building an OpContext (frontends that construct their actor from
     the target guild — e.g. the MCP server — need this first). Returns None
@@ -412,7 +438,7 @@ class Op:
     # -- id resolution ----------------------------------------------------
 
     async def resolve_kwargs(self, bot: Any, guild: Optional[Any], raw: Dict[str, Any],
-                             allowed_guild_ids: frozenset) -> Dict[str, Any]:
+                             allowed_guild_ids: Optional[frozenset]) -> Dict[str, Any]:
         """Resolve raw wire params (ids + scalars) into impl kwargs.
         Raises ResolutionError on any missing/unknown/out-of-guild target."""
         raw = dict(raw)
@@ -488,6 +514,15 @@ class Op:
                     raise ResolutionError(f"Op '{self.name}' requires a guild context to resolve members.")
                 kwargs[p.name] = await resolve_member(guild, _as_int(user_id, "user_id"))
 
+            elif p.kind == ParamKind.USER:
+                user_id = raw.pop("user_id", None)
+                if user_id is None:
+                    if p.required:
+                        raise ResolutionError(f"Missing required parameter 'user_id' for op '{self.name}'.")
+                    kwargs[p.name] = None
+                    continue
+                kwargs[p.name] = await resolve_user(bot, _as_int(user_id, "user_id"))
+
             elif p.kind == ParamKind.ROLE:
                 role_id = raw.pop("role_id", None)
                 if role_id is None:
@@ -501,8 +536,16 @@ class Op:
             elif p.kind == ParamKind.GUILD:
                 guild_id = raw.pop("guild_id", None)
                 if guild_id is None:
-                    raise ResolutionError(f"Missing required parameter 'guild_id' for op '{self.name}'.")
+                    if p.required:
+                        raise ResolutionError(f"Missing required parameter 'guild_id' for op '{self.name}'.")
+                    kwargs[p.name] = None
+                    continue
                 kwargs[p.name] = resolve_guild(bot, _as_int(guild_id, "guild_id"), allowed_guild_ids)
+                # An explicit guild_id also becomes the resolution context
+                # for MEMBER/ROLE params declared after it — the API calls
+                # behind those ops are guild-keyed, so the wire guild wins
+                # over any ambient ctx.guild.
+                guild = kwargs[p.name]
 
             else:  # scalar
                 if p.name not in raw:
@@ -667,19 +710,18 @@ class OpsRegistry:
         user_id, role_id, guild_id + scalars) to live objects, then run the
         op with the same permission gates as `call()`.
 
-        Guild confinement: every id-resolved target must belong to
-        `allowed_guild_ids` (default: exactly ctx.guild — an id-based call
-        cannot reach into other guilds the bot is in). Resolution failures
+        Guild confinement is CALLER policy: pass `allowed_guild_ids` to
+        confine id-resolved targets to those guilds (the in-bot agent loop
+        passes exactly {ctx.guild.id}); the default None means NO
+        confinement — targets resolve anywhere the bot is (the MCP
+        frontend: primitives, access control upstream). Resolution failures
         come back as OpResult(ok=False), never as raised exceptions.
         """
         op = self._ops.get(op_name)
         if op is None:
             return OpResult(ok=False, error=f"Unknown op: {op_name}")
-        if allowed_guild_ids is None:
-            allowed_guild_ids = (
-                frozenset({ctx.guild.id}) if getattr(ctx, "guild", None) is not None
-                else frozenset()
-            )
+        if allowed_guild_ids is not None:
+            allowed_guild_ids = frozenset(allowed_guild_ids)
         # Gate BEFORE resolution: an unauthorized caller must not be able to
         # trigger Discord fetches (channel/message/member lookups) as a side
         # effect of a call it was never allowed to make. Op.__call__ checks
@@ -689,7 +731,7 @@ class OpsRegistry:
             return OpResult(ok=False, error=reason)
         try:
             kwargs = await op.resolve_kwargs(ctx.bot, getattr(ctx, "guild", None),
-                                             raw, frozenset(allowed_guild_ids))
+                                             raw, allowed_guild_ids)
         except ResolutionError as exc:
             return OpResult(ok=False, error=str(exc))
         return await op(ctx, **kwargs)
@@ -988,6 +1030,12 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
     "one channel — optionally filtered by author id and/or a content keyword.",
     PermissionLevel.EVERYONE,
     params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to search server-wide. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); pass it explicitly for a server-wide search "
+                "when channel_ids is omitted.",
+                required=False),
         OpParam("channels", ParamKind.CHANNEL_LIST,
                 "Discord channel ids to search, unioned in one call — "
                 "[id] for a single channel, [id1, id2, ...] for a subset. "
@@ -1021,12 +1069,12 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
         "only the most recent messages were checked — say so instead of "
         "claiming 'never'."),
 )
-async def search_history(ctx: OpContext, channels=None,
+async def search_history(ctx: OpContext, guild=None, channels=None,
                           limit: int = 100,
                           author_id: Optional[int] = None,
                           contains: Optional[str] = None):
     scoped = list(channels or [])
-    guild = scoped[0].guild if scoped else ctx.guild
+    guild = scoped[0].guild if scoped else (guild or ctx.guild)
     if guild is None:
         raise ValueError("search_history needs a channel or a guild context.")
     # Snowflake scalars arrive as strings on the wire; compare as ints.
@@ -1071,11 +1119,17 @@ async def search_history(ctx: OpContext, channels=None,
     "is the reaction-role system's job (cogs/dynamic/setrole.py), not this op's.",
     PermissionLevel.ADMIN,
     params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member and role belong to (the API "
+                "call is guild-keyed). Optional when the invoking context "
+                "already carries a guild (in-guild commands); required "
+                "over guild-less frontends like MCP.",
+                required=False),
         OpParam("member", ParamKind.MEMBER, "Discord user id to grant the role to."),
         OpParam("role", ParamKind.ROLE, "Discord role id to grant."),
     ],
 )
-async def add_role(ctx: OpContext, member, role):
+async def add_role(ctx: OpContext, member, role, guild=None):
     await member.add_roles(role)
     return True
 
@@ -1085,11 +1139,17 @@ async def add_role(ctx: OpContext, member, role):
     "Remove a role from a member. Requires admin, mirroring add_role.",
     PermissionLevel.ADMIN,
     params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member and role belong to (the API "
+                "call is guild-keyed). Optional when the invoking context "
+                "already carries a guild (in-guild commands); required "
+                "over guild-less frontends like MCP.",
+                required=False),
         OpParam("member", ParamKind.MEMBER, "Discord user id to remove the role from."),
         OpParam("role", ParamKind.ROLE, "Discord role id to remove."),
     ],
 )
-async def remove_role(ctx: OpContext, member, role):
+async def remove_role(ctx: OpContext, member, role, guild=None):
     await member.remove_roles(role)
     return True
 
@@ -1202,17 +1262,18 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
 # Direct messages.
 #
 # DM channels belong to no guild, so they cannot travel through the CHANNEL
-# param kind (which is guild-confined by design). These ops instead resolve a
-# MEMBER — the target must be a member of an allowlisted guild — and open the
-# DM channel from that member. The confinement therefore still holds: the DM
-# surface reaches exactly the people the bot already serves, and a raw DM
-# channel id is never accepted from the wire.
+# param kind (which rejects guild-less targets by design). These ops resolve
+# a USER (guild-independent, one-to-one with the API: POST /users/@me/channels
+# takes only the recipient id) and open the DM channel from that user. A raw
+# DM channel id is never accepted from the wire.
 #
-# The GUILD param is declared explicitly rather than leaning on the MCP
-# frontend's single-allowlisted-guild fallback: MEMBER resolution needs a
-# guild, and an op that only works when exactly one guild is allowlisted
-# would be a silent trap for every other frontend (agent loop, future
-# multi-guild MCP deployments).
+# The former GUILD+MEMBER shape (guild_id required on the wire) was removed
+# 2026-08 by owner decision — one-to-one primitives; no invented params. The
+# membership confinement it provided was redundant: Discord itself refuses
+# bot DMs to users who share no guild. Consequence for the ADMIN gate: over
+# guild-less frontends (MCP) there is no guild admin list to consult, so DM
+# ops are effectively superadmin-only there; in-bot, ambient ctx.guild keeps
+# the per-guild admin check.
 #
 # CONSENT IS DELIBERATELY NOT ENFORCED HERE. Whether a given user has opted in
 # is a per-deployment convention (one guild's opt-in role id is meaningless in
@@ -1224,15 +1285,13 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
 
 @registry.op(
     "send_dm",
-    "Send a direct message to a member. The member must belong to a guild "
-    "the bot serves. Never pings. Optional local file attachment(s) via "
-    "file_paths. NOTE: this op does not check whether the "
-    "user consented to DMs — the caller owns that decision.",
+    "Send a direct message to a user. Never pings. Optional local file "
+    "attachment(s) via file_paths. Discord only delivers bot DMs to users "
+    "sharing at least one guild with the bot. NOTE: this op does not check "
+    "whether the user consented to DMs — the caller owns that decision.",
     PermissionLevel.ADMIN,
     params=[
-        OpParam("guild", ParamKind.GUILD,
-                "Discord guild id the member belongs to."),
-        OpParam("member", ParamKind.MEMBER, "Discord user id to DM."),
+        OpParam("user", ParamKind.USER, "Discord user id to DM."),
         OpParam("content", ParamKind.STRING,
                 "Message text to send (may be empty if attaching a file).",
                 required=False, default=""),
@@ -1250,7 +1309,7 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
         "cannot be seen by the channel, so never use it to answer a question "
         "asked in public."),
 )
-async def send_dm(ctx: OpContext, guild, member, content: str = "",
+async def send_dm(ctx: OpContext, user, content: str = "",
                   file_paths: Optional[List[str]] = None,
                   allowed_mentions=None):
     # Same never-ping default as send_message; a DM notifies on its own.
@@ -1264,7 +1323,7 @@ async def send_dm(ctx: OpContext, guild, member, content: str = "",
     if files:
         kwargs["files"] = files
     try:
-        message = await member.send(text if str(text).strip() else None, **kwargs)
+        message = await user.send(text if str(text).strip() else None, **kwargs)
     except BaseException:
         # Same pre-send handle ownership rule as send_message.
         for f in files:
@@ -1273,7 +1332,7 @@ async def send_dm(ctx: OpContext, guild, member, content: str = "",
     # Store our own side too, so read_dms returns a conversation rather than
     # a one-sided mailbox.
     try:
-        log_dm(member.id, row_from_message(message, member.id))
+        log_dm(user.id, row_from_message(message, user.id))
     except Exception:  # noqa: BLE001 - a storage failure must not undo a sent DM
         logger = getattr(ctx.bot, "logger", None)
         if logger:
@@ -1283,14 +1342,12 @@ async def send_dm(ctx: OpContext, guild, member, content: str = "",
 
 @registry.op(
     "read_dms",
-    "Read the stored DM transcript with a member, oldest first. Covers DMs "
+    "Read the stored DM transcript with a user, oldest first. Covers DMs "
     "exchanged since transcript storage was enabled — use fetch_dms for "
     "older history straight from Discord.",
     PermissionLevel.ADMIN,
     params=[
-        OpParam("guild", ParamKind.GUILD,
-                "Discord guild id the member belongs to."),
-        OpParam("member", ParamKind.MEMBER, "Discord user id whose DMs to read."),
+        OpParam("user", ParamKind.USER, "Discord user id whose DMs to read."),
         OpParam("since", ParamKind.STRING,
                 "Optional ISO timestamp — only rows strictly after it. "
                 "Coarse filter; can drop a message sharing the cursor row's "
@@ -1316,24 +1373,22 @@ async def send_dm(ctx: OpContext, guild, member, content: str = "",
         "after_message_id and repeat while pages come back full — it never "
         "skips or repeats a message."),
 )
-async def read_dms(ctx: OpContext, guild, member, since: Optional[str] = None,
+async def read_dms(ctx: OpContext, user, since: Optional[str] = None,
                    after_message_id: Optional[int] = None, limit: int = 50):
     # File I/O off the event loop: a large transcript must not stall the bot.
-    return await asyncio.to_thread(load_dms, member.id, limit=limit,
+    return await asyncio.to_thread(load_dms, user.id, limit=limit,
                                    since=since, after_id=after_message_id)
 
 
 @registry.op(
     "fetch_dms",
-    "Fetch DM history with a member directly from Discord, oldest first. "
+    "Fetch DM history with a user directly from Discord, oldest first. "
     "Unlike read_dms this covers the full conversation history, including "
     "messages that predate transcript storage. Paginate backwards with "
     "before_message_id.",
     PermissionLevel.ADMIN,
     params=[
-        OpParam("guild", ParamKind.GUILD,
-                "Discord guild id the member belongs to."),
-        OpParam("member", ParamKind.MEMBER,
+        OpParam("user", ParamKind.USER,
                 "Discord user id whose DM history to fetch."),
         OpParam("limit", ParamKind.INTEGER,
                 "Max messages to fetch (default 50, clamped to 100 — one "
@@ -1353,14 +1408,14 @@ async def read_dms(ctx: OpContext, guild, member, since: Optional[str] = None,
         "call again with before_message_id set to the first row's "
         "message_id, until a page comes back empty."),
 )
-async def fetch_dms(ctx: OpContext, guild, member, limit: int = 50,
+async def fetch_dms(ctx: OpContext, user, limit: int = 50,
                     before_message_id: Optional[int] = None):
-    channel = member.dm_channel or await member.create_dm()
+    channel = user.dm_channel or await user.create_dm()
     before = (discord.Object(id=before_message_id)
               if before_message_id is not None else None)
     rows = []
     async for msg in channel.history(limit=limit, before=before):
-        rows.append(row_from_message(msg, member.id))
+        rows.append(row_from_message(msg, user.id))
     rows.reverse()  # history() yields newest-first; present oldest-first
     return rows
 
@@ -1645,7 +1700,7 @@ def _smoke_test() -> None:
     assert set(edit["properties"]) == {"channel_id", "message_id", "content"}, edit
 
     search = registry.get("search_history").to_json_schema()
-    assert set(search["properties"]) == {"channel_ids", "limit",
+    assert set(search["properties"]) == {"guild_id", "channel_ids", "limit",
                                          "author_id", "contains"}
     assert search["required"] == []  # no channel scope => guild-wide search
     assert search["properties"]["channel_ids"]["type"] == "array"
@@ -1657,7 +1712,8 @@ def _smoke_test() -> None:
     assert set(thread["required"]) == {"channel_id", "name"}
 
     roles = registry.get("add_role").to_json_schema()
-    assert set(roles["properties"]) == {"user_id", "role_id"}
+    assert set(roles["properties"]) == {"guild_id", "user_id", "role_id"}
+    assert set(roles["required"]) == {"user_id", "role_id"}  # guild from wire OR ambient ctx
 
     # Snowflakes travel as strings (2**53 — see _SNOWFLAKE_JSON_TYPE); real
     # scalar ints keep "integer" so clamping still applies.
@@ -1666,25 +1722,25 @@ def _smoke_test() -> None:
     assert search["properties"]["author_id"]["type"] == "string", search
     assert search["properties"]["limit"]["type"] == "integer", search
 
-    # DM ops resolve a MEMBER inside a GUILD — never a raw DM channel id.
+    # DM ops resolve a guild-independent USER (one-to-one with the DM API) —
+    # never a raw DM channel id, never an invented guild_id.
     dm = registry.get("send_dm").to_json_schema()
-    assert set(dm["properties"]) == {
-        "guild_id", "user_id", "content", "file_paths",
-    }, dm
+    assert set(dm["properties"]) == {"user_id", "content", "file_paths"}, dm
     assert dm["properties"]["user_id"]["type"] == "string", dm
     assert "channel_id" not in dm["properties"], dm
-    assert set(dm["required"]) == {"guild_id", "user_id"}
+    assert "guild_id" not in dm["properties"], dm
+    assert set(dm["required"]) == {"user_id"}
 
     read = registry.get("read_dms").to_json_schema()
-    assert set(read["properties"]) == {"guild_id", "user_id", "since",
+    assert set(read["properties"]) == {"user_id", "since",
                                        "after_message_id", "limit"}
-    assert set(read["required"]) == {"guild_id", "user_id"}
+    assert set(read["required"]) == {"user_id"}
     assert read["properties"]["after_message_id"]["type"] == "string", read
 
     fetch = registry.get("fetch_dms").to_json_schema()
-    assert set(fetch["properties"]) == {"guild_id", "user_id", "limit",
+    assert set(fetch["properties"]) == {"user_id", "limit",
                                         "before_message_id"}
-    assert set(fetch["required"]) == {"guild_id", "user_id"}
+    assert set(fetch["required"]) == {"user_id"}
     assert fetch["properties"]["before_message_id"]["type"] == "string", fetch
 
     rolemem = registry.get("list_role_members").to_json_schema()
@@ -1715,8 +1771,8 @@ def _smoke_test() -> None:
     assert unknown.ok is False
     assert "Unknown op" in (unknown.error or "")
 
-    # call_ids with no guild on ctx and no allowlist fails closed on
-    # guild-bound targets, and rejects unknown params by name.
+    # call_ids surfaces resolution failures as OpResult errors (never
+    # raises), and rejects unknown params by name.
     class _FakeBot:
         def get_channel(self, cid):
             return None

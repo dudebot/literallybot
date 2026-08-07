@@ -88,18 +88,24 @@ callers that bypass `call_ids` and resolved nothing through the registry.
 `mcp_ops/server.py` exposes a subset of the ops registry over HTTP. All gates are
 fail-closed and independently required (`mcp_ops/run_mcp_server.py`):
 
-- **Off by default.** Refuses to start unless `MCP_OPS_ENABLED=1`.
+- **Off by default.** Refuses to start unless the `mcp_ops_enabled` global
+  config boolean is true (toggled from `/ai settings` → MCP tab; moved out of
+  `.env` 2026-08 so it's operable without shell access; binds on restart).
 - **Loopback-only bind.** Hard-coded `127.0.0.1`; there is no host parameter. A
   legacy `MCP_OPS_HOST` set to any non-loopback value refuses startup rather than
   rebinding.
 - **Bearer token required.** Every request must carry
   `Authorization: Bearer <MCP_OPS_TOKEN>`; the token is compared with
   `hmac.compare_digest` (constant-time). No token configured → refuses to start.
-- **Guild allowlist required.** `MCP_OPS_GUILD_ALLOWLIST` (comma-separated guild
-  ids) must name at least one guild; an empty allowlist refuses to build the
-  server. Every id-resolved target must belong to an allowlisted guild.
-  `list_guilds` output is filtered to the allowlist.
 - **Mentions suppressed** on `send_message`, same as the agent loop.
+- **Full guild reach by design** (owner decision 2026-08; the former
+  `MCP_OPS_GUILD_ALLOWLIST` gate was removed). MCP tools act as raw
+  primitives: every guild the bot account is in is addressable, and access
+  control belongs upstream in the MCP caller. DM channels are still refused
+  on id-based calls — DMs flow only through the user-keyed DM ops (user_id
+  only, matching the DM API; Discord refuses bot DMs to strangers). The one
+  guild-confined surface in the system is the in-bot `!gpt` agent loop,
+  which passes exactly `{ctx.guild.id}` to the registry.
 
 ### Accepted risk: caller-supplied `actor_id`
 

@@ -96,6 +96,7 @@ illustration; they are not real.)
 | `cooldown_tier_bases` | `{tier: seconds}` | `/ai settings` → Cooldowns | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS` |
 | `cooldown_windows` | `list[[count, period_mult]]` | `/ai settings` → Cooldowns | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
 | `mcp_tools_enabled` | `list[str]` op names | `/ai settings` → MCP tools | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
+| `mcp_ops_enabled` | `bool` | `/ai settings` → MCP tools (🔌 toggle) | The MCP server's on/off switch (was the `MCP_OPS_ENABLED` env var until 2026-08). Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
 | `error_logging` | `{default_channel?, category_channels?, severity_channels?, rate_limit_minutes?}` | `!errorlog` subcommands | Same shape also exists per-guild (guild overrides global) |
 | `reminders` | `list[{user_id, timestamp, text, delay}]` | `!remindme` + snooze buttons | Deliberately ONE global list across all guilds/DMs, filtered by `user_id` on read. `delay` (original duration, seconds) scales the snooze options; legacy rows without it get static 10m/1h/1d |
 | `hue_bridge_ip` | `str` | `!sethuebridgeip` | signal cog |

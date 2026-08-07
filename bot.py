@@ -104,9 +104,9 @@ async def on_ready():
         await bot.tree.sync()
         bot._synced = True
 
-    # MCP ops server — OFF unless MCP_OPS_ENABLED=1 in the environment
-    # (plus MCP_OPS_TOKEN and MCP_OPS_GUILD_ALLOWLIST; all gates fail
-    # closed). Loopback-only. See mcp_ops/run_mcp_server.py.
+    # MCP ops server — OFF unless the `mcp_ops_enabled` global config bool is set
+    # (plus MCP_OPS_TOKEN in env; all gates fail closed). Loopback-only.
+    # See mcp_ops/run_mcp_server.py.
     if getattr(bot, '_mcp_ops_task', None) is None:
         try:
             from mcp_ops.run_mcp_server import maybe_start_in_bot

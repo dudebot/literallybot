@@ -9,7 +9,7 @@ FastMCP app.
 
 Security model:
 - OFF by default: the server (mcp_ops/run_mcp_server.py) will refuse to start
-  unless MCP_OPS_ENABLED=1 is set (see run_mcp_server.py).
+  unless the `mcp_ops_enabled` global config bool is set (run_mcp_server.py).
 - Auth required: every request must carry `Authorization: Bearer <token>`
   matching MCP_OPS_TOKEN. No token configured => server refuses to start
   (fail closed, not fail open).
