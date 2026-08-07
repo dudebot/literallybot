@@ -1,9 +1,11 @@
-"""/help — one embed of the bot's commands, grouped strictly by cog.
+"""/help and !help — one embed of the bot's commands, grouped strictly by cog.
 
-The prefix !help is gone (help_command is set to None on load) and so is
-the old hand-curated category map, which went stale the moment cogs were
-reshaped. The ONLY grouping mechanism is the cog a command came from; no
-category abstraction to maintain.
+discord.py's stock help_command is set to None on load; both surfaces
+render the same embed via build_help_embed. The old hand-curated category
+map is gone — it went stale the moment cogs were reshaped. The ONLY
+grouping mechanism is the cog a command came from; no category
+abstraction to maintain. Disabling this cog (!cogs / disabled_cogs)
+removes both surfaces with zero code changes.
 
 Visibility rules:
 - prefix commands: `hidden=True` ones (the admin/superadmin surface,
@@ -98,6 +100,16 @@ class Help(commands.Cog):
     async def slash_help(self, interaction: discord.Interaction):
         embed = build_help_embed(self.bot, is_admin(interaction))
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @commands.command(name="help")
+    async def help_prefix(self, ctx):
+        """Overview of the bot's commands."""
+        # Same invoker-based rendering as /help — but a channel message is
+        # public, so an admin running !help in a busy channel does print
+        # the admin command names where everyone can read them. /help
+        # (ephemeral) is the discreet variant.
+        embed = build_help_embed(self.bot, is_admin(ctx))
+        await ctx.send(embed=embed)
 
 
 async def setup(bot):
