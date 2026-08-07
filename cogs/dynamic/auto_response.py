@@ -1,27 +1,21 @@
-"""Config-driven auto-responses: canned replies to message patterns.
+"""Config-driven auto-responses: weighted canned replies to exact messages.
 
-Replaces the hardcoded reddit-meme reply graph and absorbs the old
-interrogative cog (!should-style coin flips) into one per-guild trigger
+Replaces the hardcoded reddit-meme reply graph with a per-guild trigger
 table. Guild config key `auto_responses` — list of entries:
 
-    {"triggers": ["cope"],             # aliases, matched case-insensitively
-     "match": "exact",                 # "exact" whole message | "command" !word
-     "responses": ["yikes", "cringe"], # one chosen uniformly at random
-     "chance": 1.0}                    # optional reply probability, default 1
+    {"triggers": ["cope"],                  # aliases, case-insensitive
+     "responses": ["yikes", ["rare", 2]]}   # str = weight 1, [text, weight]
+                                            # = relative weight
 
-Absent/empty key = inert in that guild (default OFF everywhere; enable by
-adding entries with /autoresponse add). First matching entry wins, in
-config order.
+One response is chosen by relative weight — e.g. Yes 49 / No 49 /
+"those are bad answers" 2. Absent/empty key = inert in that guild
+(default OFF everywhere; enable with /autoresponse add). First matching
+entry wins, in config order. Matching is whole-message exact only — this
+cog never answers prefixed commands (that's interrogative/media territory).
 
 Loop safety: ALL bot-authored messages are ignored (message.author.bot),
 not just our own — two bots both running this cog once replied to each
-other's replies forever (the cope->seethe incident, 2026-08-07). Keep that
-guard; a chance below 1.0 is spam damping, not loop protection.
-
-"command" entries answer prefix-style invocations (e.g. "!should we?")
-without registering real commands, so the trigger words stay per-guild
-config. The cog registers an error-handler whitelist hook so those
-messages don't log CommandNotFound noise.
+other's replies forever (the cope->seethe incident, 2026-08-07).
 """
 from discord.ext import commands
 from discord import app_commands
@@ -29,45 +23,73 @@ import discord
 import random
 
 from core.utils import is_admin
-from core.error_handler import (
-    register_error_whitelist_hook, unregister_error_whitelist_hook
-)
-
-MATCH_KINDS = ("exact", "command")
-COMMAND_PREFIX = "!"
 
 
-def _command_word(text, prefix=COMMAND_PREFIX):
-    """The lowercased bare command word of a prefixed message, else None."""
-    text = text.strip()
-    if not text.startswith(prefix) or len(text) <= len(prefix):
-        return None
-    return text[len(prefix):].split(None, 1)[0].lower()
+def _weighted(responses):
+    """(texts, weights) from mixed str / [text, weight] response entries.
+    Malformed weights fall back to 1 rather than killing the entry."""
+    texts, weights = [], []
+    for r in responses:
+        if isinstance(r, (list, tuple)) and r:
+            text = str(r[0])
+            try:
+                weight = float(r[1]) if len(r) > 1 else 1.0
+            except (TypeError, ValueError):
+                weight = 1.0
+        else:
+            text, weight = str(r), 1.0
+        if weight > 0:
+            texts.append(text)
+            weights.append(weight)
+    return texts, weights
 
 
 def find_response(entries, content):
-    """(entry, response) for the first entry matching `content`, else None.
-
-    Pure function of (config entries, message text) so the matching rules
-    stay unit-testable without a bot.
-    """
+    """The weighted-random response for the first entry matching `content`,
+    else None. Pure function of (config entries, message text) so the
+    matching rules stay unit-testable without a bot."""
     text = content.strip().lower()
-    word = _command_word(content)
     for entry in entries:
-        kind = entry.get("match", "exact")
         triggers = [str(t).lower() for t in entry.get("triggers", [])]
-        responses = entry.get("responses") or []
-        if not triggers or not responses:
+        texts, weights = _weighted(entry.get("responses") or [])
+        if not triggers or not texts:
             continue
-        if kind == "exact":
-            hit = text in triggers
-        elif kind == "command":
-            hit = word is not None and word in triggers
-        else:
-            continue
-        if hit:
-            return entry, random.choice(responses)
+        if text in triggers:
+            return random.choices(texts, weights=weights)[0]
     return None
+
+
+def _format_responses(responses, limit=120):
+    parts = []
+    for r in responses:
+        if isinstance(r, (list, tuple)) and r:
+            parts.append(f"{r[0]}×{r[1]}" if len(r) > 1 else str(r[0]))
+        else:
+            parts.append(str(r))
+    out = ", ".join(parts)
+    return out[:limit - 3] + "..." if len(out) > limit else out
+
+
+def parse_responses(raw):
+    """'Yes::49 | No::49 | bad::2' -> config response entries.
+    `::weight` suffix optional; plain text = weight 1."""
+    out = []
+    for part in raw.split("|"):
+        part = part.strip()
+        if not part:
+            continue
+        if "::" in part:
+            text, _, tail = part.rpartition("::")
+            text = text.strip()
+            try:
+                weight = float(tail.strip())
+            except ValueError:
+                text, weight = part, None
+            if text and weight is not None:
+                out.append([text, weight] if weight != 1 else text)
+                continue
+        out.append(part)
+    return out
 
 
 class AutoResponse(commands.Cog):
@@ -77,26 +99,6 @@ class AutoResponse(commands.Cog):
 
     def _entries(self, guild_id):
         return self.bot.config.get(guild_id, "auto_responses", []) or []
-
-    def _suppress_command_not_found(self, ctx, error):
-        """Whitelist hook: a CommandNotFound whose word is one of this
-        guild's command-type triggers is expected traffic, not an error."""
-        if ctx.guild is None:
-            return False
-        word = _command_word(ctx.message.content)
-        if word is None:
-            return False
-        for entry in self._entries(ctx.guild.id):
-            if entry.get("match") == "command":
-                if word in [str(t).lower() for t in entry.get("triggers", [])]:
-                    return True
-        return False
-
-    async def cog_load(self):
-        register_error_whitelist_hook(self._suppress_command_not_found)
-
-    async def cog_unload(self):
-        unregister_error_whitelist_hook(self._suppress_command_not_found)
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -109,17 +111,9 @@ class AutoResponse(commands.Cog):
         entries = self._entries(message.guild.id)
         if not entries:
             return
-        found = find_response(entries, message.content)
-        if not found:
-            return
-        entry, response = found
-        try:
-            chance = float(entry.get("chance", 1.0))
-        except (TypeError, ValueError):
-            chance = 1.0
-        if random.random() > chance:
-            return
-        await message.channel.send(response)
+        response = find_response(entries, message.content)
+        if response is not None:
+            await message.channel.send(response)
 
     # ---- admin UI --------------------------------------------------------
 
@@ -142,61 +136,35 @@ class AutoResponse(commands.Cog):
             return
         lines = []
         for i, e in enumerate(entries):
-            chance = e.get("chance", 1.0)
-            chance_note = f", {int(float(chance) * 100)}%" if float(chance) < 1.0 else ""
-            responses = ", ".join(str(r) for r in e.get("responses", []))
-            if len(responses) > 120:
-                responses = responses[:117] + "..."
             lines.append(
-                f"`{i}` [{e.get('match', 'exact')}{chance_note}] "
-                f"{', '.join(e.get('triggers', []))} → {responses}")
+                f"`{i}` {', '.join(e.get('triggers', []))} → "
+                f"{_format_responses(e.get('responses', []))}")
         await interaction.response.send_message("\n".join(lines)[:2000], ephemeral=True)
 
     @autoresponse.command(name="add", description="Add an auto-response trigger")
     @app_commands.describe(
-        triggers="Trigger words/phrases, comma-separated (aliases)",
-        responses="Possible replies, separated by | (one picked at random)",
-        match="exact: whole message equals a trigger; command: !word invocation",
-        chance="Probability of replying, 0.0-1.0 (default 1.0)",
+        triggers="Trigger messages, comma-separated (matched as the whole message)",
+        responses="Replies separated by | — append ::weight for odds, e.g. Yes::49 | No::49 | maybe::2",
     )
-    @app_commands.choices(match=[
-        app_commands.Choice(name=k, value=k) for k in MATCH_KINDS])
     async def ar_add(self, interaction: discord.Interaction, triggers: str,
-                     responses: str, match: str = "exact",
-                     chance: float = 1.0):
+                     responses: str):
         if not is_admin(interaction):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
         trigger_list = [t.strip().lower() for t in triggers.split(",") if t.strip()]
-        # command words are single tokens by construction — a phrase can
-        # never match, so reject it here instead of dying silently later
-        if match == "command":
-            bad = [t for t in trigger_list if " " in t]
-            if bad:
-                await interaction.response.send_message(
-                    f"Command triggers must be single words: {', '.join(bad)}",
-                    ephemeral=True)
-                return
-        response_list = [r.strip() for r in responses.split("|") if r.strip()]
+        response_list = parse_responses(responses)
         if not trigger_list or not response_list:
             await interaction.response.send_message(
                 "Need at least one trigger and one response.", ephemeral=True)
             return
-        if not (0.0 < chance <= 1.0):
-            await interaction.response.send_message(
-                "chance must be within (0, 1].", ephemeral=True)
-            return
-        entry = {"triggers": trigger_list, "match": match,
-                 "responses": response_list}
-        if chance < 1.0:
-            entry["chance"] = chance
+        entry = {"triggers": trigger_list, "responses": response_list}
         entries = self._entries(interaction.guild.id)
         entries.append(entry)
         self.bot.config.set(interaction.guild.id, "auto_responses", entries)
         self.logger.info(
             f"{interaction.user} added auto-response {entry} in guild {interaction.guild.id}")
         await interaction.response.send_message(
-            f"Added: {', '.join(trigger_list)} → {len(response_list)} response(s).",
+            f"Added: {', '.join(trigger_list)} → {_format_responses(response_list)}",
             ephemeral=True)
 
     @autoresponse.command(name="remove", description="Remove a trigger by its /autoresponse list index")
