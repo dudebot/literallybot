@@ -73,8 +73,9 @@ current guild, with mentions suppressed and a per-run tool-call cap.
   panel.
 
 The same ops registry also backs an optional localhost-only **MCP server**
-(`mcp_ops/`, off unless `MCP_OPS_ENABLED=1`) so an external agent can drive the
-bot over an authenticated, guild-allowlisted channel. See `mcp_ops/` for setup.
+(`mcp_ops/`, off unless the `mcp_ops_enabled` global config bool is set) so an
+external agent can drive the bot over an authenticated loopback channel with
+full guild reach. See `mcp_ops/` for setup.
 
 ### Image Search (Danbooru)
 Add to your `.env` file:
@@ -184,26 +185,29 @@ frontend re-implementing Discord plumbing or permission logic.
 **This is OFF by default.** Two ways to run it, sharing the same guardrails:
 
 1. **In-process with the bot** — `bot.py` starts it automatically after
-   ready when `MCP_OPS_ENABLED=1` (tools then act through the live bot).
-   When the env gates are unset, running the normal bot never starts it.
+   ready when the `mcp_ops_enabled` global config bool is true (toggle in
+   `/ai settings` → MCP tab; binds on restart). Tools act through the live
+   bot. When the flag is unset/false, running the normal bot never starts it.
 2. **Standalone** — `python3 -m mcp_ops.run_mcp_server` runs a separate
    process with a minimal cog-less Discord client on the same token.
 
 **Security model (all gates fail closed):**
-- **Off by default** — refuses to start unless `MCP_OPS_ENABLED=1` is set.
+- **Off by default** — refuses to start unless the `mcp_ops_enabled` global
+  config boolean is true (`/ai settings` → MCP tab, or `configs/global.json`).
 - **Auth required** — refuses to start unless `MCP_OPS_TOKEN` is set to a
   non-empty shared secret. Every request must send
   `Authorization: Bearer <token>`; requests without a matching token get a
   `401`.
-- **Guild allowlist required** — refuses to start unless
-  `MCP_OPS_GUILD_ALLOWLIST` (comma-separated guild ids) is set. Every tool
-  call verifies its resolved channel belongs to an allowlisted guild; DMs
-  and channels in other guilds are refused.
 - **Loopback only** — binds to `127.0.0.1`, no host override. Every tool
   call is a live, authenticated Discord bot action; do not tunnel this port
   off-host casually.
 - `send_message` always sends with `allowed_mentions` = none (no pings);
   `search_history` clamps `limit` to 200.
+- **Full guild reach by design** — tools act as raw primitives: every guild
+  the bot account is in is addressable, and DM channels are refused on
+  id-based calls (DMs flow through `send_dm`/`read_dms`/`fetch_dms`). Access
+  control belongs upstream in the MCP caller; the only guild-confined
+  surface is the in-bot agent loop (pinned to its invoking guild).
 - **Accepted risk:** `actor_id` is caller-supplied and not bound to the
   bearer token, so any token-holder can act as any user id for permission
   purposes. Fine for localhost self-use; add real actor auth before any
@@ -211,10 +215,10 @@ frontend re-implementing Discord plumbing or permission logic.
 
 **Run it (standalone):**
 ```bash
+# enable the server in global config (or via /ai settings -> MCP tab):
+python3 -c "import json;p='configs/global.json';d=json.load(open(p));d['mcp_ops_enabled']=True;json.dump(d,open(p,'w'),indent=4)"
 # in your .env or exported in the shell:
-export MCP_OPS_ENABLED=1
 export MCP_OPS_TOKEN=$(openssl rand -hex 32)   # generate a real secret
-export MCP_OPS_GUILD_ALLOWLIST=your_guild_id
 export DISCORD_TOKEN=your_bot_token_here        # same token the bot uses
 
 python3 -m mcp_ops.run_mcp_server

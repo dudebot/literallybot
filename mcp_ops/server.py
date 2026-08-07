@@ -6,22 +6,27 @@ Discord call plumbing, id resolution, result serialization, or permission
 checks — all of that lives in the registry. This module GENERATES its MCP
 tools mechanically from each op's typed param declarations
 (`Op.wire_params()`): the only hand-written pieces here are frontend
-policy (actor construction from `actor_id`, the guild allowlist, forced
-allowed_mentions=none on sends, allowlist-filtered list_guilds).
+policy (actor construction from `actor_id`, forced allowed_mentions=none
+on sends).
 
 This module does NOT start anything on import — call build_server() to get a
 configured FastMCP instance, or serve() to run it over authenticated
-streamable HTTP. bot.py only starts it when MCP_OPS_ENABLED=1.
+streamable HTTP. bot.py only starts it when the `mcp_ops_enabled` global
+config boolean is true.
 
 Guardrails (per the Codex review of the original spike, issue #58):
 - Shared-token bearer auth is mandatory (see mcp_ops/auth.py) — the serve()
   helper refuses to run without a token.
 - Binds to loopback ONLY. serve() hard-codes 127.0.0.1; there is no host
   parameter on purpose.
-- Server-side guild allowlist: every id-resolved target is verified to
-  belong to an allowlisted guild (enforced by the registry's shared
-  resolver via `allowed_guild_ids`). DM channels and channels in other
-  guilds are refused. An empty allowlist refuses to serve (fail closed).
+- Guild reach is UNRESTRICTED by design (owner decision 2026-08): tools
+  act as raw primitives across every guild the bot account is in; access
+  control belongs upstream in the caller. The only guild confinement in
+  the system is the in-bot !gpt agent loop's own {ctx.guild.id} policy.
+  DM channels are still refused on id-based calls — DMs flow only through
+  the user-keyed DM ops (send_dm/read_dms/fetch_dms), one-to-one with the
+  DM API (user_id only; Discord itself refuses bot DMs to users sharing
+  no guild).
 - send_message always sends with allowed_mentions=none — no pings, ever.
 - search_history clamps `limit` to core.ops.HISTORY_LIMIT_MAX (200),
   declared on the op itself.
@@ -34,7 +39,7 @@ from __future__ import annotations
 
 import inspect
 import logging
-from typing import Annotated, Any, Iterable, List, Optional
+from typing import Annotated, Any, List, Optional
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
@@ -42,7 +47,6 @@ from mcp.server.fastmcp import FastMCP
 from core.ops import (
     Op,
     OpContext,
-    OpResult,
     ResolutionError,
     _as_int,
     registry,
@@ -139,22 +143,7 @@ def _build_context(bot: Any, actor_id: int, guild: Any) -> OpContext:
     return OpContext(bot=bot, author=author, guild=guild)
 
 
-def parse_guild_allowlist(raw: Optional[str]) -> frozenset:
-    """Parse a comma-separated guild-id allowlist string into ids.
-    Empty/invalid input yields an empty set — callers must fail closed."""
-    ids = set()
-    for part in (raw or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            ids.add(int(part))
-        except ValueError:
-            logger.error("Ignoring non-numeric guild id in allowlist: %r", part)
-    return frozenset(ids)
-
-
-def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
+def _make_mcp_tool(bot: Any, op: Op):
     """Generate one MCP tool function from an op's typed declaration.
 
     The returned coroutine has an explicit `__signature__` built from the
@@ -168,32 +157,22 @@ def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
         # core/ops.py); coerce before it reaches guild.get_member().
         actor_id = _as_int(raw.pop("actor_id"), "actor_id")
 
-        # Resolve the target guild first (raises on unknown ids and on
-        # allowlist violations — surfaced as MCP tool errors) so the actor
-        # can be built as a real Member of that guild.
+        # Resolve the target guild first (raises on unknown ids — surfaced
+        # as MCP tool errors) so the actor can be built as a real Member of
+        # that guild. Guild-less calls (e.g. list_guilds) stand on the op's
+        # own behavior; ops that need a guild say so in their error.
         try:
-            guild = await resolve_context_guild(live_bot, raw, allowed)
+            guild = await resolve_context_guild(live_bot, raw, None)
         except ResolutionError as exc:
             raise BotUnavailableError(str(exc)) from exc
-
-        # Guild-less calls (e.g. guild-wide search_history with channel_ids
-        # omitted) default to the sole allowlisted guild — the allowlist is
-        # this frontend's trust boundary, and both deployments are pinned to
-        # exactly one guild. With multiple allowlisted guilds there is no
-        # safe default, so the op's own "needs a guild context" error stands.
-        if guild is None and len(allowed) == 1:
-            guild = live_bot.get_guild(next(iter(allowed)))
 
         ctx = _build_context(live_bot, actor_id, guild)
 
         # send_message never pings: enforced by the op itself (see
         # core/ops.py send_message — never-ping is the registry default).
-        result = await registry.call_ids(op.name, ctx, allowed_guild_ids=allowed,
-                                         **raw)
-        if result.ok and op.name == "list_guilds":
-            # MCP policy: guilds outside the allowlist are not disclosed.
-            result = OpResult(ok=True,
-                              value=[g for g in result.value if g["id"] in allowed])
+        # allowed_guild_ids stays at its None default: this frontend is
+        # unconfined primitives; access control is the caller's job.
+        result = await registry.call_ids(op.name, ctx, **raw)
 
         return op.result_payload(result)
 
@@ -237,31 +216,20 @@ def _make_mcp_tool(bot: Any, op: Op, allowed: frozenset):
     return tool_fn
 
 
-def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
+def build_server(bot: Any = None, *,
                  name: str = "literallybot-ops") -> FastMCP:
     """Construct a FastMCP server whose tools are generated from the ops
-    registry (`_EXPOSED_OPS`).
+    registry (`_EXPOSED_OPS`). Tools act as raw primitives across every
+    guild the bot account is in — host-side MCP callers have full control.
 
     `bot` should be a live discord.py Bot/Client instance (with `.config`
     attached, as bot.py does) so the tools can resolve channel/message ids
     and permission checks read the real config. If `bot` is None (schema-only
     smoke test), the tools raise BotUnavailableError when invoked.
-
-    `allowed_guild_ids` is the server-side guild allowlist; every call is
-    refused unless its resolved target belongs to one of these guilds.
     """
-    allowed = frozenset(int(g) for g in allowed_guild_ids)
-    if not allowed:
-        raise ValueError(
-            "build_server requires a non-empty guild allowlist "
-            "(set MCP_OPS_GUILD_ALLOWLIST); refusing to build an "
-            "unrestricted server."
-        )
-
-    # Which ops to expose is a global-config allowlist edited live from the
-    # /ai settings panel (MCP tab). Read once at build time — like
-    # MCP_OPS_GUILD_ALLOWLIST, changes take effect on the next server (bot)
-    # restart.
+    # Which ops to expose is a global-config list edited live from the
+    # /ai settings panel (MCP tab). Read once at build time — changes take
+    # effect on the next server (bot) restart.
     op_names = resolve_mcp_tools(
         getattr(bot, "config", None) if bot is not None else None)
 
@@ -269,26 +237,26 @@ def build_server(bot: Any = None, *, allowed_guild_ids: Iterable[int],
         "Ops-registry bridge for literallybot. Exposes a subset of the "
         "bot's ops registry as MCP tools: " + ", ".join(op_names) + ". "
         "Every call is permission-checked the same way an in-bot command "
-        "would be, via the shared ops registry, and is restricted to a "
-        "server-side guild allowlist."
+        "would be, via the shared ops registry. Tools are raw primitives: "
+        "every guild the bot is in is reachable."
     ))
 
     for op_name in op_names:
         op = registry.require(op_name)  # raises on registry drift
-        mcp.add_tool(_make_mcp_tool(bot, op, allowed),
+        mcp.add_tool(_make_mcp_tool(bot, op),
                      name=op.name, description=op.description)
 
     return mcp
 
 
 async def serve(bot: Any, *, port: int, token: str,
-                allowed_guild_ids: Iterable[int],
                 name: str = "literallybot-ops") -> None:
     """Serve the ops MCP server over authenticated streamable HTTP, bound to
     127.0.0.1 ONLY (no host parameter on purpose — do not add one).
 
     Runs until cancelled. Callers: mcp_ops/run_mcp_server.py (standalone
-    process) and bot.py (in-process, gated on MCP_OPS_ENABLED=1).
+    process) and bot.py (in-process, gated on the `mcp_ops_enabled` global
+    config boolean).
     """
     import contextlib
 
@@ -308,15 +276,15 @@ async def serve(bot: Any, *, port: int, token: str,
         def capture_signals(self):
             yield
 
-    mcp = build_server(bot=bot, allowed_guild_ids=allowed_guild_ids, name=name)
+    mcp = build_server(bot=bot, name=name)
     app = wrap_with_auth(mcp.streamable_http_app(), token)
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
     server = _NoSignalCaptureServer(config)
     logger.warning(
         "Starting MCP ops server on 127.0.0.1:%s — auth REQUIRED (Bearer "
-        "token), loopback-only bind, guild allowlist %s. Every tool call "
-        "runs as a live, authenticated Discord bot action.",
-        port, sorted(set(int(g) for g in allowed_guild_ids)),
+        "token), loopback-only bind, unrestricted guild reach. Every tool "
+        "call runs as a live, authenticated Discord bot action.",
+        port,
     )
     await server.serve()

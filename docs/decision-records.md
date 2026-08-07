@@ -31,9 +31,13 @@ API). Since then:
   so a resurrected streaming path is covered the day it exists.
 - The deferred in-bot agent loop lane shipped (`c498ebf`/`54888e7`), gated
   behind `gpt_agentic_enabled` + `!setagentic`.
-- The MCP ops server is wired to the real registry with fail-closed guild
-  allowlist, mention suppression, and history clamps (`057674d`, `96bccf3`)
-  but remains env-gated OFF (`MCP_OPS_ENABLED`).
+- The MCP ops server is wired to the real registry with mention suppression
+  and history clamps (`057674d`, `96bccf3`) and is config-gated OFF
+  (`mcp_ops_enabled` global bool; formerly the `MCP_OPS_ENABLED` env var).
+  2026-08: the original guild allowlist was REMOVED by owner decision — MCP
+  tools are raw one-to-one API primitives with full guild reach; access
+  control belongs upstream in the MCP caller. The only guild-confined
+  surface is the in-bot agent loop.
 - Codex authz finding #4 (caller-supplied `actor_id` not credential-bound)
   was consciously downgraded to a documented accepted risk for loopback
   self-use (`mcp_ops/server.py`). Reopen it only if the server is ever

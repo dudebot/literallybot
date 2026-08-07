@@ -16,6 +16,9 @@ Config model (see cogs/dynamic/gpt.py for the consuming side):
   may call. Empty/absent => plain chat. Subset of `AGENT_OPS`.
 - `mcp_tools_enabled`  (global scope, list[str]) — which ops the MCP server
   exposes to external services. Absent => the full `_EXPOSED_OPS` universe.
+- `mcp_ops_enabled`    (global scope, bool) — the MCP server's on/off switch
+  (🔌 toggle on the MCP tab; formerly the MCP_OPS_ENABLED env var). Absent =>
+  off. Like the tool set, binds on the next bot restart.
 
 Auth: opening the panel needs `is_admin`. The Server page (provider/model/
 personality/nickname) is admin-editable; the Providers, Bot-tools and MCP-tools
@@ -603,6 +606,7 @@ class AiSettingsView(discord.ui.View):
                                               self._save_mcp_tools,
                                               [o for o in _EXPOSED_OPS
                                                if o.startswith(("search", "list"))]))
+            self.add_item(self._mcp_server_toggle_button())
 
     def _personality_button(self):
         btn = discord.ui.Button(label="✏ Personality",
@@ -725,6 +729,32 @@ class AiSettingsView(discord.ui.View):
         btn.callback = cb
         return btn
 
+    def _mcp_server_toggle_button(self):
+        """On/off switch for the MCP ops server itself — the global config
+        boolean `mcp_ops_enabled` (moved out of .env 2026-08 so it's operable
+        from this panel). Like the tool set, it binds on the next restart."""
+        from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
+        enabled = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
+        btn = discord.ui.Button(
+            label=f"🔌 MCP server: {'ON' if enabled else 'OFF'}",
+            style=(discord.ButtonStyle.success if enabled
+                   else discord.ButtonStyle.danger),
+            row=3,
+        )
+
+        async def cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message(
+                    "Requires superadmin.", ephemeral=True)
+                return
+            self.bot.config.set_global(ENABLE_CONFIG_KEY, not enabled)
+            self._build()
+            await interaction.response.edit_message(
+                embed=self._embed(mcp_note=True), view=self)
+
+        btn.callback = cb
+        return btn
+
     # --- saves (superadmin-gated) ----------------------------------------
     async def _save_bot_tools(self, interaction: discord.Interaction, selected):
         if not is_superadmin(interaction):
@@ -788,8 +818,10 @@ class AiSettingsView(discord.ui.View):
             value=(", ".join(bot_tools) if bot_tools else "*none — plain chat*"),
             inline=False,
         )
+        from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
+        mcp_on = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
         e.add_field(
-            name="MCP tools (global)",
+            name=f"MCP tools (global — server {'ON' if mcp_on else 'OFF'})",
             value=(", ".join(mcp_tools) if mcp_tools else "*none*"),
             inline=False,
         )
