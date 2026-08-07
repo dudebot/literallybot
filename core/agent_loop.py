@@ -30,20 +30,12 @@ from core.ops import Op, registry
 
 # The bot agent's tool UNIVERSE — the ceiling of what a guild's
 # `bot_tools_enabled` allowlist may contain (per-guild subsets are chosen in
-# the /ai settings panel). Roles/pins/threads stay out until there's a
-# concrete ask (YAGNI) — adding one later is one string here. delete_message
+# the /aisettings panel). Derived from the registry's `agent=True` flags —
+# the registration site is the ONE place an op joins or leaves this surface
+# (the parallel name list this replaces drifted by design). delete_message
 # is ADMIN-gated in the registry, so only invoking users who pass is_admin
 # can actually use it (everyone else gets a tool error back in the loop).
-AGENT_OPS = (
-    "send_message",
-    "edit_message",
-    "delete_message",
-    "add_reaction",
-    "remove_reaction",
-    "search_history",
-    "list_channels",
-    "list_members",
-)
+AGENT_OPS = tuple(registry.agent_names())
 
 def resolve_bot_tools(raw) -> List[str]:
     """Effective bot-agent tool allowlist from the raw per-guild config

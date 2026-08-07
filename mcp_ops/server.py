@@ -63,30 +63,10 @@ logger = logging.getLogger("mcp_ops.server")
 # Member from the target guild before the gate can run), so guild/channel
 # id EXISTENCE is observable to any token-holder — accepted under the
 # loopback + bearer-token trust model, same as caller-supplied actor_id.
-_EXPOSED_OPS = (
-    "send_message",
-    "search_history",
-    "add_reaction",
-    "remove_reaction",
-    "edit_message",
-    "delete_message",
-    "list_guilds",
-    "list_channels",
-    "list_members",
-    "list_roles",
-    "list_role_members",
-    "create_role",
-    "edit_role",
-    "delete_role",
-    "send_dm",
-    "read_dms",
-    "fetch_dms",
-    "list_channel_overwrites",
-    "add_role",
-    "remove_role",
-    "pin_message",
-    "create_thread",
-)
+# The MCP surface is the WHOLE ops registry — derived, not enumerated, so a
+# newly registered op is exposed here automatically (gate what a deployment
+# actually serves via the mcp_tools_enabled allowlist, not by editing this).
+_EXPOSED_OPS = tuple(registry.names())
 
 # "array" is always a list of snowflake ids, carried as strings (ops.py
 # CHANNEL_LIST is the only array wire kind; see Op.to_json_schema).

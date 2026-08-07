@@ -95,8 +95,8 @@ illustration; they are not real.)
 | `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
 | `cooldown_tier_bases` | `{tier: seconds}` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS`; the model modal's tier dropdown covers the common case |
 | `cooldown_windows` | `list[[count, period_mult]]` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
-| `mcp_tools_enabled` | `list[str]` op names | `/aisettings` → MCP tools (superadmin) | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
-| `mcp_ops_enabled` | `bool` | `/aisettings` → MCP tools (🔌 toggle, superadmin) | The MCP server's on/off switch (was the `MCP_OPS_ENABLED` env var until 2026-08). Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
+| `mcp_tools_enabled` | `list[str]` op names | `/aisettings` → MCP (superadmin) | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
+| `mcp_ops_enabled` | `bool` | `/aisettings` → MCP (🔌 toggle, superadmin) | The MCP server's on/off switch (was the `MCP_OPS_ENABLED` env var until 2026-08). Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
 | `error_logging` | `{default_channel?, category_channels?, severity_channels?, rate_limit_minutes?}` | `!errorlog` subcommands | Same shape also exists per-guild (guild overrides global) |
 | `reminders` | `list[{user_id, timestamp, text, delay}]` | `!remindme` + snooze buttons | Deliberately ONE global list across all guilds/DMs, filtered by `user_id` on read. `delay` (original duration, seconds) scales the snooze options; legacy rows without it get static 10m/1h/1d |
 | `disabled_cogs` | `list[str]` bare lowercase dynamic-cog names (e.g. `"gpt"`) | `/cogs` panel, `!disable` / `!enable` | Deployment-level off switch: listed cogs stay on disk but are skipped by startup, `!reload`, and `!load` (filtered inside `core.utils.list_cog_modules`). Dynamic group only — static cogs are never filtered. How downstream forks carry upstream cogs without running them |
@@ -111,12 +111,13 @@ illustration; they are not real.)
 | `current_ai_provider` | `str` provider id | `/aisettings` → Server page | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
 | `current_ai_model` | `str` or absent | `/aisettings` → Server page | Absent ⇒ provider's `default_model` |
 | `gpt_personality_data` | `{prompt: str, version: int}` | `/aisettings` → Personality modal | version = unix ts, tags memories |
+| `ai_enabled` | `bool` | `/aisettings` → Server config (💬 toggle) | Per-guild AI kill switch. Absent ⇒ ON. Gates the mention/reply chat path only — the panel stays reachable to turn it back on. Chat is guild-only: DMs never answer |
 | `gpt_memories` | `list[{text, expires, type, sender, personality_version, stored_at}]` | gpt.py memory capture | TTL-purged on read/write |
-| `bot_tools_enabled` | `list[str]` ⊆ `AGENT_OPS` | `/aisettings` → Bot tools | Empty/absent ⇒ plain chat (no agent loop) |
+| `bot_tools_enabled` | `list[str]` ⊆ `AGENT_OPS` | `/aisettings` → Server config tools select | Empty/absent ⇒ plain chat (no agent loop). Universe = registry ops flagged `agent=True` (core/ops.py) |
 | `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
 | `emoji_role_toggles` | `list[{channel_id, message_id, emoji, role_id}]` | `/role add\|delete\|sync` (setrole.py) | emoji is canonical str form (unicode char or `<:name:id>`); channel_id None = legacy-migrated entry pending `/role sync`; legacy nested-dict shape auto-migrates on first read |
 | `error_logging` | as global | `!errorlog` in-guild | |
-| `auto_responses` | `list[{triggers: list[str], responses: list[str \| [str, weight]]}]` | `/autoresponse` panel | Per-guild canned replies to exact whole-message matches. Responses picked by relative weight (plain string = weight 1). Absent/empty ⇒ cog inert in the guild. First match wins; bot-authored messages are always ignored (two-bot loop guard) |
+| `auto_responses` | `list[{triggers: list[str], responses: list[str], full_match?: bool, auto_delete?: bool}]` | `/autoresponse` or `!autoresponse` panel | Per-guild canned replies. `full_match` (default true) = whole message equals a trigger; false = substring hit anywhere (keyword automod). `auto_delete` deletes the triggering message. Uniform-random response pick; capped at 25 entries (panel dropdown limit). Absent/empty ⇒ cog inert. First match wins; bot-authored messages are always ignored (two-bot loop guard) |
 
 ### User scope (`user_<id>.json`)
 
