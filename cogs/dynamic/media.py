@@ -81,47 +81,61 @@ class ConfirmDeleteView(discord.ui.View):
             content="Deletion cancelled — nothing was deleted.", embed=None, view=self)
 
 class Media(commands.Cog):
+    """Per-guild media library: `!<name>` posts the guild's file of that
+    name. Each guild's files live in media/<guild_id>/ (runtime data, not
+    in git) — libraries never bleed across guilds, and DMs have none."""
+
     def __init__(self, bot):
         self.bot = bot
-        self._media_dir = 'media/'
         register_error_whitelist_hook(self._is_media_command)
 
     def cog_unload(self):
         unregister_error_whitelist_hook(self._is_media_command)
 
+    @staticmethod
+    def _guild_dir(guild):
+        return os.path.join('media', str(guild.id))
+
+    def _guild_files(self, guild):
+        """Filenames in the guild's media dir; [] when absent (a guild that
+        never ran !addmedia has no library, which must read as empty, not
+        as an error)."""
+        try:
+            return os.listdir(self._guild_dir(guild))
+        except OSError:
+            return []
+
     def _is_media_command(self, ctx, error):
-        """Return True if the failed command matches a media file (suppress error)."""
-        if not ctx.message.content.startswith('!'):
+        """Return True if the failed command matches a media file in the
+        invoking guild (suppress the CommandNotFound error)."""
+        if ctx.guild is None or not ctx.message.content.startswith('!'):
             return False
         file_name = ctx.message.content[1:].split()[0].lower()
         if len(file_name) < 2:
             return False
-        try:
-            for file in os.listdir(self._media_dir):
-                if file.startswith(file_name):
-                    return True
-        except OSError:
-            pass
-        return False
+        return any(f.startswith(file_name) for f in self._guild_files(ctx.guild))
 
     @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.bot:
+            return
+        if message.guild is None:
             return
 
         if message.content.startswith('!'):
             file_name = message.content[1:].lower()
             if len(file_name) < 2:
                 return
-            for file in os.listdir(self._media_dir):
+            for file in self._guild_files(message.guild):
                 if file.startswith(file_name):
-                    await message.channel.send(file=File(os.path.join(self._media_dir, file)))
+                    await message.channel.send(
+                        file=File(os.path.join(self._guild_dir(message.guild), file)))
                     return
 
-    def _cleanup_media_files(self, file_name):
+    def _cleanup_media_files(self, media_dir, file_name):
         """Remove any media files matching the given base name, including temp files."""
-        for pattern in [os.path.join(self._media_dir, f'{file_name}.*'),
-                        os.path.join(self._media_dir, f'{file_name}_tmp.*')]:
+        for pattern in [os.path.join(media_dir, f'{file_name}.*'),
+                        os.path.join(media_dir, f'{file_name}_tmp.*')]:
             for f in glob.glob(pattern):
                 try:
                     os.remove(f)
@@ -158,6 +172,7 @@ class Media(commands.Cog):
         return True
 
     @commands.command(name='addmedia')
+    @commands.guild_only()
     @commands.check(is_admin)
     async def addmedia(self, ctx, link: str = None, file_name: str = None,
                        start_ms: int = None, end_ms: int = None):
@@ -197,8 +212,11 @@ class Media(commands.Cog):
             await ctx.send("start_ms must be less than end_ms.")
             return
 
-        # Check for prefix conflicts with existing files
-        for existing in os.listdir(self._media_dir):
+        media_dir = self._guild_dir(ctx.guild)
+        os.makedirs(media_dir, exist_ok=True)
+
+        # Check for prefix conflicts with existing files (within this guild)
+        for existing in os.listdir(media_dir):
             existing_base = os.path.splitext(existing)[0]
             # New file would be shadowed by existing (existing is shorter prefix)
             if file_name.startswith(existing_base):
@@ -215,13 +233,13 @@ class Media(commands.Cog):
         file_path = None
 
         # Clean up any existing files with this name before downloading
-        self._cleanup_media_files(file_name)
+        self._cleanup_media_files(media_dir, file_name)
 
         try:
             if clean_url.lower().endswith(direct_extensions):
                 # Direct file download - extract extension from URL
                 file_extension = clean_url.split('.')[-1].lower()
-                file_path = os.path.join(self._media_dir, f'{file_name}.{file_extension}')
+                file_path = os.path.join(media_dir, f'{file_name}.{file_extension}')
 
                 with requests.get(link, stream=True) as response:
                     response.raise_for_status()
@@ -232,7 +250,7 @@ class Media(commands.Cog):
                 # yt-dlp download - let it determine extension
                 ydl_opts = {
                     'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-                    'outtmpl': os.path.join(self._media_dir, f'{file_name}.%(ext)s'),
+                    'outtmpl': os.path.join(media_dir, f'{file_name}.%(ext)s'),
                     'merge_output_format': 'mp4',
                 }
 
@@ -240,7 +258,7 @@ class Media(commands.Cog):
                     ydl.download([link])
 
                 # Find what yt-dlp created (exclude temp files)
-                matches = [f for f in glob.glob(os.path.join(self._media_dir, f'{file_name}.*'))
+                matches = [f for f in glob.glob(os.path.join(media_dir, f'{file_name}.*'))
                            if '_tmp.' not in f]
                 if not matches:
                     await ctx.send('Download appeared to succeed but no file was created.')
@@ -255,7 +273,7 @@ class Media(commands.Cog):
                     start_ms = 0
 
                 if not self._trim_media(file_path, start_ms, end_ms):
-                    self._cleanup_media_files(file_name)
+                    self._cleanup_media_files(media_dir, file_name)
                     await ctx.send('Failed to trim media file.')
                     return
 
@@ -263,16 +281,17 @@ class Media(commands.Cog):
             await ctx.send(f'Media file {final_name} has been added.')
 
         except requests.RequestException as e:
-            self._cleanup_media_files(file_name)
+            self._cleanup_media_files(media_dir, file_name)
             await ctx.send(f'Failed to download the file: {e}')
         except yt_dlp.utils.DownloadError as e:
-            self._cleanup_media_files(file_name)
+            self._cleanup_media_files(media_dir, file_name)
             await ctx.send(f'Failed to download the video: {e}')
         except Exception as e:
-            self._cleanup_media_files(file_name)
+            self._cleanup_media_files(media_dir, file_name)
             await ctx.send(f'Unexpected error: {e}')
 
     @commands.command(name='delmedia')
+    @commands.guild_only()
     @commands.check(is_admin)
     async def delmedia(self, ctx, name: str = None):
         """Delete a media file after button confirmation.
@@ -285,11 +304,8 @@ class Media(commands.Cog):
             await ctx.send("Missing required argument.\nUsage: `!delmedia <name>`")
             return
 
-        try:
-            entries = os.listdir(self._media_dir)
-        except OSError as e:
-            await ctx.send(f'Failed to read media directory: {e}')
-            return
+        media_dir = self._guild_dir(ctx.guild)
+        entries = self._guild_files(ctx.guild)
 
         query = name.lower()
         matches = [f for f in entries
@@ -313,7 +329,7 @@ class Media(commands.Cog):
             return
 
         file_name = matches[0]
-        file_path = os.path.join(self._media_dir, file_name)
+        file_path = os.path.join(media_dir, file_name)
         try:
             size = _format_size(os.path.getsize(file_path))
         except OSError:
@@ -328,22 +344,15 @@ class Media(commands.Cog):
         view.message = await ctx.send(embed=embed, view=view)
 
     @commands.command(name='listmedia')
+    @commands.guild_only()
     async def listmedia(self, ctx, prefix: str = None):
-        """List available media files. Optionally filter by a starting prefix.
+        """List this server's media files. Optionally filter by a starting prefix.
 
         Usage: !listmedia [prefix]
         """
         allowed = ('.mp4', '.ogg', '.webm', '.mp3')
 
-        if not os.path.isdir(self._media_dir):
-            await ctx.send('Media directory not found.')
-            return
-
-        try:
-            entries = os.listdir(self._media_dir)
-        except OSError as e:
-            await ctx.send(f'Failed to read media directory: {e}')
-            return
+        entries = self._guild_files(ctx.guild)
 
         files = [f for f in entries if f.lower().endswith(allowed)]
         # The !<name> trigger serves EVERY file in media/, not just the

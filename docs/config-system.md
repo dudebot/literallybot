@@ -116,7 +116,7 @@ illustration; they are not real.)
 | `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
 | `emoji_role_toggles` | `list[{channel_id, message_id, emoji, role_id}]` | `/role add\|delete\|sync` (setrole.py) | emoji is canonical str form (unicode char or `<:name:id>`); channel_id None = legacy-migrated entry pending `/role sync`; legacy nested-dict shape auto-migrates on first read |
 | `error_logging` | as global | `!errorlog` in-guild | |
-| `auto_responses` | `list[{triggers: list[str], match: "exact"\|"command", responses: list[str], chance?: float}]` | `/autoresponse add\|remove` | Per-guild canned-reply triggers (absorbed the interrogative cog). Absent/empty ⇒ cog inert in the guild. First match wins; bot-authored messages are always ignored (two-bot loop guard) |
+| `auto_responses` | `list[{triggers: list[str], responses: list[str \| [str, weight]]}]` | `/autoresponse add\|remove` | Per-guild canned replies to exact whole-message matches. Responses picked by relative weight (plain string = weight 1). Absent/empty ⇒ cog inert in the guild. First match wins; bot-authored messages are always ignored (two-bot loop guard) |
 
 ### User scope (`user_<id>.json`)
 

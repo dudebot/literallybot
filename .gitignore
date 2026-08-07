@@ -26,16 +26,9 @@ backups/
 .pytest_cache/
 settings.local.json
 
-# Bot-Specific: literallybot media files
-# Protect media files - ignore all except already tracked files
-/media/*
-!/media/aaaaaaaa_hd.mp4
-!/media/dingdingdoo.webm
-!/media/fuck.mp4
-!/media/poggers.mp4
-!/media/squish.webm
-!/media/yahallo.mp4
-!/media/heyhey.mp4
+# Bot-Specific: per-guild media libraries (media/<guild_id>/) are
+# runtime deployment data, never tracked
+/media/
 
 # Legacy - keeping for safety
 cogs/vibes/*
