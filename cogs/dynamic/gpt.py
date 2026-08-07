@@ -11,6 +11,19 @@ from typing import Dict, List, Optional, Any
 from core.utils import is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import registry
+from core.agent_loop import AGENT_OPS, resolve_bot_tools
+from mcp_ops.server import _EXPOSED_OPS, resolve_mcp_tools
+
+# send_message is deliberately NOT default-on for the in-bot agent (it can post
+# into arbitrary channels); it stays available to the MCP surface. This only
+# affects the migration seed and the panel's "read-only preset" button.
+_BOT_READONLY_OPS = ("add_reaction", "search_history", "list_channels", "list_members")
+# What an old `gpt_agentic_enabled=True` guild is migrated to: everything the
+# agent loop offers EXCEPT send_message (matches the pre-migration behavior
+# minus the never-defaulted broadcast tool).
+AGENT_OPS_DEFAULT_ON = tuple(op for op in AGENT_OPS if op != "send_message")
+
+PANEL_TIMEOUT = 180
 
 # Rate limiting is a nested-window ladder, not a flat per-message cooldown.
 # A model's declared cost per million OUTPUT tokens (`cost_per_mtok_output`)
@@ -30,7 +43,7 @@ from core.ops import registry
 # (the same cap the flat 300s gave, minus the broken UX). 2^n-style ladders
 # decay allowed rate too fast (block everything); ladders without a
 # day-scale outer window leak to ~$127/day sustained. Both knobs are
-# superadmin-tunable in /ai settings → Cooldowns (global config:
+# hand-tunable via global config keys (no panel surface since the 2026-08 UX pass:
 # cooldown_tier_bases, cooldown_windows).
 COOLDOWN_TIERS = (
     # (label, max_cost_exclusive, default_base_seconds) — first bucket whose
@@ -557,7 +570,7 @@ class Gpt(commands.Cog):
         return "\n".join(prompt_parts)
 
     async def process_askgpt(self, ctx, question: str):
-        # Per-model cooldown, enforced here so BOTH entry points (the !gpt
+        # Per-model cooldown, enforced here so BOTH entry points (the mention
         # command and the mention/reply path in on_message) share one gate.
         remaining = self._check_cooldown(ctx)
         if remaining is not None:
@@ -664,7 +677,7 @@ class Gpt(commands.Cog):
                 # The command text is repeated as the closing user turn so the
                 # actionable instruction is unambiguous even when the channel
                 # scrape attributed the invoking message oddly (e.g. a
-                # bot-authored `!gpt` landing in history as an assistant turn).
+                # bot-authored mention landing in history as an assistant turn).
                 user_prompt=command_turn,
                 max_tool_calls=AGENT_TOOL_BUDGET * 2,
             )
@@ -734,17 +747,6 @@ class Gpt(commands.Cog):
         # Message passes all compliance checks
         return True, message
         
-    @commands.command(name='gpt')
-    async def askgpt(self, ctx, *, question: str):
-        """Ask GPT a question."""
-        # Restrict DM usage to superadmin only
-        if not ctx.guild:
-            if not is_superadmin(self.bot.config, ctx.author.id):
-                await ctx.send("This command cannot be used in DMs.")
-                return
-
-        await self.process_askgpt(ctx, question)
-
     def _do_setprovider(self, ctx, provider: str) -> str:
         """Core logic for changing the AI provider. Returns the response text."""
         config = self.bot.config
@@ -924,7 +926,7 @@ class Gpt(commands.Cog):
         cost_str = "unset → pricy" if cost is None else f"${cost:g}/Mtok out"
         return f"Updated '{model_name}' ({cost_str}, {tier} tier: {base:g}s burst spacing)"
 
-    async def _do_setapikey(self, provider: str, api_key: str, key_usage_hint: str = "/ai settings → Providers") -> List[str]:
+    async def _do_setapikey(self, provider: str, api_key: str, key_usage_hint: str = "/aisettings → Models & Providers") -> List[str]:
         """Core logic for storing a provider API key and attempting model discovery.
 
         Returns a list of response lines the caller can send (kept as multiple
@@ -955,7 +957,7 @@ class Gpt(commands.Cog):
             discovered_models = await self.discover_models(provider, api_key, provider_info)
 
             if discovered_models:
-                lines.append(f"Discovered {len(discovered_models)} models. See them in /ai settings → Providers.")
+                lines.append(f"Discovered {len(discovered_models)} models. See them in /aisettings → Models & Providers.")
             else:
                 lines.append(f"Could not auto-discover models. You can add them manually with {key_usage_hint}")
         except Exception as e:
@@ -1012,13 +1014,13 @@ class Gpt(commands.Cog):
         if should_respond:
             question = cleaned_content.strip()
             if question:  # Ensure there's content
-                # Same DM gate as the !gpt prefix command — a mention/reply in
+                # Same DM gate as the removed !gpt prefix command had — a mention/reply in
                 # DM must not bypass the superadmin-only restriction.
                 if not ctx.guild and not is_superadmin(self.bot.config, ctx.author.id):
                     return
 
                 # Cooldown is enforced inside process_askgpt (per-model,
-                # per-guild) so mention/reply and !gpt share one rate limit.
+                # per-guild) so all entry points share one rate limit.
                 await self.process_askgpt(ctx, question)
                 
     def _do_setpersonality(self, ctx, personality: str) -> None:
@@ -1026,74 +1028,6 @@ class Gpt(commands.Cog):
         config = self.bot.config
         personality_version = int(time.time())  # Use timestamp as version
         config.set(ctx, "gpt_personality_data", {"prompt": personality, "version": personality_version})
-
-    def _do_aistatus(self, ctx) -> str:
-        """Configured-vs-missing checklist with the exact next command for
-        each gap — the anti-"5-step setup I will forget" command."""
-        config = self.bot.config
-        stored = config.get(None, "ai_providers", scope="global")
-        all_providers = self.llm.get_all_providers()
-        pc = self.get_provider_config(ctx)
-        provider, model = pc["provider"], pc["model"]
-        info = pc["provider_info"]
-
-        lines = ["**AI setup status:**"]
-
-        if stored:
-            lines.append(f"✅ Providers configured: {', '.join(all_providers.keys())}")
-        else:
-            lines.append(
-                "▫️ No provider config saved yet — running on built-in defaults. "
-                "It persists automatically on your first `/ai setapikey` or "
-                "model change in `/ai settings` → Providers."
-            )
-
-        lines.append(f"✅ Current provider/model: **{provider}** / **{model}**")
-
-        key_name = f"{provider.upper()}_API_KEY"
-        has_key = bool(config.get(None, key_name, scope="global") or os.environ.get(key_name))
-        key_ok = True
-        if not info.get("requires_api_key", True):
-            lines.append(f"✅ API key: not required for {provider} (local)")
-        elif has_key:
-            lines.append(f"✅ API key: configured for {provider}")
-        else:
-            key_ok = False
-            lines.append(
-                f"❌ API key missing for {provider} → "
-                f"`/ai setapikey provider:{provider}` (superadmin)"
-            )
-
-        bot_tools = self._resolve_bot_tools(ctx)
-        if bot_tools:
-            lines.append(f"✅ Bot tools: **{len(bot_tools)} enabled** ({', '.join(bot_tools)})")
-        else:
-            lines.append(
-                "▫️ Bot tools: none (plain chat) → "
-                "`/ai settings` → Bot tools (superadmin)"
-            )
-
-        personality_data = config.get(ctx, "gpt_personality_data")
-        if personality_data and isinstance(personality_data, dict) and personality_data.get("prompt"):
-            lines.append("✅ Personality: custom prompt set")
-        else:
-            lines.append(
-                "▫️ Personality: default → "
-                "`/ai settings` → ✏ Personality (admin)"
-            )
-
-        lines.append("")
-        lines.append(
-            "**Ready** — mention the bot or use `!gpt <question>`." if key_ok
-            else "**Not ready** — add the API key above, then re-run this command."
-        )
-        return "\n".join(lines)
-
-    @commands.command(name='aistatus')
-    async def aistatus(self, ctx):
-        """Show what's configured and what's missing for the AI features,
-        with the exact next command for each gap."""
-        await ctx.send(self._do_aistatus(ctx))
 
     def _do_addprovider(self, ctx, provider_id: str, base_url: str,
                         default_model: str, name: Optional[str]) -> str:
@@ -1103,7 +1037,7 @@ class Gpt(commands.Cog):
         provider_id = provider_id.lower()
         all_providers = self.llm.get_all_providers()
         if provider_id in all_providers:
-            return f"Provider '{provider_id}' already exists. Configure it in /ai settings → Providers."
+            return f"Provider '{provider_id}' already exists. Configure it in /aisettings → Models & Providers."
 
         all_providers[provider_id] = {
             "name": name or provider_id,
@@ -1116,7 +1050,7 @@ class Gpt(commands.Cog):
         self.llm.set_all_providers(all_providers)
         return (
             f"Added OpenAI-compatible provider '{provider_id}' (base_url: {base_url}, "
-            f"default model: {default_model}). Next: `/ai setapikey provider:{provider_id}`."
+            f"default model: {default_model}). Next: set its API key in /aisettings → Models & Providers."
         )
 
     def _do_removeprovider(self, ctx, provider_id: str) -> str:
@@ -1162,13 +1096,6 @@ class Gpt(commands.Cog):
             + (" and its stored API key." if had_key else ".")
         )
 
-    @askgpt.error
-    async def askgpt_error(self, ctx, error):
-        # Cooldown is now enforced inside process_askgpt (per-model), not by a
-        # command decorator, so CommandOnCooldown can no longer arrive here.
-        self.logger.error(f"An error occurred in askgpt: {error}", exc_info=True)
-        await ctx.send("An unexpected error occurred while processing your request.")
-    
     async def capture_and_store_memories(self, ctx, messages, current_personality_version):
         config = self.bot.config
         all_server_memories = config.get(ctx, "gpt_memories") or []
@@ -1271,61 +1198,862 @@ class Gpt(commands.Cog):
             config.set(ctx, "gpt_memories", all_server_memories)
             self.logger.debug(f"Stored {len(newly_captured_memories)} new memories")
 
-    # ==================== SLASH COMMANDS (/ai ...) ====================
+    # ==================== ADMIN SURFACE (/aisettings) ====================
     #
-    # The admin surface lives in the /ai settings panel (ai_admin.py), which
-    # consumes the _do_* helpers above. Only three subcommands remain:
-    # settings (the panel), setapikey (secret entry with provider
-    # autocomplete), and status (the onboarding checklist, also available as
-    # !aistatus for when slash sync is broken).
+    # One cog per purpose: the settings panel lives in this file with the
+    # chat machinery it configures (the old ai_admin.py was merged back in
+    # 2026-08). Chat is invoked by mentioning/replying to the bot; ALL
+    # configuration goes through the /aisettings panel. API keys are entered
+    # only via the panel's modal (never as a command argument).
 
-    ai_group = app_commands.Group(name="ai", description="Manage the AI provider/model configuration")
+    async def cog_load(self):
+        self._migrate_agentic_flag()
+        self._seed_model_costs()
 
-    @ai_group.command(name="settings", description="Open the AI settings panel for this server (admin)")
-    async def ai_settings(self, interaction: discord.Interaction):
-        # Panel UX + tool-allowlist logic lives in the ai_admin cog (CLAUDE.md:
-        # new AI-admin features land there, not in this parked-seam file).
-        from cogs.dynamic.ai_admin import open_ai_settings
-        await open_ai_settings(self, interaction)
+    def _migrate_agentic_flag(self):
+        """Map the removed per-guild agentic flag onto the tool allowlist.
 
-    async def _provider_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        """Autocomplete for provider names, sourced from the live ai_providers config."""
-        all_providers = self.llm.get_all_providers()
-        current_lower = current.lower()
-        choices = []
-        for prov_id, prov_info in all_providers.items():
-            label = f"{prov_info.get('name', prov_id)} ({prov_id})"
-            if current_lower in prov_id.lower() or current_lower in label.lower():
-                choices.append(app_commands.Choice(name=label[:100], value=prov_id))
-        return choices[:25]
+        Idempotent: guarded on `bot_tools_enabled` already existing, and the
+        old key is removed either way, so a second run is a no-op.
+        """
+        config = self.bot.config
+        _missing = object()
+        migrated = 0
+        for gid in config.guild_ids():
+            flag = config.get(gid, "gpt_agentic_enabled", _missing)
+            if flag is _missing:
+                continue
+            if flag and config.get(gid, "bot_tools_enabled", _missing) is _missing:
+                config.set(gid, "bot_tools_enabled", list(AGENT_OPS_DEFAULT_ON))
+                migrated += 1
+            config.rem(gid, "gpt_agentic_enabled")
+        config.flush()                        # beat the delayed-save timer (no-op when clean)
+        if migrated:
+            self.logger.info(
+                "gpt: migrated %d guild(s) from gpt_agentic_enabled to "
+                "bot_tools_enabled=%s", migrated, list(AGENT_OPS_DEFAULT_ON))
 
-    @ai_group.command(name="setapikey", description="Set the API key for a provider (response is private)")
-    @app_commands.describe(provider="The provider this key belongs to", api_key="The API key value")
-    async def ai_setapikey(self, interaction: discord.Interaction, provider: str, api_key: str):
-        if not is_superadmin(self.bot.config, interaction.user.id):
-            await interaction.response.send_message("This changes global bot config — superadmin only.", ephemeral=True)
+    def _seed_model_costs(self):
+        """Backfill `cost_per_mtok_output` on existing models from known prices.
+
+        Without this, every model configured before the cost field existed
+        would fall through to the pricy (300s) default. Idempotent: only fills
+        models that lack the field and whose price is known; unknown models are
+        left unset (still pricy) for an operator to annotate via the panel."""
+        from core.llm.usage import known_output_price
+        from core.llm.client import set_all_providers
+        config = self.bot.config
+        providers = config.get_global("ai_providers")
+        if not providers:
+            return                            # running on built-in defaults
+        seeded = 0
+        for pid, pinfo in providers.items():
+            for model_name, mcfg in pinfo.get("models", {}).items():
+                if not isinstance(mcfg, dict) or "cost_per_mtok_output" in mcfg:
+                    continue
+                price = known_output_price(pid, model_name)
+                if price is not None:
+                    mcfg["cost_per_mtok_output"] = price
+                    seeded += 1
+        if seeded:
+            set_all_providers(config, providers)
+            config.flush()
+            self.logger.info("gpt: seeded cost_per_mtok_output on %d model(s)",
+                             seeded)
+
+    @app_commands.command(
+        name="aisettings",
+        description="Open the AI settings panel for this server (admin)")
+    @app_commands.default_permissions(manage_messages=True)
+    async def aisettings(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "You do not have permission to use this command.", ephemeral=True)
             return
+        view = AiSettingsView(self, interaction)
+        await interaction.response.send_message(embed=view._embed(), view=view,
+                                                ephemeral=True)
+        view.message = await interaction.original_response()
 
-        # Slash command params aren't posted as a visible chat message, so there's
-        # nothing to delete for security here (unlike the prefix command) - but
-        # the response is still kept ephemeral so the key doesn't linger in-channel.
-        await interaction.response.defer(ephemeral=True)
-        try:
-            lines = await self._do_setapikey(provider, api_key)
-        except ValueError as e:
-            await interaction.followup.send(str(e), ephemeral=True)
-            return
-        await interaction.followup.send("\n".join(lines), ephemeral=True)
 
-    @ai_setapikey.autocomplete("provider")
-    async def ai_setapikey_provider_autocomplete(self, interaction: discord.Interaction, current: str):
-        return await self._provider_autocomplete(interaction, current)
+# ==================== /aisettings PANEL ====================
+#
+# Dynamic by invoker tier: admins see the Server and Bot-tools pages;
+# superadmins additionally get Models & Providers (the global catalog) and
+# MCP tools. Every mutating callback re-checks its gate server-side —
+# hidden/disabled controls are only cosmetic.
 
-    @ai_group.command(name="status", description="Show what's configured and what's missing for the AI features")
-    async def ai_status(self, interaction: discord.Interaction):
-        await interaction.response.send_message(
-            self._do_aistatus(interaction), ephemeral=True
+class _ToolSelect(discord.ui.Select):
+    """A multi-select over a fixed op universe, wired to save on change."""
+
+    def __init__(self, universe, current, on_save, *, row=1):
+        self._on_save = on_save
+        current_set = set(current)
+        options = [
+            discord.SelectOption(label=name, value=name, default=(name in current_set))
+            for name in universe
+        ]
+        super().__init__(
+            placeholder="Select enabled tools (none = off)",
+            min_values=0,
+            max_values=len(options),
+            options=options,
+            row=row,
         )
+
+    async def callback(self, interaction: discord.Interaction):
+        await self._on_save(interaction, list(self.values))
+
+
+class _ProviderSelect(discord.ui.Select):
+    def __init__(self, view: "AiSettingsView", *, row=1):
+        self._panel = view
+        providers = view.gpt.llm.get_all_providers()
+        current = view.provider
+        options = [
+            discord.SelectOption(
+                label=info.get("name", pid), value=pid, description=pid,
+                default=(pid == current),
+            )
+            for pid, info in list(providers.items())[:25]
+        ]
+        super().__init__(placeholder="AI provider", min_values=1, max_values=1,
+                         options=options, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Requires admin.", ephemeral=True)
+            return
+        # _do_setprovider resets the model to the provider default.
+        self._panel.gpt._do_setprovider(interaction, self.values[0])
+        self._panel.refresh_state()
+        await self._panel.rerender(interaction)
+
+
+class _ModelSelect(discord.ui.Select):
+    def __init__(self, view: "AiSettingsView", *, row=2):
+        self._panel = view
+        providers = view.gpt.llm.get_all_providers()
+        info = providers.get(view.provider, {})
+        models = list(info.get("models", {}).keys())
+        current = view.model
+        if models:
+            options = [
+                discord.SelectOption(label=m, value=m, default=(m == current))
+                for m in models[:25]
+            ]
+            disabled = False
+        else:
+            options = [discord.SelectOption(label="(no models)", value="_none")]
+            disabled = True
+        super().__init__(placeholder="Model", min_values=1, max_values=1,
+                         options=options, row=row, disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Requires admin.", ephemeral=True)
+            return
+        self._panel.gpt._do_setmodel(interaction, self.values[0])
+        self._panel.refresh_state()
+        await self._panel.rerender(interaction)
+
+
+class _MgmtProviderSelect(discord.ui.Select):
+    """Models & Providers page browse select: which provider is being managed.
+    Distinct from the Server page's _ProviderSelect, which switches the
+    guild's ACTIVE provider — this one only changes what the CRUD controls
+    point at."""
+
+    def __init__(self, view: "AiSettingsView", *, row=1):
+        self._panel = view
+        providers = view.gpt.llm.get_all_providers()
+        options = [
+            discord.SelectOption(
+                label=info.get("name", pid), value=pid, description=pid,
+                default=(pid == view.mgmt_provider),
+            )
+            for pid, info in list(providers.items())[:25]
+        ]
+        super().__init__(placeholder="Provider to manage", min_values=1,
+                         max_values=1, options=options, row=row)
+
+    async def callback(self, interaction: discord.Interaction):
+        self._panel.mgmt_provider = self.values[0]
+        self._panel.mgmt_model = None
+        await self._panel.rerender(interaction)
+
+
+class _MgmtModelSelect(discord.ui.Select):
+    """Models & Providers page browse select: which model the edit/remove/
+    default buttons target. min_values=0 so it can be deselected."""
+
+    def __init__(self, view: "AiSettingsView", *, row=2):
+        self._panel = view
+        providers = view.gpt.llm.get_all_providers()
+        models = list(providers.get(view.mgmt_provider, {}).get("models", {}).keys())
+        if models:
+            options = [
+                discord.SelectOption(label=m, value=m,
+                                     default=(m == view.mgmt_model))
+                for m in models[:25]
+            ]
+            disabled = False
+        else:
+            options = [discord.SelectOption(label="(no models)", value="_none")]
+            disabled = True
+        super().__init__(placeholder="Model to edit / remove / make default",
+                         min_values=0, max_values=1, options=options, row=row,
+                         disabled=disabled)
+
+    async def callback(self, interaction: discord.Interaction):
+        self._panel.mgmt_model = self.values[0] if self.values else None
+        await self._panel.rerender(interaction)
+
+
+class _AddProviderModal(discord.ui.Modal, title="Add OpenAI-compatible provider"):
+    def __init__(self, view: "AiSettingsView"):
+        super().__init__()
+        self._panel = view
+        self.provider_id = discord.ui.TextInput(
+            label="Provider id (short, e.g. groq)", required=True, max_length=32)
+        self.base_url = discord.ui.TextInput(
+            label="API base URL", required=True, max_length=200,
+            placeholder="https://api.groq.com/openai/v1")
+        self.default_model = discord.ui.TextInput(
+            label="Default model id", required=True, max_length=100)
+        self.display_name = discord.ui.TextInput(
+            label="Display name (optional)", required=False, max_length=64)
+        for item in (self.provider_id, self.base_url, self.default_model,
+                     self.display_name):
+            self.add_item(item)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message("Requires superadmin.", ephemeral=True)
+            return
+        pid = str(self.provider_id.value).strip().lower()
+        result = self._panel.gpt._do_addprovider(
+            interaction, pid, str(self.base_url.value).strip(),
+            str(self.default_model.value).strip(),
+            str(self.display_name.value).strip() or None)
+        if result.startswith("Added"):
+            self._panel.mgmt_provider = pid
+            self._panel.mgmt_model = None
+        self._panel.flash(result)
+        await self._panel.rerender(interaction)
+
+
+# Representative cost stored when only a tier (not an exact price) is chosen
+# in the model modal. The value just needs to land inside the tier's cost
+# band (cheap <$1, standard $1–5); "pricy" stores nothing — unset already
+# means pricy.
+_TIER_REPRESENTATIVE_COST = {"cheap": 0.5, "standard": 2.5, "pricy": None}
+
+
+class _ModelModal(discord.ui.Modal):
+    """Add a model, or edit an existing one.
+
+    Cost drives the rate-limit tier, so the modal offers a tier dropdown for
+    the common case and an exact $/Mtok text field that overrides it."""
+
+    def __init__(self, view: "AiSettingsView", *, edit: bool):
+        self._panel = view
+        self._edit = edit
+        bases, _ = view.gpt.cooldown_config()
+        if edit:
+            super().__init__(title=f"Edit {view.mgmt_model}"[:45])
+            providers = view.gpt.llm.get_all_providers()
+            mcfg = providers.get(view.mgmt_provider, {}).get("models", {}).get(view.mgmt_model, {})
+            if not isinstance(mcfg, dict):
+                mcfg = {}
+            cost_default = mcfg.get("cost_per_mtok_output")
+            tokens_default = mcfg.get("max_completion_tokens")
+        else:
+            super().__init__(title=f"Add model to {view.mgmt_provider}"[:45])
+            cost_default = None
+            tokens_default = None
+            self.model_name = discord.ui.TextInput(
+                label="Model id (as the provider API expects)",
+                required=True, max_length=100)
+            self.add_item(self.model_name)
+        current_tier, _ = cooldown_tier_for_cost(cost_default, bases)
+        self.tier = discord.ui.Select(
+            min_values=1, max_values=1,
+            options=[
+                discord.SelectOption(
+                    label=f"{label} — {'under $1' if label == 'cheap' else '$1–5' if label == 'standard' else '$5+ or unknown'}/Mtok",
+                    value=label,
+                    description=f"{_fmt_secs(bases[label])} between messages",
+                    default=(label == current_tier))
+                for label, _bound, _default in COOLDOWN_TIERS
+            ])
+        self.add_item(discord.ui.Label(
+            text="Price bracket (sets the rate limit)", component=self.tier))
+        self.cost = discord.ui.TextInput(
+            label="Exact $/Mtok output (optional, overrides)", required=False,
+            max_length=16, default="" if cost_default is None else f"{cost_default:g}")
+        self.max_tokens = discord.ui.TextInput(
+            label="Max completion tokens (blank = default)", required=False,
+            max_length=16, default="" if tokens_default is None else str(tokens_default))
+        self.add_item(self.cost)
+        self.add_item(self.max_tokens)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message("Requires superadmin.", ephemeral=True)
+            return
+        try:
+            cost = float(str(self.cost.value).strip()) if str(self.cost.value).strip() else None
+            max_tokens = int(str(self.max_tokens.value).strip()) if str(self.max_tokens.value).strip() else None
+        except ValueError:
+            self._panel.flash("⚠ Cost must be a number and max tokens an integer — nothing saved.")
+            await self._panel.rerender(interaction)
+            return
+        if cost is None:
+            # No exact price — the tier dropdown decides the stored cost.
+            tier = self.tier.values[0] if self.tier.values else "pricy"
+            cost = _TIER_REPRESENTATIVE_COST.get(tier)
+        gpt = self._panel.gpt
+        if self._edit:
+            result = gpt._do_editmodel(self._panel.mgmt_model,
+                                       self._panel.mgmt_provider, cost, max_tokens)
+        else:
+            name = str(self.model_name.value).strip()
+            result = gpt._do_addmodel(interaction, name,
+                                      self._panel.mgmt_provider, cost, max_tokens)
+            if result.startswith("Added"):
+                self._panel.mgmt_model = name
+        self._panel.flash(result)
+        await self._panel.rerender(interaction)
+
+
+class _ApiKeyModal(discord.ui.Modal, title="Set provider API key"):
+    """Key entry via modal — the value never appears in any channel, and the
+    panel (like the whole flow) is ephemeral."""
+
+    def __init__(self, view: "AiSettingsView"):
+        super().__init__()
+        self._panel = view
+        self.api_key = discord.ui.TextInput(
+            label=f"API key for {view.mgmt_provider}"[:45], required=True,
+            max_length=400)
+        self.add_item(self.api_key)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message("Requires superadmin.", ephemeral=True)
+            return
+        # Model discovery is a network call — defer (update-message style) so
+        # the 3s interaction window can't expire under it.
+        await interaction.response.defer()
+        try:
+            lines = await self._panel.gpt._do_setapikey(
+                self._panel.mgmt_provider, str(self.api_key.value).strip())
+        except ValueError as e:
+            lines = [str(e)]
+        self._panel.flash(" ".join(lines))
+        await self._panel.rerender(interaction)
+
+
+class _RemoveProviderModal(discord.ui.Modal, title="Remove provider"):
+    """Typed-confirmation gate: dropping a provider discards every model under
+    it plus its stored key, so a stray click must not be enough."""
+
+    def __init__(self, view: "AiSettingsView"):
+        super().__init__()
+        self._panel = view
+        self.confirm = discord.ui.TextInput(
+            label=f"Type '{view.mgmt_provider}' to confirm"[:45],
+            required=True, max_length=64)
+        self.add_item(self.confirm)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message("Requires superadmin.", ephemeral=True)
+            return
+        target = self._panel.mgmt_provider
+        if str(self.confirm.value).strip().lower() != target:
+            self._panel.flash("Confirmation text didn't match — nothing removed.")
+            await self._panel.rerender(interaction)
+            return
+        result = self._panel.gpt._do_removeprovider(interaction, target)
+        if result.startswith("Removed"):
+            self._panel.mgmt_provider = None  # refresh_state picks a survivor
+            self._panel.mgmt_model = None
+        self._panel.flash(result)
+        await self._panel.rerender(interaction)
+
+
+class _PersonalityModal(discord.ui.Modal, title="Set AI personality"):
+    def __init__(self, view: "AiSettingsView"):
+        super().__init__()
+        self._panel = view
+        self.prompt = discord.ui.TextInput(
+            label="Personality prompt",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=2000,
+            default=view.current_personality() or "",
+        )
+        self.add_item(self.prompt)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self._panel.gpt._do_setpersonality(interaction, str(self.prompt.value))
+        self._panel.refresh_state()
+        await self._panel.rerender(interaction)
+
+
+class _NicknameModal(discord.ui.Modal, title="Set bot nickname"):
+    def __init__(self, view: "AiSettingsView"):
+        super().__init__()
+        self._panel = view
+        self.nickname = discord.ui.TextInput(
+            label="New nickname", required=True, max_length=32)
+        self.add_item(self.nickname)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await interaction.guild.me.edit(nick=str(self.nickname.value))
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I don't have permission to change my nickname here.", ephemeral=True)
+            return
+        await self._panel.rerender(interaction)
+
+
+def _fmt_secs(s: float) -> str:
+    """Humanize a period: 45s, 7.5min, 2.1h."""
+    if s < 120:
+        return f"{s:g}s"
+    if s < 7200:
+        return f"{s / 60:g}min"
+    return f"{s / 3600:.1f}h"
+
+
+class AiSettingsView(discord.ui.View):
+    """Tabbed, ephemeral, single-invoker settings panel.
+
+    Dynamic by tier: admins get Server + Bot tools; superadmins additionally
+    get Models & Providers and MCP tools (global scope). Row 0 is always the
+    page tabs; rows 1+ are rebuilt per page on each render.
+    """
+
+    def __init__(self, gpt_cog, interaction: discord.Interaction):
+        super().__init__(timeout=PANEL_TIMEOUT)
+        self.gpt = gpt_cog
+        self.bot = gpt_cog.bot
+        self.invoker_id = interaction.user.id
+        self.is_super = is_superadmin(interaction)
+        self.guild = interaction.guild
+        self.page = "server"
+        self.message = None
+        self.mgmt_provider = None   # Models & Providers page browse state
+        self.mgmt_model = None
+        self._flash = None          # one-render status line (last action result)
+        self.refresh_state()
+        self._build()
+
+    # --- state -----------------------------------------------------------
+    def refresh_state(self):
+        pc = self.gpt.get_provider_config(self._cfg_ctx())
+        self.provider = pc["provider"]
+        self.model = pc["model"]
+        # Keep the browse state valid across CRUD ops: default to the guild's
+        # active provider, fall back to any survivor after a removal, and
+        # drop a model selection that no longer exists.
+        all_providers = self.gpt.llm.get_all_providers()
+        if self.mgmt_provider not in all_providers:
+            self.mgmt_provider = self.provider if self.provider in all_providers \
+                else next(iter(all_providers), None)
+            self.mgmt_model = None
+        if self.mgmt_model is not None:
+            models = all_providers.get(self.mgmt_provider, {}).get("models", {})
+            if self.mgmt_model not in models:
+                self.mgmt_model = None
+
+    def flash(self, text: str):
+        """Queue a status line shown once in the next embed render."""
+        self._flash = text
+
+    def _cfg_ctx(self):
+        """Config resolves guild scope from a bare guild id (int)."""
+        return self.guild.id if self.guild else None
+
+    def current_personality(self):
+        data = self.bot.config.get(self._cfg_ctx(), "gpt_personality_data")
+        if isinstance(data, dict):
+            return data.get("prompt")
+        return None
+
+    def _bot_tools(self):
+        # Same resolver the agent loop uses — the panel must show exactly
+        # the effective set, never a private re-derivation of it.
+        return resolve_bot_tools(
+            self.bot.config.get(self._cfg_ctx(), "bot_tools_enabled"))
+
+    def _mcp_tools(self):
+        # Same resolver the MCP server build uses (incl. unset => full
+        # universe default).
+        return resolve_mcp_tools(self.bot.config)
+
+    # --- rendering -------------------------------------------------------
+    def _tab_button(self, label, page):
+        style = (discord.ButtonStyle.primary if self.page == page
+                 else discord.ButtonStyle.secondary)
+        btn = discord.ui.Button(label=label, style=style, row=0)
+
+        async def cb(interaction: discord.Interaction, _page=page):
+            self.page = _page
+            self._build()
+            await self.rerender(interaction)
+
+        btn.callback = cb
+        return btn
+
+    def _build(self):
+        self.clear_items()
+        self.add_item(self._tab_button("⚙ Server", "server"))
+        self.add_item(self._tab_button("🤖 Bot tools", "bot"))
+        if self.is_super:
+            # Global-scope pages: invisible to non-superadmins, not merely
+            # disabled — a guild admin shouldn't even see the catalog knobs.
+            self.add_item(self._tab_button("🧩 Models & Providers", "providers"))
+            self.add_item(self._tab_button("🌐 MCP tools", "mcp"))
+        if self.page in ("providers", "mcp") and not self.is_super:
+            self.page = "server"
+
+        if self.page == "server":
+            self.add_item(_ProviderSelect(self, row=1))
+            self.add_item(_ModelSelect(self, row=2))
+            self.add_item(self._personality_button())
+            self.add_item(self._nickname_button())
+        elif self.page == "providers":
+            self.add_item(_MgmtProviderSelect(self, row=1))
+            self.add_item(_MgmtModelSelect(self, row=2))
+            has_model = self.mgmt_model is not None
+            providers = self.gpt.llm.get_all_providers()
+            is_default = has_model and providers.get(self.mgmt_provider, {}) \
+                .get("default_model") == self.mgmt_model
+            self.add_item(self._crud_button(
+                "➕ Add model", row=3,
+                opener=lambda: _ModelModal(self, edit=False)))
+            self.add_item(self._crud_button(
+                "✏ Edit model", row=3, disabled=not has_model,
+                opener=lambda: _ModelModal(self, edit=True)))
+            self.add_item(self._remove_model_button(disabled=not has_model))
+            self.add_item(self._default_model_button(
+                disabled=not has_model or is_default))
+            self.add_item(self._crud_button(
+                "➕ Add provider", row=4,
+                opener=lambda: _AddProviderModal(self)))
+            self.add_item(self._crud_button(
+                "🔑 Set API key", row=4,
+                opener=lambda: _ApiKeyModal(self)))
+            self.add_item(self._crud_button(
+                "🗑 Remove provider", row=4,
+                style=discord.ButtonStyle.danger,
+                opener=lambda: _RemoveProviderModal(self)))
+        elif self.page == "bot":
+            self.add_item(_ToolSelect(list(AGENT_OPS), self._bot_tools(),
+                                      self._save_bot_tools, row=1))
+            self.add_item(self._preset_button("Clear all (plain chat)",
+                                              self._save_bot_tools, []))
+            self.add_item(self._preset_button("Enable read-only set",
+                                              self._save_bot_tools,
+                                              list(_BOT_READONLY_OPS)))
+        elif self.page == "mcp":
+            self.add_item(_ToolSelect(list(_EXPOSED_OPS), self._mcp_tools(),
+                                      self._save_mcp_tools, row=1))
+            self.add_item(self._preset_button("Clear all", self._save_mcp_tools, []))
+            self.add_item(self._preset_button("Enable read-only set",
+                                              self._save_mcp_tools,
+                                              [o for o in _EXPOSED_OPS
+                                               if o.startswith(("search", "list"))]))
+            self.add_item(self._mcp_server_toggle_button())
+
+    def _personality_button(self):
+        btn = discord.ui.Button(label="✏ Personality",
+                                style=discord.ButtonStyle.secondary, row=3)
+
+        async def cb(interaction: discord.Interaction):
+            if not is_admin(interaction):
+                await interaction.response.send_message("Requires admin.", ephemeral=True)
+                return
+            await interaction.response.send_modal(_PersonalityModal(self))
+
+        btn.callback = cb
+        return btn
+
+    def _nickname_button(self):
+        btn = discord.ui.Button(label="🏷 Nickname",
+                                style=discord.ButtonStyle.secondary, row=3)
+
+        async def cb(interaction: discord.Interaction):
+            if not is_admin(interaction):
+                await interaction.response.send_message("Requires admin.", ephemeral=True)
+                return
+            if not self.guild:
+                await interaction.response.send_message(
+                    "Nickname can only be set in a server.", ephemeral=True)
+                return
+            await interaction.response.send_modal(_NicknameModal(self))
+
+        btn.callback = cb
+        return btn
+
+    def _preset_button(self, label, saver, value):
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, row=2)
+
+        async def cb(interaction: discord.Interaction):
+            await saver(interaction, value)
+
+        btn.callback = cb
+        return btn
+
+    # --- Models & Providers controls (superadmin: global catalog) ---------
+    def _crud_button(self, label, *, row, opener, disabled=False,
+                     style=discord.ButtonStyle.secondary):
+        """Button that opens a modal — superadmin-gated at open (the modal's
+        on_submit re-checks again; the button state is only cosmetic)."""
+        btn = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
+
+        async def cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message(
+                    "Requires superadmin (this edits global bot config).",
+                    ephemeral=True)
+                return
+            await interaction.response.send_modal(opener())
+
+        btn.callback = cb
+        return btn
+
+    def _remove_model_button(self, *, disabled):
+        btn = discord.ui.Button(label="🗑 Remove model",
+                                style=discord.ButtonStyle.danger, row=3,
+                                disabled=disabled)
+
+        async def cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message(
+                    "Requires superadmin (this edits global bot config).",
+                    ephemeral=True)
+                return
+            # _do_removemodel guards the provider's default model itself, so
+            # no extra confirm step: a misclick is always recoverable via
+            # ➕ Add model.
+            result = self.gpt._do_removemodel(interaction, self.mgmt_model,
+                                              self.mgmt_provider)
+            self.mgmt_model = None
+            self.flash(result)
+            await self.rerender(interaction)
+
+        btn.callback = cb
+        return btn
+
+    def _default_model_button(self, *, disabled):
+        btn = discord.ui.Button(label="⭐ Make default",
+                                style=discord.ButtonStyle.secondary, row=3,
+                                disabled=disabled)
+
+        async def cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message(
+                    "Requires superadmin (this edits global bot config).",
+                    ephemeral=True)
+                return
+            all_providers = self.gpt.llm.get_all_providers()
+            if self.mgmt_model not in all_providers.get(self.mgmt_provider, {}).get("models", {}):
+                self.flash("That model no longer exists.")
+            else:
+                all_providers[self.mgmt_provider]["default_model"] = self.mgmt_model
+                self.gpt.llm.set_all_providers(all_providers)
+                self.flash(f"Default model for {self.mgmt_provider} is now {self.mgmt_model}.")
+            await self.rerender(interaction)
+
+        btn.callback = cb
+        return btn
+
+    def _mcp_server_toggle_button(self):
+        """On/off switch for the MCP ops server itself — the global config
+        boolean `mcp_ops_enabled` (moved out of .env 2026-08 so it's operable
+        from this panel). Like the tool set, it binds on the next restart."""
+        from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
+        enabled = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
+        btn = discord.ui.Button(
+            label=f"🔌 MCP server: {'ON' if enabled else 'OFF'}",
+            style=(discord.ButtonStyle.success if enabled
+                   else discord.ButtonStyle.danger),
+            row=3,
+        )
+
+        async def cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message(
+                    "Requires superadmin.", ephemeral=True)
+                return
+            self.bot.config.set_global(ENABLE_CONFIG_KEY, not enabled)
+            self._build()
+            await interaction.response.edit_message(
+                embed=self._embed(mcp_note=True), view=self)
+
+        btn.callback = cb
+        return btn
+
+    # --- saves (superadmin-gated) ----------------------------------------
+    async def _save_bot_tools(self, interaction: discord.Interaction, selected):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Requires superadmin.", ephemeral=True)
+            return
+        cleaned = [n for n in selected if n in AGENT_OPS]
+        self.bot.config.set(self._cfg_ctx(), "bot_tools_enabled", cleaned)
+        await self.rerender(interaction)
+
+    async def _save_mcp_tools(self, interaction: discord.Interaction, selected):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Requires superadmin.", ephemeral=True)
+            return
+        cleaned = [n for n in selected if n in _EXPOSED_OPS]
+        self.bot.config.set_global("mcp_tools_enabled", cleaned)
+        # Rebuild so the Select's checkmarks reflect the saved set, and note
+        # that MCP changes only bind on the next bot restart.
+        self._build()
+        await interaction.response.edit_message(embed=self._embed(mcp_note=True),
+                                                 view=self)
+
+    # --- embed -----------------------------------------------------------
+    def _embed(self, mcp_note=False):
+        if self.page == "providers":
+            e = self._providers_embed()
+        else:
+            e = self._overview_embed()
+        if self._flash:
+            e.add_field(name="Last action", value=self._flash[:1024], inline=False)
+            self._flash = None
+        if mcp_note:
+            e.set_footer(text="MCP changes take effect on next bot restart.")
+        else:
+            e.set_footer(text="Panel expires after 3 minutes of inactivity.")
+        return e
+
+    def _overview_embed(self):
+        model_info = self.gpt._current_model_info(self._cfg_ctx())
+        bases, windows = self.gpt.cooldown_config()
+        tier, base = cooldown_tier_for_cost(
+            model_info.get("cost_per_mtok_output"), bases)
+        bot_tools = self._bot_tools()
+        e = discord.Embed(
+            title="AI settings",
+            description=f"Server: **{self.guild.name}**" if self.guild else "DM",
+            color=discord.Color.blurple(),
+        )
+        e.add_field(name="Provider / Model",
+                    value=f"{self.provider} / **{self.model}**", inline=True)
+        e.add_field(name="Rate limit",
+                    value=" · ".join(f"{c}/{_fmt_secs(m * base)}"
+                                     for c, m in windows) + f" ({tier})",
+                    inline=True)
+        e.add_field(
+            name="Bot tools (this server)",
+            value=(", ".join(bot_tools) if bot_tools else "*none — plain chat*"),
+            inline=False,
+        )
+        # Global MCP state deliberately does NOT appear here — it lives on
+        # the (superadmin-only) MCP tools page, where it can be acted on.
+        if self.page == "mcp":
+            from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
+            mcp_on = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
+            mcp_tools = self._mcp_tools()
+            e.add_field(
+                name=f"MCP tools (global — server {'ON' if mcp_on else 'OFF'})",
+                value=(", ".join(mcp_tools) if mcp_tools else "*none*"),
+                inline=False,
+            )
+        return e
+
+    def _providers_embed(self):
+        """The Models & Providers page: the global catalog, tabulated."""
+        all_providers = self.gpt.llm.get_all_providers()
+        pid = self.mgmt_provider
+        info = all_providers.get(pid, {})
+        e = discord.Embed(
+            title="AI settings — Models & Providers",
+            description="Global catalog — changes here affect every server "
+                        "this bot is in.",
+            color=discord.Color.blurple(),
+        )
+        e.add_field(
+            name=f"{info.get('name', pid)} ({pid})",
+            value=info.get("base_url") or "*built-in provider*",
+            inline=False,
+        )
+        default_model = info.get("default_model")
+        bases, _windows = self.gpt.cooldown_config()
+        rows = []
+        for m, mcfg in info.get("models", {}).items():
+            if not isinstance(mcfg, dict):
+                mcfg = {}
+            cost = mcfg.get("cost_per_mtok_output")
+            tier, _base = cooldown_tier_for_cost(cost, bases)
+            rows.append((
+                f"{m}{' ⭐' if m == default_model else ''}",
+                "—" if cost is None else f"{cost:g}",
+                tier,
+                str(mcfg.get("max_completion_tokens", "—")),
+            ))
+        if rows:
+            name_w = max(len(r[0]) for r in rows)
+            cost_w = max(len("$/Mtok"), max(len(r[1]) for r in rows))
+            tier_w = max(len("tier"), max(len(r[2]) for r in rows))
+            header = f"{'model'.ljust(name_w)}  {'$/Mtok'.rjust(cost_w)}  {'tier'.ljust(tier_w)}  max_tok"
+            body_lines = [
+                f"{r[0].ljust(name_w)}  {r[1].rjust(cost_w)}  {r[2].ljust(tier_w)}  {r[3]}"
+                for r in rows
+            ]
+            table = "```\n" + "\n".join([header] + body_lines) + "\n```"
+            if len(table) > 1024:
+                table = table[:1000].rstrip() + "\n…```"
+        else:
+            table = "*no models*"
+        e.add_field(name=f"Models ({len(rows)})", value=table, inline=False)
+        overview = " · ".join(
+            f"{p} {'✅' if self.gpt.provider_key_status(p, pi).startswith('✅') else '❌'}"
+            f" ({len(pi.get('models', {}))})"
+            for p, pi in all_providers.items()
+        )
+        e.add_field(name="All providers (key · models)",
+                    value=overview[:1024] or "*none*", inline=False)
+        return e
+
+    async def rerender(self, interaction: discord.Interaction):
+        self.refresh_state()
+        self._build()
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=self._embed(), view=self)
+        else:
+            await interaction.response.edit_message(embed=self._embed(), view=self)
+
+    # --- lifecycle -------------------------------------------------------
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This panel isn't yours — run `/aisettings` to open your own.",
+                ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Panel expired — run `/aisettings` again.", view=self)
+            except discord.HTTPException:
+                pass
+
 
 async def setup(bot):
     """Every cog needs a setup function like this."""

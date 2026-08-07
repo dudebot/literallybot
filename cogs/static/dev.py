@@ -1,4 +1,5 @@
 from discord.ext import commands
+from discord import app_commands
 import discord
 from sys import version_info as sysv
 import subprocess
@@ -352,6 +353,20 @@ class Dev(commands.Cog):
             self.logger.error("Error during shutdown", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
+    @app_commands.command(
+        name="cogs",
+        description="Manage dynamic cogs: enable, disable, reload (superadmin)")
+    @app_commands.default_permissions()
+    async def cogs_panel(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Superadmin only.", ephemeral=True)
+            return
+        view = CogsView(self, interaction)
+        await interaction.response.send_message(
+            embed=view.render_embed(), view=view, ephemeral=True)
+        view.message = await interaction.original_response()
+
     @commands.command(name='sync', hidden=True)
     @commands.check(is_superadmin)
     async def sync(self, ctx):
@@ -366,6 +381,192 @@ class Dev(commands.Cog):
         except Exception as exc:
             self.logger.error("Error during sync", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
+
+class _CogSelect(discord.ui.Select):
+    def __init__(self, panel: "CogsView"):
+        self._panel = panel
+        options = []
+        for name in panel.cog_names():
+            state = panel.cog_state(name)
+            options.append(discord.SelectOption(
+                label=name, value=name, description=state,
+                default=(name == panel.selected)))
+        if not options:
+            options = [discord.SelectOption(label="(no cogs)", value="_none")]
+        super().__init__(placeholder="Select a dynamic cog", min_values=0,
+                         max_values=1, options=options[:25], row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self._panel.selected = self.values[0] if self.values else None
+        await self._panel.rerender(interaction)
+
+
+class CogsView(discord.ui.View):
+    """Superadmin panel over the disabled_cogs machinery: the slash-native
+    face of !disable/!enable/!reload. Single-invoker, ephemeral."""
+
+    def __init__(self, dev_cog, interaction: discord.Interaction):
+        super().__init__(timeout=180)
+        self.dev = dev_cog
+        self.bot = dev_cog.bot
+        self.invoker_id = interaction.user.id
+        self.selected = None
+        self.message = None
+        self._flash = None
+        self._build()
+
+    def cog_names(self):
+        return sorted(mod.rsplit('.', 1)[-1] for mod in list_cog_modules('dynamic'))
+
+    def cog_state(self, name):
+        if name in self.dev.disabled_cogs():
+            return "disabled"
+        if f"cogs.dynamic.{name}" in self.bot.extensions:
+            return "loaded"
+        return "unloaded"
+
+    def flash(self, text):
+        self._flash = text
+
+    def _set_disabled_list(self, names):
+        self.bot.config.set_global("disabled_cogs", sorted(names))
+
+    def _build(self):
+        self.clear_items()
+        if self.selected not in self.cog_names():
+            self.selected = None
+        self.add_item(_CogSelect(self))
+        state = self.cog_state(self.selected) if self.selected else None
+        toggle_label = "▶ Enable" if state == "disabled" else "⏸ Disable"
+        toggle_btn = discord.ui.Button(
+            label=toggle_label,
+            style=(discord.ButtonStyle.success if state == "disabled"
+                   else discord.ButtonStyle.danger),
+            row=1, disabled=state is None)
+        reload_btn = discord.ui.Button(label="🔄 Reload", row=1,
+                                       style=discord.ButtonStyle.secondary,
+                                       disabled=state != "loaded")
+        reload_all_btn = discord.ui.Button(label="🔄 Reload all", row=1,
+                                           style=discord.ButtonStyle.secondary)
+
+        async def toggle_cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message("Superadmin only.", ephemeral=True)
+                return
+            name = self.selected
+            if name is None:
+                await interaction.response.send_message("Select a cog first.", ephemeral=True)
+                return
+            module = f"cogs.dynamic.{name}"
+            disabled = self.dev.disabled_cogs()
+            if name in disabled:
+                self._set_disabled_list(disabled - {name})
+                note = ""
+                if module not in self.bot.extensions:
+                    try:
+                        await self.bot.load_extension(module)
+                        note = " and loaded"
+                    except Exception as e:
+                        note = f" (load failed: {e})"
+                self.flash(f"{name} enabled{note}.")
+            else:
+                self._set_disabled_list(disabled | {name})
+                note = ""
+                if module in self.bot.extensions:
+                    try:
+                        await self.bot.unload_extension(module)
+                        note = " and unloaded"
+                    except Exception as e:
+                        note = f" (unload failed: {e})"
+                self.flash(f"{name} disabled{note}.")
+            await self.rerender(interaction)
+
+        async def reload_cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message("Superadmin only.", ephemeral=True)
+                return
+            name = self.selected
+            if name is None:
+                await interaction.response.send_message("Select a cog first.", ephemeral=True)
+                return
+            module = f"cogs.dynamic.{name}"
+            try:
+                await self.bot.reload_extension(module)
+                self.flash(f"{name} reloaded.")
+            except Exception as e:
+                self.flash(f"Reload of {name} failed: {e}")
+            await self.rerender(interaction)
+
+        async def reload_all_cb(interaction: discord.Interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message("Superadmin only.", ephemeral=True)
+                return
+            # Same semantics as !reload with no argument: unload every loaded
+            # dynamic cog, load the enabled set — sheds newly disabled cogs.
+            errors = []
+            for module in [c for c in list(self.bot.extensions)
+                           if c.startswith("cogs.dynamic.")]:
+                try:
+                    await self.bot.unload_extension(module)
+                except Exception as e:
+                    errors.append(f"unload {module}: {e}")
+            for module in list_cog_modules('dynamic', self.bot.config):
+                try:
+                    await self.bot.load_extension(module)
+                except Exception as e:
+                    errors.append(f"load {module}: {e}")
+            self.flash("Reloaded all dynamic cogs."
+                       if not errors else "Errors: " + "; ".join(errors)[:900])
+            await self.rerender(interaction)
+
+        toggle_btn.callback = toggle_cb
+        reload_btn.callback = reload_cb
+        reload_all_btn.callback = reload_all_cb
+        self.add_item(toggle_btn)
+        self.add_item(reload_btn)
+        self.add_item(reload_all_btn)
+
+    def render_embed(self):
+        marks = {"loaded": "✅", "unloaded": "⬜", "disabled": "🚫"}
+        e = discord.Embed(
+            title="Dynamic cogs",
+            description="🚫 disabled cogs stay on disk but are skipped by "
+                        "startup and reloads (global `disabled_cogs`).",
+            color=discord.Color.blurple(),
+        )
+        lines = [f"{marks[self.cog_state(n)]} {n}" for n in self.cog_names()]
+        e.add_field(name="Cogs", value="\n".join(lines)[:1024] or "*none*", inline=False)
+        if self._flash:
+            e.add_field(name="Last action", value=self._flash[:1024], inline=False)
+            self._flash = None
+        e.set_footer(text="Panel expires after 3 minutes of inactivity.")
+        return e
+
+    async def rerender(self, interaction: discord.Interaction):
+        self._build()
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=self.render_embed(), view=self)
+        else:
+            await interaction.response.edit_message(embed=self.render_embed(), view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This panel isn't yours — run /cogs to open your own.",
+                ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Panel expired — run /cogs again.", view=self)
+            except discord.HTTPException:
+                pass
+
 
 async def setup(bot):
     """Every cog needs a setup function like this."""

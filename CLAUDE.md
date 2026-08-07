@@ -55,12 +55,16 @@ Where new code should land, so seams don't re-greed:
   frontends (`core/agent_loop.py`, `mcp_ops/server.py`) generate their surface
   from the registry and must stay thin. `call_ids` gates permissions before
   resolving ids — keep that ordering.
-- **`cogs/dynamic/gpt.py` is the historical landing zone.** The AI-admin UX
-  (the `/ai settings` panel and all provider/model CRUD surfaces) lives in
-  `ai_admin.py`; gpt.py keeps the `_do_*` core-logic helpers, the chat paths,
-  and the slim `/ai` group (settings/setapikey/status). New AI-admin features
-  land in ai_admin.py, not gpt.py. Remaining parked seam: memory capture
-  could be its own cog.
+- **One cog per purpose** (owner standard, 2026-08): cogs of the same purpose
+  are coupled into one file. gpt.py owns ALL AI surface — chat paths, `_do_*`
+  helpers, and the `/aisettings` panel (the former ai_admin.py was merged
+  back in). Remaining parked seam: memory capture could be its own cog.
+- **Admin slash surfaces are panels, not command sets**: one command opening
+  an ephemeral single-invoker View (`/aisettings`, `/autoresponse`, `/media`,
+  `/cogs`), with `@app_commands.default_permissions(...)` hiding it from
+  regular members Discord-side and `is_admin`/`is_superadmin` as the real
+  runtime boundary. Superadmin-only controls are OMITTED from the render for
+  non-superadmins (dynamic panel), not merely disabled.
 - Other parked (real-but-leave-it): error-handler module globals -> instance on
   bot; `LLMClient.has_api_key()` helper to dedupe key-presence checks.
 - The 2026-07-21 seam audit's parked items (fold-in triggers + upheld

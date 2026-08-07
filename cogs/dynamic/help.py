@@ -42,7 +42,7 @@ CATEGORY_ORDER = [
     "Channel Tools", "Admin", "Error Logging", "Dev",
 ]
 
-MEDIA_NOTE = "Any file in the media library can be posted with !<name> — see !listmedia"
+MEDIA_NOTE = "Any file in this server's media library can be posted with !<name> — admins manage it via /media"
 
 EMBED_COLOUR = discord.Colour.blurple()
 

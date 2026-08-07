@@ -3,7 +3,7 @@ import glob
 import subprocess
 import discord
 from discord.ext import commands
-from discord import File
+from discord import File, app_commands
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
@@ -11,74 +11,13 @@ from core.utils import is_admin
 
 
 def _format_size(num_bytes):
-    """Human-readable file size for the delmedia confirmation embed."""
+    """Human-readable file size for the panel listing."""
     size = float(num_bytes)
     for unit in ('B', 'KB', 'MB'):
         if size < 1024:
             return f'{num_bytes} B' if unit == 'B' else f'{size:.1f} {unit}'
         size /= 1024
     return f'{size:.1f} GB'
-
-
-class ConfirmDeleteView(discord.ui.View):
-    """Confirm/Cancel buttons for !delmedia. Invoker-only, 60s timeout.
-
-    Only the Confirm callback deletes anything, and it re-checks is_admin
-    server-side — the button gate alone is cosmetic.
-    """
-
-    def __init__(self, ctx, file_path):
-        super().__init__(timeout=60)
-        self.ctx = ctx
-        self.file_path = file_path
-        self.message = None
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message(
-                "These buttons aren't yours — run `!delmedia` yourself.",
-                ephemeral=True)
-            return False
-        return True
-
-    def _disable_all(self):
-        for child in self.children:
-            child.disabled = True
-
-    async def on_timeout(self):
-        self._disable_all()
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content="Delete confirmation expired — nothing was deleted.",
-                    view=self)
-            except discord.HTTPException:
-                pass
-
-    @discord.ui.button(label="Confirm delete", style=discord.ButtonStyle.danger)
-    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "You do not have permission to do this.", ephemeral=True)
-            return
-        file_name = os.path.basename(self.file_path)
-        self._disable_all()
-        self.stop()
-        try:
-            os.remove(self.file_path)
-        except OSError as e:
-            await interaction.response.edit_message(
-                content=f"Failed to delete `{file_name}`: {e}", embed=None, view=self)
-            return
-        await interaction.response.edit_message(
-            content=f"Deleted `{file_name}`.", embed=None, view=self)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self._disable_all()
-        self.stop()
-        await interaction.response.edit_message(
-            content="Deletion cancelled — nothing was deleted.", embed=None, view=self)
 
 class Media(commands.Cog):
     """Per-guild media library: `!<name>` posts the guild's file of that
@@ -171,48 +110,24 @@ class Media(commands.Cog):
         os.replace(temp_path, file_path)
         return True
 
-    @commands.command(name='addmedia')
-    @commands.guild_only()
-    @commands.check(is_admin)
-    async def addmedia(self, ctx, link: str = None, file_name: str = None,
-                       start_ms: int = None, end_ms: int = None):
-        """Download and save YouTube videos or direct file links as media files.
+    def _do_addmedia(self, guild, link, file_name, start_ms, end_ms):
+        """Download (and optionally trim) a file into the guild's library.
 
-        Usage: !addmedia <link> <filename> [start_ms] [end_ms]
-        - start_ms: start from this point (optional, if alone = first N ms)
-        - end_ms: end at this point (optional)
-
-        Examples:
-          !addmedia <url> clip           - full video
-          !addmedia <url> clip 2000      - first 2 seconds
-          !addmedia <url> clip 200 1700  - from 200ms to 1700ms (1500ms clip)
-        """
-        # Authorization is handled by @commands.check(is_admin) on the
-        # decorator (shared gate: superadmins, per-guild admins list, and
-        # Discord Administrator).
-        if not link or not file_name:
-            await ctx.send("Missing required arguments.\nUsage: `!addmedia <link> <filename> [start_ms] [end_ms]`")
-            return
-
+        Synchronous — the panel runs it via asyncio.to_thread so a slow
+        yt-dlp download can't stall the event loop. Returns the result
+        message shown in the panel."""
         file_name = file_name.lower()
 
         if len(file_name) < 2:
-            await ctx.send("Filename must be at least 2 characters long.")
-            return
-
+            return "Filename must be at least 2 characters long."
         if start_ms is not None and start_ms < 0:
-            await ctx.send("start_ms cannot be negative.")
-            return
-
+            return "start_ms cannot be negative."
         if end_ms is not None and end_ms <= 0:
-            await ctx.send("end_ms must be positive.")
-            return
-
+            return "end_ms must be positive."
         if start_ms is not None and end_ms is not None and start_ms >= end_ms:
-            await ctx.send("start_ms must be less than end_ms.")
-            return
+            return "start_ms must be less than end_ms."
 
-        media_dir = self._guild_dir(ctx.guild)
+        media_dir = self._guild_dir(guild)
         os.makedirs(media_dir, exist_ok=True)
 
         # Check for prefix conflicts with existing files (within this guild)
@@ -220,12 +135,10 @@ class Media(commands.Cog):
             existing_base = os.path.splitext(existing)[0]
             # New file would be shadowed by existing (existing is shorter prefix)
             if file_name.startswith(existing_base):
-                await ctx.send(f"Conflict: `!{file_name}` would be captured by existing `{existing}`")
-                return
+                return f"Conflict: `!{file_name}` would be captured by existing `{existing}`"
             # New file would shadow existing (new is shorter prefix)
             if existing_base.startswith(file_name):
-                await ctx.send(f"Conflict: `!{file_name}` would shadow existing `{existing}`")
-                return
+                return f"Conflict: `!{file_name}` would shadow existing `{existing}`"
 
         # Check if it's a direct media URL
         clean_url = link.split('?')[0]
@@ -261,8 +174,7 @@ class Media(commands.Cog):
                 matches = [f for f in glob.glob(os.path.join(media_dir, f'{file_name}.*'))
                            if '_tmp.' not in f]
                 if not matches:
-                    await ctx.send('Download appeared to succeed but no file was created.')
-                    return
+                    return 'Download appeared to succeed but no file was created.'
                 file_path = matches[0]
 
             # Trim if requested
@@ -274,117 +186,228 @@ class Media(commands.Cog):
 
                 if not self._trim_media(file_path, start_ms, end_ms):
                     self._cleanup_media_files(media_dir, file_name)
-                    await ctx.send('Failed to trim media file.')
-                    return
+                    return 'Failed to trim media file.'
 
             final_name = os.path.basename(file_path)
-            await ctx.send(f'Media file {final_name} has been added.')
+            return f'Media file {final_name} has been added — post it with `!{file_name}`.'
 
         except requests.RequestException as e:
             self._cleanup_media_files(media_dir, file_name)
-            await ctx.send(f'Failed to download the file: {e}')
+            return f'Failed to download the file: {e}'
         except yt_dlp.utils.DownloadError as e:
             self._cleanup_media_files(media_dir, file_name)
-            await ctx.send(f'Failed to download the video: {e}')
+            return f'Failed to download the video: {e}'
         except Exception as e:
             self._cleanup_media_files(media_dir, file_name)
-            await ctx.send(f'Unexpected error: {e}')
+            return f'Unexpected error: {e}'
 
-    @commands.command(name='delmedia')
-    @commands.guild_only()
-    @commands.check(is_admin)
-    async def delmedia(self, ctx, name: str = None):
-        """Delete a media file after button confirmation.
+    # ---- admin UI: single /media panel ----------------------------------
 
-        Usage: !delmedia <name>
-        Matches the exact file name, with or without extension — never a
-        prefix or substring (a computed delete target must be exact).
-        """
-        if not name:
-            await ctx.send("Missing required argument.\nUsage: `!delmedia <name>`")
+    @app_commands.command(
+        name="media",
+        description="Manage this server's media library (admin)")
+    @app_commands.default_permissions(manage_messages=True)
+    @app_commands.guild_only()
+    async def media_panel(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "You do not have permission to use this command.", ephemeral=True)
             return
+        view = MediaView(self, interaction)
+        await interaction.response.send_message(
+            embed=view.render_embed(), view=view, ephemeral=True)
+        view.message = await interaction.original_response()
 
-        media_dir = self._guild_dir(ctx.guild)
-        entries = self._guild_files(ctx.guild)
 
-        query = name.lower()
-        matches = [f for f in entries
-                   if f.lower() == query or os.path.splitext(f)[0].lower() == query]
+class _AddMediaModal(discord.ui.Modal, title="Add media file"):
+    def __init__(self, panel: "MediaView"):
+        super().__init__()
+        self._panel = panel
+        self.link = discord.ui.TextInput(
+            label="URL (YouTube or direct file link)", required=True, max_length=400)
+        self.file_name = discord.ui.TextInput(
+            label="Name (posted with !<name>)", required=True, max_length=64)
+        self.trim = discord.ui.TextInput(
+            label="Trim ms: end, or start-end (blank = full)",
+            required=False, max_length=20, placeholder="2000  or  200-1700")
+        for item in (self.link, self.file_name, self.trim):
+            self.add_item(item)
 
-        if not matches:
-            near = [f for f in sorted(entries, key=str.lower) if query in f.lower()][:5]
-            if near:
-                listing = '\n'.join(near)
-                await ctx.send(f'No exact match for `{name}`. Did you mean:\n{listing}\n'
-                               'Nothing was deleted.')
-            else:
-                await ctx.send(f'No media file named `{name}` found. Nothing was deleted.')
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_admin(interaction):
+            await interaction.response.send_message("Admins only.", ephemeral=True)
             return
+        start_ms = end_ms = None
+        raw = str(self.trim.value).strip()
+        if raw:
+            try:
+                if "-" in raw:
+                    start_str, end_str = raw.split("-", 1)
+                    start_ms, end_ms = int(start_str), int(end_str)
+                else:
+                    end_ms = int(raw)
+                    start_ms = 0
+            except ValueError:
+                self._panel.flash("⚠ Trim must be `end` or `start-end` in ms — nothing added.")
+                await self._panel.rerender(interaction)
+                return
+        # Download can take a while: defer, run off-loop, then re-render.
+        await interaction.response.defer()
+        import asyncio
+        result = await asyncio.to_thread(
+            self._panel.cog._do_addmedia, self._panel.guild,
+            str(self.link.value).strip(), str(self.file_name.value).strip(),
+            start_ms, end_ms)
+        self._panel.flash(result)
+        await self._panel.rerender(interaction)
 
-        if len(matches) > 1:
-            listing = '\n'.join(sorted(matches, key=str.lower))
-            await ctx.send(f'`{name}` matches multiple files:\n{listing}\n'
-                           'Re-run with the full file name (including extension). '
-                           'Nothing was deleted.')
-            return
 
-        file_name = matches[0]
-        file_path = os.path.join(media_dir, file_name)
-        try:
-            size = _format_size(os.path.getsize(file_path))
-        except OSError:
-            size = 'unknown size'
+class _FileSelect(discord.ui.Select):
+    def __init__(self, panel: "MediaView"):
+        self._panel = panel
+        files = sorted(panel.files(), key=str.lower)
+        options = [
+            discord.SelectOption(label=f[:100], value=f,
+                                 default=(f == panel.selected))
+            for f in files[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="(no files)", value="_none")]
+        placeholder = "Select a file to delete"
+        if len(files) > 25:
+            placeholder += f" (first 25 of {len(files)})"
+        super().__init__(placeholder=placeholder, min_values=0, max_values=1,
+                         options=options, disabled=not files, row=0)
 
-        embed = discord.Embed(
-            title='Delete media file?',
-            description=f'`{file_name}` ({size})',
-            color=discord.Color.red(),
+    async def callback(self, interaction: discord.Interaction):
+        self._panel.selected = self.values[0] if self.values else None
+        self._panel.confirming = False
+        await self._panel.rerender(interaction)
+
+
+class MediaView(discord.ui.View):
+    """Single-invoker ephemeral panel: file list + Add / Delete (two-click)."""
+
+    def __init__(self, cog: Media, interaction: discord.Interaction):
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.guild = interaction.guild
+        self.invoker_id = interaction.user.id
+        self.selected = None
+        self.confirming = False   # armed delete: next click actually deletes
+        self.message = None
+        self._flash = None
+        self._build()
+
+    def files(self):
+        return self.cog._guild_files(self.guild)
+
+    def flash(self, text):
+        self._flash = text
+
+    def _build(self):
+        self.clear_items()
+        files = self.files()
+        if self.selected not in files:
+            self.selected = None
+            self.confirming = False
+        self.add_item(_FileSelect(self))
+        add_btn = discord.ui.Button(label="➕ Add", style=discord.ButtonStyle.primary, row=1)
+        del_label = "⚠ Confirm delete" if self.confirming else "🗑 Delete"
+        del_btn = discord.ui.Button(label=del_label, style=discord.ButtonStyle.danger,
+                                    row=1, disabled=self.selected is None)
+
+        async def add_cb(interaction):
+            if not is_admin(interaction):
+                await interaction.response.send_message("Admins only.", ephemeral=True)
+                return
+            await interaction.response.send_modal(_AddMediaModal(self))
+
+        async def del_cb(interaction):
+            if not is_admin(interaction):
+                await interaction.response.send_message("Admins only.", ephemeral=True)
+                return
+            if self.selected is None:
+                await interaction.response.send_message("Select a file first.", ephemeral=True)
+                return
+            if not self.confirming:
+                # First click arms; the relabeled button makes the second
+                # click an explicit confirmation (deletes are unrecoverable).
+                self.confirming = True
+                self.flash(f"Click **⚠ Confirm delete** to remove `{self.selected}`.")
+                await self.rerender(interaction)
+                return
+            target = self.selected
+            path = os.path.join(self.cog._guild_dir(self.guild), target)
+            try:
+                os.remove(path)
+                self.flash(f"Deleted `{target}`.")
+            except OSError as e:
+                self.flash(f"Failed to delete `{target}`: {e}")
+            self.selected = None
+            self.confirming = False
+            await self.rerender(interaction)
+
+        add_btn.callback = add_cb
+        del_btn.callback = del_cb
+        self.add_item(add_btn)
+        self.add_item(del_btn)
+
+    def render_embed(self):
+        files = sorted(self.files(), key=str.lower)
+        e = discord.Embed(
+            title="Media library",
+            description=(f"**{self.guild.name}** — any file posts with `!<name>` "
+                         "(prefix match, e.g. `!pog` hits poggers.mp4)."),
+            color=discord.Color.blurple(),
         )
-        view = ConfirmDeleteView(ctx, file_path)
-        view.message = await ctx.send(embed=embed, view=view)
+        if files:
+            lines = []
+            for f in files:
+                try:
+                    size = _format_size(os.path.getsize(
+                        os.path.join(self.cog._guild_dir(self.guild), f)))
+                except OSError:
+                    size = "?"
+                lines.append(f"`{f}` — {size}")
+            body = "\n".join(lines)
+            e.add_field(name=f"Files ({len(files)})",
+                        value=body[:1010] + ("\n… (more)" if len(body) > 1010 else ""),
+                        inline=False)
+        else:
+            e.add_field(name="Files", value="*none — this server's library is empty*",
+                        inline=False)
+        if self._flash:
+            e.add_field(name="Last action", value=self._flash[:1024], inline=False)
+            self._flash = None
+        e.set_footer(text="Panel expires after 3 minutes of inactivity.")
+        return e
 
-    @commands.command(name='listmedia')
-    @commands.guild_only()
-    async def listmedia(self, ctx, prefix: str = None):
-        """List this server's media files. Optionally filter by a starting prefix.
+    async def rerender(self, interaction: discord.Interaction):
+        self._build()
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=self.render_embed(), view=self)
+        else:
+            await interaction.response.edit_message(embed=self.render_embed(), view=self)
 
-        Usage: !listmedia [prefix]
-        """
-        allowed = ('.mp4', '.ogg', '.webm', '.mp3')
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This panel isn't yours — run /media to open your own.",
+                ephemeral=True)
+            return False
+        return True
 
-        entries = self._guild_files(ctx.guild)
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Panel expired — run /media again.", view=self)
+            except discord.HTTPException:
+                pass
 
-        files = [f for f in entries if f.lower().endswith(allowed)]
-        # The !<name> trigger serves EVERY file in media/, not just the
-        # allowlisted extensions — surface the rest so the two views agree.
-        others = [f for f in entries if not f.lower().endswith(allowed)]
-
-        if prefix:
-            p = prefix.lower()
-            files = [f for f in files if f.lower().startswith(p)]
-            others = [f for f in others if f.lower().startswith(p)]
-
-        files.sort(key=str.lower)
-        others.sort(key=str.lower)
-
-        if not files and not others:
-            if prefix:
-                await ctx.send(f'No media files found starting with "{prefix}".')
-            else:
-                await ctx.send('No media files found.')
-            return
-
-        # Chunk messages to avoid exceeding Discord limits (shared splitter —
-        # the inline accumulator this replaces declared a 1900 limit but
-        # compared against 2000)
-        from core.utils import recursive_split
-        header = f'Media files ({len(files)} total' + (f', filtered by "{prefix}"' if prefix else '') + '):\n'
-        body = header + '\n'.join(files)
-        if others:
-            body += (f'\n\nOther files ({len(others)} — non-standard extension, '
-                     'still served by `!<name>`):\n' + '\n'.join(others))
-        for chunk in recursive_split(body, 2000):
-            await ctx.send(chunk)
 
 async def setup(bot):
     await bot.add_cog(Media(bot))
