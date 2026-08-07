@@ -14,6 +14,7 @@ class Config:
         self._save_delay = 5.0  # seconds
         self._reload_delay = 2.0  # seconds - check for external changes
         self._lock = Lock()  # Thread safety for timer operations
+        self._data_lock = Lock()  # Thread safety for config dict access
         self._writing = False  # Flag to prevent read-during-write
         self._load_all()
         self._schedule_reload()  # Start monitoring for external changes
@@ -130,25 +131,28 @@ class Config:
     def get(self, ctx, key, default=None, scope='guild'):
         """Get a config value from guild, user, or global scope. Read-only - does not persist defaults."""
         config_id = self._resolve_config_id(ctx, scope)
-        cfg = self._configs.setdefault(config_id, {})
-        return cfg.get(key, default)
+        with self._data_lock:
+            cfg = self._configs.get(config_id, {})
+            return cfg.get(key, default)
 
     def set(self, ctx, key, value, scope='guild'):
         """Set a config value in guild, user, or global scope"""
         config_id = self._resolve_config_id(ctx, scope)
-        cfg = self._configs.setdefault(config_id, {})
-        cfg[key] = value
+        with self._data_lock:
+            cfg = self._configs.setdefault(config_id, {})
+            cfg[key] = value
         self._dirty_configs.add(config_id)
         self._schedule_save()
 
     def rem(self, ctx, key, scope='guild'):
         """Remove a config key from guild, user, or global scope"""
         config_id = self._resolve_config_id(ctx, scope)
-        if config_id in self._configs and key in self._configs[config_id]:
-            del self._configs[config_id][key]
-            self._dirty_configs.add(config_id)
-            self._schedule_save()
-            return True
+        with self._data_lock:
+            if config_id in self._configs and key in self._configs[config_id]:
+                del self._configs[config_id][key]
+                self._dirty_configs.add(config_id)
+                self._schedule_save()
+                return True
         return False
 
     def has(self, ctx, key, scope='guild'):
@@ -228,7 +232,8 @@ class Config:
                     print(f"  - Key '{conflict['key']}': memory={conflict['memory_value']}, file={conflict['file_value']} (using file value)")
         
         # Merge: external data takes precedence
-        self._configs[config_id] = external_data.copy()
+        with self._data_lock:
+            self._configs[config_id] = external_data.copy()
     
     def _check_external_changes(self):
         """Check for external file modifications and reload if needed"""
