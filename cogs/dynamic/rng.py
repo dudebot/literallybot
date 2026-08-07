@@ -1,6 +1,5 @@
 import discord
 from discord.ext import commands
-from discord import app_commands
 import random
 import re
 from core.utils import smart_split
@@ -81,16 +80,6 @@ class RNG(commands.Cog):
                         await message.channel.send(result)
                         return
             
-    @app_commands.command(name="roll_dice")
-    @app_commands.describe(dice="Dice in NdX format, e.g. d6 or 2d20 (default d6)")
-    async def roll_dice(self, interaction: discord.Interaction, dice: str = "d6"):
-        """Roll dice in NdX format (defaults to a single d6)."""
-        result = await self.handle_dice_roll(dice)
-        if result is None:
-            await interaction.response.send_message("Invalid format. Use something like d6 or 2d20.")
-        else:
-            await interaction.response.send_message(result)
-
 async def setup(bot):
     """Every cog needs a setup function like this."""
     await bot.add_cog(RNG(bot))

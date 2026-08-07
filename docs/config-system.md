@@ -90,16 +90,16 @@ illustration; they are not real.)
 | Key | Shape | Written by | Notes |
 |-----|-------|-----------|-------|
 | `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin` | Read through `core.utils.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes" |
-| `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?}}}}` | `/ai settings` → Providers tab, `/ai setapikey` discovery | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
-| `<PROVIDER>_API_KEY` | `str` (e.g. `XAI_API_KEY`) | `/ai setapikey`, Providers-tab key modal | Env var of the same name is the fallback; removed with its provider |
+| `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?}}}}` | `/aisettings` → Models & Providers (superadmin) | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
+| `<PROVIDER>_API_KEY` | `str` (e.g. `XAI_API_KEY`) | `/aisettings` → Models & Providers key modal | Env var of the same name is the fallback; removed with its provider. Keys are entered ONLY via the panel modal (no slash parameter) |
 | `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
-| `cooldown_tier_bases` | `{tier: seconds}` | `/ai settings` → Cooldowns | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS` |
-| `cooldown_windows` | `list[[count, period_mult]]` | `/ai settings` → Cooldowns | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
-| `mcp_tools_enabled` | `list[str]` op names | `/ai settings` → MCP tools | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
-| `mcp_ops_enabled` | `bool` | `/ai settings` → MCP tools (🔌 toggle) | The MCP server's on/off switch (was the `MCP_OPS_ENABLED` env var until 2026-08). Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
+| `cooldown_tier_bases` | `{tier: seconds}` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS`; the model modal's tier dropdown covers the common case |
+| `cooldown_windows` | `list[[count, period_mult]]` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
+| `mcp_tools_enabled` | `list[str]` op names | `/aisettings` → MCP tools (superadmin) | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
+| `mcp_ops_enabled` | `bool` | `/aisettings` → MCP tools (🔌 toggle, superadmin) | The MCP server's on/off switch (was the `MCP_OPS_ENABLED` env var until 2026-08). Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
 | `error_logging` | `{default_channel?, category_channels?, severity_channels?, rate_limit_minutes?}` | `!errorlog` subcommands | Same shape also exists per-guild (guild overrides global) |
 | `reminders` | `list[{user_id, timestamp, text, delay}]` | `!remindme` + snooze buttons | Deliberately ONE global list across all guilds/DMs, filtered by `user_id` on read. `delay` (original duration, seconds) scales the snooze options; legacy rows without it get static 10m/1h/1d |
-| `disabled_cogs` | `list[str]` bare lowercase dynamic-cog names (e.g. `"gpt"`) | `!disable` / `!enable` | Deployment-level off switch: listed cogs stay on disk but are skipped by startup, `!reload`, and `!load` (filtered inside `core.utils.list_cog_modules`). Dynamic group only — static cogs are never filtered. How downstream forks carry upstream cogs without running them |
+| `disabled_cogs` | `list[str]` bare lowercase dynamic-cog names (e.g. `"gpt"`) | `/cogs` panel, `!disable` / `!enable` | Deployment-level off switch: listed cogs stay on disk but are skipped by startup, `!reload`, and `!load` (filtered inside `core.utils.list_cog_modules`). Dynamic group only — static cogs are never filtered. How downstream forks carry upstream cogs without running them |
 | `hue_bridge_ip` | `str` | `!sethuebridgeip` | signal cog |
 | `command_author_allowlist` | `list[int]` | *no command surface* | bot.py bot-authored-command dispatch; hand-edit only |
 
@@ -108,15 +108,15 @@ illustration; they are not real.)
 | Key | Shape | Written by | Notes |
 |-----|-------|-----------|-------|
 | `admins` | `list[int]` user ids | `!addadmin` / `!removeadmin` / `!claimadmin` | Read via `core.utils.is_admin` |
-| `current_ai_provider` | `str` provider id | `/ai settings` → Server tab | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
-| `current_ai_model` | `str` or absent | `/ai settings` → Server tab | Absent ⇒ provider's `default_model` |
-| `gpt_personality_data` | `{prompt: str, version: int}` | `/ai settings` → Personality modal | version = unix ts, tags memories |
+| `current_ai_provider` | `str` provider id | `/aisettings` → Server page | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
+| `current_ai_model` | `str` or absent | `/aisettings` → Server page | Absent ⇒ provider's `default_model` |
+| `gpt_personality_data` | `{prompt: str, version: int}` | `/aisettings` → Personality modal | version = unix ts, tags memories |
 | `gpt_memories` | `list[{text, expires, type, sender, personality_version, stored_at}]` | gpt.py memory capture | TTL-purged on read/write |
-| `bot_tools_enabled` | `list[str]` ⊆ `AGENT_OPS` | `/ai settings` → Bot tools | Empty/absent ⇒ plain chat (no agent loop) |
+| `bot_tools_enabled` | `list[str]` ⊆ `AGENT_OPS` | `/aisettings` → Bot tools | Empty/absent ⇒ plain chat (no agent loop) |
 | `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
 | `emoji_role_toggles` | `list[{channel_id, message_id, emoji, role_id}]` | `/role add\|delete\|sync` (setrole.py) | emoji is canonical str form (unicode char or `<:name:id>`); channel_id None = legacy-migrated entry pending `/role sync`; legacy nested-dict shape auto-migrates on first read |
 | `error_logging` | as global | `!errorlog` in-guild | |
-| `auto_responses` | `list[{triggers: list[str], responses: list[str \| [str, weight]]}]` | `/autoresponse add\|remove` | Per-guild canned replies to exact whole-message matches. Responses picked by relative weight (plain string = weight 1). Absent/empty ⇒ cog inert in the guild. First match wins; bot-authored messages are always ignored (two-bot loop guard) |
+| `auto_responses` | `list[{triggers: list[str], responses: list[str \| [str, weight]]}]` | `/autoresponse` panel | Per-guild canned replies to exact whole-message matches. Responses picked by relative weight (plain string = weight 1). Absent/empty ⇒ cog inert in the guild. First match wins; bot-authored messages are always ignored (two-bot loop guard) |
 
 ### User scope (`user_<id>.json`)
 
