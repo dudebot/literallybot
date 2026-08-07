@@ -10,7 +10,7 @@ Guild config key `auto_responses` — list of entries:
      "auto_delete": false}            # true = delete the triggering message
 
 Absent/empty key = inert in that guild (default OFF everywhere; manage with
-/autoresponse or !autoresponse). First matching entry wins, in config
+!autoresponse). First matching entry wins, in config
 order. Capped at 25 entries per guild — the panel dropdown's hard limit.
 
 Loop safety: ALL bot-authored messages are ignored (message.author.bot),
@@ -18,7 +18,7 @@ not just our own — two bots both running this cog once replied to each
 other's replies forever (the cope->seethe incident, 2026-08-07).
 """
 from discord.ext import commands
-from discord import app_commands
+
 import discord
 import random
 
@@ -92,30 +92,15 @@ class AutoResponse(commands.Cog):
                     f"in guild {message.guild.id}: {e}")
         await message.channel.send(response)
 
-    # ---- admin UI: one panel, two entry points --------------------------
-
-    @app_commands.command(
-        name="autoresponse",
-        description="Manage this server's auto-response triggers (admin)")
-    @app_commands.default_permissions(manage_messages=True)
-    @app_commands.guild_only()
-    async def autoresponse(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "You do not have permission to use this command.", ephemeral=True)
-            return
-        view = AutoResponseView(self, interaction.user, interaction.guild)
-        await interaction.response.send_message(
-            embed=view.render_embed(), view=view, ephemeral=True)
-        view.message = await interaction.original_response()
+    # ---- admin UI -------------------------------------------------------
 
     @commands.command(name="autoresponse", hidden=True)
     @commands.guild_only()
     @commands.check(is_admin)
     async def autoresponse_prefix(self, ctx):
-        """Prefix fallback for admins who can't see the slash command
-        (default_permissions hides it from members without Manage
-        Messages, which bot-admins don't necessarily hold)."""
+        """Open the auto-response panel. Prefix-only by design: panel
+        launchers gate on the bot's admin concept and stay out of the
+        public slash picker."""
         view = AutoResponseView(self, ctx.author, ctx.guild)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
 
@@ -352,7 +337,7 @@ class AutoResponseView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
             await interaction.response.send_message(
-                "This panel isn't yours — run /autoresponse to open your own.",
+                "This panel isn't yours — run !autoresponse to open your own.",
                 ephemeral=True)
             return False
         return True
@@ -363,7 +348,7 @@ class AutoResponseView(discord.ui.View):
         if self.message is not None:
             try:
                 await self.message.edit(
-                    content="Panel expired — run /autoresponse again.", view=self)
+                    content="Panel expired — run !autoresponse again.", view=self)
             except discord.HTTPException:
                 pass
 

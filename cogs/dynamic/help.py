@@ -6,11 +6,11 @@ reshaped. The ONLY grouping mechanism is the cog a command came from; no
 category abstraction to maintain.
 
 Visibility rules:
-- prefix commands: shown unless `hidden=True`
+- prefix commands: `hidden=True` ones (the admin/superadmin surface,
+  including every panel launcher) appear only for invokers passing
+  `is_admin`; everything else shows for everyone
 - slash commands: shown to everyone when they carry no default_permissions;
-  gated ones (admin panels) appear only for invokers passing `is_admin` —
-  matching Discord's own picker behavior of not advertising commands the
-  member can't run.
+  gated ones appear only for admin invokers.
 """
 import discord
 from discord import app_commands
@@ -56,7 +56,7 @@ def build_help_embed(bot, invoker_is_admin):
         cog = bot.cogs[cog_name]
         entries = []
         for cmd in sorted(cog.get_commands(), key=lambda c: c.name):
-            if cmd.hidden:
+            if cmd.hidden and not invoker_is_admin:
                 continue
             entries.append((f"!{cmd.name}", cmd.short_doc or ""))
         for ac in slash_by_cog.get(cog_name, []):

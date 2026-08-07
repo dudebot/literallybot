@@ -3,7 +3,7 @@ import glob
 import subprocess
 import discord
 from discord.ext import commands
-from discord import File, app_commands
+from discord import File
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
@@ -201,22 +201,17 @@ class Media(commands.Cog):
             self._cleanup_media_files(media_dir, file_name)
             return f'Unexpected error: {e}'
 
-    # ---- admin UI: single /media panel ----------------------------------
+    # ---- admin UI -------------------------------------------------------
 
-    @app_commands.command(
-        name="media",
-        description="Manage this server's media library (admin)")
-    @app_commands.default_permissions(manage_messages=True)
-    @app_commands.guild_only()
-    async def media_panel(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "You do not have permission to use this command.", ephemeral=True)
-            return
-        view = MediaView(self, interaction)
-        await interaction.response.send_message(
-            embed=view.render_embed(), view=view, ephemeral=True)
-        view.message = await interaction.original_response()
+    @commands.command(name="media", hidden=True)
+    @commands.guild_only()
+    @commands.check(is_admin)
+    async def media_panel(self, ctx):
+        """Open the media-library panel. Prefix-only by design: panel
+        launchers gate on the bot's admin concept and stay out of the
+        public slash picker."""
+        view = MediaView(self, ctx.author, ctx.guild)
+        view.message = await ctx.send(embed=view.render_embed(), view=view)
 
 
 class _AddMediaModal(discord.ui.Modal, title="Add media file"):
@@ -288,11 +283,11 @@ class _FileSelect(discord.ui.Select):
 class MediaView(discord.ui.View):
     """Single-invoker ephemeral panel: file list + Add / Delete (two-click)."""
 
-    def __init__(self, cog: Media, interaction: discord.Interaction):
+    def __init__(self, cog: Media, user, guild):
         super().__init__(timeout=180)
         self.cog = cog
-        self.guild = interaction.guild
-        self.invoker_id = interaction.user.id
+        self.guild = guild
+        self.invoker_id = user.id
         self.selected = None
         self.confirming = False   # armed delete: next click actually deletes
         self.message = None
@@ -393,7 +388,7 @@ class MediaView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
             await interaction.response.send_message(
-                "This panel isn't yours — run /media to open your own.",
+                "This panel isn't yours — run !media to open your own.",
                 ephemeral=True)
             return False
         return True
@@ -404,7 +399,7 @@ class MediaView(discord.ui.View):
         if self.message is not None:
             try:
                 await self.message.edit(
-                    content="Panel expired — run /media again.", view=self)
+                    content="Panel expired — run !media again.", view=self)
             except discord.HTTPException:
                 pass
 

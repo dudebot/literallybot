@@ -1,5 +1,4 @@
 from discord.ext import commands
-from discord import app_commands
 import discord
 from sys import version_info as sysv
 import subprocess
@@ -353,19 +352,23 @@ class Dev(commands.Cog):
             self.logger.error("Error during shutdown", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
-    @app_commands.command(
-        name="cogs",
-        description="Manage dynamic cogs: enable, disable, reload (superadmin)")
-    @app_commands.default_permissions()
-    async def cogs_panel(self, interaction: discord.Interaction):
-        if not is_superadmin(interaction):
-            await interaction.response.send_message(
-                "Superadmin only.", ephemeral=True)
-            return
-        view = CogsView(self, interaction)
-        await interaction.response.send_message(
-            embed=view.render_embed(), view=view, ephemeral=True)
-        view.message = await interaction.original_response()
+    @commands.command(name="cogs", hidden=True)
+    @commands.check(is_superadmin)
+    async def cogs_panel(self, ctx):
+        """Open the cog-management panel (enable/disable/reload).
+        Prefix-only by design: superadmin surfaces stay out of the public
+        slash picker entirely."""
+        view = CogsView(self, ctx.author)
+        view.message = await ctx.send(embed=view.render_embed(), view=view)
+
+    @commands.command(name="config", hidden=True)
+    @commands.check(is_superadmin)
+    async def config_panel(self, ctx):
+        """Open the global-config editor panel. Prefix-only and superadmin:
+        global state must be reachable regardless of the invoker's Discord
+        permissions in whatever server they happen to be standing in."""
+        view = ConfigView(self, ctx.author)
+        view.message = await ctx.send(embed=view.render_embed(), view=view)
 
     @commands.command(name='sync', hidden=True)
     @commands.check(is_superadmin)
@@ -405,11 +408,11 @@ class CogsView(discord.ui.View):
     """Superadmin panel over the disabled_cogs machinery: the slash-native
     face of !disable/!enable/!reload. Single-invoker, ephemeral."""
 
-    def __init__(self, dev_cog, interaction: discord.Interaction):
+    def __init__(self, dev_cog, user):
         super().__init__(timeout=180)
         self.dev = dev_cog
         self.bot = dev_cog.bot
-        self.invoker_id = interaction.user.id
+        self.invoker_id = user.id
         self.selected = None
         self.message = None
         self._flash = None
@@ -552,7 +555,7 @@ class CogsView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
             await interaction.response.send_message(
-                "This panel isn't yours — run /cogs to open your own.",
+                "This panel isn't yours — run !cogs to open your own.",
                 ephemeral=True)
             return False
         return True
@@ -563,7 +566,220 @@ class CogsView(discord.ui.View):
         if self.message is not None:
             try:
                 await self.message.edit(
-                    content="Panel expired — run /cogs again.", view=self)
+                    content="Panel expired — run !cogs again.", view=self)
+            except discord.HTTPException:
+                pass
+
+
+# Key-name fragments whose global values are secrets: masked in every
+# render and never prefilled into the edit modal.
+_SECRET_KEY_FRAGMENTS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
+
+
+def _is_secret_key(key):
+    return any(fragment in key.upper() for fragment in _SECRET_KEY_FRAGMENTS)
+
+
+class _ConfigValueModal(discord.ui.Modal):
+    """Set a global config key. Values are JSON — strings need quotes."""
+
+    def __init__(self, panel: "ConfigView", key=None):
+        super().__init__(title=f"Edit {key}"[:45] if key else "Add global key")
+        self._panel = panel
+        import json
+        if key is None:
+            current = ""
+        elif _is_secret_key(key):
+            current = ""   # never surface a stored secret, even to its editor
+        else:
+            current = json.dumps(self._panel.bot.config.get_global(key), indent=None)
+        self.key_input = discord.ui.TextInput(
+            label="Key", required=True, max_length=100, default=key or "")
+        self.value_input = discord.ui.TextInput(
+            label='Value (JSON: "text", 42, true, [1,2], {...})',
+            style=discord.TextStyle.paragraph, required=True, max_length=4000,
+            default=current[:4000])
+        self.add_item(self.key_input)
+        self.add_item(self.value_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not is_superadmin(interaction):
+            await interaction.response.send_message("Superadmin only.", ephemeral=True)
+            return
+        import json
+        key = str(self.key_input.value).strip()
+        try:
+            value = json.loads(str(self.value_input.value))
+        except json.JSONDecodeError as e:
+            self._panel.flash(f"⚠ Value is not valid JSON ({e}) — nothing saved. "
+                              'Strings need quotes: "like this".')
+            await self._panel.rerender(interaction)
+            return
+        self._panel.bot.config.set_global(key, value)
+        self._panel.selected = key
+        self._panel.flash(f"Saved `{key}`.")
+        self._panel.bot.logger.info(
+            f"{interaction.user} set global config key {key} via !config")
+        await self._panel.rerender(interaction)
+
+
+class _ConfigKeySelect(discord.ui.Select):
+    def __init__(self, panel: "ConfigView"):
+        self._panel = panel
+        keys = panel.keys()
+        options = [
+            discord.SelectOption(label=k[:100], value=k,
+                                 description=panel.preview(k)[:100],
+                                 default=(k == panel.selected))
+            for k in keys[:25]
+        ]
+        if not options:
+            options = [discord.SelectOption(label="(no keys)", value="_none")]
+        placeholder = "Select a key"
+        if len(keys) > 25:
+            placeholder += f" (first 25 of {len(keys)})"
+        super().__init__(placeholder=placeholder, min_values=0, max_values=1,
+                         options=options, disabled=not keys, row=0)
+
+    async def callback(self, interaction: discord.Interaction):
+        self._panel.selected = self.values[0] if self.values else None
+        self._panel.confirming = False
+        await self._panel.rerender(interaction)
+
+
+class ConfigView(discord.ui.View):
+    """Superadmin editor over configs/global.json. Values render as JSON;
+    secret-looking keys are masked and never prefilled. Deleting requires a
+    second, relabeled click."""
+
+    def __init__(self, dev_cog, user):
+        super().__init__(timeout=180)
+        self.dev = dev_cog
+        self.bot = dev_cog.bot
+        self.invoker_id = user.id
+        self.selected = None
+        self.confirming = False
+        self.message = None
+        self._flash = None
+        self._build()
+
+    def keys(self):
+        return sorted(self.bot.config.global_keys())
+
+    def preview(self, key):
+        import json
+        if _is_secret_key(key):
+            return "••••••"
+        try:
+            return json.dumps(self.bot.config.get_global(key))
+        except (TypeError, ValueError):
+            return str(self.bot.config.get_global(key))
+
+    def flash(self, text):
+        self._flash = text
+
+    def _build(self):
+        self.clear_items()
+        keys = self.keys()
+        if self.selected not in keys:
+            self.selected = None
+            self.confirming = False
+        self.add_item(_ConfigKeySelect(self))
+        add_btn = discord.ui.Button(label="➕ Add", style=discord.ButtonStyle.primary, row=1)
+        edit_btn = discord.ui.Button(label="✏ Edit", style=discord.ButtonStyle.secondary,
+                                     row=1, disabled=self.selected is None)
+        del_label = "⚠ Confirm delete" if self.confirming else "🗑 Delete"
+        del_btn = discord.ui.Button(label=del_label, style=discord.ButtonStyle.danger,
+                                    row=1, disabled=self.selected is None)
+
+        async def add_cb(interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message("Superadmin only.", ephemeral=True)
+                return
+            await interaction.response.send_modal(_ConfigValueModal(self))
+
+        async def edit_cb(interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message("Superadmin only.", ephemeral=True)
+                return
+            if self.selected is None:
+                await interaction.response.send_message("Select a key first.", ephemeral=True)
+                return
+            await interaction.response.send_modal(_ConfigValueModal(self, key=self.selected))
+
+        async def del_cb(interaction):
+            if not is_superadmin(interaction):
+                await interaction.response.send_message("Superadmin only.", ephemeral=True)
+                return
+            if self.selected is None:
+                await interaction.response.send_message("Select a key first.", ephemeral=True)
+                return
+            if not self.confirming:
+                self.confirming = True
+                self.flash(f"Click **⚠ Confirm delete** to remove `{self.selected}`.")
+                await self.rerender(interaction)
+                return
+            target = self.selected
+            self.bot.config.rem(None, target, scope="global")
+            self.bot.logger.info(
+                f"{interaction.user} deleted global config key {target} via !config")
+            self.selected = None
+            self.confirming = False
+            self.flash(f"Deleted `{target}`.")
+            await self.rerender(interaction)
+
+        add_btn.callback = add_cb
+        edit_btn.callback = edit_cb
+        del_btn.callback = del_cb
+        self.add_item(add_btn)
+        self.add_item(edit_btn)
+        self.add_item(del_btn)
+
+    def render_embed(self):
+        keys = self.keys()
+        e = discord.Embed(
+            title="Global config",
+            description="configs/global.json — every server this bot is in "
+                        "reads these. Values are JSON; secret-looking keys "
+                        "are masked.",
+            color=discord.Color.blurple(),
+        )
+        if keys:
+            lines = [f"`{k}` = {self.preview(k)[:80]}" for k in keys]
+            body = "\n".join(lines)
+            e.add_field(name=f"Keys ({len(keys)})",
+                        value=body[:1010] + ("\n… (more)" if len(body) > 1010 else ""),
+                        inline=False)
+        else:
+            e.add_field(name="Keys", value="*empty*", inline=False)
+        if self._flash:
+            e.add_field(name="Last action", value=self._flash[:1024], inline=False)
+            self._flash = None
+        e.set_footer(text="Panel expires after 3 minutes of inactivity.")
+        return e
+
+    async def rerender(self, interaction: discord.Interaction):
+        self._build()
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=self.render_embed(), view=self)
+        else:
+            await interaction.response.edit_message(embed=self.render_embed(), view=self)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.invoker_id:
+            await interaction.response.send_message(
+                "This panel isn't yours — run !config to open your own.",
+                ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(
+                    content="Panel expired — run !config again.", view=self)
             except discord.HTTPException:
                 pass
 

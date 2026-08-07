@@ -59,11 +59,14 @@ Where new code should land, so seams don't re-greed:
   are coupled into one file. gpt.py owns ALL AI surface — chat paths, `_do_*`
   helpers, and the `/aisettings` panel (the former ai_admin.py was merged
   back in). Remaining parked seam: memory capture could be its own cog.
-- **Admin slash surfaces are panels, not command sets**: one command opening
-  an ephemeral single-invoker View (`/aisettings`, `/autoresponse`, `/media`,
-  `/cogs`), with `@app_commands.default_permissions(...)` hiding it from
-  regular members Discord-side and `is_admin`/`is_superadmin` as the real
-  runtime boundary. Superadmin-only controls are OMITTED from the render for
+- **Admin surfaces are panels behind hidden `!` commands** (`!aisettings`,
+  `!autoresponse`, `!media`, `!cogs`, `!config`): single-invoker Views gated
+  by `is_admin`/`is_superadmin` — the BOT's admin concept, independent of
+  the invoker's Discord permissions in whichever server they stand in.
+  Slash commands are reserved for parameterized one-liners where the typed
+  arg UI earns its place (`/role`) and truly public commands (`/help`) — so
+  the slash picker never advertises admin machinery to regular members.
+  Superadmin-only controls are OMITTED from a panel's render for
   non-superadmins (dynamic panel), not merely disabled.
 - Other parked (real-but-leave-it): error-handler module globals -> instance on
   bot; `LLMClient.has_api_key()` helper to dedupe key-presence checks.

@@ -1266,27 +1266,14 @@ class Gpt(commands.Cog):
             self.logger.info("gpt: seeded cost_per_mtok_output on %d model(s)",
                              seeded)
 
-    @app_commands.command(
-        name="aisettings",
-        description="Open the AI settings panel for this server (admin)")
-    @app_commands.default_permissions(manage_messages=True)
-    @app_commands.guild_only()
-    async def aisettings(self, interaction: discord.Interaction):
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "You do not have permission to use this command.", ephemeral=True)
-            return
-        view = AiSettingsView(self, interaction.user, interaction.guild)
-        await interaction.response.send_message(view=view, ephemeral=True)
-        view.message = await interaction.original_response()
-
     @commands.command(name="aisettings", hidden=True)
     @commands.guild_only()
     @commands.check(is_admin)
     async def aisettings_prefix(self, ctx):
-        """Prefix fallback for admins who can't see the slash command
-        (default_permissions hides it from members without Manage Messages,
-        which bot-admins don't necessarily hold)."""
+        """Open the AI settings panel. Deliberately a prefix command, not a
+        slash command: panel launchers gate on the BOT's admin concept, and
+        keeping them out of the slash picker keeps the bot's public surface
+        clean (slash is reserved for parameterized one-liners and /help)."""
         view = AiSettingsView(self, ctx.author, ctx.guild)
         view.message = await ctx.send(view=view)
 
@@ -2041,7 +2028,7 @@ class AiSettingsView(discord.ui.LayoutView):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
             await interaction.response.send_message(
-                "This panel isn't yours — run `/aisettings` to open your own.",
+                "This panel isn't yours — run `!aisettings` to open your own.",
                 ephemeral=True)
             return False
         return True

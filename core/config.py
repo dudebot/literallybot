@@ -128,6 +128,14 @@ class Config:
         this rather than reaching into the private storage dicts."""
         return [int(cid) for cid in self._configs if cid.isdigit()]
 
+    def global_keys(self):
+        """All keys currently present in the global config — the public
+        key-enumeration API (same contract as guild_ids: never scan the
+        private storage dicts)."""
+        config_id = self._resolve_config_id(None, 'global')
+        with self._data_lock:
+            return list(self._configs.get(config_id, {}).keys())
+
     def get(self, ctx, key, default=None, scope='guild'):
         """Get a config value from guild, user, or global scope. Read-only - does not persist defaults."""
         config_id = self._resolve_config_id(ctx, scope)
