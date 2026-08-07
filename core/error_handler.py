@@ -401,6 +401,20 @@ async def handle_app_command_error(bot, interaction, error: Exception):
     except Exception as log_error:
         bot.logger.error(f"Failed to log slash command error to Discord: {log_error}", exc_info=True)
 
+    # Always give the user *some* acknowledgement: a command that raised
+    # before its first ack shows "The application did not respond", and one
+    # that raised after a defer hangs on "thinking..." forever.
+    try:
+        message = "❌ Something went wrong running that command. The error has been logged."
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except (discord.InteractionResponded, discord.HTTPException):
+        # Token expired (10062), already acked elsewhere, or channel gone —
+        # nothing further we can do for the user.
+        pass
+
 
 async def handle_event_error(bot, event: str, *args, **kwargs):
     """
