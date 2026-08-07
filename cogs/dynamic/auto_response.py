@@ -1,17 +1,17 @@
-"""Config-driven auto-responses: weighted canned replies to exact messages.
+"""Config-driven auto-responses: canned replies (and optional auto-delete)
+for message patterns — the meme graph and a lightweight keyword automod in
+one table.
 
-Replaces the hardcoded reddit-meme reply graph with a per-guild trigger
-table. Guild config key `auto_responses` — list of entries:
+Guild config key `auto_responses` — list of entries:
 
-    {"triggers": ["cope"],                  # aliases, case-insensitive
-     "responses": ["yikes", ["rare", 2]]}   # str = weight 1, [text, weight]
-                                            # = relative weight
+    {"triggers": ["cope"],            # aliases, case-insensitive, CSV in UI
+     "responses": ["yikes", "cringe"],# one picked uniformly at random
+     "full_match": true,              # false = fires on substring anywhere
+     "auto_delete": false}            # true = delete the triggering message
 
-One response is chosen by relative weight — e.g. Yes 49 / No 49 /
-"those are bad answers" 2. Absent/empty key = inert in that guild
-(default OFF everywhere; enable with /autoresponse add). First matching
-entry wins, in config order. Matching is whole-message exact only — this
-cog never answers prefixed commands (that's interrogative/media territory).
+Absent/empty key = inert in that guild (default OFF everywhere; manage with
+/autoresponse or !autoresponse). First matching entry wins, in config
+order. Capped at 25 entries per guild — the panel dropdown's hard limit.
 
 Loop safety: ALL bot-authored messages are ignored (message.author.bot),
 not just our own — two bots both running this cog once replied to each
@@ -24,84 +24,40 @@ import random
 
 from core.utils import is_admin
 
+MAX_ENTRIES = 25  # Discord select-menu option cap
 
-def _weighted(responses):
-    """(texts, weights) from mixed str / [text, weight] response entries.
-    Malformed weights fall back to 1 rather than killing the entry."""
-    texts, weights = [], []
-    for r in responses:
+
+def _response_texts(responses):
+    """Plain response strings; tolerates the short-lived [text, weight]
+    shape by taking the text and ignoring the weight."""
+    out = []
+    for r in responses or []:
         if isinstance(r, (list, tuple)) and r:
-            text = str(r[0])
-            try:
-                weight = float(r[1]) if len(r) > 1 else 1.0
-            except (TypeError, ValueError):
-                weight = 1.0
-        else:
-            text, weight = str(r), 1.0
-        if weight > 0:
-            texts.append(text)
-            weights.append(weight)
-    return texts, weights
+            out.append(str(r[0]))
+        elif r is not None and str(r).strip():
+            out.append(str(r))
+    return out
 
 
 def find_response(entries, content):
-    """The weighted-random response for the first entry matching `content`,
-    else None. Pure function of (config entries, message text) so the
-    matching rules stay unit-testable without a bot."""
+    """(entry, response) for the first entry matching `content`, else None.
+
+    full_match entries equal the whole (case-folded, stripped) message;
+    non-full entries fire on a substring hit anywhere in it. Pure function
+    of (config entries, message text) so the rules stay unit-testable."""
     text = content.strip().lower()
     for entry in entries:
         triggers = [str(t).lower() for t in entry.get("triggers", [])]
-        texts, weights = _weighted(entry.get("responses") or [])
+        texts = _response_texts(entry.get("responses"))
         if not triggers or not texts:
             continue
-        if text in triggers:
-            return random.choices(texts, weights=weights)[0]
+        if entry.get("full_match", True):
+            hit = text in triggers
+        else:
+            hit = any(t in text for t in triggers)
+        if hit:
+            return entry, random.choice(texts)
     return None
-
-
-def _format_responses(responses, limit=120):
-    parts = []
-    for r in responses:
-        if isinstance(r, (list, tuple)) and r:
-            parts.append(f"{r[0]}×{r[1]:g}" if len(r) > 1 else str(r[0]))
-        else:
-            parts.append(str(r))
-    out = ", ".join(parts)
-    return out[:limit - 3] + "..." if len(out) > limit else out
-
-
-def responses_to_syntax(responses):
-    """Config response entries -> the modal's editable 'a | b::2' syntax
-    (inverse of parse_responses)."""
-    parts = []
-    for r in responses:
-        if isinstance(r, (list, tuple)) and r:
-            parts.append(f"{r[0]}::{r[1]:g}" if len(r) > 1 else str(r[0]))
-        else:
-            parts.append(str(r))
-    return " | ".join(parts)
-
-
-def parse_responses(raw):
-    """'Yes::49 | No::49 | bad::2' -> config response entries.
-    `::weight` suffix optional; plain text = weight 1."""
-    out = []
-    for part in raw.split("|"):
-        part = part.strip()
-        if not part:
-            continue
-        if "::" in part:
-            text, _, tail = part.rpartition("::")
-            text = text.strip()
-            try:
-                weight = float(tail.strip())
-            except ValueError:
-                text, weight = part, None
-            if text and weight is not None:
-                out.append([text, weight] if weight != 1 else text)
-                continue
-        out.append(part)
-    return out
 
 
 class AutoResponse(commands.Cog):
@@ -123,11 +79,20 @@ class AutoResponse(commands.Cog):
         entries = self._entries(message.guild.id)
         if not entries:
             return
-        response = find_response(entries, message.content)
-        if response is not None:
-            await message.channel.send(response)
+        found = find_response(entries, message.content)
+        if not found:
+            return
+        entry, response = found
+        if entry.get("auto_delete"):
+            try:
+                await message.delete()
+            except (discord.Forbidden, discord.HTTPException) as e:
+                self.logger.warning(
+                    f"auto_responses: couldn't delete message {message.id} "
+                    f"in guild {message.guild.id}: {e}")
+        await message.channel.send(response)
 
-    # ---- admin UI: single /autoresponse panel ---------------------------
+    # ---- admin UI: one panel, two entry points --------------------------
 
     @app_commands.command(
         name="autoresponse",
@@ -139,38 +104,76 @@ class AutoResponse(commands.Cog):
             await interaction.response.send_message(
                 "You do not have permission to use this command.", ephemeral=True)
             return
-        view = AutoResponseView(self, interaction)
+        view = AutoResponseView(self, interaction.user, interaction.guild)
         await interaction.response.send_message(
             embed=view.render_embed(), view=view, ephemeral=True)
         view.message = await interaction.original_response()
 
+    @commands.command(name="autoresponse", hidden=True)
+    @commands.guild_only()
+    @commands.check(is_admin)
+    async def autoresponse_prefix(self, ctx):
+        """Prefix fallback for admins who can't see the slash command
+        (default_permissions hides it from members without Manage
+        Messages, which bot-admins don't necessarily hold)."""
+        view = AutoResponseView(self, ctx.author, ctx.guild)
+        view.message = await ctx.send(embed=view.render_embed(), view=view)
+
 
 class _EntryModal(discord.ui.Modal):
     """Add a new entry, or edit the one selected in the panel."""
+
+    _MATCH_FULL = "full"
+    _MATCH_CONTAINS = "contains"
+    _ACT_REPLY = "reply"
+    _ACT_DELETE = "reply_delete"
 
     def __init__(self, panel: "AutoResponseView", *, index=None):
         self._panel = panel
         self._index = index
         if index is None:
             super().__init__(title="Add auto-response")
-            triggers_default = ""
-            responses_default = ""
+            entry = {}
         else:
             entry = panel.entries()[index]
             super().__init__(title=f"Edit: {', '.join(entry.get('triggers', []))}"[:45])
-            triggers_default = ", ".join(entry.get("triggers", []))
-            responses_default = responses_to_syntax(entry.get("responses", []))
         self.triggers = discord.ui.TextInput(
-            label="Triggers (comma-separated, whole message)",
-            required=True, max_length=200, default=triggers_default,
+            label="Triggers (comma-separated)",
+            required=True, max_length=200,
+            default=", ".join(entry.get("triggers", [])),
             placeholder="cope, copes")
         self.responses = discord.ui.TextInput(
-            label="Responses — a | b::weight (weight optional)",
+            label="Responses (comma-separated, one is picked)",
             style=discord.TextStyle.paragraph,
-            required=True, max_length=1000, default=responses_default,
-            placeholder="Yes::49 | No::49 | those are bad answers::2")
+            required=True, max_length=1000,
+            default=", ".join(_response_texts(entry.get("responses"))),
+            placeholder="have sex, yikes, cringe")
+        full = entry.get("full_match", True)
+        self.match = discord.ui.Select(min_values=1, max_values=1, options=[
+            discord.SelectOption(
+                label="Full message", value=self._MATCH_FULL,
+                description="Fires only when the whole message equals a trigger",
+                default=full),
+            discord.SelectOption(
+                label="Contains", value=self._MATCH_CONTAINS,
+                description="Fires when a trigger appears anywhere (keyword/automod)",
+                default=not full),
+        ])
+        delete = bool(entry.get("auto_delete", False))
+        self.action = discord.ui.Select(min_values=1, max_values=1, options=[
+            discord.SelectOption(
+                label="Reply", value=self._ACT_REPLY,
+                description="Post the response, leave the message",
+                default=not delete),
+            discord.SelectOption(
+                label="Reply + delete their message", value=self._ACT_DELETE,
+                description="Needs the bot to have Manage Messages",
+                default=delete),
+        ])
         self.add_item(self.triggers)
         self.add_item(self.responses)
+        self.add_item(discord.ui.Label(text="Matching", component=self.match))
+        self.add_item(discord.ui.Label(text="On match", component=self.action))
 
     async def on_submit(self, interaction: discord.Interaction):
         if not is_admin(interaction):
@@ -178,16 +181,27 @@ class _EntryModal(discord.ui.Modal):
             return
         trigger_list = [t.strip().lower()
                         for t in str(self.triggers.value).split(",") if t.strip()]
-        response_list = parse_responses(str(self.responses.value))
+        response_list = [r.strip()
+                         for r in str(self.responses.value).split(",") if r.strip()]
         if not trigger_list or not response_list:
             self._panel.flash("⚠ Need at least one trigger and one response — nothing saved.")
             await self._panel.rerender(interaction)
             return
-        entry = {"triggers": trigger_list, "responses": response_list}
+        entry = {
+            "triggers": trigger_list,
+            "responses": response_list,
+            "full_match": (self.match.values[0] if self.match.values
+                           else self._MATCH_FULL) == self._MATCH_FULL,
+            "auto_delete": (self.action.values[0] if self.action.values
+                            else self._ACT_REPLY) == self._ACT_DELETE,
+        }
         entries = self._panel.entries()
         if self._index is None:
+            if len(entries) >= MAX_ENTRIES:
+                self._panel.flash(f"⚠ Entry cap ({MAX_ENTRIES}) reached — remove one first.")
+                await self._panel.rerender(interaction)
+                return
             entries.append(entry)
-            self._panel.selected = len(entries) - 1
             self._panel.flash(f"Added: {', '.join(trigger_list)}")
         else:
             entries[self._index] = entry
@@ -204,10 +218,10 @@ class _EntrySelect(discord.ui.Select):
             discord.SelectOption(
                 label=", ".join(e.get("triggers", ["?"]))[:100],
                 value=str(i),
-                description=_format_responses(e.get("responses", []), limit=100),
+                description=", ".join(_response_texts(e.get("responses")))[:100],
                 default=(i == panel.selected),
             )
-            for i, e in enumerate(entries[:25])
+            for i, e in enumerate(entries[:MAX_ENTRIES])
         ]
         if not options:
             options = [discord.SelectOption(label="(no entries)", value="_none")]
@@ -221,13 +235,13 @@ class _EntrySelect(discord.ui.Select):
 
 
 class AutoResponseView(discord.ui.View):
-    """Single-invoker ephemeral panel: entry select + Add/Edit/Remove."""
+    """Single-invoker panel: entry select + Add/Edit/Remove."""
 
-    def __init__(self, cog: AutoResponse, interaction: discord.Interaction):
+    def __init__(self, cog: AutoResponse, user, guild):
         super().__init__(timeout=180)
         self.cog = cog
-        self.guild = interaction.guild
-        self.invoker_id = interaction.user.id
+        self.guild = guild
+        self.invoker_id = user.id
         self.selected = None
         self.message = None
         self._flash = None
@@ -257,6 +271,11 @@ class AutoResponseView(discord.ui.View):
         async def add_cb(interaction):
             if not is_admin(interaction):
                 await interaction.response.send_message("Admins only.", ephemeral=True)
+                return
+            if len(self.entries()) >= MAX_ENTRIES:
+                await interaction.response.send_message(
+                    f"Entry cap ({MAX_ENTRIES}) reached — remove one first.",
+                    ephemeral=True)
                 return
             await interaction.response.send_modal(_EntryModal(self))
 
@@ -294,18 +313,24 @@ class AutoResponseView(discord.ui.View):
         entries = self.entries()
         e = discord.Embed(
             title="Auto-responses",
-            description=(f"Exact whole-message triggers for **{self.guild.name}**. "
-                         "Responses are picked by relative weight."),
+            description=(f"Triggers for **{self.guild.name}** — full-message "
+                         "or contains matching, optional auto-delete."),
             color=discord.Color.blurple(),
         )
         if entries:
-            lines = [
-                f"{'▸ ' if i == self.selected else ''}**{', '.join(en.get('triggers', []))}** → "
-                f"{_format_responses(en.get('responses', []))}"
-                for i, en in enumerate(entries)
-            ]
+            lines = []
+            for en in entries:
+                tags = []
+                if not en.get("full_match", True):
+                    tags.append("contains")
+                if en.get("auto_delete"):
+                    tags.append("deletes")
+                tag_str = f" ({', '.join(tags)})" if tags else ""
+                lines.append(
+                    f"**{', '.join(en.get('triggers', []))}**{tag_str} → "
+                    f"{', '.join(_response_texts(en.get('responses')))[:80]}")
             body = "\n".join(lines)
-            e.add_field(name=f"Entries ({len(entries)})",
+            e.add_field(name=f"Entries ({len(entries)}/{MAX_ENTRIES})",
                         value=body[:1010] + ("\n… (more)" if len(body) > 1010 else ""),
                         inline=False)
         else:

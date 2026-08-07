@@ -339,6 +339,12 @@ class Op:
     # and can't drift out of sync with the enabled-tool set. Distinct from
     # `description`, which rides inside the function schema itself.
     agent_guidance: Optional[str] = None
+    # Part of the in-guild agent surface (the /aisettings Bot-tools set).
+    # The MCP surface is always the whole registry; the agent surface is the
+    # subset safe for a guild-confined, user-actored loop — declared HERE so
+    # frontends derive their universes from the registry instead of keeping
+    # parallel name lists.
+    agent: bool = False
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
         allowed, reason = _check_permission(ctx, self.permission)
@@ -663,7 +669,8 @@ class OpsRegistry:
     def op(self, name: str, description: str, permission: PermissionLevel,
            params: Optional[List[OpParam]] = None,
            serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
-           agent_guidance: Optional[str] = None):
+           agent_guidance: Optional[str] = None,
+           agent: bool = False):
         """Decorator: `@registry.op("name", "...", PermissionLevel.ADMIN)`
         registers an `async def impl(ctx, **kwargs)` under `name`."""
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -674,7 +681,7 @@ class OpsRegistry:
             self._ops[name] = Op(
                 name=name, description=description, permission=permission,
                 impl=func, params=params or [], serialize=serialize,
-                agent_guidance=agent_guidance,
+                agent_guidance=agent_guidance, agent=agent,
             )
             return func
         return decorator
@@ -696,6 +703,10 @@ class OpsRegistry:
 
     def names(self) -> List[str]:
         return list(self._ops.keys())
+
+    def agent_names(self) -> List[str]:
+        """Ops flagged for the in-guild agent surface (`agent=True`)."""
+        return [name for name, op in self._ops.items() if op.agent]
 
     async def call(self, op_name: str, ctx: OpContext, **kwargs) -> OpResult:
         op = self._ops.get(op_name)
@@ -841,6 +852,7 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
         "follow-up edits or reactions, and use reference_message_id to reply "
         "to a message. Your final text reply is posted to the current channel "
         "automatically — never duplicate it with send_message."),
+    agent=True
 )
 async def send_message(ctx: OpContext, channel, content: str = "",
                        reference_message_id: Optional[int] = None,
@@ -887,6 +899,7 @@ async def send_message(ctx: OpContext, channel, content: str = "",
         OpParam("content", ParamKind.STRING, "Replacement message text."),
     ],
     serialize=lambda m: {"message_id": m.id},
+    agent=True
 )
 async def edit_message(ctx: OpContext, message, content: str):
     return await message.edit(content=content)
@@ -901,6 +914,7 @@ async def edit_message(ctx: OpContext, message, content: str):
     agent_guidance=(
         "delete_message requires the invoking user to be a bot admin; if the "
         "tool returns a permission error, relay that plainly."),
+    agent=True
 )
 async def delete_message(ctx: OpContext, message):
     await message.delete()
@@ -920,6 +934,7 @@ async def delete_message(ctx: OpContext, message):
         "add_reaction needs a literal unicode emoji character (💩, 💨, ❤️) or "
         "name:id for custom emoji — never a word or description. ('fart' and "
         "'-' are invalid; the fart/dash emoji is 💨.)"),
+    agent=True
 )
 async def add_reaction(ctx: OpContext, message, emoji: str):
     await message.add_reaction(emoji)
@@ -941,6 +956,7 @@ async def add_reaction(ctx: OpContext, message, emoji: str):
     agent_guidance=(
         "remove_reaction only removes reactions the bot itself added, and "
         "takes the same literal-emoji form as add_reaction."),
+    agent=True
 )
 async def remove_reaction(ctx: OpContext, message, emoji: str):
     await message.remove_reaction(emoji, ctx.bot.user)
@@ -1068,6 +1084,7 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
         "them raw. If the result carries a `note` about a fallback scan, "
         "only the most recent messages were checked — say so instead of "
         "claiming 'never'."),
+    agent=True
 )
 async def search_history(ctx: OpContext, guild=None, channels=None,
                           limit: int = 100,
@@ -1208,6 +1225,7 @@ async def list_guilds(ctx: OpContext):
         "Channel ids must come from list_channels or the visible context — "
         "NEVER guess or invent an id. When the user names channels (e.g. "
         "'check #memes'), call list_channels first to resolve names to ids."),
+    agent=True
 )
 async def list_channels(ctx: OpContext, guild):
     return [
@@ -1237,6 +1255,7 @@ async def list_channels(ctx: OpContext, guild):
                 required=False, default=100, minimum=1, maximum=1000),
     ],
     serialize=lambda ms: {"members": ms, "count": len(ms)},
+    agent=True
 )
 async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
                        include_bots: bool = False, limit: int = 100):

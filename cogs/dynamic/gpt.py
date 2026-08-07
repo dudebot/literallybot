@@ -1014,9 +1014,14 @@ class Gpt(commands.Cog):
         if should_respond:
             question = cleaned_content.strip()
             if question:  # Ensure there's content
-                # Same DM gate as the removed !gpt prefix command had — a mention/reply in
-                # DM must not bypass the superadmin-only restriction.
-                if not ctx.guild and not is_superadmin(self.bot.config, ctx.author.id):
+                # Guild-only, full stop: DM chat is off for everyone until a
+                # deliberate DM story exists (quota control; owner decision
+                # 2026-08-07 — the conditioner replier/brooder flow is its
+                # own machinery, not this path).
+                if not ctx.guild:
+                    return
+                # Per-guild kill switch (/aisettings → Server config).
+                if not self.bot.config.get(ctx, "ai_enabled", True):
                     return
 
                 # Cooldown is enforced inside process_askgpt (per-model,
@@ -1265,28 +1270,40 @@ class Gpt(commands.Cog):
         name="aisettings",
         description="Open the AI settings panel for this server (admin)")
     @app_commands.default_permissions(manage_messages=True)
+    @app_commands.guild_only()
     async def aisettings(self, interaction: discord.Interaction):
         if not is_admin(interaction):
             await interaction.response.send_message(
                 "You do not have permission to use this command.", ephemeral=True)
             return
-        view = AiSettingsView(self, interaction)
-        await interaction.response.send_message(embed=view._embed(), view=view,
-                                                ephemeral=True)
+        view = AiSettingsView(self, interaction.user, interaction.guild)
+        await interaction.response.send_message(view=view, ephemeral=True)
         view.message = await interaction.original_response()
+
+    @commands.command(name="aisettings", hidden=True)
+    @commands.guild_only()
+    @commands.check(is_admin)
+    async def aisettings_prefix(self, ctx):
+        """Prefix fallback for admins who can't see the slash command
+        (default_permissions hides it from members without Manage Messages,
+        which bot-admins don't necessarily hold)."""
+        view = AiSettingsView(self, ctx.author, ctx.guild)
+        view.message = await ctx.send(view=view)
 
 
 # ==================== /aisettings PANEL ====================
 #
-# Dynamic by invoker tier: admins see the Server and Bot-tools pages;
-# superadmins additionally get Models & Providers (the global catalog) and
-# MCP tools. Every mutating callback re-checks its gate server-side —
-# hidden/disabled controls are only cosmetic.
+# Components-V2 LayoutView so the page tabs render ABOVE the text and the
+# text above the dropdowns (embeds always render above components; the v2
+# layout is what makes this ordering possible). Dynamic by invoker tier:
+# admins get Server config; superadmins additionally get Models & Providers
+# and MCP. Every mutating callback re-checks its gate server-side — hidden
+# or disabled controls are only cosmetic.
 
 class _ToolSelect(discord.ui.Select):
     """A multi-select over a fixed op universe, wired to save on change."""
 
-    def __init__(self, universe, current, on_save, *, row=1):
+    def __init__(self, universe, current, on_save):
         self._on_save = on_save
         current_set = set(current)
         options = [
@@ -1298,7 +1315,6 @@ class _ToolSelect(discord.ui.Select):
             min_values=0,
             max_values=len(options),
             options=options,
-            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1306,7 +1322,7 @@ class _ToolSelect(discord.ui.Select):
 
 
 class _ProviderSelect(discord.ui.Select):
-    def __init__(self, view: "AiSettingsView", *, row=1):
+    def __init__(self, view: "AiSettingsView"):
         self._panel = view
         providers = view.gpt.llm.get_all_providers()
         current = view.provider
@@ -1318,7 +1334,7 @@ class _ProviderSelect(discord.ui.Select):
             for pid, info in list(providers.items())[:25]
         ]
         super().__init__(placeholder="AI provider", min_values=1, max_values=1,
-                         options=options, row=row)
+                         options=options)
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin(interaction):
@@ -1326,12 +1342,11 @@ class _ProviderSelect(discord.ui.Select):
             return
         # _do_setprovider resets the model to the provider default.
         self._panel.gpt._do_setprovider(interaction, self.values[0])
-        self._panel.refresh_state()
         await self._panel.rerender(interaction)
 
 
 class _ModelSelect(discord.ui.Select):
-    def __init__(self, view: "AiSettingsView", *, row=2):
+    def __init__(self, view: "AiSettingsView"):
         self._panel = view
         providers = view.gpt.llm.get_all_providers()
         info = providers.get(view.provider, {})
@@ -1347,24 +1362,23 @@ class _ModelSelect(discord.ui.Select):
             options = [discord.SelectOption(label="(no models)", value="_none")]
             disabled = True
         super().__init__(placeholder="Model", min_values=1, max_values=1,
-                         options=options, row=row, disabled=disabled)
+                         options=options, disabled=disabled)
 
     async def callback(self, interaction: discord.Interaction):
         if not is_admin(interaction):
             await interaction.response.send_message("Requires admin.", ephemeral=True)
             return
         self._panel.gpt._do_setmodel(interaction, self.values[0])
-        self._panel.refresh_state()
         await self._panel.rerender(interaction)
 
 
 class _MgmtProviderSelect(discord.ui.Select):
     """Models & Providers page browse select: which provider is being managed.
-    Distinct from the Server page's _ProviderSelect, which switches the
-    guild's ACTIVE provider — this one only changes what the CRUD controls
-    point at."""
+    Distinct from the Server config page's _ProviderSelect, which switches
+    the guild's ACTIVE provider — this one only changes what the CRUD
+    controls point at."""
 
-    def __init__(self, view: "AiSettingsView", *, row=1):
+    def __init__(self, view: "AiSettingsView"):
         self._panel = view
         providers = view.gpt.llm.get_all_providers()
         options = [
@@ -1375,7 +1389,7 @@ class _MgmtProviderSelect(discord.ui.Select):
             for pid, info in list(providers.items())[:25]
         ]
         super().__init__(placeholder="Provider to manage", min_values=1,
-                         max_values=1, options=options, row=row)
+                         max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
         self._panel.mgmt_provider = self.values[0]
@@ -1387,7 +1401,7 @@ class _MgmtModelSelect(discord.ui.Select):
     """Models & Providers page browse select: which model the edit/remove/
     default buttons target. min_values=0 so it can be deselected."""
 
-    def __init__(self, view: "AiSettingsView", *, row=2):
+    def __init__(self, view: "AiSettingsView"):
         self._panel = view
         providers = view.gpt.llm.get_all_providers()
         models = list(providers.get(view.mgmt_provider, {}).get("models", {}).keys())
@@ -1402,7 +1416,7 @@ class _MgmtModelSelect(discord.ui.Select):
             options = [discord.SelectOption(label="(no models)", value="_none")]
             disabled = True
         super().__init__(placeholder="Model to edit / remove / make default",
-                         min_values=0, max_values=1, options=options, row=row,
+                         min_values=0, max_values=1, options=options,
                          disabled=disabled)
 
     async def callback(self, interaction: discord.Interaction):
@@ -1528,8 +1542,7 @@ class _ModelModal(discord.ui.Modal):
 
 
 class _ApiKeyModal(discord.ui.Modal, title="Set provider API key"):
-    """Key entry via modal — the value never appears in any channel, and the
-    panel (like the whole flow) is ephemeral."""
+    """Key entry via modal — the value never appears in any channel."""
 
     def __init__(self, view: "AiSettingsView"):
         super().__init__()
@@ -1599,7 +1612,6 @@ class _PersonalityModal(discord.ui.Modal, title="Set AI personality"):
 
     async def on_submit(self, interaction: discord.Interaction):
         self._panel.gpt._do_setpersonality(interaction, str(self.prompt.value))
-        self._panel.refresh_state()
         await self._panel.rerender(interaction)
 
 
@@ -1630,21 +1642,21 @@ def _fmt_secs(s: float) -> str:
     return f"{s / 3600:.1f}h"
 
 
-class AiSettingsView(discord.ui.View):
-    """Tabbed, ephemeral, single-invoker settings panel.
+class AiSettingsView(discord.ui.LayoutView):
+    """Tabbed, single-invoker settings panel (Components V2).
 
-    Dynamic by tier: admins get Server + Bot tools; superadmins additionally
-    get Models & Providers and MCP tools (global scope). Row 0 is always the
-    page tabs; rows 1+ are rebuilt per page on each render.
+    Render order per page: tab buttons, then the page text, then the
+    controls. Admins get Server config; superadmins additionally get
+    Models & Providers and MCP.
     """
 
-    def __init__(self, gpt_cog, interaction: discord.Interaction):
+    def __init__(self, gpt_cog, user, guild):
         super().__init__(timeout=PANEL_TIMEOUT)
         self.gpt = gpt_cog
         self.bot = gpt_cog.bot
-        self.invoker_id = interaction.user.id
-        self.is_super = is_superadmin(interaction)
-        self.guild = interaction.guild
+        self.invoker_id = user.id
+        self.is_super = is_superadmin(self.bot.config, user.id)
+        self.guild = guild
         self.page = "server"
         self.message = None
         self.mgmt_provider = None   # Models & Providers page browse state
@@ -1672,7 +1684,7 @@ class AiSettingsView(discord.ui.View):
                 self.mgmt_model = None
 
     def flash(self, text: str):
-        """Queue a status line shown once in the next embed render."""
+        """Queue a status line shown once in the next render."""
         self._flash = text
 
     def _cfg_ctx(self):
@@ -1685,6 +1697,9 @@ class AiSettingsView(discord.ui.View):
             return data.get("prompt")
         return None
 
+    def _ai_enabled(self):
+        return bool(self.bot.config.get(self._cfg_ctx(), "ai_enabled", True))
+
     def _bot_tools(self):
         # Same resolver the agent loop uses — the panel must show exactly
         # the effective set, never a private re-derivation of it.
@@ -1696,15 +1711,20 @@ class AiSettingsView(discord.ui.View):
         # universe default).
         return resolve_mcp_tools(self.bot.config)
 
-    # --- rendering -------------------------------------------------------
+    # --- layout ----------------------------------------------------------
+    def _row(self, *items):
+        row = discord.ui.ActionRow()
+        for item in items:
+            row.add_item(item)
+        return row
+
     def _tab_button(self, label, page):
         style = (discord.ButtonStyle.primary if self.page == page
                  else discord.ButtonStyle.secondary)
-        btn = discord.ui.Button(label=label, style=style, row=0)
+        btn = discord.ui.Button(label=label, style=style)
 
         async def cb(interaction: discord.Interaction, _page=page):
             self.page = _page
-            self._build()
             await self.rerender(interaction)
 
         btn.callback = cb
@@ -1712,68 +1732,166 @@ class AiSettingsView(discord.ui.View):
 
     def _build(self):
         self.clear_items()
-        self.add_item(self._tab_button("⚙ Server", "server"))
-        self.add_item(self._tab_button("🤖 Bot tools", "bot"))
+        if self.page in ("providers", "mcp") and not self.is_super:
+            self.page = "server"
+        tabs = [self._tab_button("⚙ Server config", "server")]
         if self.is_super:
             # Global-scope pages: invisible to non-superadmins, not merely
             # disabled — a guild admin shouldn't even see the catalog knobs.
-            self.add_item(self._tab_button("🧩 Models & Providers", "providers"))
-            self.add_item(self._tab_button("🌐 MCP tools", "mcp"))
-        if self.page in ("providers", "mcp") and not self.is_super:
-            self.page = "server"
+            tabs.append(self._tab_button("🧩 Models & Providers", "providers"))
+            tabs.append(self._tab_button("🌐 MCP", "mcp"))
+        self.add_item(self._row(*tabs))
+        self.add_item(discord.ui.TextDisplay(self._text()))
 
         if self.page == "server":
-            self.add_item(_ProviderSelect(self, row=1))
-            self.add_item(_ModelSelect(self, row=2))
-            self.add_item(self._personality_button())
-            self.add_item(self._nickname_button())
+            self.add_item(self._row(_ProviderSelect(self)))
+            self.add_item(self._row(_ModelSelect(self)))
+            self.add_item(self._row(_ToolSelect(list(AGENT_OPS), self._bot_tools(),
+                                                self._save_bot_tools)))
+            self.add_item(self._row(self._ai_toggle_button(),
+                                    self._personality_button(),
+                                    self._nickname_button()))
         elif self.page == "providers":
-            self.add_item(_MgmtProviderSelect(self, row=1))
-            self.add_item(_MgmtModelSelect(self, row=2))
+            self.add_item(self._row(_MgmtProviderSelect(self)))
+            self.add_item(self._row(_MgmtModelSelect(self)))
             has_model = self.mgmt_model is not None
             providers = self.gpt.llm.get_all_providers()
             is_default = has_model and providers.get(self.mgmt_provider, {}) \
                 .get("default_model") == self.mgmt_model
-            self.add_item(self._crud_button(
-                "➕ Add model", row=3,
-                opener=lambda: _ModelModal(self, edit=False)))
-            self.add_item(self._crud_button(
-                "✏ Edit model", row=3, disabled=not has_model,
-                opener=lambda: _ModelModal(self, edit=True)))
-            self.add_item(self._remove_model_button(disabled=not has_model))
-            self.add_item(self._default_model_button(
-                disabled=not has_model or is_default))
-            self.add_item(self._crud_button(
-                "➕ Add provider", row=4,
-                opener=lambda: _AddProviderModal(self)))
-            self.add_item(self._crud_button(
-                "🔑 Set API key", row=4,
-                opener=lambda: _ApiKeyModal(self)))
-            self.add_item(self._crud_button(
-                "🗑 Remove provider", row=4,
-                style=discord.ButtonStyle.danger,
-                opener=lambda: _RemoveProviderModal(self)))
-        elif self.page == "bot":
-            self.add_item(_ToolSelect(list(AGENT_OPS), self._bot_tools(),
-                                      self._save_bot_tools, row=1))
-            self.add_item(self._preset_button("Clear all (plain chat)",
-                                              self._save_bot_tools, []))
-            self.add_item(self._preset_button("Enable read-only set",
-                                              self._save_bot_tools,
-                                              list(_BOT_READONLY_OPS)))
+            self.add_item(self._row(
+                self._crud_button("➕ Add model",
+                                  opener=lambda: _ModelModal(self, edit=False)),
+                self._crud_button("✏ Edit model", disabled=not has_model,
+                                  opener=lambda: _ModelModal(self, edit=True)),
+                self._remove_model_button(disabled=not has_model),
+                self._default_model_button(disabled=not has_model or is_default),
+            ))
+            self.add_item(self._row(
+                self._crud_button("➕ Add provider",
+                                  opener=lambda: _AddProviderModal(self)),
+                self._crud_button("🔑 Set API key",
+                                  opener=lambda: _ApiKeyModal(self)),
+                self._crud_button("🗑 Remove provider",
+                                  style=discord.ButtonStyle.danger,
+                                  opener=lambda: _RemoveProviderModal(self)),
+            ))
         elif self.page == "mcp":
-            self.add_item(_ToolSelect(list(_EXPOSED_OPS), self._mcp_tools(),
-                                      self._save_mcp_tools, row=1))
-            self.add_item(self._preset_button("Clear all", self._save_mcp_tools, []))
-            self.add_item(self._preset_button("Enable read-only set",
-                                              self._save_mcp_tools,
-                                              [o for o in _EXPOSED_OPS
-                                               if o.startswith(("search", "list"))]))
-            self.add_item(self._mcp_server_toggle_button())
+            self.add_item(self._row(_ToolSelect(list(_EXPOSED_OPS), self._mcp_tools(),
+                                                self._save_mcp_tools)))
+            self.add_item(self._row(
+                self._preset_button("Clear all", self._save_mcp_tools, []),
+                self._preset_button("Enable read-only set", self._save_mcp_tools,
+                                    [o for o in _EXPOSED_OPS
+                                     if o.startswith(("search", "list"))]),
+                self._mcp_server_toggle_button(),
+            ))
+
+    # --- page text -------------------------------------------------------
+    def _text(self):
+        if self.page == "providers":
+            body = self._providers_text()
+        elif self.page == "mcp":
+            body = self._mcp_text()
+        else:
+            body = self._server_text()
+        if self._flash:
+            body += f"\n\n**Last action:** {self._flash[:500]}"
+            self._flash = None
+        return body[:3900]
+
+    def _server_text(self):
+        model_info = self.gpt._current_model_info(self._cfg_ctx())
+        bases, windows = self.gpt.cooldown_config()
+        tier, base = cooldown_tier_for_cost(
+            model_info.get("cost_per_mtok_output"), bases)
+        bot_tools = self._bot_tools()
+        rate = " · ".join(f"{c}/{_fmt_secs(m * base)}" for c, m in windows)
+        return (
+            f"## AI settings — {self.guild.name}\n"
+            f"**AI replies:** {'ON — mention or reply to the bot' if self._ai_enabled() else 'OFF'}\n"
+            f"**Provider / model:** {self.provider} / **{self.model}** ({tier}: {rate})\n"
+            f"**Bot tools here:** "
+            + (", ".join(bot_tools) if bot_tools else "*none — plain chat*")
+        )
+
+    def _providers_text(self):
+        all_providers = self.gpt.llm.get_all_providers()
+        pid = self.mgmt_provider
+        info = all_providers.get(pid, {})
+        default_model = info.get("default_model")
+        bases, _windows = self.gpt.cooldown_config()
+        rows = []
+        for m, mcfg in info.get("models", {}).items():
+            if not isinstance(mcfg, dict):
+                mcfg = {}
+            cost = mcfg.get("cost_per_mtok_output")
+            tier, _base = cooldown_tier_for_cost(cost, bases)
+            rows.append((
+                f"{m}{' (default)' if m == default_model else ''}",
+                "—" if cost is None else f"{cost:g}",
+                tier,
+                str(mcfg.get("max_completion_tokens", "—")),
+            ))
+        if rows:
+            name_w = max(len(r[0]) for r in rows)
+            cost_w = max(len("$/Mtok"), max(len(r[1]) for r in rows))
+            tier_w = max(len("tier"), max(len(r[2]) for r in rows))
+            header = f"{'model'.ljust(name_w)}  {'$/Mtok'.rjust(cost_w)}  {'tier'.ljust(tier_w)}  max_tok"
+            body_lines = [
+                f"{r[0].ljust(name_w)}  {r[1].rjust(cost_w)}  {r[2].ljust(tier_w)}  {r[3]}"
+                for r in rows
+            ]
+            table = "```\n" + "\n".join([header] + body_lines) + "\n```"
+            if len(table) > 1800:
+                table = table[:1780].rstrip() + "\n…```"
+        else:
+            table = "*no models*"
+        overview = " · ".join(
+            f"{p} {'✅' if self.gpt.provider_key_status(p, pi).startswith('✅') else '❌'}"
+            f" ({len(pi.get('models', {}))})"
+            for p, pi in all_providers.items()
+        )
+        return (
+            "## AI settings — Models & Providers\n"
+            "Global catalog — changes here affect every server this bot is in.\n"
+            f"**{info.get('name', pid)} ({pid})** — {info.get('base_url') or '*built-in provider*'}\n"
+            f"{table}\n"
+            f"**All providers (key · models):** {overview}"
+        )
+
+    def _mcp_text(self):
+        from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
+        mcp_on = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
+        return (
+            "## AI settings — MCP\n"
+            "The functions external agent harnesses can call when this bot "
+            "runs as an MCP server (loopback-only, bearer-token auth). The "
+            "dropdown below picks which ops are served.\n"
+            f"**MCP server:** {'ON' if mcp_on else 'OFF'} — changes take "
+            "effect on the next bot restart."
+        )
+
+    # --- buttons ---------------------------------------------------------
+    def _ai_toggle_button(self):
+        enabled = self._ai_enabled()
+        btn = discord.ui.Button(
+            label=f"💬 AI replies: {'ON' if enabled else 'OFF'}",
+            style=(discord.ButtonStyle.success if enabled
+                   else discord.ButtonStyle.danger))
+
+        async def cb(interaction: discord.Interaction):
+            if not is_admin(interaction):
+                await interaction.response.send_message("Requires admin.", ephemeral=True)
+                return
+            self.bot.config.set(self._cfg_ctx(), "ai_enabled", not self._ai_enabled())
+            await self.rerender(interaction)
+
+        btn.callback = cb
+        return btn
 
     def _personality_button(self):
         btn = discord.ui.Button(label="✏ Personality",
-                                style=discord.ButtonStyle.secondary, row=3)
+                                style=discord.ButtonStyle.secondary)
 
         async def cb(interaction: discord.Interaction):
             if not is_admin(interaction):
@@ -1786,15 +1904,11 @@ class AiSettingsView(discord.ui.View):
 
     def _nickname_button(self):
         btn = discord.ui.Button(label="🏷 Nickname",
-                                style=discord.ButtonStyle.secondary, row=3)
+                                style=discord.ButtonStyle.secondary)
 
         async def cb(interaction: discord.Interaction):
             if not is_admin(interaction):
                 await interaction.response.send_message("Requires admin.", ephemeral=True)
-                return
-            if not self.guild:
-                await interaction.response.send_message(
-                    "Nickname can only be set in a server.", ephemeral=True)
                 return
             await interaction.response.send_modal(_NicknameModal(self))
 
@@ -1802,7 +1916,7 @@ class AiSettingsView(discord.ui.View):
         return btn
 
     def _preset_button(self, label, saver, value):
-        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary, row=2)
+        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.secondary)
 
         async def cb(interaction: discord.Interaction):
             await saver(interaction, value)
@@ -1810,12 +1924,11 @@ class AiSettingsView(discord.ui.View):
         btn.callback = cb
         return btn
 
-    # --- Models & Providers controls (superadmin: global catalog) ---------
-    def _crud_button(self, label, *, row, opener, disabled=False,
+    def _crud_button(self, label, *, opener, disabled=False,
                      style=discord.ButtonStyle.secondary):
         """Button that opens a modal — superadmin-gated at open (the modal's
         on_submit re-checks again; the button state is only cosmetic)."""
-        btn = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
+        btn = discord.ui.Button(label=label, style=style, disabled=disabled)
 
         async def cb(interaction: discord.Interaction):
             if not is_superadmin(interaction):
@@ -1830,7 +1943,7 @@ class AiSettingsView(discord.ui.View):
 
     def _remove_model_button(self, *, disabled):
         btn = discord.ui.Button(label="🗑 Remove model",
-                                style=discord.ButtonStyle.danger, row=3,
+                                style=discord.ButtonStyle.danger,
                                 disabled=disabled)
 
         async def cb(interaction: discord.Interaction):
@@ -1852,8 +1965,8 @@ class AiSettingsView(discord.ui.View):
         return btn
 
     def _default_model_button(self, *, disabled):
-        btn = discord.ui.Button(label="⭐ Make default",
-                                style=discord.ButtonStyle.secondary, row=3,
+        btn = discord.ui.Button(label="Make default",
+                                style=discord.ButtonStyle.secondary,
                                 disabled=disabled)
 
         async def cb(interaction: discord.Interaction):
@@ -1883,9 +1996,7 @@ class AiSettingsView(discord.ui.View):
         btn = discord.ui.Button(
             label=f"🔌 MCP server: {'ON' if enabled else 'OFF'}",
             style=(discord.ButtonStyle.success if enabled
-                   else discord.ButtonStyle.danger),
-            row=3,
-        )
+                   else discord.ButtonStyle.danger))
 
         async def cb(interaction: discord.Interaction):
             if not is_superadmin(interaction):
@@ -1893,9 +2004,7 @@ class AiSettingsView(discord.ui.View):
                     "Requires superadmin.", ephemeral=True)
                 return
             self.bot.config.set_global(ENABLE_CONFIG_KEY, not enabled)
-            self._build()
-            await interaction.response.edit_message(
-                embed=self._embed(mcp_note=True), view=self)
+            await self.rerender(interaction)
 
         btn.callback = cb
         return btn
@@ -1917,125 +2026,18 @@ class AiSettingsView(discord.ui.View):
             return
         cleaned = [n for n in selected if n in _EXPOSED_OPS]
         self.bot.config.set_global("mcp_tools_enabled", cleaned)
-        # Rebuild so the Select's checkmarks reflect the saved set, and note
-        # that MCP changes only bind on the next bot restart.
-        self._build()
-        await interaction.response.edit_message(embed=self._embed(mcp_note=True),
-                                                 view=self)
+        self.flash("Saved — MCP changes take effect on next bot restart.")
+        await self.rerender(interaction)
 
-    # --- embed -----------------------------------------------------------
-    def _embed(self, mcp_note=False):
-        if self.page == "providers":
-            e = self._providers_embed()
-        else:
-            e = self._overview_embed()
-        if self._flash:
-            e.add_field(name="Last action", value=self._flash[:1024], inline=False)
-            self._flash = None
-        if mcp_note:
-            e.set_footer(text="MCP changes take effect on next bot restart.")
-        else:
-            e.set_footer(text="Panel expires after 3 minutes of inactivity.")
-        return e
-
-    def _overview_embed(self):
-        model_info = self.gpt._current_model_info(self._cfg_ctx())
-        bases, windows = self.gpt.cooldown_config()
-        tier, base = cooldown_tier_for_cost(
-            model_info.get("cost_per_mtok_output"), bases)
-        bot_tools = self._bot_tools()
-        e = discord.Embed(
-            title="AI settings",
-            description=f"Server: **{self.guild.name}**" if self.guild else "DM",
-            color=discord.Color.blurple(),
-        )
-        e.add_field(name="Provider / Model",
-                    value=f"{self.provider} / **{self.model}**", inline=True)
-        e.add_field(name="Rate limit",
-                    value=" · ".join(f"{c}/{_fmt_secs(m * base)}"
-                                     for c, m in windows) + f" ({tier})",
-                    inline=True)
-        e.add_field(
-            name="Bot tools (this server)",
-            value=(", ".join(bot_tools) if bot_tools else "*none — plain chat*"),
-            inline=False,
-        )
-        # Global MCP state deliberately does NOT appear here — it lives on
-        # the (superadmin-only) MCP tools page, where it can be acted on.
-        if self.page == "mcp":
-            from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
-            mcp_on = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
-            mcp_tools = self._mcp_tools()
-            e.add_field(
-                name=f"MCP tools (global — server {'ON' if mcp_on else 'OFF'})",
-                value=(", ".join(mcp_tools) if mcp_tools else "*none*"),
-                inline=False,
-            )
-        return e
-
-    def _providers_embed(self):
-        """The Models & Providers page: the global catalog, tabulated."""
-        all_providers = self.gpt.llm.get_all_providers()
-        pid = self.mgmt_provider
-        info = all_providers.get(pid, {})
-        e = discord.Embed(
-            title="AI settings — Models & Providers",
-            description="Global catalog — changes here affect every server "
-                        "this bot is in.",
-            color=discord.Color.blurple(),
-        )
-        e.add_field(
-            name=f"{info.get('name', pid)} ({pid})",
-            value=info.get("base_url") or "*built-in provider*",
-            inline=False,
-        )
-        default_model = info.get("default_model")
-        bases, _windows = self.gpt.cooldown_config()
-        rows = []
-        for m, mcfg in info.get("models", {}).items():
-            if not isinstance(mcfg, dict):
-                mcfg = {}
-            cost = mcfg.get("cost_per_mtok_output")
-            tier, _base = cooldown_tier_for_cost(cost, bases)
-            rows.append((
-                f"{m}{' ⭐' if m == default_model else ''}",
-                "—" if cost is None else f"{cost:g}",
-                tier,
-                str(mcfg.get("max_completion_tokens", "—")),
-            ))
-        if rows:
-            name_w = max(len(r[0]) for r in rows)
-            cost_w = max(len("$/Mtok"), max(len(r[1]) for r in rows))
-            tier_w = max(len("tier"), max(len(r[2]) for r in rows))
-            header = f"{'model'.ljust(name_w)}  {'$/Mtok'.rjust(cost_w)}  {'tier'.ljust(tier_w)}  max_tok"
-            body_lines = [
-                f"{r[0].ljust(name_w)}  {r[1].rjust(cost_w)}  {r[2].ljust(tier_w)}  {r[3]}"
-                for r in rows
-            ]
-            table = "```\n" + "\n".join([header] + body_lines) + "\n```"
-            if len(table) > 1024:
-                table = table[:1000].rstrip() + "\n…```"
-        else:
-            table = "*no models*"
-        e.add_field(name=f"Models ({len(rows)})", value=table, inline=False)
-        overview = " · ".join(
-            f"{p} {'✅' if self.gpt.provider_key_status(p, pi).startswith('✅') else '❌'}"
-            f" ({len(pi.get('models', {}))})"
-            for p, pi in all_providers.items()
-        )
-        e.add_field(name="All providers (key · models)",
-                    value=overview[:1024] or "*none*", inline=False)
-        return e
-
+    # --- lifecycle -------------------------------------------------------
     async def rerender(self, interaction: discord.Interaction):
         self.refresh_state()
         self._build()
         if interaction.response.is_done():
-            await interaction.edit_original_response(embed=self._embed(), view=self)
+            await interaction.edit_original_response(view=self)
         else:
-            await interaction.response.edit_message(embed=self._embed(), view=self)
+            await interaction.response.edit_message(view=self)
 
-    # --- lifecycle -------------------------------------------------------
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.invoker_id:
             await interaction.response.send_message(
@@ -2045,12 +2047,12 @@ class AiSettingsView(discord.ui.View):
         return True
 
     async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
+        for child in self.walk_children():
+            if hasattr(child, "disabled"):
+                child.disabled = True
         if self.message is not None:
             try:
-                await self.message.edit(
-                    content="Panel expired — run `/aisettings` again.", view=self)
+                await self.message.edit(view=self)
             except discord.HTTPException:
                 pass
 
