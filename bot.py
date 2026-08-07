@@ -65,7 +65,8 @@ async def load_cogs():
     from core.utils import list_cog_modules
 
     for group in ("static", "dynamic"):
-        for cog_name in list_cog_modules(group):
+        # bot.config filters out globally disabled dynamic cogs.
+        for cog_name in list_cog_modules(group, bot.config):
             try:
                 # Skip if already loaded (handles reconnection scenarios)
                 if cog_name in bot.extensions:

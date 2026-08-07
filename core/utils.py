@@ -139,19 +139,32 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
     return False
 
 
-def list_cog_modules(group: str) -> List[str]:
+def list_cog_modules(group: str, config=None) -> List[str]:
     """Loadable cog modules for a cogs/ group, as dotted module paths
     (['cogs.dynamic.gpt', ...]). THE one owner of the loadable-cog rule
     (*.py, not underscore/dunder-prefixed) — startup load, !reload-all,
     and !list_cogs must all resolve the cog set through this so they can
     never disagree about what counts as loadable. Missing directory
-    yields [] (mirrors the startup skip)."""
+    yields [] (mirrors the startup skip).
+
+    When a Config is passed, dynamic cogs named in the global
+    `disabled_cogs` list (bare lowercase names, e.g. "gpt") are excluded —
+    the deployment-level off switch that lets downstream forks carry
+    upstream cogs on disk without running them. Static cogs are never
+    filtered: they are the management backbone (admin/dev/error_handler)
+    and disabling them could brick the bot. Omitting config yields the
+    full on-disk set (what !list_cogs uses to show disabled entries)."""
     dir_path = f"./cogs/{group}"
     if not os.path.isdir(dir_path):
         return []
+    disabled = set()
+    if config is not None and group == "dynamic":
+        disabled = {str(name).lower()
+                    for name in (config.get_global("disabled_cogs", []) or [])}
     return [f"cogs.{group}.{filename[:-3]}"
             for filename in os.listdir(dir_path)
-            if filename.endswith('.py') and not filename.startswith('_')]
+            if filename.endswith('.py') and not filename.startswith('_')
+            and filename[:-3].lower() not in disabled]
 
 
 def smart_split(options):

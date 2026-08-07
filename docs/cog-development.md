@@ -240,3 +240,11 @@ self.bot.config.set_user(987654321, "preference", "value")
 - Use `!load my_cog` / `!reload my_cog` for hot-reload during development
 - Wrap risky code with try/except blocks and log errors
 - Keep commands async-friendly and avoid blocking calls
+
+## Disabling Cogs Per Deployment
+- `!disable my_cog` / `!enable my_cog` (superadmin) maintain the global
+  `disabled_cogs` config list. A disabled dynamic cog stays on disk but is
+  skipped by startup, `!reload`, and `!load` until re-enabled.
+- This is how downstream forks of this codebase carry upstream cogs without
+  running them — disable, don't delete, so upstream merges stay clean.
+- Static cogs can't be disabled; they're the management backbone.
