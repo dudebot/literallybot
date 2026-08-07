@@ -53,7 +53,19 @@ def get_prefix(bot, message):
 
     return ['!']
 
-bot = commands.Bot(command_prefix=get_prefix, intents=discord.Intents.all())
+class LiterallyBot(commands.Bot):
+    async def setup_hook(self):
+        """Runs once after login, BEFORE the gateway connects.
+
+        Cogs (and the persistent-view registrations their setup() functions
+        perform via bot.add_view / bot.add_dynamic_items) must be in place
+        before any component interaction can arrive — on_ready is too late
+        and fires again on every reconnect.
+        """
+        await load_cogs()
+
+
+bot = LiterallyBot(command_prefix=get_prefix, intents=discord.Intents.all())
 # Attach central logger to bot for use in cogs
 bot.logger = logger
 bot.config = Config()
@@ -89,10 +101,10 @@ async def load_cogs():
 
 @bot.event
 async def on_ready():
-    """Called on connect (and reconnect): loads cogs, starts the status
-    rotation, and syncs application commands once per process."""
-
-    await load_cogs()
+    """Called on connect (and reconnect): starts the status rotation and
+    syncs application commands once per process. Cogs are loaded in
+    LiterallyBot.setup_hook (before the gateway connects) so persistent
+    views are registered before any click arrives."""
 
     logger.info(f'{bot.user.name} is online and ready!')
 
