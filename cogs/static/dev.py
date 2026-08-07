@@ -33,6 +33,11 @@ class Dev(commands.Cog):
             return cog.lower()
         return f'cogs.dynamic.{cog.lower()}'
 
+    def disabled_cogs(self):
+        """Bare lowercase names from the global `disabled_cogs` list."""
+        return {str(name).lower()
+                for name in (self.bot.config.get_global("disabled_cogs", []) or [])}
+
     @commands.command(name='load', hidden=True)
     @commands.check(is_superadmin)
     async def load(self, ctx, *, cog: str):
@@ -49,6 +54,12 @@ class Dev(commands.Cog):
         self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked load on {cog}")
         message = await ctx.send('Loading...')
         await safe_delete(ctx, self.logger)
+        bare = self.check_cog(cog).rsplit('.', 1)[-1]
+        if bare in self.disabled_cogs():
+            await message.edit(
+                content=f'{bare} is disabled via the global `disabled_cogs` config. '
+                        f'Use `!enable {bare}` first.', delete_after=20)
+            return
         try:
             await self.bot.load_extension(self.check_cog(cog))
         except Exception as exc:
@@ -97,9 +108,18 @@ class Dev(commands.Cog):
         await safe_delete(ctx, self.logger)
 
         if cog is None:
+            # Filtering by config here means a reload-all also sheds cogs
+            # that were disabled while loaded: unload sweeps everything,
+            # load only brings back the enabled set.
             cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.dynamic.")]
-            cogs_to_load = list_cog_modules('dynamic')
+            cogs_to_load = list_cog_modules('dynamic', self.bot.config)
         else:
+            bare = self.check_cog(cog).rsplit('.', 1)[-1]
+            if bare in self.disabled_cogs():
+                await ctx.send(
+                    f'{bare} is disabled via the global `disabled_cogs` config. '
+                    f'Use `!enable {bare}` first.', delete_after=20)
+                return
             cogs_to_unload = [self.check_cog(cog)]
             cogs_to_load = [self.check_cog(cog)]
 
@@ -231,11 +251,77 @@ class Dev(commands.Cog):
         await safe_delete(ctx, self.logger)
         try:
             # Display keeps the bare cog names (module path stripped).
+            # Unfiltered listing so disabled cogs stay visible, marked.
+            disabled = self.disabled_cogs()
             cogs = [mod.rsplit('.', 1)[-1] for mod in list_cog_modules('dynamic')]
-            await message.edit(content=f'Available cogs: {", ".join(cogs)}', delete_after=20)
+            names = [f'{c} (disabled)' if c.lower() in disabled else c for c in cogs]
+            await message.edit(content=f'Available cogs: {", ".join(names)}', delete_after=20)
         except Exception as exc:
             self.logger.error("Error listing cogs", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
+
+    @commands.command(name='disable', hidden=True)
+    @commands.check(is_superadmin)
+    async def disable(self, ctx, *, cog: str):
+        """Add a dynamic cog to the global `disabled_cogs` list and unload it.
+
+        The deployment-level off switch: a disabled cog stays on disk but is
+        skipped by startup, !reload, and !load until re-enabled. Downstream
+        forks use this to carry upstream cogs without running them.
+
+        Note:
+            This command can be used only from superadmins.
+            This command is hidden from the help menu.
+        """
+        self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked disable on {cog}")
+        message = await ctx.send('Disabling...')
+        await safe_delete(ctx, self.logger)
+        bare = self.check_cog(cog).rsplit('.', 1)[-1]
+        known = {mod.rsplit('.', 1)[-1] for mod in list_cog_modules('dynamic')}
+        if bare not in known:
+            await message.edit(content=f'No dynamic cog named {bare}.', delete_after=20)
+            return
+        disabled = sorted(self.disabled_cogs() | {bare})
+        self.bot.config.set_global("disabled_cogs", disabled)
+        module = f'cogs.dynamic.{bare}'
+        unloaded = ''
+        if module in self.bot.extensions:
+            try:
+                await self.bot.unload_extension(module)
+                unloaded = ' and unloaded'
+            except Exception as exc:
+                self.logger.error(f"Error unloading {module} during disable", exc_info=True)
+                unloaded = f' (unload failed: {exc})'
+        await message.edit(content=f'{bare} disabled{unloaded}.', delete_after=20)
+
+    @commands.command(name='enable', hidden=True)
+    @commands.check(is_superadmin)
+    async def enable(self, ctx, *, cog: str):
+        """Remove a dynamic cog from the global `disabled_cogs` list and load it.
+
+        Note:
+            This command can be used only from superadmins.
+            This command is hidden from the help menu.
+        """
+        self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked enable on {cog}")
+        message = await ctx.send('Enabling...')
+        await safe_delete(ctx, self.logger)
+        bare = self.check_cog(cog).rsplit('.', 1)[-1]
+        disabled = self.disabled_cogs()
+        if bare not in disabled:
+            await message.edit(content=f'{bare} is not disabled.', delete_after=20)
+            return
+        self.bot.config.set_global("disabled_cogs", sorted(disabled - {bare}))
+        module = f'cogs.dynamic.{bare}'
+        loaded = ''
+        if module not in self.bot.extensions:
+            try:
+                await self.bot.load_extension(module)
+                loaded = ' and loaded'
+            except Exception as exc:
+                self.logger.error(f"Error loading {module} during enable", exc_info=True)
+                loaded = f' (load failed: {exc})'
+        await message.edit(content=f'{bare} enabled{loaded}.', delete_after=20)
 
     @commands.command(name='restart', aliases=['kys', 'shutdown'], hidden=True)
     @commands.check(is_superadmin)
