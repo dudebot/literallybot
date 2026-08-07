@@ -242,7 +242,7 @@ self.bot.config.set_user(987654321, "preference", "value")
 - Keep commands async-friendly and avoid blocking calls
 
 ## Disabling Cogs Per Deployment
-- `/cogs` (superadmin panel) or `!disable my_cog` / `!enable my_cog` maintain
+- `!cogs` (superadmin panel) or `!disable my_cog` / `!enable my_cog` maintain
   the global `disabled_cogs` config list. A disabled dynamic cog stays on
   disk but is skipped by startup, `!reload`, and `!load` until re-enabled.
 - This is how downstream forks of this codebase carry upstream cogs without
