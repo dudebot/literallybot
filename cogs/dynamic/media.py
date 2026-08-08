@@ -7,7 +7,7 @@ from discord import File, app_commands
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
-from core.utils import is_admin
+from core.utils import InvokerOnlyView, is_admin
 
 
 def _format_size(num_bytes):
@@ -294,8 +294,10 @@ class _FileSelect(discord.ui.Select):
         await self._panel.rerender(interaction)
 
 
-class MediaView(discord.ui.View):
+class MediaView(InvokerOnlyView, discord.ui.View):
     """Single-invoker ephemeral panel: file list + Add / Delete (two-click)."""
+
+    panel_command = "!media"
 
     def __init__(self, cog: Media, user, guild):
         super().__init__(timeout=180)
@@ -398,24 +400,6 @@ class MediaView(discord.ui.View):
             await interaction.edit_original_response(embed=self.render_embed(), view=self)
         else:
             await interaction.response.edit_message(embed=self.render_embed(), view=self)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.invoker_id:
-            await interaction.response.send_message(
-                "This panel isn't yours — run !media to open your own.",
-                ephemeral=True)
-            return False
-        return True
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content="Panel expired — run !media again.", view=self)
-            except discord.HTTPException:
-                pass
 
 
 async def setup(bot):
