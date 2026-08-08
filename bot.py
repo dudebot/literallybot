@@ -4,8 +4,7 @@ Entry point: creates the bot, loads cogs from cogs/static (always-on) and
 cogs/dynamic (hot-reloadable), and wires logging, error handling, and the
 optional MCP ops server. Runtime configuration lives in configs/ as JSON.
 """
-from itertools import cycle
-from discord.ext import commands, tasks
+from discord.ext import commands
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -101,15 +100,12 @@ async def load_cogs():
 
 @bot.event
 async def on_ready():
-    """Called on connect (and reconnect): starts the status rotation and
-    syncs application commands once per process. Cogs are loaded in
-    LiterallyBot.setup_hook (before the gateway connects) so persistent
-    views are registered before any click arrives."""
+    """Called on connect (and reconnect): syncs application commands once
+    per process. Cogs are loaded in LiterallyBot.setup_hook (before the
+    gateway connects) so persistent views are registered before any click
+    arrives; status rotation lives in cogs/static/status.py."""
 
     logger.info(f'{bot.user.name} is online and ready!')
-
-    if not change_status.is_running():
-        change_status.start()
 
     # on_ready refires on reconnect — only sync the command tree once per
     # process (Dev's !sync command handles manual re-syncs).
@@ -227,51 +223,6 @@ async def on_app_command_error(interaction: discord.Interaction, error: Exceptio
 async def on_error(event, *args, **kwargs):
     """Handle errors in events with enhanced logging."""
     await handle_event_error(bot, event, *args, **kwargs)
-
-def load_status_messages():
-    """Load status messages from config file, falling back to defaults if file not found."""
-    status_file = "configs/status_messages.txt"
-    default_statuses = ["01010101", "01110111", "01010101", "01111110"]
-
-    try:
-        if os.path.exists(status_file):
-            with open(status_file, 'r') as f:
-                messages = [line.strip() for line in f if line.strip()]
-                if messages:
-                    logger.info(f"Loaded {len(messages)} status messages from {status_file}")
-                    return cycle(messages)
-        logger.info(f"Status file not found, using defaults")
-        return cycle(default_statuses)
-    except Exception as e:
-        logger.error(f"Error loading status messages: {e}, using defaults")
-        return cycle(default_statuses)
-
-statuslist = load_status_messages()
-
-@tasks.loop(seconds=300)
-async def change_status():
-    """Background task cycling the bot's presence through `statuslist`."""
-    await bot.change_presence(activity=discord.Game(next(statuslist)))
-
-
-# Must be registered BEFORE the blocking __main__ guard: bot.run() doesn't
-# return until shutdown, so anything below it never executes on a live run
-# (this handler previously sat there, dead — loop failures silently killed
-# status rotation with no Discord report).
-@change_status.error
-async def change_status_error(error):
-    """Handle errors in the change_status task loop."""
-    logger.error(f"Error in change_status task: {error}", exc_info=True)
-    try:
-        import asyncio as _asyncio
-        _asyncio.create_task(log_error_to_discord(
-            bot, error, 'task_change_status',
-            category=ErrorCategory.TASK_ERROR,
-            severity=ErrorSeverity.WARNING
-        ))
-    except Exception as log_error:
-        logger.error(f"Failed to log error to Discord: {log_error}", exc_info=True)
-
 
 if __name__ == "__main__":
     #Grab token from the token.txt file
