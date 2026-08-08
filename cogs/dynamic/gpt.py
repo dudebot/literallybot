@@ -1287,25 +1287,63 @@ class Gpt(commands.Cog):
 # and MCP. Every mutating callback re-checks its gate server-side — hidden
 # or disabled controls are only cosmetic.
 
-class _ToolSelect(discord.ui.Select):
-    """A multi-select over a fixed op universe, wired to save on change."""
+# Discord's hard cap on options in a single select. The op universe grew
+# past this (26 ops as of the emoji CRUD addition), and discord.py does NOT
+# validate it client-side — an over-long select constructs fine and then
+# fails with an HTTP 400 when the panel is opened. So the tool universe is
+# CHUNKED across as many selects as it takes.
+SELECT_MAX_OPTIONS = 25
 
-    def __init__(self, universe, current, on_save):
+
+def _tool_selects(universe, current, on_save):
+    """Build one _ToolSelect per 25-op chunk of `universe`.
+
+    Chunking (rather than truncating) matters because this is an ALLOWLIST
+    editor: an op that isn't rendered is one nobody can enable, and — worse —
+    a naive save would read only the visible select's values and silently
+    drop the enabled ops living in the other chunks.
+    """
+    universe = list(universe)
+    chunks = [universe[i:i + SELECT_MAX_OPTIONS]
+              for i in range(0, len(universe), SELECT_MAX_OPTIONS)] or [[]]
+    return [_ToolSelect(chunk, current, on_save, universe,
+                        page=i + 1, pages=len(chunks))
+            for i, chunk in enumerate(chunks)]
+
+
+class _ToolSelect(discord.ui.Select):
+    """A multi-select over one chunk of the op universe, wired to save on
+    change. Saves merge across chunks — see `callback`."""
+
+    def __init__(self, chunk, current, on_save, universe=None,
+                 page=1, pages=1):
         self._on_save = on_save
+        # Ops shown in OTHER chunks, whose enabled state this select must
+        # carry through untouched rather than clobber.
+        self._chunk = list(chunk)
+        self._elsewhere = [n for n in (universe or chunk)
+                           if n not in set(self._chunk)]
         current_set = set(current)
+        self._current = list(current)
         options = [
             discord.SelectOption(label=name, value=name, default=(name in current_set))
-            for name in universe
+            for name in self._chunk
         ]
+        placeholder = "Select enabled tools (none = off)"
+        if pages > 1:
+            placeholder = f"Enabled tools ({page}/{pages}) — none = off"
         super().__init__(
-            placeholder="Select enabled tools (none = off)",
+            placeholder=placeholder,
             min_values=0,
-            max_values=len(options),
+            max_values=max(1, len(options)),
             options=options,
         )
 
     async def callback(self, interaction: discord.Interaction):
-        await self._on_save(interaction, list(self.values))
+        # This select only speaks for its own chunk. Anything enabled in
+        # another chunk stays enabled.
+        kept = [n for n in self._current if n in self._elsewhere]
+        await self._on_save(interaction, kept + list(self.values))
 
 
 class _ProviderSelect(discord.ui.Select):
@@ -1733,8 +1771,9 @@ class AiSettingsView(discord.ui.LayoutView):
         if self.page == "server":
             self.add_item(self._row(_ProviderSelect(self)))
             self.add_item(self._row(_ModelSelect(self)))
-            self.add_item(self._row(_ToolSelect(list(AGENT_OPS), self._bot_tools(),
-                                                self._save_bot_tools)))
+            for sel in _tool_selects(list(AGENT_OPS), self._bot_tools(),
+                                     self._save_bot_tools):
+                self.add_item(self._row(sel))
             self.add_item(self._row(self._ai_toggle_button(),
                                     self._personality_button(),
                                     self._nickname_button()))
@@ -1763,8 +1802,9 @@ class AiSettingsView(discord.ui.LayoutView):
                                   opener=lambda: _RemoveProviderModal(self)),
             ))
         elif self.page == "mcp":
-            self.add_item(self._row(_ToolSelect(list(_EXPOSED_OPS), self._mcp_tools(),
-                                                self._save_mcp_tools)))
+            for sel in _tool_selects(list(_EXPOSED_OPS), self._mcp_tools(),
+                                     self._save_mcp_tools):
+                self.add_item(self._row(sel))
             self.add_item(self._row(
                 self._preset_button("Clear all", self._save_mcp_tools, []),
                 self._preset_button("Enable read-only set", self._save_mcp_tools,
