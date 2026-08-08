@@ -4,10 +4,16 @@ one table.
 
 Guild config key `auto_responses` — list of entries:
 
-    {"triggers": ["cope"],            # aliases, case-insensitive, CSV in UI
-     "responses": ["yikes", "cringe"],# one picked uniformly at random
-     "full_match": true,              # false = fires on substring anywhere
+    {"triggers": ["ping"],            # aliases, case-insensitive, CSV in UI
+     "responses": ["pong"],           # one picked uniformly at random
+     "match": "full",                 # full | contains | regex
      "auto_delete": false}            # true = delete the triggering message
+
+`match` replaces the older boolean `full_match`, which is still read for
+entries written before the third mode existed (true -> "full", false ->
+"contains"). "regex" treats each trigger as a Python pattern, which is how
+you get word boundaries: `\bthink\b` fires on "think" but not "rethinking".
+An invalid pattern never matches and never raises.
 
 Absent/empty key = inert in that guild (default OFF everywhere; manage with
 !autoresponse). First matching entry wins, in config
@@ -21,10 +27,15 @@ from discord.ext import commands
 
 import discord
 import random
+import re
 
 from core.utils import is_admin
 
 MAX_ENTRIES = 25  # Discord select-menu option cap
+
+MATCH_FULL = "full"
+MATCH_CONTAINS = "contains"
+MATCH_REGEX = "regex"
 
 
 def _response_texts(responses):
@@ -39,22 +50,44 @@ def _response_texts(responses):
     return out
 
 
+def entry_match_mode(entry):
+    """Match mode for an entry, honouring the legacy `full_match` bool."""
+    mode = entry.get("match")
+    if mode in (MATCH_FULL, MATCH_CONTAINS, MATCH_REGEX):
+        return mode
+    return MATCH_FULL if entry.get("full_match", True) else MATCH_CONTAINS
+
+
 def find_response(entries, content):
     """(entry, response) for the first entry matching `content`, else None.
 
-    full_match entries equal the whole (case-folded, stripped) message;
-    non-full entries fire on a substring hit anywhere in it. Pure function
-    of (config entries, message text) so the rules stay unit-testable."""
+    full   — the whole (case-folded, stripped) message equals a trigger
+    contains — a trigger appears anywhere in it
+    regex  — a trigger is a case-insensitive pattern searched against it
+
+    Pure function of (config entries, message text) so the rules stay
+    unit-testable. A malformed regex is skipped rather than raised: a bad
+    pattern in one guild's config must not break message handling."""
     text = content.strip().lower()
     for entry in entries:
-        triggers = [str(t).lower() for t in entry.get("triggers", [])]
+        triggers = [str(t) for t in entry.get("triggers", [])]
         texts = _response_texts(entry.get("responses"))
         if not triggers or not texts:
             continue
-        if entry.get("full_match", True):
-            hit = text in triggers
+        mode = entry_match_mode(entry)
+        if mode == MATCH_REGEX:
+            hit = False
+            for pattern in triggers:
+                try:
+                    if re.search(pattern, content, re.IGNORECASE):
+                        hit = True
+                        break
+                except re.error:
+                    continue
+        elif mode == MATCH_CONTAINS:
+            hit = any(t.lower() in text for t in triggers)
         else:
-            hit = any(t in text for t in triggers)
+            hit = text in [t.lower() for t in triggers]
         if hit:
             return entry, random.choice(texts)
     return None
@@ -108,8 +141,9 @@ class AutoResponse(commands.Cog):
 class _EntryModal(discord.ui.Modal):
     """Add a new entry, or edit the one selected in the panel."""
 
-    _MATCH_FULL = "full"
-    _MATCH_CONTAINS = "contains"
+    _MATCH_FULL = MATCH_FULL
+    _MATCH_CONTAINS = MATCH_CONTAINS
+    _MATCH_REGEX = MATCH_REGEX
     _ACT_REPLY = "reply"
     _ACT_DELETE = "reply_delete"
 
@@ -126,23 +160,27 @@ class _EntryModal(discord.ui.Modal):
             label="Triggers (comma-separated)",
             required=True, max_length=200,
             default=", ".join(entry.get("triggers", [])),
-            placeholder="cope, copes")
+            placeholder="word, phrase   (regex mode: \\bword\\b)")
         self.responses = discord.ui.TextInput(
             label="Responses (comma-separated, one is picked)",
             style=discord.TextStyle.paragraph,
             required=True, max_length=1000,
             default=", ".join(_response_texts(entry.get("responses"))),
-            placeholder="have sex, yikes, cringe")
-        full = entry.get("full_match", True)
+            placeholder="reply text, another reply")
+        mode = entry_match_mode(entry) if entry else self._MATCH_FULL
         self.match = discord.ui.Select(min_values=1, max_values=1, options=[
             discord.SelectOption(
                 label="Full message", value=self._MATCH_FULL,
                 description="Fires only when the whole message equals a trigger",
-                default=full),
+                default=mode == self._MATCH_FULL),
             discord.SelectOption(
                 label="Contains", value=self._MATCH_CONTAINS,
                 description="Fires when a trigger appears anywhere (keyword/automod)",
-                default=not full),
+                default=mode == self._MATCH_CONTAINS),
+            discord.SelectOption(
+                label="Regex", value=self._MATCH_REGEX,
+                description="Trigger is a pattern; \\bword\\b matches whole words only",
+                default=mode == self._MATCH_REGEX),
         ])
         delete = bool(entry.get("auto_delete", False))
         self.action = discord.ui.Select(min_values=1, max_values=1, options=[
@@ -164,8 +202,22 @@ class _EntryModal(discord.ui.Modal):
         if not is_admin(interaction):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
-        trigger_list = [t.strip().lower()
+        mode = (self.match.values[0] if self.match.values else self._MATCH_FULL)
+        # Regex triggers keep their case: matching is case-insensitive at search
+        # time, but lowercasing here would mangle patterns like \bT\b or [A-Z].
+        trigger_list = [t.strip() if mode == self._MATCH_REGEX else t.strip().lower()
                         for t in str(self.triggers.value).split(",") if t.strip()]
+        if mode == self._MATCH_REGEX:
+            bad = []
+            for pattern in trigger_list:
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    bad.append(f"`{pattern}` ({exc.msg})")
+            if bad:
+                self._panel.flash("⚠ Invalid regex — nothing saved: " + ", ".join(bad))
+                await self._panel.rerender(interaction)
+                return
         response_list = [r.strip()
                          for r in str(self.responses.value).split(",") if r.strip()]
         if not trigger_list or not response_list:
@@ -175,8 +227,7 @@ class _EntryModal(discord.ui.Modal):
         entry = {
             "triggers": trigger_list,
             "responses": response_list,
-            "full_match": (self.match.values[0] if self.match.values
-                           else self._MATCH_FULL) == self._MATCH_FULL,
+            "match": mode,
             "auto_delete": (self.action.values[0] if self.action.values
                             else self._ACT_REPLY) == self._ACT_DELETE,
         }
@@ -306,8 +357,9 @@ class AutoResponseView(discord.ui.View):
             lines = []
             for en in entries:
                 tags = []
-                if not en.get("full_match", True):
-                    tags.append("contains")
+                mode = entry_match_mode(en)
+                if mode != MATCH_FULL:
+                    tags.append(mode)
                 if en.get("auto_delete"):
                     tags.append("deletes")
                 tag_str = f" ({', '.join(tags)})" if tags else ""
