@@ -1631,6 +1631,182 @@ async def delete_role(ctx: OpContext, guild, role):
     return info
 
 
+# Discord rejects custom emoji images above 256KB. Checked here so an
+# oversized file fails with a clear message instead of a raw HTTP 400, and
+# so we never read a huge file into memory to hand to the API.
+EMOJI_MAX_BYTES = 256 * 1024
+EMOJI_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+
+
+def serialize_emoji(emoji: Any) -> Dict[str, Any]:
+    return {
+        "id": emoji.id,
+        "name": emoji.name,
+        "animated": emoji.animated,
+        "managed": emoji.managed,
+        "url": str(emoji.url),
+        # The literal form add_reaction/message content needs. Getting this
+        # wrong is the single most common custom-emoji mistake, so the op
+        # hands back the exact string rather than making callers build it.
+        "mention": str(emoji),
+        "reaction_form": f"{emoji.name}:{emoji.id}",
+    }
+
+
+def _require_guild_emoji(guild, emoji_id: int):
+    """Resolve an emoji id against THIS guild. Emoji are not resolved by the
+    shared id resolver (no ParamKind), so guild confinement is enforced here:
+    an id from another guild must not be editable/deletable through an op
+    scoped to this one."""
+    for e in guild.emojis:
+        if e.id == emoji_id:
+            return e
+    raise ValueError(
+        f"No custom emoji with id {emoji_id} in guild '{guild.name}'. "
+        f"Call list_emojis to see valid ids."
+    )
+
+
+def _guard_emoji_editable(emoji: Any):
+    if emoji.managed:
+        raise ValueError(
+            f"Emoji '{emoji.name}' is managed by an integration (e.g. Twitch) "
+            f"and cannot be modified."
+        )
+
+
+def load_emoji_image(file_path: str) -> bytes:
+    """Read a local image as bytes for create_custom_emoji.
+
+    Unlike send_message attachments (which discord.py streams from a path),
+    the emoji API takes raw bytes, so this validates BEFORE reading: a
+    2GB file must not be slurped into memory just to be rejected.
+    """
+    path = Path(str(file_path).strip()).expanduser()
+    try:
+        path = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"emoji image not found: {file_path}") from exc
+    if not path.is_file():
+        raise ValueError(f"emoji image is not a file: {path}")
+    ext = path.suffix.lower()
+    if ext not in EMOJI_EXTENSIONS:
+        raise ValueError(
+            f"emoji image extension not allowed: {ext or '(none)'} "
+            f"(allowed: {', '.join(sorted(EMOJI_EXTENSIONS))})"
+        )
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError(f"emoji image is empty: {path}")
+    if size > EMOJI_MAX_BYTES:
+        raise ValueError(
+            f"emoji image too large ({size} bytes > {EMOJI_MAX_BYTES}). "
+            f"Discord's custom-emoji limit is 256KB — resize or re-encode it."
+        )
+    return path.read_bytes()
+
+
+@registry.op(
+    "list_emojis",
+    "List a guild's custom emoji (id, name, animated, and the exact string "
+    "to use in a message or reaction).",
+    PermissionLevel.EVERYONE,
+    params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
+    serialize=lambda es: {"emojis": es, "count": len(es)},
+    agent_guidance=(
+        "Use list_emojis to get a custom emoji's exact id before add_reaction "
+        "or edit/delete — never guess an id or assume a name is unique. Pass "
+        "`reaction_form` (name:id) to add_reaction, and `mention` when writing "
+        "the emoji into message content."),
+)
+async def list_emojis(ctx: OpContext, guild):
+    return [serialize_emoji(e) for e in guild.emojis]
+
+
+@registry.op(
+    "create_emoji",
+    "Upload a new custom emoji to a guild from a local image file. Requires "
+    "admin. Image must be png/jpg/gif/webp and under 256KB.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to add the emoji to."),
+        OpParam("name", ParamKind.STRING,
+                "Emoji name (2-32 chars, letters/numbers/underscores only; "
+                "this is what users type between colons)."),
+        OpParam("file_path", ParamKind.STRING,
+                "Absolute server-side path to the image (png/jpg/gif/webp, "
+                "max 256KB). Animated gifs create an animated emoji."),
+    ],
+    serialize=serialize_emoji,
+    agent_guidance=(
+        "create_emoji returns the new emoji's id plus `reaction_form` and "
+        "`mention` — reuse those directly instead of calling list_emojis "
+        "again. Guilds have a hard emoji slot limit; if creation fails for a "
+        "full guild, say so rather than retrying."),
+)
+async def create_emoji(ctx: OpContext, guild, name: str, file_path: str):
+    # Reads the HOST filesystem, so it carries the same admin gate as
+    # send_message attachments even though the op is already ADMIN — keeping
+    # the check explicit means the rule survives a future tier change.
+    _require_admin_for_attachments(ctx, [file_path])
+    image = load_emoji_image(file_path)
+    return await guild.create_custom_emoji(
+        name=name, image=image,
+        reason=f"create_emoji op by {ctx.author} ({ctx.author.id})",
+    )
+
+
+@registry.op(
+    "edit_emoji",
+    "Rename an existing custom emoji. Requires admin. Managed "
+    "(integration-owned) emoji are refused.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id the emoji belongs to."),
+        OpParam("emoji_id", ParamKind.SNOWFLAKE,
+                "Custom emoji id to edit (from list_emojis)."),
+        OpParam("name", ParamKind.STRING, "New emoji name."),
+    ],
+    serialize=serialize_emoji,
+    agent_guidance=(
+        "Renaming an emoji changes the :name: users type but keeps its id, so "
+        "existing reactions and messages keep working."),
+)
+async def edit_emoji(ctx: OpContext, guild, emoji_id: int, name: str):
+    emoji = _require_guild_emoji(guild, _as_int(emoji_id, "emoji_id"))
+    _guard_emoji_editable(emoji)
+    await emoji.edit(
+        name=name,
+        reason=f"edit_emoji op by {ctx.author} ({ctx.author.id})",
+    )
+    return emoji
+
+
+@registry.op(
+    "delete_emoji",
+    "Delete a custom emoji from a guild. Requires admin. Managed "
+    "(integration-owned) emoji are refused.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id the emoji belongs to."),
+        OpParam("emoji_id", ParamKind.SNOWFLAKE,
+                "Custom emoji id to delete (from list_emojis)."),
+    ],
+    serialize=lambda info: info,
+    agent_guidance=(
+        "delete_emoji is irreversible and breaks every existing message and "
+        "reaction using that emoji — confirm intent before calling it."),
+)
+async def delete_emoji(ctx: OpContext, guild, emoji_id: int):
+    emoji = _require_guild_emoji(guild, _as_int(emoji_id, "emoji_id"))
+    _guard_emoji_editable(emoji)
+    info = {"deleted_emoji_id": emoji.id, "name": emoji.name}
+    await emoji.delete(
+        reason=f"delete_emoji op by {ctx.author} ({ctx.author.id})",
+    )
+    return info
+
+
 @registry.op(
     "list_channel_overwrites",
     "List permission overwrites (channel ACLs): which roles/members are "
@@ -1687,7 +1863,8 @@ def _smoke_test() -> None:
         "create_thread", "list_guilds", "list_channels", "list_members",
         "list_roles", "list_role_members", "create_role", "edit_role",
         "delete_role", "list_channel_overwrites", "send_dm", "read_dms",
-        "fetch_dms",
+        "fetch_dms", "list_emojis", "create_emoji", "edit_emoji",
+        "delete_emoji",
     }
     names = set(registry.names())
     missing = expected - names
@@ -1842,6 +2019,35 @@ def _smoke_test() -> None:
             os.unlink(tmp_path)
         except OSError:
             pass
+
+    # Emoji ops: ids travel as SNOWFLAKE strings (see _SNOWFLAKE_JSON_TYPE)
+    # and are resolved against the guild inside the op, not by the shared
+    # id resolver — so guild confinement lives in _require_guild_emoji.
+    create_emoji_schema = registry.get("create_emoji").to_json_schema()
+    assert set(create_emoji_schema["properties"]) == {
+        "guild_id", "name", "file_path"}, create_emoji_schema
+    edit_emoji_schema = registry.get("edit_emoji").to_json_schema()
+    assert edit_emoji_schema["properties"]["emoji_id"]["type"] == "string", \
+        "emoji_id must be a string on the wire (64-bit snowflake)"
+
+    # Frontends render the op universe into Discord select menus, which
+    # accept at most 25 options EACH. discord.py does not validate this —
+    # an over-long select builds fine and fails with an HTTP 400 when the
+    # panel opens. The /aisettings panel chunks the universe across selects
+    # (see _tool_selects in cogs/dynamic/gpt.py); this assert is the tripwire
+    # that tells you WHY if that chunking is ever removed.
+    from cogs.dynamic.gpt import SELECT_MAX_OPTIONS, _tool_selects
+    _selects = _tool_selects(sorted(names), [], None)
+    for _sel in _selects:
+        assert len(_sel.options) <= SELECT_MAX_OPTIONS, (
+            f"select renders {len(_sel.options)} options — Discord's cap is "
+            f"{SELECT_MAX_OPTIONS} and discord.py will NOT catch this")
+    assert sum(len(s.options) for s in _selects) == len(names), \
+        "chunking dropped ops — every op must remain selectable"
+    if len(names) > SELECT_MAX_OPTIONS:
+        print(f"  note: {len(names)} ops exceed Discord's "
+              f"{SELECT_MAX_OPTIONS}-option select cap — /aisettings chunks "
+              f"them across {len(_selects)} selects.")
 
     print(f"core.ops smoke test OK — {len(names)} ops registered:")
     for tool in tools:
