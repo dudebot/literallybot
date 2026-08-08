@@ -3,7 +3,7 @@ import glob
 import subprocess
 import discord
 from discord.ext import commands
-from discord import File
+from discord import File, app_commands
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
@@ -203,13 +203,27 @@ class Media(commands.Cog):
 
     # ---- admin UI -------------------------------------------------------
 
+    @app_commands.command(name="media",
+                          description="Open the media-library panel (admin)")
+    @app_commands.guild_only()
+    async def media_slash(self, interaction: discord.Interaction):
+        """Ephemeral twin of `!media` (#76). No default_permissions: the
+        gate is the bot's own admin concept, not Discord permissions."""
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "Requires admin.", ephemeral=True)
+            return
+        view = MediaView(self, interaction.user, interaction.guild)
+        await interaction.response.send_message(
+            embed=view.render_embed(), view=view, ephemeral=True)
+        view.message = None
+
     @commands.command(name="media", hidden=True)
     @commands.guild_only()
     @commands.check(is_admin)
     async def media_panel(self, ctx):
-        """Open the media-library panel. Prefix-only by design: panel
-        launchers gate on the bot's admin concept and stay out of the
-        public slash picker."""
+        """Open the media-library panel. Posts PUBLICLY — use /media for a
+        private one (#76)."""
         view = MediaView(self, ctx.author, ctx.guild)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
 
