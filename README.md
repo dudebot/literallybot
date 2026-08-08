@@ -293,4 +293,4 @@ Contributions are welcome! Please open an issue or submit a pull request for any
 
 ## License
 
-This project is released under [CC0 1.0 Universal](LICENSE) — public domain dedication.
+This project is released under the [MIT License](LICENSE).
