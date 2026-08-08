@@ -8,7 +8,7 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from core.utils import is_admin, is_superadmin, recursive_split
+from core.utils import InvokerOnlyView, is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import registry
 from core.agent_loop import AGENT_OPS, resolve_bot_tools
@@ -1716,13 +1716,18 @@ def _fmt_secs(s: float) -> str:
     return f"{s / 3600:.1f}h"
 
 
-class AiSettingsView(discord.ui.LayoutView):
+class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
     """Tabbed, single-invoker settings panel (Components V2).
 
     Render order per page: tab buttons, then the page text, then the
     controls. Admins get Server config; superadmins additionally get
     Models & Providers and MCP.
     """
+
+    panel_command = "`!aisettings`"
+    # A Components-V2 message carries no separate content field, so expiry
+    # only disables the controls (the mixin skips the content edit on None).
+    expiry_text = None
 
     def __init__(self, gpt_cog, user, guild):
         super().__init__(timeout=PANEL_TIMEOUT)
@@ -2113,24 +2118,6 @@ class AiSettingsView(discord.ui.LayoutView):
             await interaction.edit_original_response(view=self)
         else:
             await interaction.response.edit_message(view=self)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.invoker_id:
-            await interaction.response.send_message(
-                "This panel isn't yours — run `!aisettings` to open your own.",
-                ephemeral=True)
-            return False
-        return True
-
-    async def on_timeout(self):
-        for child in self.walk_children():
-            if hasattr(child, "disabled"):
-                child.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(view=self)
-            except discord.HTTPException:
-                pass
 
 
 async def setup(bot):

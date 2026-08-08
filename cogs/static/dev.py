@@ -5,7 +5,7 @@ from sys import version_info as sysv
 import subprocess
 from datetime import datetime
 import sys
-from core.utils import is_superadmin, safe_delete, list_cog_modules
+from core.utils import InvokerOnlyView, is_superadmin, safe_delete, list_cog_modules
 
 class Dev(commands.Cog):
     """Superadmin-only maintenance commands: cog load/unload/reload, git
@@ -437,9 +437,11 @@ class _CogSelect(discord.ui.Select):
         await self._panel.rerender(interaction)
 
 
-class CogsView(discord.ui.View):
+class CogsView(InvokerOnlyView, discord.ui.View):
     """Superadmin panel over the disabled_cogs machinery: the slash-native
     face of !disable/!enable/!reload. Single-invoker, ephemeral."""
+
+    panel_command = "!cogs"
 
     def __init__(self, dev_cog, user):
         super().__init__(timeout=180)
@@ -585,24 +587,6 @@ class CogsView(discord.ui.View):
         else:
             await interaction.response.edit_message(embed=self.render_embed(), view=self)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.invoker_id:
-            await interaction.response.send_message(
-                "This panel isn't yours — run !cogs to open your own.",
-                ephemeral=True)
-            return False
-        return True
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content="Panel expired — run !cogs again.", view=self)
-            except discord.HTTPException:
-                pass
-
 
 # Key-name fragments whose global values are secrets: masked in every
 # render and never prefilled into the edit modal.
@@ -680,10 +664,12 @@ class _ConfigKeySelect(discord.ui.Select):
         await self._panel.rerender(interaction)
 
 
-class ConfigView(discord.ui.View):
+class ConfigView(InvokerOnlyView, discord.ui.View):
     """Superadmin editor over configs/global.json. Values render as JSON;
     secret-looking keys are masked and never prefilled. Deleting requires a
     second, relabeled click."""
+
+    panel_command = "!config"
 
     def __init__(self, dev_cog, user):
         super().__init__(timeout=180)
@@ -797,24 +783,6 @@ class ConfigView(discord.ui.View):
             await interaction.edit_original_response(embed=self.render_embed(), view=self)
         else:
             await interaction.response.edit_message(embed=self.render_embed(), view=self)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.invoker_id:
-            await interaction.response.send_message(
-                "This panel isn't yours — run !config to open your own.",
-                ephemeral=True)
-            return False
-        return True
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content="Panel expired — run !config again.", view=self)
-            except discord.HTTPException:
-                pass
 
 
 async def setup(bot):

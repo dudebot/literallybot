@@ -30,7 +30,7 @@ from discord import app_commands
 import random
 import re
 
-from core.utils import is_admin
+from core.utils import InvokerOnlyView, is_admin
 
 MAX_ENTRIES = 25  # Discord select-menu option cap
 
@@ -285,8 +285,10 @@ class _EntrySelect(discord.ui.Select):
         await self._panel.rerender(interaction)
 
 
-class AutoResponseView(discord.ui.View):
+class AutoResponseView(InvokerOnlyView, discord.ui.View):
     """Single-invoker panel: entry select + Add/Edit/Remove."""
+
+    panel_command = "!autoresponse"
 
     def __init__(self, cog: AutoResponse, user, guild):
         super().__init__(timeout=180)
@@ -400,24 +402,6 @@ class AutoResponseView(discord.ui.View):
             await interaction.edit_original_response(embed=self.render_embed(), view=self)
         else:
             await interaction.response.edit_message(embed=self.render_embed(), view=self)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.invoker_id:
-            await interaction.response.send_message(
-                "This panel isn't yours — run !autoresponse to open your own.",
-                ephemeral=True)
-            return False
-        return True
-
-    async def on_timeout(self):
-        for child in self.children:
-            child.disabled = True
-        if self.message is not None:
-            try:
-                await self.message.edit(
-                    content="Panel expired — run !autoresponse again.", view=self)
-            except discord.HTTPException:
-                pass
 
 
 async def setup(bot):
