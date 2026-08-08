@@ -1266,14 +1266,63 @@ class Gpt(commands.Cog):
             self.logger.info("gpt: seeded cost_per_mtok_output on %d model(s)",
                              seeded)
 
+    @commands.command(name="gpt")
+    @commands.guild_only()
+    async def askgpt(self, ctx, *, question: str = None):
+        """Ask the AI a question.
+
+        Restored after being dropped in the #67 command purge: mentioning the
+        bot was assumed to cover this, and users reached for `!gpt` the next
+        day anyway. Mention, reply, and this command all funnel into
+        process_askgpt, so the per-guild kill switch and the shared
+        per-model/per-guild cooldown are enforced in ONE place — do not
+        re-implement either here.
+        """
+        if not question or not question.strip():
+            await ctx.send(f"Usage: `{ctx.prefix}gpt <question>` — or just "
+                           f"mention me.")
+            return
+        if not self.bot.config.get(ctx, "ai_enabled", True):
+            return
+        await self.process_askgpt(ctx, question.strip())
+
+    @app_commands.command(name="aisettings",
+                          description="Open the AI settings panel (admin)")
+    @app_commands.guild_only()
+    async def aisettings_slash(self, interaction: discord.Interaction):
+        """Ephemeral twin of `!aisettings` (#76).
+
+        A prefix command cannot answer ephemerally — ephemeral is a property
+        of an interaction response — so the panel was readable by the whole
+        channel. Bystanders could never *click* it (see interaction_check),
+        but they could read the guild's model/provider/tool configuration.
+
+        Deliberately NO app_commands.default_permissions: that gates on
+        DISCORD permissions, which the bot's own admins do not necessarily
+        hold, and is exactly what caused the /aisettings lockout that made
+        #67 move these to prefix-only. The gate is the bot's own admin
+        concept, checked here.
+        """
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "Requires admin.", ephemeral=True)
+            return
+        view = AiSettingsView(self, interaction.user, interaction.guild)
+        await interaction.response.send_message(view=view, ephemeral=True)
+        # An ephemeral message has no fetchable Message object; rerender()
+        # falls back to edit_original_response, and on_timeout skips the
+        # edit when message is None.
+        view.message = None
+
     @commands.command(name="aisettings", hidden=True)
     @commands.guild_only()
     @commands.check(is_admin)
     async def aisettings_prefix(self, ctx):
-        """Open the AI settings panel. Deliberately a prefix command, not a
-        slash command: panel launchers gate on the BOT's admin concept, and
-        keeping them out of the slash picker keeps the bot's public surface
-        clean (slash is reserved for parameterized one-liners and /help)."""
+        """Open the AI settings panel.
+
+        Kept alongside /aisettings: prefix is muscle memory and works where
+        slash is unavailable. Note this posts PUBLICLY — the channel can read
+        the panel (not click it). Use /aisettings for a private one (#76)."""
         view = AiSettingsView(self, ctx.author, ctx.guild)
         view.message = await ctx.send(view=view)
 

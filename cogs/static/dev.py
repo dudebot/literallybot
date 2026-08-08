@@ -1,5 +1,6 @@
 from discord.ext import commands
 import discord
+from discord import app_commands
 from sys import version_info as sysv
 import subprocess
 from datetime import datetime
@@ -352,21 +353,53 @@ class Dev(commands.Cog):
             self.logger.error("Error during shutdown", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
+    @app_commands.command(name="cogs",
+                          description="Open the cog-management panel (superadmin)")
+    async def cogs_slash(self, interaction: discord.Interaction):
+        """Ephemeral twin of `!cogs` (#76). No default_permissions — the gate
+        is the bot's own superadmin list, not Discord permissions."""
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Requires superadmin.", ephemeral=True)
+            return
+        view = CogsView(self, interaction.user)
+        await interaction.response.send_message(
+            embed=view.render_embed(), view=view, ephemeral=True)
+        view.message = None
+
+    @app_commands.command(name="config",
+                          description="Open the global-config editor (superadmin)")
+    async def config_slash(self, interaction: discord.Interaction):
+        """Ephemeral twin of `!config` (#76).
+
+        The strongest case for ephemeral of all the panels: this one
+        ENUMERATES global config keys. Values that look secret are masked and
+        never prefilled, but the key list itself is a map of the bot's
+        configuration surface and does not belong in a public channel."""
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Requires superadmin.", ephemeral=True)
+            return
+        view = ConfigView(self, interaction.user)
+        await interaction.response.send_message(
+            embed=view.render_embed(), view=view, ephemeral=True)
+        view.message = None
+
     @commands.command(name="cogs", hidden=True)
     @commands.check(is_superadmin)
     async def cogs_panel(self, ctx):
-        """Open the cog-management panel (enable/disable/reload).
-        Prefix-only by design: superadmin surfaces stay out of the public
-        slash picker entirely."""
+        """Open the cog-management panel (enable/disable/reload). Posts
+        PUBLICLY — use /cogs for a private one (#76)."""
         view = CogsView(self, ctx.author)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
 
     @commands.command(name="config", hidden=True)
     @commands.check(is_superadmin)
     async def config_panel(self, ctx):
-        """Open the global-config editor panel. Prefix-only and superadmin:
-        global state must be reachable regardless of the invoker's Discord
-        permissions in whatever server they happen to be standing in."""
+        """Open the global-config editor panel. Superadmin: global state must
+        be reachable regardless of the invoker's Discord permissions in
+        whatever server they happen to be standing in. Posts PUBLICLY and
+        enumerates config KEY NAMES — prefer /config (#76)."""
         view = ConfigView(self, ctx.author)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
 

@@ -26,6 +26,7 @@ other's replies forever (the cope->seethe incident, 2026-08-07).
 from discord.ext import commands
 
 import discord
+from discord import app_commands
 import random
 import re
 
@@ -127,13 +128,27 @@ class AutoResponse(commands.Cog):
 
     # ---- admin UI -------------------------------------------------------
 
+    @app_commands.command(name="autoresponse",
+                          description="Open the auto-response panel (admin)")
+    @app_commands.guild_only()
+    async def autoresponse_slash(self, interaction: discord.Interaction):
+        """Ephemeral twin of `!autoresponse` (#76). No default_permissions:
+        the gate is the bot's own admin concept, not Discord permissions."""
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "Requires admin.", ephemeral=True)
+            return
+        view = AutoResponseView(self, interaction.user, interaction.guild)
+        await interaction.response.send_message(
+            embed=view.render_embed(), view=view, ephemeral=True)
+        view.message = None
+
     @commands.command(name="autoresponse", hidden=True)
     @commands.guild_only()
     @commands.check(is_admin)
     async def autoresponse_prefix(self, ctx):
-        """Open the auto-response panel. Prefix-only by design: panel
-        launchers gate on the bot's admin concept and stay out of the
-        public slash picker."""
+        """Open the auto-response panel. Posts PUBLICLY — use
+        /autoresponse for a private one (#76)."""
         view = AutoResponseView(self, ctx.author, ctx.guild)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
 
