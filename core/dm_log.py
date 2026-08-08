@@ -17,8 +17,9 @@ snowflakes are monotonic, so `after_id` is the lossless poll cursor.
 """
 
 import json
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 DM_LOG_DIR = Path('logs/dms')
 
@@ -79,12 +80,21 @@ def load_dms(user_id: int, limit: Optional[int] = None,
     missing file is a legitimately empty transcript ([]); an unreadable
     file RAISES, because "they never wrote" and "the read failed" must not
     look identical to a caller deciding whether to re-contact someone.
+
+    Memory is bounded by `limit`, not by transcript size: the file is
+    streamed a line at a time and at most `limit` rows are ever retained
+    (forward paging stops reading once its page is full; a tail read keeps
+    a rolling window of the last N). A 50-row read of a 200k-row
+    transcript costs 50 rows of memory, not 200k.
     """
     path = _dm_file(user_id)
     if not path.exists():
         return []
 
-    rows: List[Dict] = []
+    # Tail reads keep a rolling window of the most recent `limit` rows;
+    # everything older falls off the left as it is read.
+    rows: Any = ([] if (limit is None or after_id is not None)
+                 else deque(maxlen=limit))
     with open(path, 'r') as f:
         for line in f:
             line = line.strip()
@@ -103,10 +113,12 @@ def load_dms(user_id: int, limit: Optional[int] = None,
             if since is not None and str(row.get('timestamp', '')) <= since:
                 continue
             rows.append(row)
+            # Forward paging takes the OLDEST matching rows, so the page is
+            # complete as soon as it is full — no reason to read further.
+            if after_id is not None and limit is not None and len(rows) >= limit:
+                break
 
-    if limit is not None and len(rows) > limit:
-        rows = rows[:limit] if after_id is not None else rows[-limit:]
-    return rows
+    return list(rows)
 
 
 def list_dm_users() -> List[int]:
