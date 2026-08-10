@@ -40,7 +40,7 @@ class ChannelMigrator(commands.Cog):
         # aiohttp.ClientSession() may not have a running event loop.
         self._http_session: Optional[aiohttp.ClientSession] = None
 
-    @commands.command(name="backupchannel")
+    @commands.command(name="backupchannel", hidden=True)
     @commands.check(is_superadmin)
     async def backup_channel(
         self,
@@ -86,7 +86,7 @@ class ChannelMigrator(commands.Cog):
             f"Use `!migratehere {safe_name}` in the destination channel to replay."
         )
 
-    @commands.command(name="migratehere")
+    @commands.command(name="migratehere", hidden=True)
     @commands.check(is_superadmin)
     async def migrate_here(
         self,
@@ -125,7 +125,7 @@ class ChannelMigrator(commands.Cog):
             f"Migration complete. Replayed {sent_entries} entries from `{safe_name}` into {target_channel.mention}."
         )
 
-    @commands.command(name="downloadbundleassets")
+    @commands.command(name="downloadbundleassets", hidden=True)
     @commands.check(is_superadmin)
     async def download_bundle_assets(
         self,
