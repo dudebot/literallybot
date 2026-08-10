@@ -8,9 +8,13 @@ abstraction to maintain. Disabling this cog (!cogs / disabled_cogs)
 removes both surfaces with zero code changes.
 
 Visibility rules:
-- prefix commands: `hidden=True` ones (the admin/superadmin surface,
-  including every panel launcher) appear only for invokers passing
-  `is_admin`; everything else shows for everyone
+- prefix commands (!help): a command is listed only if the invoker could
+  actually run it — `hidden=True` ones (the admin/superadmin surface,
+  including every panel launcher) require `is_admin`, and every command
+  must additionally pass its own checks via can_run. Gating on `hidden`
+  alone used to advertise checked-but-unhidden commands to everyone.
+- prefix commands (/help): no Context exists to evaluate checks against,
+  so only the `hidden` rule applies.
 - slash commands: shown to everyone when they carry no default_permissions;
   gated ones appear only for admin invokers.
 """
@@ -40,7 +44,31 @@ def _slash_entries(cmd):
         yield (f"/{cmd.name}", cmd.description or "")
 
 
-def build_help_embed(bot, invoker_is_admin):
+async def _visible_to(cmd, ctx, invoker_is_admin):
+    """Whether a prefix command belongs in this invoker's listing.
+
+    `hidden` is an authoring hint, not an authorization boundary: a command
+    can be gated by a check and still ship without hidden=True (that is how
+    an is_owner() command once got advertised to every DM user, who then
+    ran it and got "You do not own this bot"). So the real test is the
+    command's own checks via can_run — advertise only what the invoker
+    could actually run. ctx is None for the slash surface, which has no
+    Context to run prefix-command checks against; fall back to `hidden`
+    there rather than guessing at a check's outcome.
+    """
+    if cmd.hidden and not invoker_is_admin:
+        return False
+    if ctx is None:
+        return True
+    try:
+        return await cmd.can_run(ctx)
+    except commands.CommandError:
+        # Any check that raises (NotOwner, CheckFailure, ...) means "not
+        # for this invoker" — same answer as a plain False.
+        return False
+
+
+async def build_help_embed(bot, invoker_is_admin, ctx=None):
     """One monolithic embed: a field per cog, commands listed inside."""
     # Slash-command ownership: which cog registered each top-level command.
     slash_by_cog = {}
@@ -58,7 +86,7 @@ def build_help_embed(bot, invoker_is_admin):
         cog = bot.cogs[cog_name]
         entries = []
         for cmd in sorted(cog.get_commands(), key=lambda c: c.name):
-            if cmd.hidden and not invoker_is_admin:
+            if not await _visible_to(cmd, ctx, invoker_is_admin):
                 continue
             entries.append((f"!{cmd.name}", cmd.short_doc or ""))
         for ac in slash_by_cog.get(cog_name, []):
@@ -98,7 +126,7 @@ class Help(commands.Cog):
 
     @app_commands.command(name="help", description="Overview of the bot's commands")
     async def slash_help(self, interaction: discord.Interaction):
-        embed = build_help_embed(self.bot, is_admin(interaction))
+        embed = await build_help_embed(self.bot, is_admin(interaction))
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @commands.command(name="help")
@@ -108,7 +136,7 @@ class Help(commands.Cog):
         # public, so an admin running !help in a busy channel does print
         # the admin command names where everyone can read them. /help
         # (ephemeral) is the discreet variant.
-        embed = build_help_embed(self.bot, is_admin(ctx))
+        embed = await build_help_embed(self.bot, is_admin(ctx), ctx)
         await ctx.send(embed=embed)
 
 
