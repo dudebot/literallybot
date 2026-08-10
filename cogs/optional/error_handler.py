@@ -44,7 +44,7 @@ class ErrorLoggingAdmin(commands.Cog):
 
     # ==================== TEXT COMMANDS ====================
 
-    @commands.group(name="errorlog", invoke_without_command=True)
+    @commands.group(name="errorlog", invoke_without_command=True, hidden=True)
     async def errorlog(self, ctx):
         """
         Error logging configuration commands.
@@ -55,7 +55,7 @@ class ErrorLoggingAdmin(commands.Cog):
     @errorlog.command(name="status")
     @commands.check(is_admin)
     async def errorlog_status(self, ctx):
-        """Show current error logging configuration. Requires: Guild admin or superadmin"""
+        """Show current error logging configuration."""
         if not ctx.guild:
             await ctx.send("This command must be run in a guild.")
             return
@@ -138,7 +138,6 @@ class ErrorLoggingAdmin(commands.Cog):
         """
         Set the default error logging channel for this guild.
         Usage: !errorlog setchannel #channel
-        Requires: Guild admin or superadmin
         """
         if not ctx.guild:
             await ctx.send("This command must be run in a guild.")
@@ -204,7 +203,6 @@ class ErrorLoggingAdmin(commands.Cog):
         Route a specific error category to a channel for this guild.
         Categories: command_error, event_error, task_error, other
         Usage: !errorlog setcategory command_error #channel
-        Requires: Guild admin or superadmin
         """
         if not ctx.guild:
             await ctx.send("This command must be run in a guild.")
@@ -241,7 +239,6 @@ class ErrorLoggingAdmin(commands.Cog):
         Route a specific severity level to a channel for this guild.
         Severities: info, warning, error, critical
         Usage: !errorlog setseverity critical #channel
-        Requires: Guild admin or superadmin
         """
         if not ctx.guild:
             await ctx.send("This command must be run in a guild.")
@@ -270,7 +267,7 @@ class ErrorLoggingAdmin(commands.Cog):
     @commands.check(is_superadmin)
     async def errorlog_ratelimit(self, ctx, minutes: int):
         """
-        Set the global rate limit for duplicate errors in minutes (superadmin only).
+        Set the global rate limit for duplicate errors in minutes.
         This applies to all error deduplication across all guilds.
         Usage: !errorlog ratelimit 10
         """
@@ -290,7 +287,6 @@ class ErrorLoggingAdmin(commands.Cog):
         """
         Disable error logging for this guild by removing all error config.
         Re-enable with !errorlog setchannel
-        Requires: Guild admin or superadmin
         """
         if not ctx.guild:
             await ctx.send("This command must be run in a guild.")
@@ -306,7 +302,7 @@ class ErrorLoggingAdmin(commands.Cog):
     @commands.check(is_superadmin)
     async def errorlog_setglobal(self, ctx, *, channel: str = None):
         """
-        Set or disable global error channel (superadmin only).
+        Set or disable global error channel.
         Receives errors from: cog load failures, DMs, uncaught errors, and guilds without their own config.
         Usage: !errorlog setglobal #channel
         Usage: !errorlog setglobal disable

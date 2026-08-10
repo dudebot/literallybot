@@ -30,7 +30,7 @@ from discord import app_commands
 import random
 import re
 
-from core.utils import InvokerOnlyView, is_admin
+from core.utils import InvokerOnlyView, app_is_admin, is_admin
 
 MAX_ENTRIES = 25  # Discord select-menu option cap
 
@@ -129,11 +129,15 @@ class AutoResponse(commands.Cog):
     # ---- admin UI -------------------------------------------------------
 
     @app_commands.command(name="autoresponse",
-                          description="Open the auto-response panel (admin)")
+                          description="Open the auto-response panel")
     @app_commands.guild_only()
+    @app_is_admin()
     async def autoresponse_slash(self, interaction: discord.Interaction):
-        """Ephemeral twin of `!autoresponse` (#76). No default_permissions:
-        the gate is the bot's own admin concept, not Discord permissions."""
+        """Ephemeral twin of `!autoresponse` (#76). The gate is the bot's own
+        admin concept, not Discord permissions, so it rides on @app_is_admin
+        rather than default_permissions — that keeps the decorator
+        authoritative for both enforcement and /help visibility. The body
+        check stays as defense in depth and for the friendly denial."""
         if not is_admin(interaction):
             await interaction.response.send_message(
                 "Requires admin.", ephemeral=True)
