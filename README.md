@@ -230,10 +230,10 @@ against live bot config via `core.utils.is_admin`/`is_superadmin`.
 ## 🏗️ Development & Extension
 
 ### Creating Custom Cogs
-Add new features by creating cogs in `cogs/dynamic/`:
+Add new features by creating cogs in `cogs/optional/`:
 
 ```python
-# cogs/dynamic/my_feature.py
+# cogs/optional/my_feature.py
 from discord.ext import commands
 
 class MyFeature(commands.Cog):

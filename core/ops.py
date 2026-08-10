@@ -30,7 +30,7 @@ This module is frontend-agnostic on purpose: it does not import
 into `bot.py`. It only knows how to run an op against an `OpContext`.
 
 Permission gates route through `core.utils.is_admin` / `is_superadmin`,
-the same helpers `cogs/dynamic/cleanup.py` and `cogs/dynamic/setrole.py`
+the same helpers `cogs/optional/cleanup.py` and `cogs/optional/setrole.py`
 already use via `@commands.check(...)`. Those helpers expect a duck-typed
 ctx with `.author`, `.guild`, and `.bot.config` — `OpContext` below mirrors
 that shape so the existing helpers work unmodified.
@@ -907,7 +907,7 @@ async def edit_message(ctx: OpContext, message, content: str):
 
 @registry.op(
     "delete_message",
-    "Delete a message. Requires admin — mirrors cogs/dynamic/cleanup.py's "
+    "Delete a message. Requires admin — mirrors cogs/optional/cleanup.py's "
     "bulk-delete gate, which restricts message deletion to superadmin/admin.",
     PermissionLevel.ADMIN,
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to delete.")],
@@ -1133,7 +1133,7 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
 @registry.op(
     "add_role",
     "Add a role to a member. Requires admin — self-service role assignment "
-    "is the reaction-role system's job (cogs/dynamic/setrole.py), not this op's.",
+    "is the reaction-role system's job (cogs/optional/setrole.py), not this op's.",
     PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD,
@@ -2034,9 +2034,9 @@ def _smoke_test() -> None:
     # accept at most 25 options EACH. discord.py does not validate this —
     # an over-long select builds fine and fails with an HTTP 400 when the
     # panel opens. The /aisettings panel chunks the universe across selects
-    # (see _tool_selects in cogs/dynamic/gpt.py); this assert is the tripwire
+    # (see _tool_selects in cogs/optional/gpt.py); this assert is the tripwire
     # that tells you WHY if that chunking is ever removed.
-    from cogs.dynamic.gpt import SELECT_MAX_OPTIONS, _tool_selects
+    from cogs.optional.gpt import SELECT_MAX_OPTIONS, _tool_selects
     _selects = _tool_selects(sorted(names), [], None)
     for _sel in _selects:
         assert len(_sel.options) <= SELECT_MAX_OPTIONS, (

@@ -1,8 +1,10 @@
 """literallybot — a general-purpose Discord bot built on discord.py.
 
-Entry point: creates the bot, loads cogs from cogs/static (always-on) and
-cogs/dynamic (hot-reloadable), and wires logging, error handling, and the
-optional MCP ops server. Runtime configuration lives in configs/ as JSON.
+Entry point: creates the bot, loads cogs from cogs/core (the recovery
+surface, never disableable) and cogs/optional (everything a deployment can
+switch off via the global `disabled_cogs` config), and wires logging, error
+handling, and the optional MCP ops server. Runtime configuration lives in
+configs/ as JSON.
 """
 from discord.ext import commands
 import discord
@@ -69,14 +71,14 @@ bot = LiterallyBot(command_prefix=get_prefix, intents=discord.Intents.all())
 bot.logger = logger
 bot.config = Config()
 
-# Function to load all cogs from ./cogs/{static,dynamic}
+# Function to load all cogs from ./cogs/{core,optional}
 async def load_cogs():
     failed_cogs = []  # Track failed cogs for reporting
 
-    from core.utils import list_cog_modules
+    from core.utils import COG_GROUPS, list_cog_modules
 
-    for group in ("static", "dynamic"):
-        # bot.config filters out globally disabled dynamic cogs.
+    for group in COG_GROUPS:
+        # bot.config filters out globally disabled cogs (never cogs/core/).
         for cog_name in list_cog_modules(group, bot.config):
             try:
                 # Skip if already loaded (handles reconnection scenarios)
@@ -103,12 +105,12 @@ async def on_ready():
     """Called on connect (and reconnect): syncs application commands once
     per process. Cogs are loaded in LiterallyBot.setup_hook (before the
     gateway connects) so persistent views are registered before any click
-    arrives; status rotation lives in cogs/static/status.py."""
+    arrives; status rotation lives in cogs/optional/status.py."""
 
     logger.info(f'{bot.user.name} is online and ready!')
 
     # on_ready refires on reconnect — only sync the command tree once per
-    # process (Dev's !sync command handles manual re-syncs).
+    # process (Control's !sync command handles manual re-syncs).
     if not getattr(bot, "_synced", False):
         await bot.tree.sync()
         bot._synced = True

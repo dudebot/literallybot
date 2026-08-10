@@ -1,6 +1,6 @@
 """Presence rotation — cycles the bot's status line on a fixed interval.
 
-Lives in cogs/static rather than the entrypoint so the loop and its error
+Lives in cogs/optional rather than the entrypoint so the loop and its error
 handler are declared together at class scope: the decorators run at import,
 which makes the handler registration structurally correct instead of
 depending on where it sits relative to the blocking bot.run() call.

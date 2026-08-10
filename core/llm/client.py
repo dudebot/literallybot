@@ -79,7 +79,7 @@ DEFAULT_MAX_TOKENS = 3000
 # discovery. Model ids current as of 2026-07.
 DEFAULT_PROVIDERS: Dict[str, Any] = {
     # cost_per_mtok_output ($/1M output tokens) drives the per-message cooldown
-    # tier (see cogs/dynamic/gpt.py cooldown_tier_for_cost). timeout_multiplier
+    # tier (see cogs/optional/gpt.py cooldown_tier_for_cost). timeout_multiplier
     # is kept for back-compat but no longer affects cooldown.
     "xai": {
         "name": "xAI Grok",
