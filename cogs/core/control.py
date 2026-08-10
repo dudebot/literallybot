@@ -7,9 +7,14 @@ from datetime import datetime
 import sys
 from core.utils import InvokerOnlyView, is_superadmin, safe_delete, list_cog_modules
 
-class Dev(commands.Cog):
-    """Superadmin-only maintenance commands: cog load/unload/reload, git
-    update, restart, and slash-command sync."""
+class Control(commands.Cog):
+    """The bot's runtime control plane, superadmin-only: cog
+    load/unload/reload, the enable/disable switch over `disabled_cogs`,
+    the global !config editor, git update, restart, and command sync.
+
+    This is why cogs/core/ is never filtered by disabled_cogs. Every
+    in-Discord route to re-enable a cog runs through here, so unloading it
+    leaves shell access as the only way back."""
     def __init__(self, bot):
         self.bot = bot
         self.logger = bot.logger
@@ -30,9 +35,9 @@ class Dev(commands.Cog):
         Note:
             All cognames are made lowercase with `.lower()`_.
         """
-        if (cog.lower()).startswith('cogs.dynamic.') == True:
+        if (cog.lower()).startswith('cogs.optional.') == True:
             return cog.lower()
-        return f'cogs.dynamic.{cog.lower()}'
+        return f'cogs.optional.{cog.lower()}'
 
     def disabled_cogs(self):
         """Bare lowercase names from the global `disabled_cogs` list."""
@@ -98,22 +103,22 @@ class Dev(commands.Cog):
     @commands.command(name='reload', hidden=True)#This command is hidden from the help menu.
     @commands.check(is_superadmin)
     async def reload(self, ctx, cog=None):
-        """This commands reloads a specific cog or all cogs in the `./cogs/dynamic` folder.
+        """This commands reloads a specific cog or all cogs in the `./cogs/optional` folder.
 
         Note:
             This command can be used only from the bot owner.
             This command is hidden from the help menu.
             This command deletes its messages after 20 seconds."""
 
-        self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked reload on {cog or 'all dynamic'}")
+        self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked reload on {cog or 'all optional'}")
         await safe_delete(ctx, self.logger)
 
         if cog is None:
             # Filtering by config here means a reload-all also sheds cogs
             # that were disabled while loaded: unload sweeps everything,
             # load only brings back the enabled set.
-            cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.dynamic.")]
-            cogs_to_load = list_cog_modules('dynamic', self.bot.config)
+            cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.optional.")]
+            cogs_to_load = list_cog_modules('optional', self.bot.config)
         else:
             bare = self.check_cog(cog).rsplit('.', 1)[-1]
             if bare in self.disabled_cogs():
@@ -241,7 +246,7 @@ class Dev(commands.Cog):
     @commands.command(name='list_cogs', hidden=True)
     @commands.check(is_superadmin)
     async def list_cogs(self, ctx):
-        """This command lists all the cogs in the `cogs/dynamic` directory.
+        """This command lists all the cogs in the `cogs/optional` directory.
 
         Note:
             This command can be used only from the bot owner.
@@ -254,7 +259,7 @@ class Dev(commands.Cog):
             # Display keeps the bare cog names (module path stripped).
             # Unfiltered listing so disabled cogs stay visible, marked.
             disabled = self.disabled_cogs()
-            cogs = [mod.rsplit('.', 1)[-1] for mod in list_cog_modules('dynamic')]
+            cogs = [mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional')]
             names = [f'{c} (disabled)' if c.lower() in disabled else c for c in cogs]
             await message.edit(content=f'Available cogs: {", ".join(names)}', delete_after=20)
         except Exception as exc:
@@ -264,7 +269,7 @@ class Dev(commands.Cog):
     @commands.command(name='disable', hidden=True)
     @commands.check(is_superadmin)
     async def disable(self, ctx, *, cog: str):
-        """Add a dynamic cog to the global `disabled_cogs` list and unload it.
+        """Add an optional cog to the global `disabled_cogs` list and unload it.
 
         The deployment-level off switch: a disabled cog stays on disk but is
         skipped by startup, !reload, and !load until re-enabled. Downstream
@@ -278,13 +283,13 @@ class Dev(commands.Cog):
         message = await ctx.send('Disabling...')
         await safe_delete(ctx, self.logger)
         bare = self.check_cog(cog).rsplit('.', 1)[-1]
-        known = {mod.rsplit('.', 1)[-1] for mod in list_cog_modules('dynamic')}
+        known = {mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional')}
         if bare not in known:
-            await message.edit(content=f'No dynamic cog named {bare}.', delete_after=20)
+            await message.edit(content=f'No optional cog named {bare}.', delete_after=20)
             return
         disabled = sorted(self.disabled_cogs() | {bare})
         self.bot.config.set_global("disabled_cogs", disabled)
-        module = f'cogs.dynamic.{bare}'
+        module = f'cogs.optional.{bare}'
         unloaded = ''
         if module in self.bot.extensions:
             try:
@@ -298,7 +303,7 @@ class Dev(commands.Cog):
     @commands.command(name='enable', hidden=True)
     @commands.check(is_superadmin)
     async def enable(self, ctx, *, cog: str):
-        """Remove a dynamic cog from the global `disabled_cogs` list and load it.
+        """Remove an optional cog from the global `disabled_cogs` list and load it.
 
         Note:
             This command can be used only from superadmins.
@@ -313,7 +318,7 @@ class Dev(commands.Cog):
             await message.edit(content=f'{bare} is not disabled.', delete_after=20)
             return
         self.bot.config.set_global("disabled_cogs", sorted(disabled - {bare}))
-        module = f'cogs.dynamic.{bare}'
+        module = f'cogs.optional.{bare}'
         loaded = ''
         if module not in self.bot.extensions:
             try:
@@ -429,7 +434,7 @@ class _CogSelect(discord.ui.Select):
                 default=(name == panel.selected)))
         if not options:
             options = [discord.SelectOption(label="(no cogs)", value="_none")]
-        super().__init__(placeholder="Select a dynamic cog", min_values=0,
+        super().__init__(placeholder="Select an optional cog", min_values=0,
                          max_values=1, options=options[:25], row=0)
 
     async def callback(self, interaction: discord.Interaction):
@@ -454,12 +459,12 @@ class CogsView(InvokerOnlyView, discord.ui.View):
         self._build()
 
     def cog_names(self):
-        return sorted(mod.rsplit('.', 1)[-1] for mod in list_cog_modules('dynamic'))
+        return sorted(mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional'))
 
     def cog_state(self, name):
         if name in self.dev.disabled_cogs():
             return "disabled"
-        if f"cogs.dynamic.{name}" in self.bot.extensions:
+        if f"cogs.optional.{name}" in self.bot.extensions:
             return "loaded"
         return "unloaded"
 
@@ -495,7 +500,7 @@ class CogsView(InvokerOnlyView, discord.ui.View):
             if name is None:
                 await interaction.response.send_message("Select a cog first.", ephemeral=True)
                 return
-            module = f"cogs.dynamic.{name}"
+            module = f"cogs.optional.{name}"
             disabled = self.dev.disabled_cogs()
             if name in disabled:
                 self._set_disabled_list(disabled - {name})
@@ -527,7 +532,7 @@ class CogsView(InvokerOnlyView, discord.ui.View):
             if name is None:
                 await interaction.response.send_message("Select a cog first.", ephemeral=True)
                 return
-            module = f"cogs.dynamic.{name}"
+            module = f"cogs.optional.{name}"
             try:
                 await self.bot.reload_extension(module)
                 self.flash(f"{name} reloaded.")
@@ -540,20 +545,20 @@ class CogsView(InvokerOnlyView, discord.ui.View):
                 await interaction.response.send_message("Superadmin only.", ephemeral=True)
                 return
             # Same semantics as !reload with no argument: unload every loaded
-            # dynamic cog, load the enabled set — sheds newly disabled cogs.
+            # optional cog, load the enabled set — sheds newly disabled cogs.
             errors = []
             for module in [c for c in list(self.bot.extensions)
-                           if c.startswith("cogs.dynamic.")]:
+                           if c.startswith("cogs.optional.")]:
                 try:
                     await self.bot.unload_extension(module)
                 except Exception as e:
                     errors.append(f"unload {module}: {e}")
-            for module in list_cog_modules('dynamic', self.bot.config):
+            for module in list_cog_modules('optional', self.bot.config):
                 try:
                     await self.bot.load_extension(module)
                 except Exception as e:
                     errors.append(f"load {module}: {e}")
-            self.flash("Reloaded all dynamic cogs."
+            self.flash("Reloaded all optional cogs."
                        if not errors else "Errors: " + "; ".join(errors)[:900])
             await self.rerender(interaction)
 
@@ -787,4 +792,4 @@ class ConfigView(InvokerOnlyView, discord.ui.View):
 
 async def setup(bot):
     """Every cog needs a setup function like this."""
-    await bot.add_cog(Dev(bot))
+    await bot.add_cog(Control(bot))

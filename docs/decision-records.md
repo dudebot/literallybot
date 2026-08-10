@@ -58,7 +58,7 @@ conflict, this entry wins:
   ⇒ plain-chat path, guaranteed single model turn) plus a global
   `mcp_tools_enabled` allowlist consumed by `mcp_ops/server.py` at build
   time (restart-gated). Both are edited via the `/ai settings` panel
-  (`cogs/dynamic/ai_admin.py`), which also runs the one-shot flag→allowlist
+  (`cogs/optional/ai_admin.py`), which also runs the one-shot flag→allowlist
   migration on cog load.
 - The narration-guard regex + retry nudge (`NARRATED_ACTION_RE`) was removed:
   its word-list fired on ordinary replies and caused duplicate answers. The
@@ -80,7 +80,7 @@ Supersedes the 2026-07-10 sentence "the narration-guard regex + retry nudge
 was removed" — a narrated-call backstop exists again, but it is NOT the
 word-list regex (that stays dead). Trigger: a live incident where grok-4.5
 posted "run tool search_history with channel_id is ..." verbatim with zero
-tool calls. The redesign (`cogs/dynamic/gpt.py`):
+tool calls. The redesign (`cogs/optional/gpt.py`):
 
 - Detector fires ONLY on a verbatim enabled-tool snake_case name or explicit
   "run tool" phrasing in a zero-tool-call reply — never a generic word list.
