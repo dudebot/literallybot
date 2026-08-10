@@ -16,6 +16,12 @@ import re
 from typing import List, Union, Any
 import discord
 
+# The cogs/ groups, in load order. cogs/core/ is the recovery surface and is
+# never filtered by disabled_cogs; every other group is a deployment choice.
+# One owner for these names so the loader and the filter can never disagree.
+CORE_COG_GROUP = "core"
+COG_GROUPS = (CORE_COG_GROUP, "optional")
+
 
 def _actor(ctx_or_interaction: Any) -> Any:
     """Return the invoking user/member for either a Context or an Interaction.
@@ -141,24 +147,34 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
 
 def list_cog_modules(group: str, config=None) -> List[str]:
     """Loadable cog modules for a cogs/ group, as dotted module paths
-    (['cogs.dynamic.gpt', ...]). THE one owner of the loadable-cog rule
+    (['cogs.optional.gpt', ...]). THE one owner of the loadable-cog rule
     (*.py, not underscore/dunder-prefixed) — startup load, !reload-all,
     and !list_cogs must all resolve the cog set through this so they can
     never disagree about what counts as loadable. Missing directory
     yields [] (mirrors the startup skip).
 
-    When a Config is passed, dynamic cogs named in the global
-    `disabled_cogs` list (bare lowercase names, e.g. "gpt") are excluded —
-    the deployment-level off switch that lets downstream forks carry
-    upstream cogs on disk without running them. Static cogs are never
-    filtered: they are the management backbone (admin/dev/error_handler)
-    and disabling them could brick the bot. Omitting config yields the
-    full on-disk set (what !list_cogs uses to show disabled entries)."""
+    When a Config is passed, cogs named in the global `disabled_cogs` list
+    (bare lowercase names, e.g. "gpt") are excluded — the deployment-level
+    off switch that lets downstream forks carry upstream cogs on disk
+    without running them. Omitting config yields the full on-disk set
+    (what !list_cogs uses to show disabled entries).
+
+    cogs/core/ is the ONE exception and is never filtered: it holds the
+    recovery surface (control.py's enable/disable/load/reload/restart and
+    the !config editor, plus admin.py's claimsuper bootstrap). Disabling
+    those removes the means of re-enabling anything from Discord, leaving
+    shell access as the only way back. Everything else — including error
+    handling, which is wired in bot.py from core/error_handler.py and does
+    not need its cog loaded — is a deployment choice.
+
+    The test is deliberately `group != CORE_COG_GROUP` rather than an
+    allow-list of filterable groups, so a future third folder fails CLOSED
+    (disableable) instead of silently inheriting core's protection."""
     dir_path = f"./cogs/{group}"
     if not os.path.isdir(dir_path):
         return []
     disabled = set()
-    if config is not None and group == "dynamic":
+    if config is not None and group != CORE_COG_GROUP:
         disabled = {str(name).lower()
                     for name in (config.get_global("disabled_cogs", []) or [])}
     return [f"cogs.{group}.{filename[:-3]}"
@@ -285,7 +301,7 @@ def recursive_split(text, max_size=2000):
     """Split text into Discord-size chunks, preferring newline/sentence/space
     boundaries and keeping fenced/inline code blocks intact across chunks.
     The single shared implementation of Discord's 2000-char message limit —
-    moved here from cogs/dynamic/gpt.py (seam-machine claim 3)."""
+    moved here from cogs/optional/gpt.py (seam-machine claim 3)."""
     if len(text) <= max_size:
         return [text]
     mid = len(text) // 2

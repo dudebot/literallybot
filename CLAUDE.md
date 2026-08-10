@@ -10,8 +10,8 @@ literallybot/
 │   ├── error_handler.py # Error logging to Discord channels
 │   └── utils.py        # Permission helpers (is_admin, is_superadmin)
 ├── cogs/
-│   ├── static/         # Always-loaded cogs (admin, dev, error_handler)
-│   └── dynamic/        # Hot-reloadable feature cogs
+│   ├── core/           # Recovery surface — never disableable (control, admin)
+│   └── optional/       # Everything else; deployment picks via disabled_cogs
 ├── configs/            # Runtime JSON storage (guild, user, global)
 ├── docs/               # Developer documentation
 │   ├── cog-development.md
@@ -39,7 +39,8 @@ literallybot/
 - See `docs/error-handling.md` for patterns
 
 ### Cog Development
-- Dynamic cogs go in `cogs/dynamic/`
+- New cogs go in `cogs/optional/`. `cogs/core/` is only for the recovery
+  surface — the commands that turn things back on (`control.py`, `admin.py`)
 - Use `!reload cogname` for hot-reload during development
 - See `docs/cog-development.md` for structure and examples
 

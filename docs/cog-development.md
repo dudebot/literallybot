@@ -5,8 +5,22 @@ This guide covers creating custom cogs for LiterallyBot, from basic commands to 
 ## Cog Architecture Overview
 
 ### Cog Categories
-- **Static Cogs (`cogs/static/`)** - Core functionality (admin, dev tools) - always loaded
-- **Dynamic Cogs (`cogs/dynamic/`)** - Features that can be loaded/unloaded - main extension point
+
+The split is one question: **if this cog is off, can you still turn it — or
+anything else — back on from Discord alone?**
+
+- **Core Cogs (`cogs/core/`)** - The recovery surface. `control.py` (cog
+  load/unload/reload, `!enable`/`!disable`, `!config`, restart) and
+  `admin.py` (the `claimsuper` bootstrap). Never filtered by
+  `disabled_cogs`, because disabling them leaves shell access as the only
+  way back. Adding a cog here should be rare and needs this justification.
+- **Optional Cogs (`cogs/optional/`)** - Everything else, and the main
+  extension point. "Optional" means the deployment chooses, not that the
+  cog is unimportant — error handling's `!errorlog` surface lives here,
+  since `bot.py` wires error handling from `core/error_handler.py` and
+  does not need the cog loaded.
+
+New cogs go in `cogs/optional/` unless they are part of the recovery path.
 
 ### Basic Cog Structure
 ```python
@@ -243,8 +257,10 @@ self.bot.config.set_user(987654321, "preference", "value")
 
 ## Disabling Cogs Per Deployment
 - `!cogs` (superadmin panel) or `!disable my_cog` / `!enable my_cog` maintain
-  the global `disabled_cogs` config list. A disabled dynamic cog stays on
-  disk but is skipped by startup, `!reload`, and `!load` until re-enabled.
+  the global `disabled_cogs` config list. A disabled cog stays on disk but
+  is skipped by startup, `!reload`, and `!load` until re-enabled.
 - This is how downstream forks of this codebase carry upstream cogs without
   running them — disable, don't delete, so upstream merges stay clean.
-- Static cogs can't be disabled; they're the management backbone.
+- `cogs/core/` can't be disabled; it is the means of re-enabling everything
+  else. The filter tests `group != CORE_COG_GROUP`, so any future cog group
+  is disableable by default rather than silently inheriting that immunity.

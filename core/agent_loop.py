@@ -15,7 +15,7 @@ from core/ops.py; the only policy here is the loop's:
 - send_message always uses allowed_mentions=none.
 - Every executed op is logged at INFO (op, params, actor, ok/error).
 
-Wired up by cogs/dynamic/gpt.py when a guild has at least one tool enabled in
+Wired up by cogs/optional/gpt.py when a guild has at least one tool enabled in
 its `bot_tools_enabled` allowlist (the empty default routes to plain chat);
 nothing imports this module otherwise.
 """
