@@ -145,6 +145,45 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
     return False
 
 
+# Gate tiers, stamped onto check predicates by the factories below so a
+# listing can ask "what does this command require?" without running it.
+GATE_ADMIN = "admin"
+GATE_SUPERADMIN = "superadmin"
+
+
+def gate_of(check) -> Union[str, None]:
+    """The tier a check predicate declares, or None if it doesn't say.
+
+    Reading this off the decorator is what lets !help — which has a Context
+    and so cannot evaluate an app-command predicate typed for Interaction —
+    still render the right listing. An untagged check is treated as gated
+    but of unknown tier by callers, never as public."""
+    return getattr(check, "__gate__", None)
+
+
+def app_is_admin():
+    """`@app_commands.check` form of is_admin, tagged with its tier.
+
+    Slash commands whose gate is this bot's admin list (not Discord's
+    permissions) must NOT use @app_commands.default_permissions: that field
+    means something different, and a listing reading it would either hide
+    the command from people who can run it or show it to people who can't.
+    Declaring the real gate here keeps enforcement and visibility on the
+    same decorator, so they cannot drift."""
+    async def predicate(interaction) -> bool:
+        return is_admin(interaction)
+    predicate.__gate__ = GATE_ADMIN
+    return discord.app_commands.check(predicate)
+
+
+def app_is_superadmin():
+    """`@app_commands.check` form of is_superadmin, tagged with its tier."""
+    async def predicate(interaction) -> bool:
+        return is_superadmin(interaction)
+    predicate.__gate__ = GATE_SUPERADMIN
+    return discord.app_commands.check(predicate)
+
+
 def list_cog_modules(group: str, config=None) -> List[str]:
     """Loadable cog modules for a cogs/ group, as dotted module paths
     (['cogs.optional.gpt', ...]). THE one owner of the loadable-cog rule

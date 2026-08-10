@@ -5,7 +5,8 @@ from sys import version_info as sysv
 import subprocess
 from datetime import datetime
 import sys
-from core.utils import InvokerOnlyView, is_superadmin, safe_delete, list_cog_modules
+from core.utils import (InvokerOnlyView, app_is_superadmin, is_superadmin,
+                        safe_delete, list_cog_modules)
 
 class Control(commands.Cog):
     """The bot's runtime control plane, superadmin-only: cog
@@ -359,10 +360,15 @@ class Control(commands.Cog):
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
 
     @app_commands.command(name="cogs",
-                          description="Open the cog-management panel (superadmin)")
+                          description="Open the cog-management panel")
+    @app_is_superadmin()
     async def cogs_slash(self, interaction: discord.Interaction):
-        """Ephemeral twin of `!cogs` (#76). No default_permissions — the gate
-        is the bot's own superadmin list, not Discord permissions."""
+        """Ephemeral twin of `!cogs` (#76). The gate is the bot's own
+        superadmin list, not Discord permissions, so it rides on
+        @app_is_superadmin rather than default_permissions — that keeps the
+        decorator authoritative for both enforcement and /help visibility.
+        The body check stays as defense in depth and to render the friendly
+        denial for anyone who invokes past a stale client cache."""
         if not is_superadmin(interaction):
             await interaction.response.send_message(
                 "Requires superadmin.", ephemeral=True)
@@ -373,7 +379,8 @@ class Control(commands.Cog):
         view.message = None
 
     @app_commands.command(name="config",
-                          description="Open the global-config editor (superadmin)")
+                          description="Open the global-config editor")
+    @app_is_superadmin()
     async def config_slash(self, interaction: discord.Interaction):
         """Ephemeral twin of `!config` (#76).
 

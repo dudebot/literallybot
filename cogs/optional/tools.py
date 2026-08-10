@@ -14,7 +14,7 @@ class Tools(commands.Cog):
         self.bot = bot
         self.start_time = datetime.datetime.now(datetime.timezone.utc)
 
-    @commands.command(name='echo')
+    @commands.command(name='echo', hidden=True)
     @commands.check(is_admin)
     async def echo(self, ctx, *, message):
         """Repost the given text as the bot (admin only — deleting the

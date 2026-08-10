@@ -7,22 +7,33 @@ grouping mechanism is the cog a command came from; no category
 abstraction to maintain. Disabling this cog (!cogs / disabled_cogs)
 removes both surfaces with zero code changes.
 
-Visibility rules:
-- prefix commands (!help): a command is listed only if the invoker could
-  actually run it — `hidden=True` ones (the admin/superadmin surface,
-  including every panel launcher) require `is_admin`, and every command
-  must additionally pass its own checks via can_run. Gating on `hidden`
-  alone used to advertise checked-but-unhidden commands to everyone.
-- prefix commands (/help): no Context exists to evaluate checks against,
-  so only the `hidden` rule applies.
-- slash commands: shown to everyone when they carry no default_permissions;
-  gated ones appear only for admin invokers.
+Visibility rule, one sentence: THE DECORATOR DECIDES. A command is listed
+only if the invoker could actually run it, and the answer comes from the
+command's own checks — never from `hidden=True` alone (an authoring hint)
+and never from a "(superadmin)" suffix in the description (a string that
+goes stale silently). Both surfaces apply the same rule:
+
+- with the matching context (a Context for !help, an Interaction for
+  /help), the checks are EXECUTED and answer exactly;
+- without it — !help cannot run an Interaction-typed predicate, /help
+  cannot run a Context-typed one — the fallback reads the tier the check
+  declares via core.utils' app_is_admin/app_is_superadmin factories, which
+  stamp `__gate__` on their predicates. A gate of unknown tier fails
+  closed (admin-or-better), never open.
+
+Two leaks this replaced: gating on `hidden` alone advertised an is_owner()
+command to every DM user, and treating `default_permissions is None` as
+"public" advertised /cogs, /config and /autoresponse to everyone, since
+their gate is this bot's admin list rather than a Discord permission.
 """
+import inspect
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core.utils import is_admin
+from core.utils import (GATE_ADMIN, GATE_SUPERADMIN, gate_of, is_admin,
+                        is_superadmin)
 
 MEDIA_NOTE = "Any file in this server's media library can be posted with !<name> — admins manage it via /media"
 
@@ -44,21 +55,78 @@ def _slash_entries(cmd):
         yield (f"/{cmd.name}", cmd.description or "")
 
 
-async def _visible_to(cmd, ctx, invoker_is_admin):
+def _is_gated(cmd, cog=None):
+    """Whether anything at all restricts who may run this command.
+
+    Deliberately structural: the presence of a check, a cog-wide cog_check,
+    or Discord-level default_permissions. It never reads the description —
+    a "(superadmin)" suffix in help text is a string that goes stale and
+    must never be what decides visibility.
+    """
+    if getattr(cmd, "checks", None):
+        return True
+    if getattr(cmd, "default_permissions", None) is not None:
+        return True
+    parent = getattr(cmd, "parent", None)
+    if parent is not None and _is_gated(parent):
+        return True
+    cog = cog if cog is not None else getattr(cmd, "cog", None)
+    # A cog_check gates every command in the cog (how !errorlog is gated
+    # without any per-command decorator).
+    if cog is not None and type(cog).cog_check is not commands.Cog.cog_check:
+        return True
+    return False
+
+
+def _gate_tier(cmd):
+    """The strictest tier any of this command's checks declares, or None.
+
+    Reads the __gate__ stamp that core.utils' is_admin/is_superadmin check
+    factories leave on their predicates. This is what lets a surface that
+    cannot EXECUTE a check still know who it was meant for."""
+    tiers = set()
+    node = cmd
+    while node is not None:
+        for check in (getattr(node, "checks", None) or []):
+            tier = gate_of(check)
+            if tier:
+                tiers.add(tier)
+        node = getattr(node, "parent", None)
+    if GATE_SUPERADMIN in tiers:
+        return GATE_SUPERADMIN
+    if GATE_ADMIN in tiers:
+        return GATE_ADMIN
+    return None
+
+
+def _passes_tier(cmd, invoker_is_admin, invoker_is_superadmin):
+    """Static visibility for a gated command, used when the surface cannot
+    run the check itself. Unknown tier is treated as admin-or-better, never
+    as public — an untagged gate fails closed."""
+    tier = _gate_tier(cmd)
+    if tier == GATE_SUPERADMIN:
+        return invoker_is_superadmin
+    return invoker_is_admin
+
+
+async def _visible_to(cmd, ctx, invoker_is_admin, invoker_is_superadmin):
     """Whether a prefix command belongs in this invoker's listing.
 
     `hidden` is an authoring hint, not an authorization boundary: a command
     can be gated by a check and still ship without hidden=True (that is how
     an is_owner() command once got advertised to every DM user, who then
     ran it and got "You do not own this bot"). So the real test is the
-    command's own checks via can_run — advertise only what the invoker
-    could actually run. ctx is None for the slash surface, which has no
-    Context to run prefix-command checks against; fall back to `hidden`
-    there rather than guessing at a check's outcome.
+    command's own checks.
+
+    With a Context, can_run answers exactly. Without one (the /help path),
+    fall back to the structural test rather than assuming public — that
+    assumption is what leaked cog_check-gated commands like !errorlog.
     """
     if cmd.hidden and not invoker_is_admin:
         return False
     if ctx is None:
+        if _is_gated(cmd):
+            return _passes_tier(cmd, invoker_is_admin, invoker_is_superadmin)
         return True
     try:
         return await cmd.can_run(ctx)
@@ -68,13 +136,44 @@ async def _visible_to(cmd, ctx, invoker_is_admin):
         return False
 
 
-async def build_help_embed(bot, invoker_is_admin, ctx=None):
+async def _slash_visible_to(ac, interaction, invoker_is_admin,
+                            invoker_is_superadmin):
+    """Whether a slash command belongs in this invoker's listing.
+
+    The mirror of _visible_to. `default_permissions is None` used to stand
+    in for "public", but commands whose gate is this bot's own admin list
+    deliberately set no default_permissions — so that test advertised every
+    admin panel to everyone. Ask the decorator instead.
+
+    With an Interaction the checks run for real; !help has only a Context,
+    which an Interaction-typed predicate cannot accept, so it falls back to
+    the declared tier.
+    """
+    if not _is_gated(ac):
+        return True
+    if interaction is None:
+        return _passes_tier(ac, invoker_is_admin, invoker_is_superadmin)
+    for check in (getattr(ac, "checks", None) or []):
+        try:
+            result = check(interaction)
+            if inspect.isawaitable(result):
+                result = await result
+            if not result:
+                return False
+        except app_commands.AppCommandError:
+            return False
+    return True
+
+
+async def build_help_embed(bot, invoker_is_admin, ctx=None,
+                           invoker_is_superadmin=False, interaction=None):
     """One monolithic embed: a field per cog, commands listed inside."""
     # Slash-command ownership: which cog registered each top-level command.
     slash_by_cog = {}
     for cog in bot.cogs.values():
         for ac in cog.get_app_commands():
-            if invoker_is_admin or ac.default_permissions is None:
+            if await _slash_visible_to(ac, interaction, invoker_is_admin,
+                                       invoker_is_superadmin):
                 slash_by_cog.setdefault(cog.qualified_name, []).append(ac)
 
     embed = discord.Embed(
@@ -86,7 +185,8 @@ async def build_help_embed(bot, invoker_is_admin, ctx=None):
         cog = bot.cogs[cog_name]
         entries = []
         for cmd in sorted(cog.get_commands(), key=lambda c: c.name):
-            if not await _visible_to(cmd, ctx, invoker_is_admin):
+            if not await _visible_to(cmd, ctx, invoker_is_admin,
+                                     invoker_is_superadmin):
                 continue
             entries.append((f"!{cmd.name}", cmd.short_doc or ""))
         for ac in slash_by_cog.get(cog_name, []):
@@ -126,7 +226,10 @@ class Help(commands.Cog):
 
     @app_commands.command(name="help", description="Overview of the bot's commands")
     async def slash_help(self, interaction: discord.Interaction):
-        embed = await build_help_embed(self.bot, is_admin(interaction))
+        embed = await build_help_embed(
+            self.bot, is_admin(interaction),
+            invoker_is_superadmin=is_superadmin(interaction),
+            interaction=interaction)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @commands.command(name="help")
@@ -136,7 +239,9 @@ class Help(commands.Cog):
         # public, so an admin running !help in a busy channel does print
         # the admin command names where everyone can read them. /help
         # (ephemeral) is the discreet variant.
-        embed = await build_help_embed(self.bot, is_admin(ctx), ctx)
+        embed = await build_help_embed(
+            self.bot, is_admin(ctx), ctx,
+            invoker_is_superadmin=is_superadmin(ctx))
         await ctx.send(embed=embed)
 
 

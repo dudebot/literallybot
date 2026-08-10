@@ -8,7 +8,7 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from core.utils import InvokerOnlyView, is_admin, is_superadmin, recursive_split
+from core.utils import InvokerOnlyView, app_is_admin, is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import registry
 from core.agent_loop import AGENT_OPS, resolve_bot_tools
@@ -1287,8 +1287,9 @@ class Gpt(commands.Cog):
         await self.process_askgpt(ctx, question.strip())
 
     @app_commands.command(name="aisettings",
-                          description="Open the AI settings panel (admin)")
+                          description="Open the AI settings panel")
     @app_commands.guild_only()
+    @app_is_admin()
     async def aisettings_slash(self, interaction: discord.Interaction):
         """Ephemeral twin of `!aisettings` (#76).
 

@@ -7,7 +7,7 @@ from discord import File, app_commands
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
-from core.utils import InvokerOnlyView, is_admin
+from core.utils import InvokerOnlyView, app_is_admin, is_admin
 
 
 def _format_size(num_bytes):
@@ -204,11 +204,14 @@ class Media(commands.Cog):
     # ---- admin UI -------------------------------------------------------
 
     @app_commands.command(name="media",
-                          description="Open the media-library panel (admin)")
+                          description="Open the media-library panel")
     @app_commands.guild_only()
+    @app_is_admin()
     async def media_slash(self, interaction: discord.Interaction):
-        """Ephemeral twin of `!media` (#76). No default_permissions: the
-        gate is the bot's own admin concept, not Discord permissions."""
+        """Ephemeral twin of `!media` (#76). The gate is the bot's own admin
+        concept, not Discord permissions, so it rides on @app_is_admin rather
+        than default_permissions — keeping the decorator authoritative for
+        both enforcement and /help visibility."""
         if not is_admin(interaction):
             await interaction.response.send_message(
                 "Requires admin.", ephemeral=True)

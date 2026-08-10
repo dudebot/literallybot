@@ -23,7 +23,7 @@ class Admin(commands.Cog):
     @commands.command(name="addsuperadmin", hidden=True)
     @commands.check(is_superadmin)
     async def addsuperadmin(self, ctx, member: discord.Member = None):
-        """Add a user as a bot superadmin (owner only)."""
+        """Add a user as a bot superadmin."""
         if not member:
             await ctx.send("Please specify a user to add as bot superadmin.")
             self.logger.warning(f"addsuperadmin called without member by {ctx.author} (ID: {ctx.author.id})")
@@ -119,7 +119,7 @@ class Admin(commands.Cog):
     @commands.command(name="removesuperadmin", hidden=True)
     @commands.check(is_superadmin)
     async def removesuperadmin(self, ctx, user: discord.User = None):
-        """Remove a user from the global bot superadmins (superadmin only)."""
+        """Remove a user from the global bot superadmins."""
         if not user:
             await ctx.send("Please specify a user to remove as bot superadmin.")
             self.logger.warning(f"removesuperadmin called without member by {ctx.author} (ID: {ctx.author.id})")
