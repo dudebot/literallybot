@@ -255,3 +255,75 @@ Discord id (so a failed gate is not an id-probing oracle). Fail-open-to-full on
 the MCP side is safe only in combination with the gates that are not
 configurable: loopback bind, mandatory bearer token, and per-op permission
 checks.
+
+## #86 — The cog set is fixed at boot (2026-08-11)
+
+**Decision (owner):** hot cog manipulation had functionally never been used.
+The dynamic surface is deleted; the capability survives through restart.
+
+**Deleted outright:**
+
+- `!load`, `!unload`, `!reload` (including bare `!reload` = reload-all) in
+  `cogs/core/control.py`.
+- `!update` — **entirely**, not just its reload step. Its purpose belonged to
+  the desktop-dev era: develop and commit elsewhere, avoid logging into the
+  server to pull. Development now happens on the server itself, so deployment
+  pulls happen in the same shell that restarts the bot. A `git pull` command
+  that a superadmin can fire from Discord is RCE-adjacent surface bought for
+  nothing.
+- The `!cogs` panel's live callbacks: the 🔄 Reload and 🔄 Reload all buttons,
+  and the load/unload half of the enable/disable toggle. `!disable` / `!enable`
+  likewise stopped unloading and loading.
+
+**End state.** `disabled_cogs` is read once, by startup, through
+`core.utils.list_cog_modules`. Every editor of that list — `!disable`,
+`!enable`, and the `!cogs` panel — now writes config and nothing else. The
+panel gained a **Restart** button that calls `Control.do_restart`, the *same*
+exit path as `!restart`/`!kys` (`bot.close()` then `sys.exit()`, with systemd
+restarting the process) rather than a second, parallel one. Its render marks
+entries whose configured state disagrees with what is running as
+*pending restart*, so an edit is never mistaken for an applied change.
+
+**Consistency argument.** The MCP tool surface was already restart-bound by
+deliberate decision (see the section above: FastMCP on mcp 1.x cannot
+reliably broadcast `tools/list_changed` to connected sessions). Cogs churn
+less often than tool lists. Rather than carry two lifetimes, the bot now has
+one mental model: **config edits bind at restart.**
+
+**Deliberately kept:**
+
+- The `add_cog` / `remove_cog` overrides in `bot.py`. They are the boot-time
+  registration path — the only thing stamping `origin='cog'` — and
+  `remove_cog` still fires at shutdown teardown.
+- The op-identity fail-closed guards in `core/agent_loop.py` and
+  `core/mcp_server.py` (aeea912, 9be22f9), including the mid-await TOCTOU
+  re-check, plus their regression tests. These are now **inert**: nothing in
+  production re-registers a name mid-run. They stay because they are ~20
+  tested lines and because they encode *why* name-based dispatch is sound —
+  identity is re-checked, not assumed. If dynamism is ever reintroduced, the
+  belt is already fastened.
+- `registry.unregister_owner` and the register/unregister/register cycle
+  tests, retargeted from "reload semantics" to registry machinery: a name
+  left reserved by teardown would fail the *next* boot's registration, far
+  from its cause.
+
+**Correction to earlier records in this file.** Three passages above were
+accurate when written and are left as written: the panel-doctrine section says
+a cog load/unload "changes the panel on the next rerender without a restart";
+the live-queries paragraph cites "the first `!reload`"; and the `add_cog`
+seam rationale cites "a failed `!reload` restores the old cog" as a consequence
+that made `bot.py` the right seam. That last one keeps its force — the seam is
+still right, and the all-or-none/`finally`/eject properties it names are all
+still live at boot and teardown — it simply no longer has a `!reload` to point
+at. Read the others as: the
+frontends still query the registry **live** rather than freezing an import-time
+tuple — which remains mandatory, because *which* cogs register is a runtime
+config decision resolved during startup — but the event that changes the answer
+is a **restart**, not a reload.
+
+**Docs retired with the surface:** the "hot-reload during development"
+guidance in `CLAUDE.md` and `docs/cog-development.md`, the `!reload setrole`
+apply-my-JSON-edits note in `cogs/optional/setrole.py` (`/role sync` already
+covers that case, through the same `_sync_guild` service), the `disabled_cogs`
+row in `docs/config-system.md`, the superadmin-tier inventory in
+`docs/security.md`, and the README's hot-reload claims.

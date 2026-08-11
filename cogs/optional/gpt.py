@@ -1818,8 +1818,9 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         (owner's terms): API primitives — raw Discord actions from
         core/ops.py — first, then behavioral primitives — capabilities cogs
         register with internal intelligence of their own. Both come from the
-        registry at RENDER time, so a cog load/unload changes the panel on
-        the next rerender without a restart."""
+        registry at RENDER time rather than from an import-time snapshot, so
+        the panel always shows the ops this boot's cog set actually
+        registered (the cog set is fixed at boot, #86)."""
         return [
             ("**API primitives**", registry.grouped(scope=scope, origin=ORIGIN_CORE)),
             ("**Behavioral primitives**", registry.grouped(scope=scope, origin=ORIGIN_COG)),

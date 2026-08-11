@@ -4,7 +4,7 @@ A modular Discord bot built with discord.py that's designed to be a "jack of all
 
 Its organizing idea: **every Discord action the bot can take is declared exactly once**, in a permission-checked ops registry, and every way of driving the bot is generated from that declaration. Write one op and it becomes an AI tool your members can use in chat, an MCP tool your own agents can call over loopback, and a toggle in the admin panel — no per-frontend plumbing, no duplicated auth check, no hand-maintained tool lists. Cogs can contribute ops too, registering and unregistering with the cog itself.
 
-Also: hot-reloadable cogs, a three-scope JSON config system with atomic saves and live external-edit reload, and provider-agnostic AI. Actively developed.
+Also: a boot-fixed cog set with a per-deployment enable/disable switch, a three-scope JSON config system with atomic saves and live external-edit reload, and provider-agnostic AI. Actively developed.
 
 ## 🚀 Quick Start
 
@@ -31,12 +31,12 @@ That's it! Your bot is now running with all core features available.
 ## ✨ Key Features
 
 - **🧭 One Ops Layer, Many Frontends** — 26 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
-- **🧩 Modular Cog System** — load/unload/hot-reload features without restarts; disable cogs globally without deleting them; cogs can register their own ops
+- **🧩 Modular Cog System** — features are self-contained cogs; disable them globally without deleting them (binds at restart); cogs can register their own ops
 - **🤖 AI Integration** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory, personality, and an optional agentic mode that performs real Discord actions
 - **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
 - **⚙️ Smart Configuration** — per-server, per-user, and global JSON settings with write buffering, atomic saves, and live reload on external edits
 - **🎲 Utilities & Fun** — dice rolling, random choices, reminders with snooze buttons, auto-responses, per-guild media libraries, reaction roles
-- **🛠️ Developer Friendly** — hot-reload cogs, comprehensive logging, error routing to Discord channels
+- **🛠️ Developer Friendly** — comprehensive logging, error routing to Discord channels, one-command restart
 
 ## 🏛️ Architecture: one ops layer, many frontends
 
@@ -97,7 +97,7 @@ flowchart TB
   offerable to the agent the moment it registers.
 - **Cogs contribute ops.** A cog decorates a method with `@op(...)`; the ops
   register when the cog loads and unregister when it unloads, all-or-none, so
-  `!reload` swaps a cog's op batch atomically. `origin` is stamped by the
+  a cog never runs with half its ops missing. `origin` is stamped by the
   registration *path*, never claimed by a decorator argument — a cog cannot
   pass itself off as an API primitive.
 - **Config is an exposure filter, not the authorization.** Turning an op on in
@@ -239,13 +239,13 @@ and browse the listing with file sizes.
 - `!aisettings` — AI provider/model/keys/personality/agentic tools/cooldowns/MCP (admin; superadmin tabs hidden from admins)
 - `!autoresponse` — per-guild trigger→response entries, weighted responses, automod-style deletion (admin)
 - `!media` — this guild's media library (admin)
-- `!cogs` — enable/disable/reload cogs bot-wide (superadmin)
+- `!cogs` — enable/disable cogs bot-wide, plus a restart button (superadmin)
 - `!config` — global-config editor (superadmin)
 
-**Cog & code management** (superadmin):
-- `!load <cog>` / `!unload <cog>` / `!reload <cog>` — manage features live
+**Cog & code management** (superadmin) — the cog set is fixed at boot; these edit
+config and take effect on the next restart:
 - `!disable <cog>` / `!enable <cog>` — global disabled_cogs switch: carry a cog on disk without running it
-- `!update` — pull latest changes from git
+- `!list_cogs` — the optional cogs on disk, disabled ones marked
 - `!sync` — sync slash commands
 - `!restart` (alias `!kys`) — graceful shutdown (systemd restarts it)
 
@@ -397,8 +397,8 @@ async def setup(bot):
     await bot.add_cog(MyFeature(bot))
 ```
 
-Load with `!load my_feature` — no restart needed! It shows up in `/help`
-automatically, grouped under its cog.
+Restart the bot and it loads automatically (anything in `cogs/optional/` not
+listed in `disabled_cogs`), showing up in `/help` grouped under its cog.
 
 ### Giving a Cog an Op
 
@@ -434,9 +434,10 @@ class MyFeature(commands.Cog):
         return await self._do_thing(ctx.guild, target)
 ```
 
-The ops register when the cog loads and unregister when it unloads — `!reload`
-swaps the batch atomically, and a batch is all-or-none so a malformed op means
-zero ops registered rather than half. See `docs/cog-development.md` →
+The ops register when the cog loads and unregister when it unloads. A batch is
+all-or-none, so a malformed op means zero ops registered rather than half — and
+the cog is ejected rather than running with its ops silently missing. See
+`docs/cog-development.md` →
 "Registering ops from a cog" for the full contract, and `cogs/optional/setrole.py`
 for a live example.
 

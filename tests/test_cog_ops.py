@@ -4,8 +4,8 @@ tests/test_ops_registry.py already proves the registry machinery against
 synthetic cogs. This file proves the shipped cogs actually participate: that
 `cogs/optional/setrole.py`, `cogs/optional/danbooru.py`,
 `cogs/optional/auto_response.py` and `cogs/optional/media.py` declare ops
-which appear on load, vanish on unload, and survive a reload without
-colliding.
+which appear on load, vanish on unload, and re-register cleanly on the next
+boot without colliding with their own stale names.
 Most tests here drive the registry API directly for isolation; the
 `test_real_literallybot_add_cog_*` pair at the bottom exercises the actual
 `LiterallyBot.add_cog`/`remove_cog` overrides bot.py installs, against the
@@ -99,7 +99,13 @@ def bot():
 
 
 # --------------------------------------------------------------------------
-# Lifecycle: load -> ops present; unload -> gone; reload -> no collision.
+# Lifecycle: load -> ops present; unload -> gone; load again -> no collision.
+#
+# The cog set is fixed at boot (#86), so in production this is startup and
+# shutdown teardown. The register/unregister/register cycle is asserted at the
+# REGISTRY level because that is the machinery both ends run through, and
+# because it is what makes a restart (or a re-registration through the kept
+# fail-closed belt) clean rather than a duplicate-name failure.
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cog_class", COG_CLASSES, ids=lambda c: c.__name__)
@@ -127,9 +133,11 @@ def test_unload_removes_the_cogs_ops(reg, bot, cog_class):
 
 
 @pytest.mark.parametrize("cog_class", COG_CLASSES, ids=lambda c: c.__name__)
-def test_reload_does_not_collide(reg, bot, cog_class):
-    """A reload builds a NEW cog instance after tearing the old one down; the
-    new batch must register cleanly rather than hitting its own stale names."""
+def test_reregistration_does_not_collide(reg, bot, cog_class):
+    """A restart builds a NEW cog instance after the old one was torn down;
+    the new batch must register cleanly rather than hitting its own stale
+    names. Asserted per-process here because unregister_owner leaving a name
+    reserved would only surface on the NEXT boot, i.e. far from the cause."""
     old = cog_class(bot)
     reg.register_cog_ops(old)
     reg.unregister_owner(old)

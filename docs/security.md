@@ -28,8 +28,9 @@ member with the Discord **Administrator** permission, or the guild owner.
   self-authored command (driven through the agent loop or MCP server) could
   escalate. See `bot.py`'s `on_message` allowlist shim, which relies on this.
 - **Superadmin is a trusted (owner) tier.** Superadmin-gated commands include
-  arbitrary cog load/reload (`!load`, `!reload`), `git pull` (`!update`), process
-  restart (`!restart`), bulk delete (`!cleanup`), and channel migration. These are
+  the global config editor (`!config`, which stores provider API keys), the
+  `disabled_cogs` editor (`!cogs`, `!disable`/`!enable`), process restart
+  (`!restart`), bulk delete (`!cleanup`), and channel migration. These are
   effectively owner-level and are RCE-adjacent by design — grant superadmin only to
   the operator.
 - **Claim-once semantics.** `!claimsuper` no-ops if any superadmin already exists;
@@ -228,8 +229,10 @@ admin/superadmin list.
 
 1. **MCP `actor_id` is caller-supplied** — acceptable for localhost self-use only
    (see above).
-2. **Superadmin tier is owner-level RCE-adjacent** — cog load/reload, `git pull`,
-   restart, and bulk delete are intentionally available to superadmins.
+2. **Superadmin tier is owner-level RCE-adjacent** — the global config editor,
+   the `disabled_cogs` editor, restart, and bulk delete are intentionally
+   available to superadmins. (Arbitrary cog load/reload and `git pull` were
+   deleted in #86; deployment pulls happen in the shell that restarts the bot.)
 3. **Provider API keys are stored plaintext** in `global.json` (outside git). Rely
    on filesystem permissions.
 4. **Channel history egress to the LLM provider** is inherent to the `!gpt`

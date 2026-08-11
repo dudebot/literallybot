@@ -2,19 +2,23 @@ from discord.ext import commands
 import discord
 from discord import app_commands
 from sys import version_info as sysv
-import subprocess
-from datetime import datetime
 import sys
 from core.utils import (InvokerOnlyView, app_is_superadmin, is_superadmin,
                         safe_delete, list_cog_modules)
 
 class Control(commands.Cog):
-    """The bot's runtime control plane, superadmin-only: cog
-    load/unload/reload, the enable/disable switch over `disabled_cogs`,
-    the global !config editor, git update, restart, and command sync.
+    """The bot's runtime control plane, superadmin-only: the enable/disable
+    switch over `disabled_cogs`, the global !config editor, restart, and
+    command sync.
+
+    The cog set is FIXED AT BOOT (#86): startup reads `disabled_cogs` and
+    loads the rest, and there is no live load/unload/reload surface. Editing
+    `disabled_cogs` — via `!enable`/`!disable` or the `!cogs` panel — writes
+    config only; the change binds on the next restart. Same doctrine as the
+    MCP tool surface: config edits bind at restart.
 
     This is why cogs/core/ is never filtered by disabled_cogs. Every
-    in-Discord route to re-enable a cog runs through here, so unloading it
+    in-Discord route to re-enable a cog runs through here, so disabling it
     leaves shell access as the only way back."""
     def __init__(self, bot):
         self.bot = bot
@@ -45,205 +49,6 @@ class Control(commands.Cog):
         return {str(name).lower()
                 for name in (self.bot.config.get_global("disabled_cogs", []) or [])}
 
-    @commands.command(name='load', hidden=True)
-    @commands.check(is_superadmin)
-    async def load(self, ctx, *, cog: str):
-        """This commands loads the selected cog, as long as that cog is in the `./cogs` folder.
-
-        Args:
-            cog (str): The name of the cog to load. The name is checked with `.check_cog(cog)`_.
-
-        Note:
-            This command can be used only from the bot owner.
-            This command is hidden from the help menu.
-            This command deletes its messages after 20 seconds.
-        """
-        self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked load on {cog}")
-        message = await ctx.send('Loading...')
-        await safe_delete(ctx, self.logger)
-        bare = self.check_cog(cog).rsplit('.', 1)[-1]
-        if bare in self.disabled_cogs():
-            await message.edit(
-                content=f'{bare} is disabled via the global `disabled_cogs` config. '
-                        f'Use `!enable {bare}` first.', delete_after=20)
-            return
-        try:
-            await self.bot.load_extension(self.check_cog(cog))
-        except Exception as exc:
-            self.logger.error(f"Error loading {cog} by {ctx.author}", exc_info=True)
-            await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
-        else:
-            self.logger.info(f"Loaded {cog} successfully by {ctx.author}")
-            await message.edit(content=f'{self.check_cog(cog)} has been loaded.', delete_after=20)
-
-    @commands.command(name='unload', hidden=True)
-    @commands.check(is_superadmin)
-    async def unload(self, ctx, *, cog: str):
-        """This commands unloads the selected cog, as long as that cog is in the `./cogs` folder.
-
-        Args:
-            cog (str): The name of the cog to unload. The name is checked with `.check_cog(cog)`_.
-        Note:
-            This command can be used only from the bot owner.
-            This command is hidden from the help menu.
-            This command deletes its messages after 20 seconds.
-        """
-
-        self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked unload on {cog}")
-        message = await ctx.send('Unloading...')
-        await safe_delete(ctx, self.logger)
-        try:
-            await self.bot.unload_extension(self.check_cog(cog))
-        except Exception as exc:
-            self.logger.error(f"Error unloading {cog} by {ctx.author}", exc_info=True)
-            await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
-        else:
-            self.logger.info(f"Unloaded {cog} successfully by {ctx.author}")
-            await message.edit(content=f'{self.check_cog(cog)} has been unloaded.', delete_after=20)
-
-    @commands.command(name='reload', hidden=True)#This command is hidden from the help menu.
-    @commands.check(is_superadmin)
-    async def reload(self, ctx, cog=None):
-        """This commands reloads a specific cog or all cogs in the `./cogs/optional` folder.
-
-        Note:
-            This command can be used only from the bot owner.
-            This command is hidden from the help menu.
-            This command deletes its messages after 20 seconds."""
-
-        self.logger.info(f"{ctx.author} (ID: {ctx.author.id}) invoked reload on {cog or 'all optional'}")
-        await safe_delete(ctx, self.logger)
-
-        if cog is None:
-            # Filtering by config here means a reload-all also sheds cogs
-            # that were disabled while loaded: unload sweeps everything,
-            # load only brings back the enabled set.
-            cogs_to_unload = [c for c in self.bot.extensions if c.startswith("cogs.optional.")]
-            cogs_to_load = list_cog_modules('optional', self.bot.config)
-        else:
-            bare = self.check_cog(cog).rsplit('.', 1)[-1]
-            if bare in self.disabled_cogs():
-                await ctx.send(
-                    f'{bare} is disabled via the global `disabled_cogs` config. '
-                    f'Use `!enable {bare}` first.', delete_after=20)
-                return
-            cogs_to_unload = [self.check_cog(cog)]
-            cogs_to_load = [self.check_cog(cog)]
-
-        errors = []
-        message = await ctx.send(f'Reloading...')
-        for cog in cogs_to_unload:
-            if cog not in self.bot.extensions:
-                continue
-            try:
-                await self.bot.unload_extension(cog)
-            except Exception as exc:
-                self.logger.error(f"Error unloading {cog} during reload by {ctx.author}", exc_info=True)
-                errors.append(f'Error unloading {cog}: {exc}')
-
-        for cog in cogs_to_load:
-            try:
-                await self.bot.load_extension(cog)
-            except Exception as exc:
-                self.logger.error(f"Error loading {cog} during reload by {ctx.author}", exc_info=True)
-                errors.append(f'Error loading {cog}: {exc}')
-
-        if errors:
-            formatted_errors = '\n'.join([f"- {error}" for error in errors])
-            response = f'Errors occurred:\n{formatted_errors}'
-        else:
-            formatted_cogs = '\n'.join([f"- {cog}" for cog in cogs_to_load])
-            response = f'All cogs reloaded successfully:\n{formatted_cogs}'
-
-        await message.edit(content=response, delete_after=20)
-
-    @commands.command(name='update', hidden=True)
-    @commands.check(is_superadmin)
-    async def update(self, ctx):
-        """This command executes a git pull command in the current environment to update the code.
-
-        Note:
-            This command can be used only from the bot owner.
-            This command is hidden from the help menu.
-        """
-        self.logger.info(f"{ctx.author} invoked update command")
-        message = await ctx.send('Attempting to update code via git pull...')
-        try:
-            # Delete the command message if possible, but don't fail if it's already gone or permissions are an issue
-            try:
-                await ctx.message.delete()
-            except discord.HTTPException:
-                self.logger.warning("Could not delete update command message, it might have been already deleted or permissions are missing.")
-
-            # Execute git pull
-            result = subprocess.run(['git', 'pull'], capture_output=True, text=True, check=False)
-
-            stdout_output = result.stdout.strip() if result.stdout else ""
-            stderr_output = result.stderr.strip() if result.stderr else ""
-
-            if result.returncode == 0:
-                self.logger.info(f"Git pull successful. Output: {stdout_output if stdout_output else 'No output.'}")
-
-                commit_hash = "N/A"
-                human_time = "N/A"
-                try:
-                    commit_info_result = subprocess.run(
-                        ['git', 'log', '-1', '--format="%H %ct"'],
-                        capture_output=True, text=True, check=False
-                    )
-                    if commit_info_result.returncode == 0 and commit_info_result.stdout:
-                        parsed_commit_hash, commit_timestamp_str = commit_info_result.stdout.replace("\"", "").strip().split()
-                        commit_timestamp = int(commit_timestamp_str)
-                        commit_hash = parsed_commit_hash
-                        human_time = datetime.fromtimestamp(commit_timestamp).strftime("%Y-%m-%d %H:%M")
-                    else:
-                        self.logger.warning(f"Failed to get commit info after successful pull. Git log stderr: {commit_info_result.stderr.strip() if commit_info_result.stderr else 'None'}")
-                except Exception as e_commit:
-                    self.logger.warning(f"Error processing commit info after successful pull: {e_commit}")
-
-                response_content = (
-                    f'Code update pull completed successfully!\n'
-                    f'Current Commit Hash: {commit_hash}\n'
-                    f'Commit Timestamp: {human_time}\n\n'
-                )
-                if stdout_output:
-                    response_content += f'Git Pull Output:\n```\n{stdout_output}\n```'
-                else:
-                    response_content += 'No specific output from git pull.'
-
-                await message.edit(content=response_content, delete_after=60)
-
-            else: # result.returncode != 0, git pull encountered issues
-                log_message_parts = [f"Git pull command finished with return code {result.returncode}."]
-                if stdout_output: log_message_parts.append(f"Stdout: {stdout_output}")
-                if stderr_output: log_message_parts.append(f"Stderr: {stderr_output}")
-                full_log_message = "\n".join(log_message_parts)
-
-                user_message_content = f"Git pull finished with return code {result.returncode}.\n"
-                if stdout_output:
-                    user_message_content += f"Output:\n```\n{stdout_output}\n```\n"
-                if stderr_output:
-                    user_message_content += f"Errors:\n```\n{stderr_output}\n```\n"
-
-                if "Permission denied" in stderr_output or "unable to unlink" in stderr_output or "failed to unlink" in stderr_output:
-                    self.logger.warning(f"Git pull encountered permission issues. {full_log_message}")
-                    user_message_content += ("\n**Some files may not have been updated due to permission issues** (e.g., unable to delete old files). "
-                                             "The bot continues to run. You might need to resolve permissions manually. "
-                                             "Consider reloading cogs if applicable after resolving.")
-                else:
-                    self.logger.error(f"Git pull failed. {full_log_message}")
-                    user_message_content += ("\n**The code update may have failed or is incomplete.** "
-                                             "The bot continues to run. Check the output above and bot logs for details.")
-
-                await message.edit(content=user_message_content, delete_after=180) # Keep message much longer for review
-
-        except Exception as exc:
-            self.logger.error("Exception during update command execution", exc_info=True)
-            try:
-                await message.edit(content=f'An unexpected error occurred during the update command: {exc}\nThe bot continues to run.', delete_after=60)
-            except discord.HTTPException: # If message itself is gone
-                self.logger.error(f"Failed to send update error to Discord, message gone. Error: {exc}")
-
     @commands.command(name='list_cogs', hidden=True)
     @commands.check(is_superadmin)
     async def list_cogs(self, ctx):
@@ -270,11 +75,14 @@ class Control(commands.Cog):
     @commands.command(name='disable', hidden=True)
     @commands.check(is_superadmin)
     async def disable(self, ctx, *, cog: str):
-        """Add an optional cog to the global `disabled_cogs` list and unload it.
+        """Add an optional cog to the global `disabled_cogs` list.
 
         The deployment-level off switch: a disabled cog stays on disk but is
-        skipped by startup, !reload, and !load until re-enabled. Downstream
-        forks use this to carry upstream cogs without running them.
+        skipped by startup until re-enabled. Downstream forks use this to
+        carry upstream cogs without running them.
+
+        Writes config only — the cog set is fixed at boot (#86), so a
+        currently-loaded cog keeps running until the bot restarts.
 
         Note:
             This command can be used only from superadmins.
@@ -290,21 +98,17 @@ class Control(commands.Cog):
             return
         disabled = sorted(self.disabled_cogs() | {bare})
         self.bot.config.set_global("disabled_cogs", disabled)
-        module = f'cogs.optional.{bare}'
-        unloaded = ''
-        if module in self.bot.extensions:
-            try:
-                await self.bot.unload_extension(module)
-                unloaded = ' and unloaded'
-            except Exception as exc:
-                self.logger.error(f"Error unloading {module} during disable", exc_info=True)
-                unloaded = f' (unload failed: {exc})'
-        await message.edit(content=f'{bare} disabled{unloaded}.', delete_after=20)
+        await message.edit(
+            content=f'{bare} disabled — takes effect on the next restart '
+                    f'(`!restart`).', delete_after=20)
 
     @commands.command(name='enable', hidden=True)
     @commands.check(is_superadmin)
     async def enable(self, ctx, *, cog: str):
-        """Remove an optional cog from the global `disabled_cogs` list and load it.
+        """Remove an optional cog from the global `disabled_cogs` list.
+
+        Writes config only — the cog set is fixed at boot (#86), so the cog
+        starts running at the next restart.
 
         Note:
             This command can be used only from superadmins.
@@ -319,16 +123,20 @@ class Control(commands.Cog):
             await message.edit(content=f'{bare} is not disabled.', delete_after=20)
             return
         self.bot.config.set_global("disabled_cogs", sorted(disabled - {bare}))
-        module = f'cogs.optional.{bare}'
-        loaded = ''
-        if module not in self.bot.extensions:
-            try:
-                await self.bot.load_extension(module)
-                loaded = ' and loaded'
-            except Exception as exc:
-                self.logger.error(f"Error loading {module} during enable", exc_info=True)
-                loaded = f' (load failed: {exc})'
-        await message.edit(content=f'{bare} enabled{loaded}.', delete_after=20)
+        await message.edit(
+            content=f'{bare} enabled — takes effect on the next restart '
+                    f'(`!restart`).', delete_after=20)
+
+    async def do_restart(self):
+        """Close the gateway and exit; systemd brings the process back.
+
+        THE one exit path. `!restart`/`!kys`/`!shutdown` and the `!cogs`
+        panel's Restart button both call this, so there is exactly one way
+        the bot goes down deliberately — and, since the cog set is fixed at
+        boot (#86), exactly one way a `disabled_cogs` edit takes effect.
+        Raises whatever `bot.close()` raised; callers report it."""
+        await self.bot.close()
+        sys.exit()
 
     @commands.command(name='restart', aliases=['kys', 'shutdown'], hidden=True)
     @commands.check(is_superadmin)
@@ -353,8 +161,7 @@ class Control(commands.Cog):
 
         # Actually shut down
         try:
-            await self.bot.close()
-            sys.exit()
+            await self.do_restart()
         except Exception as exc:
             self.logger.error("Error during shutdown", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)
@@ -400,7 +207,7 @@ class Control(commands.Cog):
     @commands.command(name="cogs", hidden=True)
     @commands.check(is_superadmin)
     async def cogs_panel(self, ctx):
-        """Open the cog-management panel (enable/disable/reload). Posts
+        """Open the cog-management panel (the `disabled_cogs` editor). Posts
         PUBLICLY — use /cogs for a private one (#76)."""
         view = CogsView(self, ctx.author)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
@@ -451,7 +258,12 @@ class _CogSelect(discord.ui.Select):
 
 class CogsView(InvokerOnlyView, discord.ui.View):
     """Superadmin panel over the disabled_cogs machinery: the slash-native
-    face of !disable/!enable/!reload. Single-invoker, ephemeral."""
+    face of !disable/!enable. Single-invoker, ephemeral.
+
+    Toggling writes the global `disabled_cogs` list and NOTHING else — the
+    cog set is fixed at boot (#86). The Restart button is how a pending edit
+    becomes reality, and it goes through Control.do_restart, the same exit
+    path as `!restart`."""
 
     panel_command = "!cogs"
 
@@ -469,11 +281,19 @@ class CogsView(InvokerOnlyView, discord.ui.View):
         return sorted(mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional'))
 
     def cog_state(self, name):
+        """Configured state: what the NEXT boot will do with this cog."""
         if name in self.dev.disabled_cogs():
             return "disabled"
-        if f"cogs.optional.{name}" in self.bot.extensions:
-            return "loaded"
-        return "unloaded"
+        return "enabled"
+
+    def is_pending(self, name):
+        """True when the configured state disagrees with what is running, so
+        the panel can mark the edits a restart would apply."""
+        running = f"cogs.optional.{name}" in self.bot.extensions
+        return running is (self.cog_state(name) == "disabled")
+
+    def has_pending(self):
+        return any(self.is_pending(n) for n in self.cog_names())
 
     def flash(self, text):
         self._flash = text
@@ -493,11 +313,14 @@ class CogsView(InvokerOnlyView, discord.ui.View):
             style=(discord.ButtonStyle.success if state == "disabled"
                    else discord.ButtonStyle.danger),
             row=1, disabled=state is None)
-        reload_btn = discord.ui.Button(label="🔄 Reload", row=1,
-                                       style=discord.ButtonStyle.secondary,
-                                       disabled=state != "loaded")
-        reload_all_btn = discord.ui.Button(label="🔄 Reload all", row=1,
-                                           style=discord.ButtonStyle.secondary)
+        # Relabelled once there is something to apply, so the operator can see
+        # from the panel that their edit is still only config.
+        restart_label = ("♻ Restart to apply" if self.has_pending()
+                         else "♻ Restart bot")
+        restart_btn = discord.ui.Button(
+            label=restart_label, row=1,
+            style=(discord.ButtonStyle.primary if self.has_pending()
+                   else discord.ButtonStyle.secondary))
 
         async def toggle_cb(interaction: discord.Interaction):
             if not is_superadmin(interaction):
@@ -507,85 +330,61 @@ class CogsView(InvokerOnlyView, discord.ui.View):
             if name is None:
                 await interaction.response.send_message("Select a cog first.", ephemeral=True)
                 return
-            module = f"cogs.optional.{name}"
+            # Config only. The cog set is fixed at boot (#86): nothing is
+            # loaded or unloaded here, by design.
             disabled = self.dev.disabled_cogs()
             if name in disabled:
                 self._set_disabled_list(disabled - {name})
-                note = ""
-                if module not in self.bot.extensions:
-                    try:
-                        await self.bot.load_extension(module)
-                        note = " and loaded"
-                    except Exception as e:
-                        note = f" (load failed: {e})"
-                self.flash(f"{name} enabled{note}.")
+                self.flash(f"{name} enabled in config — restart to apply.")
             else:
                 self._set_disabled_list(disabled | {name})
-                note = ""
-                if module in self.bot.extensions:
-                    try:
-                        await self.bot.unload_extension(module)
-                        note = " and unloaded"
-                    except Exception as e:
-                        note = f" (unload failed: {e})"
-                self.flash(f"{name} disabled{note}.")
+                self.flash(f"{name} disabled in config — restart to apply.")
+            self.bot.logger.info(
+                f"{interaction.user} toggled cog {name} via the !cogs panel")
             await self.rerender(interaction)
 
-        async def reload_cb(interaction: discord.Interaction):
+        async def restart_cb(interaction: discord.Interaction):
             if not is_superadmin(interaction):
                 await interaction.response.send_message("Superadmin only.", ephemeral=True)
                 return
-            name = self.selected
-            if name is None:
-                await interaction.response.send_message("Select a cog first.", ephemeral=True)
-                return
-            module = f"cogs.optional.{name}"
+            self.bot.logger.info(
+                f"{interaction.user} invoked restart via the !cogs panel")
+            # Answer the interaction BEFORE the process goes away — the
+            # gateway close below means no later response could be sent.
+            await interaction.response.edit_message(
+                content="Restarting...", embed=None, view=None)
             try:
-                await self.bot.reload_extension(module)
-                self.flash(f"{name} reloaded.")
+                await self.dev.do_restart()
             except Exception as e:
-                self.flash(f"Reload of {name} failed: {e}")
-            await self.rerender(interaction)
-
-        async def reload_all_cb(interaction: discord.Interaction):
-            if not is_superadmin(interaction):
-                await interaction.response.send_message("Superadmin only.", ephemeral=True)
-                return
-            # Same semantics as !reload with no argument: unload every loaded
-            # optional cog, load the enabled set — sheds newly disabled cogs.
-            errors = []
-            for module in [c for c in list(self.bot.extensions)
-                           if c.startswith("cogs.optional.")]:
-                try:
-                    await self.bot.unload_extension(module)
-                except Exception as e:
-                    errors.append(f"unload {module}: {e}")
-            for module in list_cog_modules('optional', self.bot.config):
-                try:
-                    await self.bot.load_extension(module)
-                except Exception as e:
-                    errors.append(f"load {module}: {e}")
-            self.flash("Reloaded all optional cogs."
-                       if not errors else "Errors: " + "; ".join(errors)[:900])
-            await self.rerender(interaction)
+                self.bot.logger.error("Error during shutdown from !cogs panel",
+                                      exc_info=True)
+                await interaction.edit_original_response(
+                    content=f"Restart failed: {e}")
 
         toggle_btn.callback = toggle_cb
-        reload_btn.callback = reload_cb
-        reload_all_btn.callback = reload_all_cb
+        restart_btn.callback = restart_cb
         self.add_item(toggle_btn)
-        self.add_item(reload_btn)
-        self.add_item(reload_all_btn)
+        self.add_item(restart_btn)
 
     def render_embed(self):
-        marks = {"loaded": "✅", "unloaded": "⬜", "disabled": "🚫"}
+        marks = {"enabled": "✅", "disabled": "🚫"}
         e = discord.Embed(
-            title="Dynamic cogs",
-            description="🚫 disabled cogs stay on disk but are skipped by "
-                        "startup and reloads (global `disabled_cogs`).",
+            title="Cogs (bind at restart)",
+            description="Editing the global `disabled_cogs` list. 🚫 disabled "
+                        "cogs stay on disk but are skipped by startup. The "
+                        "cog set is fixed at boot — toggles here change "
+                        "config only and take effect on the next restart.",
             color=discord.Color.blurple(),
         )
-        lines = [f"{marks[self.cog_state(n)]} {n}" for n in self.cog_names()]
+        lines = [f"{marks[self.cog_state(n)]} {n}"
+                 + (" ⏳ *pending restart*" if self.is_pending(n) else "")
+                 for n in self.cog_names()]
         e.add_field(name="Cogs", value="\n".join(lines)[:1024] or "*none*", inline=False)
+        if self.has_pending():
+            e.add_field(
+                name="Pending",
+                value="⏳ entries differ from what is running — press "
+                      "**♻ Restart to apply**.", inline=False)
         if self._flash:
             e.add_field(name="Last action", value=self._flash[:1024], inline=False)
             self._flash = None

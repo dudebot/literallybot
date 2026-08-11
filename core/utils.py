@@ -187,7 +187,7 @@ def app_is_superadmin():
 def list_cog_modules(group: str, config=None) -> List[str]:
     """Loadable cog modules for a cogs/ group, as dotted module paths
     (['cogs.optional.gpt', ...]). THE one owner of the loadable-cog rule
-    (*.py, not underscore/dunder-prefixed) — startup load, !reload-all,
+    (*.py, not underscore/dunder-prefixed) — startup load, the !cogs panel,
     and !list_cogs must all resolve the cog set through this so they can
     never disagree about what counts as loadable. Missing directory
     yields [] (mirrors the startup skip).
@@ -199,8 +199,8 @@ def list_cog_modules(group: str, config=None) -> List[str]:
     (what !list_cogs uses to show disabled entries).
 
     cogs/core/ is the ONE exception and is never filtered: it holds the
-    recovery surface (control.py's enable/disable/load/reload/restart and
-    the !config editor, plus admin.py's claimsuper bootstrap). Disabling
+    recovery surface (control.py's enable/disable/restart and the !config
+    editor, plus admin.py's claimsuper bootstrap). Disabling
     those removes the means of re-enabling anything from Discord, leaving
     shell access as the only way back. Everything else — including error
     handling, which is wired in bot.py from core/error_handler.py and does

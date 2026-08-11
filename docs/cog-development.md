@@ -9,8 +9,8 @@ This guide covers creating custom cogs for LiterallyBot, from basic commands to 
 The split is one question: **if this cog is off, can you still turn it — or
 anything else — back on from Discord alone?**
 
-- **Core Cogs (`cogs/core/`)** - The recovery surface. `control.py` (cog
-  load/unload/reload, `!enable`/`!disable`, `!config`, restart) and
+- **Core Cogs (`cogs/core/`)** - The recovery surface. `control.py`
+  (`!enable`/`!disable` over `disabled_cogs`, `!cogs`, `!config`, restart) and
   `admin.py` (the `claimsuper` bootstrap). Never filtered by
   `disabled_cogs`, because disabling them leaves shell access as the only
   way back. Adding a cog here should be rare and needs this justification.
@@ -391,28 +391,22 @@ You do not call the registry yourself. `LiterallyBot.add_cog` /
 - **On unload** — `registry.unregister_owner(cog)` drops the batch, in a
   `finally`, so a cog whose own teardown raises still leaves no orphaned ops
   (an op whose owner is gone would fail confusingly at call time and keep its
-  name reserved against the reload).
-- **On `!reload`** — discord.py's reload is atomic: it tears the old cog down
-  (dropping its ops) before adding the new one, and **restores the old cog if
-  the new one fails to load**, which re-registers the old batch through the same
-  path. A broken edit leaves the previous ops working.
+  name reserved against the next registration). In practice unload happens at
+  shutdown teardown: the cog set is fixed at boot (#86).
 
 Ops are bound methods, so they see cog state (`self.bot`, caches, config
 helpers) exactly as your commands do.
 
-### Config keeps your op's name across an unload
+### Config keeps your op's name while its cog is disabled
 
 Every frontend queries the registry **live** — never a snapshot taken at import
-— so your ops appear in the panel the moment the cog loads.
+— so your ops appear in the panel as soon as the cog is in the boot set.
 
-When a cog is unloaded, its op names stay in the stored `bot_tools_enabled` /
-`mcp_tools_enabled` config lists and are simply filtered out of the *effective*
-set. Reloading the cog restores the guild's choice instead of silently losing
-it. Don't write code that prunes unknown names out of stored config.
-
-One caveat: the **MCP** tool surface is built once at server start, so a cog
-loaded afterwards contributes its ops to MCP only on the next bot restart. The
-in-chat agent loop and the panel pick them up immediately.
+When a cog is not loaded (disabled via `disabled_cogs`), its op names stay in
+the stored `bot_tools_enabled` / `mcp_tools_enabled` config lists and are simply
+filtered out of the *effective* set. Re-enabling the cog restores the guild's
+choice instead of silently losing it. Don't write code that prunes unknown names
+out of stored config.
 
 ### Checklist
 
@@ -423,7 +417,8 @@ in-chat agent loop and the panel pick them up immediately.
 - [ ] `permission` is the tier you'd require of a human running it
 - [ ] `scope=OpScope.GUILD` only if it genuinely cannot act outside the guild
 - [ ] `group` exists in `OP_GROUPS` (add it there if you need a new one)
-- [ ] `!reload <cog>` twice in a row still works (no duplicate-name error)
+- [ ] The bot restarts cleanly twice in a row with the cog in the boot set
+      (no duplicate-name error from the batch registering again)
 
 Live examples: `cogs/optional/setrole.py` (two ops sharing the slash commands'
 services), `cogs/optional/danbooru.py` (one op sharing the prefix command's
@@ -486,15 +481,21 @@ self.bot.config.set(1234567890, "setting_name", True)
 self.bot.config.set_user(987654321, "preference", "value")
 ```
 
-## Testing & Reloading Tips
-- Use `!load my_cog` / `!reload my_cog` for hot-reload during development
+## Testing & Restarting Tips
+- **The cog set is fixed at boot (#86)** — there is no hot-reload. To pick up a
+  code change, restart the bot: `!restart` in Discord (or the `!cogs` panel's
+  Restart button — same exit path), or restart the service from the shell,
+  which is also where deployment `git pull`s happen.
+- Run `pytest tests/` before restarting; a cog that fails to import is reported
+  to Discord at startup but simply won't be there.
 - Wrap risky code with try/except blocks and log errors
 - Keep commands async-friendly and avoid blocking calls
 
 ## Disabling Cogs Per Deployment
 - `!cogs` (superadmin panel) or `!disable my_cog` / `!enable my_cog` maintain
-  the global `disabled_cogs` config list. A disabled cog stays on disk but
-  is skipped by startup, `!reload`, and `!load` until re-enabled.
+  the global `disabled_cogs` config list. These write config only and bind at
+  the next restart. A disabled cog stays on disk but is skipped by startup
+  until re-enabled.
 - This is how downstream forks of this codebase carry upstream cogs without
   running them — disable, don't delete, so upstream merges stay clean.
 - `cogs/core/` can't be disabled; it is the means of re-enabling everything

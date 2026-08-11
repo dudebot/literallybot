@@ -36,8 +36,9 @@ def agent_ops() -> List[str]:
     Queried LIVE from the registry: it is every guild-scoped op, because a
     guild-confined, user-actored loop is exactly what guild-scoped ops are
     safe for. There is no `agent=True` flag any more, and this must never
-    be frozen into a module-level tuple — cog-provided ops appear and
-    disappear with cog load/unload. delete_message is ADMIN-gated in the
+    be frozen into a module-level tuple — cog-provided ops arrive as their
+    cogs load during startup, and which cogs those are is config
+    (`disabled_cogs`). delete_message is ADMIN-gated in the
     registry, so only invoking users who pass is_admin can actually use it
     (everyone else gets a tool error back in the loop)."""
     return registry.guild_agent_names()
@@ -52,8 +53,9 @@ def resolve_bot_tools(raw) -> List[str]:
     panel shows is what the loop gets.
 
     Dropping here is an effective-set filter only: a name stays in stored
-    config even while its op is unregistered (a cog unloaded), so reloading
-    the cog restores the guild's choice instead of silently losing it."""
+    config even while its op is unregistered (its cog disabled), so
+    re-enabling the cog restores the guild's choice instead of silently
+    losing it."""
     universe = set(agent_ops())
     return [n for n in (raw or []) if n in universe]
 
@@ -119,10 +121,13 @@ def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
             return {"ok": False, "error": BUDGET_EXHAUSTED_ERROR}
         # Fail closed if the op changed under this run: the tool's schema,
         # serializer and (crucially) SCOPE were captured from `op` when the
-        # run started, but dispatch resolves by name — a cog reload that
-        # re-registers the same name with a different declaration would
+        # run started, but dispatch resolves by NAME — anything that
+        # re-registered that name with a different declaration would
         # otherwise let a guild-scoped tool silently retarget to (say) a DM
-        # op the guild agent must never reach.
+        # op the guild agent must never reach. Since #86 the cog set is
+        # fixed at boot, so this guard should never fire; it is deliberately
+        # kept as the structural belt against dynamism being reintroduced —
+        # identity, not liveness, is what makes name dispatch safe.
         if registry.get(op.name) is not op:
             logger.info(
                 "agent-op %s actor=%s REFUSED (op re-registered mid-run)",
@@ -130,7 +135,7 @@ def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
             )
             return {"ok": False,
                     "error": f"Tool '{op.name}' changed while this run was in "
-                             "flight (its cog was reloaded). Call refused; "
+                             "flight (it was re-registered). Call refused; "
                              "ask again to use the updated tool."}
         # send_message never pings: enforced by the op itself (see
         # core/ops.py send_message — never-ping is the registry default).
