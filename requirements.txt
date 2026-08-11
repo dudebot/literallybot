@@ -8,5 +8,5 @@ yt-dlp
 requests
 
 # MCP ops server (spike, opt-in — see mcp_ops/ and README's "MCP Ops Server" section)
-mcp
+mcp>=1.28,<2
 uvicorn

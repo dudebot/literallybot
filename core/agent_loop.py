@@ -28,23 +28,34 @@ from pydantic_ai import Tool
 
 from core.ops import Op, registry
 
-# The bot agent's tool UNIVERSE — the ceiling of what a guild's
-# `bot_tools_enabled` allowlist may contain (per-guild subsets are chosen in
-# the /aisettings panel). Derived from the registry's `agent=True` flags —
-# the registration site is the ONE place an op joins or leaves this surface
-# (the parallel name list this replaces drifted by design). delete_message
-# is ADMIN-gated in the registry, so only invoking users who pass is_admin
-# can actually use it (everyone else gets a tool error back in the loop).
-AGENT_OPS = tuple(registry.agent_names())
+def agent_ops() -> List[str]:
+    """The bot agent's tool UNIVERSE — the ceiling of what a guild's
+    `bot_tools_enabled` allowlist may contain (per-guild subsets are chosen
+    in the /aisettings panel).
+
+    Queried LIVE from the registry: it is every guild-scoped op, because a
+    guild-confined, user-actored loop is exactly what guild-scoped ops are
+    safe for. There is no `agent=True` flag any more, and this must never
+    be frozen into a module-level tuple — cog-provided ops appear and
+    disappear with cog load/unload. delete_message is ADMIN-gated in the
+    registry, so only invoking users who pass is_admin can actually use it
+    (everyone else gets a tool error back in the loop)."""
+    return registry.guild_agent_names()
+
 
 def resolve_bot_tools(raw) -> List[str]:
     """Effective bot-agent tool allowlist from the raw per-guild config
     value (`bot_tools_enabled`): None/empty means no tools (the plain-chat
-    path); stale names from an older AGENT_OPS are dropped by intersecting
-    with the current universe. THE one owner of this rule — gpt.py and the
-    /ai settings panel both resolve through it, so what the panel shows is
-    what the loop gets."""
-    return [n for n in (raw or []) if n in AGENT_OPS]
+    path); names whose op is not currently registered are dropped by
+    intersecting with the LIVE universe. THE one owner of this rule —
+    gpt.py and the /aisettings panel both resolve through it, so what the
+    panel shows is what the loop gets.
+
+    Dropping here is an effective-set filter only: a name stays in stored
+    config even while its op is unregistered (a cog unloaded), so reloading
+    the cog restores the guild's choice instead of silently losing it."""
+    universe = set(agent_ops())
+    return [n for n in (raw or []) if n in universe]
 
 
 # Soft tool budget per agentic run, enforced HERE (not via pydantic-ai's

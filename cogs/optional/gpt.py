@@ -11,17 +11,21 @@ from typing import Dict, List, Optional, Any
 from core.utils import InvokerOnlyView, app_is_admin, is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import registry
-from core.agent_loop import AGENT_OPS, resolve_bot_tools
+from core.agent_loop import agent_ops, resolve_bot_tools
 from mcp_ops.server import _EXPOSED_OPS, resolve_mcp_tools
 
-# send_message is deliberately NOT default-on for the in-bot agent (it can post
-# into arbitrary channels); it stays available to the MCP surface. This only
-# affects the migration seed and the panel's "read-only preset" button.
-_BOT_READONLY_OPS = ("add_reaction", "search_history", "list_channels", "list_members")
-# What an old `gpt_agentic_enabled=True` guild is migrated to: everything the
-# agent loop offers EXCEPT send_message (matches the pre-migration behavior
-# minus the never-defaulted broadcast tool).
-AGENT_OPS_DEFAULT_ON = tuple(op for op in AGENT_OPS if op != "send_message")
+# HISTORICAL SNAPSHOT — not a live gate. What an old
+# `gpt_agentic_enabled=True` guild is migrated to, frozen as a literal: the
+# 8 ops that carried the former `agent=True` flag, minus send_message (which
+# was never default-on for the in-bot agent because it can post into
+# arbitrary channels). This is a one-shot migration seed that must keep
+# meaning the same thing forever, so it must NOT be recomputed from the live
+# registry — a later op addition would retroactively change what past guilds
+# were migrated to.
+AGENT_OPS_DEFAULT_ON = (
+    "edit_message", "delete_message", "add_reaction", "remove_reaction",
+    "search_history", "list_channels", "list_members",
+)
 
 PANEL_TIMEOUT = 180
 
@@ -1826,7 +1830,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         if self.page == "server":
             self.add_item(self._row(_ProviderSelect(self)))
             self.add_item(self._row(_ModelSelect(self)))
-            for sel in _tool_selects(list(AGENT_OPS), self._bot_tools(),
+            for sel in _tool_selects(agent_ops(), self._bot_tools(),
                                      self._save_bot_tools):
                 self.add_item(self._row(sel))
             self.add_item(self._row(self._ai_toggle_button(),
@@ -2097,7 +2101,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             await interaction.response.send_message(
                 "Requires superadmin.", ephemeral=True)
             return
-        cleaned = [n for n in selected if n in AGENT_OPS]
+        cleaned = [n for n in selected if n in set(agent_ops())]
         self.bot.config.set(self._cfg_ctx(), "bot_tools_enabled", cleaned)
         await self.rerender(interaction)
 

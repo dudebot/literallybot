@@ -113,7 +113,7 @@ illustration; they are not real.)
 | `gpt_personality_data` | `{prompt: str, version: int}` | `!aisettings` → Personality modal | version = unix ts, tags memories |
 | `ai_enabled` | `bool` | `!aisettings` → Server config (💬 toggle) | Per-guild AI kill switch. Absent ⇒ ON. Gates the mention/reply chat path only — the panel stays reachable to turn it back on. Chat is guild-only: DMs never answer |
 | `gpt_memories` | `list[{text, expires, type, sender, personality_version, stored_at}]` | gpt.py memory capture | TTL-purged on read/write |
-| `bot_tools_enabled` | `list[str]` ⊆ `AGENT_OPS` | `!aisettings` → Server config tools select | Empty/absent ⇒ plain chat (no agent loop). Universe = registry ops flagged `agent=True` (core/ops.py) |
+| `bot_tools_enabled` | `list[str]` ⊆ live guild-scoped ops | `!aisettings` → Server config tools select | Empty/absent ⇒ plain chat (no agent loop). Universe = every registry op with `scope=GUILD`, queried live (core/ops.py `guild_agent_names()`). A stored name whose op is currently unregistered (cog unloaded) is KEPT in config and just dropped from the effective set |
 | `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
 | `emoji_role_toggles` | `list[{channel_id, message_id, emoji, role_id}]` | `/role add\|delete\|sync` (setrole.py) | emoji is canonical str form (unicode char or `<:name:id>`); channel_id None = legacy-migrated entry pending `/role sync`; legacy nested-dict shape auto-migrates on first read |
 | `error_logging` | as global | `!errorlog` in-guild | |

@@ -25,9 +25,25 @@ declaration the registry mechanically generates:
 Object-based callers keep using `registry.call(...)` with live discord.py
 objects and pay no re-fetches; id-based frontends use `call_ids(...)`.
 
+Each op also carries the metadata frontends need to DERIVE their surfaces
+instead of hand-listing them: `scope` (GUILD/DM/GLOBAL — the in-guild agent
+universe is exactly the guild-scoped ops), `group` (which section a panel
+renders it under), and `origin` ('core' for the registrations below, 'cog'
+for ops a cog contributed). Origin is stamped by the registration PATH and
+is never a decorator argument, so a cog cannot claim to be core.
+
+There is deliberately no code-level "agent" subset flag. Frontends query
+the registry LIVE (`guild_agent_names()`, `ops(...)`, `grouped(...)`) rather
+than freezing a module-level tuple at import: cog ops come and go with cog
+load/unload, so any import-time snapshot is stale after the first reload.
+
 This module is frontend-agnostic on purpose: it does not import
-`discord.ext.commands`, does not know about cogs, and does not get wired
-into `bot.py`. It only knows how to run an op against an `OpContext`.
+`discord.ext.commands`, and it does not get wired into `bot.py`. Cogs are
+known only as opaque owner objects — a cog declares ops with the
+module-level `op(...)` decorator, and `bot.py` calls
+`registry.register_cog_ops(cog)` / `unregister_owner(cog)` around the
+discord.py cog lifecycle. It only knows how to run an op against an
+`OpContext`.
 
 Permission gates route through `core.utils.is_admin` / `is_superadmin`,
 the same helpers `cogs/optional/cleanup.py` and `cogs/optional/setrole.py`
@@ -36,8 +52,11 @@ ctx with `.author`, `.guild`, and `.bot.config` — `OpContext` below mirrors
 that shape so the existing helpers work unmodified.
 
 Frontends: mcp_ops/server.py (MCP) and core/agent_loop.py (in-bot agent
-loop) both generate their tool surfaces from this registry. See the
-bottom-of-file smoke test for a no-bot-required sanity check.
+loop) both generate their tool surfaces from this registry.
+
+`python3 -m core.ops` prints the offline JSON schemas for every registered
+op (no bot, no Discord connection). The registry's invariants are covered
+by tests/test_ops_registry.py.
 """
 from __future__ import annotations
 
@@ -73,6 +92,39 @@ class PermissionLevel(IntEnum):
     EVERYONE = 0
     ADMIN = 1
     SUPERADMIN = 2
+
+
+class OpScope(str, Enum):
+    """WHERE an op acts, which is what makes a frontend's op universe
+    derivable instead of hand-listed.
+
+    GUILD  — acts on/inside a guild (channels, members, roles, emoji). The
+             in-guild agent surface is exactly this set, queried LIVE.
+    DM     — acts on a one-to-one DM conversation; no guild involved.
+    GLOBAL — acts on the bot itself across guilds (e.g. list_guilds).
+    """
+    GUILD = "guild"
+    DM = "dm"
+    GLOBAL = "global"
+
+
+# Op groups: a stable kebab-case id -> human display label. The id is what
+# code and (eventually) stored config speak; the label is presentation only,
+# so relabeling never breaks a lookup. Frontends render one select/section
+# per group, so each group must stay under Discord's 25-option select cap.
+OP_GROUPS: Dict[str, str] = {
+    "messaging": "Messaging",
+    "roles": "Roles",
+    "emojis": "Emojis",
+    "guild-info": "Guild info",
+    "dm": "Direct messages",
+    "guild": "Guild",
+}
+
+# Where an op came from. Assigned by the REGISTRATION PATH, never accepted
+# as a decorator argument — a cog cannot claim to be core.
+ORIGIN_CORE = "core"
+ORIGIN_COG = "cog"
 
 
 class ParamKind(str, Enum):
@@ -333,18 +385,27 @@ class Op:
     impl: Callable[..., Any]
     params: List[OpParam] = field(default_factory=list)
     serialize: Optional[Callable[[Any], Dict[str, Any]]] = None
+    # WHERE this op acts. The in-guild agent universe is derived from this
+    # (scope == GUILD), queried live — there is deliberately NO code-level
+    # "agent" subset flag, because every such flag drifted from the surface
+    # it claimed to describe.
+    scope: OpScope = OpScope.GUILD
+    # Which group this op renders under in a frontend's grouped listing.
+    # Kebab-case key into OP_GROUPS.
+    group: str = "messaging"
+    # 'core' for ops registered inline in this module, 'cog' for ops a cog
+    # contributed via register_cog_ops. Stamped by the registration path,
+    # never passed in by the op author.
+    origin: str = ORIGIN_CORE
+    # The cog instance that owns a 'cog'-origin op, so unregister_owner can
+    # remove exactly that cog's batch on unload. None for core ops.
+    owner: Any = None
     # Behavioral guidance injected into the agent system prompt when this op
     # is on a guild's enabled-tool list (see gpt.py build_agentic_guidance).
     # Lives here, not in the prompt builder, so guidance travels with the op
     # and can't drift out of sync with the enabled-tool set. Distinct from
     # `description`, which rides inside the function schema itself.
     agent_guidance: Optional[str] = None
-    # Part of the in-guild agent surface (the /aisettings Bot-tools set).
-    # The MCP surface is always the whole registry; the agent surface is the
-    # subset safe for a guild-confined, user-actored loop — declared HERE so
-    # frontends derive their universes from the registry instead of keeping
-    # parallel name lists.
-    agent: bool = False
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
         allowed, reason = _check_permission(ctx, self.permission)
@@ -438,6 +499,9 @@ class Op:
             "name": self.name,
             "description": self.description,
             "permission": self.permission.name,
+            "scope": self.scope.value,
+            "group": self.group,
+            "origin": self.origin,
             "params": self.to_json_schema(),
         }
 
@@ -658,6 +722,85 @@ def _check_permission(ctx: OpContext, level: PermissionLevel) -> "tuple[bool, Op
     return False, f"Unknown permission level: {level!r}"
 
 
+@dataclass(frozen=True)
+class OpSpec:
+    """An op declaration attached to a cog method by the module-level
+    `op(...)` decorator, waiting to be registered.
+
+    Deliberately inert: attaching a spec at import time must NOT touch the
+    registry, or a module import would leak ops that no live cog backs (and
+    a re-import would collide with itself). Registration happens per cog
+    INSTANCE in `register_cog_ops`, and is undone in `unregister_owner`.
+    """
+    name: str
+    description: str
+    permission: PermissionLevel
+    params: Tuple[OpParam, ...] = ()
+    serialize: Optional[Callable[[Any], Dict[str, Any]]] = None
+    agent_guidance: Optional[str] = None
+    scope: OpScope = OpScope.GUILD
+    group: str = "messaging"
+
+
+# Attribute an OpSpec rides on. Mirrors how discord.py's CogMeta finds
+# commands: decorate the method, let the cog machinery collect them on the
+# instance.
+OP_SPEC_ATTR = "__op_spec__"
+
+
+def op(name: str, description: str, permission: PermissionLevel,
+       params: Optional[List[OpParam]] = None,
+       serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
+       agent_guidance: Optional[str] = None,
+       scope: OpScope = OpScope.GUILD,
+       group: str = "messaging"):
+    """Declare a cog method as an op, WITHOUT registering it.
+
+        class MyCog(commands.Cog):
+            @op("do_thing", "Does the thing.", PermissionLevel.ADMIN)
+            async def do_thing(self, ctx, ...): ...
+
+    The spec is attached to the function; `registry.register_cog_ops(cog)`
+    (called from LiterallyBot.add_cog) registers the whole batch against the
+    live cog instance, and `registry.unregister_owner(cog)` removes it on
+    unload. There is no `origin` parameter — this path always stamps 'cog'.
+    """
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        if not inspect.iscoroutinefunction(func):
+            raise TypeError(f"Op '{name}' implementation must be an async function.")
+        if getattr(func, OP_SPEC_ATTR, None) is not None:
+            raise TypeError(f"Function already declares op "
+                            f"'{getattr(func, OP_SPEC_ATTR).name}'; one op per function.")
+        setattr(func, OP_SPEC_ATTR, OpSpec(
+            name=name, description=description, permission=permission,
+            params=tuple(params or []), serialize=serialize,
+            agent_guidance=agent_guidance, scope=scope, group=group,
+        ))
+        return func
+    return decorator
+
+
+def _build_op(*, name: str, description: str, permission: PermissionLevel,
+              impl: Callable[..., Any], params: Optional[List[OpParam]],
+              serialize: Optional[Callable[[Any], Dict[str, Any]]],
+              agent_guidance: Optional[str], scope: OpScope, group: str,
+              origin: str, owner: Any) -> Op:
+    """Validate and construct an Op. Shared by both registration paths so a
+    cog op and a core op are held to exactly the same rules."""
+    if not inspect.iscoroutinefunction(impl):
+        raise TypeError(f"Op '{name}' implementation must be an async function.")
+    if not isinstance(scope, OpScope):
+        raise TypeError(f"Op '{name}' scope must be an OpScope, got {scope!r}.")
+    if not group or not isinstance(group, str):
+        raise ValueError(f"Op '{name}' must declare a non-empty group id.")
+    return Op(
+        name=name, description=description, permission=permission,
+        impl=impl, params=list(params or []), serialize=serialize,
+        agent_guidance=agent_guidance, scope=scope, group=group,
+        origin=origin, owner=owner,
+    )
+
+
 class OpsRegistry:
     """Registry of ops, shared by any frontend (in-bot agent loop, MCP
     server, ...). Import the module-level `registry` instance below rather
@@ -670,21 +813,32 @@ class OpsRegistry:
            params: Optional[List[OpParam]] = None,
            serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
            agent_guidance: Optional[str] = None,
-           agent: bool = False):
+           scope: OpScope = OpScope.GUILD,
+           group: str = "messaging"):
         """Decorator: `@registry.op("name", "...", PermissionLevel.ADMIN)`
-        registers an `async def impl(ctx, **kwargs)` under `name`."""
+        registers an `async def impl(ctx, **kwargs)` under `name`.
+
+        This is the CORE registration path — ops registered through it are
+        stamped origin='core'. Cog-provided ops go through the module-level
+        `op(...)` decorator plus `register_cog_ops`, which stamps 'cog'.
+        Origin is never a decorator argument on either path.
+        """
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
-            if name in self._ops:
-                raise ValueError(f"Op '{name}' is already registered.")
-            if not inspect.iscoroutinefunction(func):
-                raise TypeError(f"Op '{name}' implementation must be an async function.")
-            self._ops[name] = Op(
+            self._insert(_build_op(
                 name=name, description=description, permission=permission,
-                impl=func, params=params or [], serialize=serialize,
-                agent_guidance=agent_guidance, agent=agent,
-            )
+                impl=func, params=params, serialize=serialize,
+                agent_guidance=agent_guidance, scope=scope, group=group,
+                origin=ORIGIN_CORE, owner=None,
+            ))
             return func
         return decorator
+
+    def _insert(self, op: Op) -> None:
+        """Add a fully-built Op, refusing a duplicate name. The single
+        mutation point for both registration paths."""
+        if op.name in self._ops:
+            raise ValueError(f"Op '{op.name}' is already registered.")
+        self._ops[op.name] = op
 
     def get(self, name: str) -> Optional[Op]:
         return self._ops.get(name)
@@ -704,9 +858,127 @@ class OpsRegistry:
     def names(self) -> List[str]:
         return list(self._ops.keys())
 
-    def agent_names(self) -> List[str]:
-        """Ops flagged for the in-guild agent surface (`agent=True`)."""
-        return [name for name, op in self._ops.items() if op.agent]
+    # -- live queries -------------------------------------------------------
+    #
+    # Every one of these reads self._ops at CALL time. Frontends must query
+    # them per use and must not freeze the result into a module-level tuple:
+    # cog ops appear and disappear with cog load/unload, so an import-time
+    # snapshot is wrong the moment any cog is reloaded.
+
+    def ops(self, *, scope: Optional[OpScope] = None,
+            origin: Optional[str] = None,
+            group: Optional[str] = None) -> List[Op]:
+        """Live, filtered view of registered ops, in registration order."""
+        return [
+            op for op in self._ops.values()
+            if (scope is None or op.scope == scope)
+            and (origin is None or op.origin == origin)
+            and (group is None or op.group == group)
+        ]
+
+    def op_names(self, *, scope: Optional[OpScope] = None,
+                 origin: Optional[str] = None,
+                 group: Optional[str] = None) -> List[str]:
+        """Names of the ops `ops()` would return, same filters."""
+        return [op.name for op in self.ops(scope=scope, origin=origin,
+                                           group=group)]
+
+    def guild_agent_names(self) -> List[str]:
+        """The in-guild agent tool UNIVERSE: every registered guild-scoped
+        op, queried live.
+
+        This replaces the former `agent=True` flag. The doctrine is that
+        there is no code-level op subset — an op is available to the
+        guild-confined agent loop exactly when it acts on a guild, and
+        WHICH of those a given guild enables is per-guild config
+        (`bot_tools_enabled`), not a constant in this file."""
+        return self.op_names(scope=OpScope.GUILD)
+
+    def grouped(self, *, scope: Optional[OpScope] = None,
+                origin: Optional[str] = None,
+                ) -> List[Tuple[str, str, List[Op]]]:
+        """Live listing partitioned by group, as (group_id, label, ops).
+
+        Ordered by OP_GROUPS declaration order so a panel's sections keep a
+        stable order across reloads; empty groups are omitted. Any group id
+        not in OP_GROUPS (a cog inventing its own) sorts after the known
+        ones and falls back to its raw id as the label."""
+        selected = self.ops(scope=scope, origin=origin)
+        order = list(OP_GROUPS)
+        seen: List[str] = []
+        for op in selected:
+            if op.group not in seen:
+                seen.append(op.group)
+        seen.sort(key=lambda g: (order.index(g) if g in order else len(order),
+                                 g))
+        return [
+            (gid, OP_GROUPS.get(gid, gid),
+             [op for op in selected if op.group == gid])
+            for gid in seen
+        ]
+
+    # -- cog op lifecycle ---------------------------------------------------
+
+    def register_cog_ops(self, cog: Any) -> List[str]:
+        """Register every `@op(...)`-decorated method of a cog instance,
+        ALL-OR-NONE.
+
+        The whole batch is built and checked for duplicates (against the
+        registry AND within the batch itself) BEFORE anything is inserted,
+        so a cog with one bad op registers zero ops rather than half of
+        them — a half-registered cog is unremovable by name and leaves the
+        agent surface lying about what actually works.
+
+        Bound methods are collected, so the op impl receives `self` and can
+        use cog state. Returns the registered names (empty if the cog
+        declares no ops).
+        """
+        batch: List[Op] = []
+        claimed: Dict[str, str] = {}
+        # dir() over the CLASS, getattr on the INSTANCE: gives bound methods
+        # while avoiding triggering instance-level descriptors/properties.
+        for attr in dir(type(cog)):
+            member = getattr(type(cog), attr, None)
+            spec = getattr(member, OP_SPEC_ATTR, None)
+            if spec is None:
+                continue
+            bound = getattr(cog, attr)
+            if spec.name in claimed:
+                raise ValueError(
+                    f"Cog {type(cog).__name__} declares op '{spec.name}' twice "
+                    f"({claimed[spec.name]} and {attr}); no ops were registered."
+                )
+            if spec.name in self._ops:
+                raise ValueError(
+                    f"Cog {type(cog).__name__}.{attr} declares op '{spec.name}', "
+                    f"which is already registered; no ops were registered."
+                )
+            claimed[spec.name] = attr
+            batch.append(_build_op(
+                name=spec.name, description=spec.description,
+                permission=spec.permission, impl=bound,
+                params=list(spec.params), serialize=spec.serialize,
+                agent_guidance=spec.agent_guidance, scope=spec.scope,
+                group=spec.group, origin=ORIGIN_COG, owner=cog,
+            ))
+        # Preflight passed — commit.
+        for built in batch:
+            self._insert(built)
+        return [built.name for built in batch]
+
+    def unregister_owner(self, owner: Any) -> List[str]:
+        """Remove every op owned by `owner` (a cog instance).
+
+        Identity-based (`is`), not name-based: two cogs of the same class
+        must not evict each other's ops. Never raises for an owner that
+        registered nothing — cog teardown can run after a partially failed
+        setup, and unregistration must be safe to call unconditionally.
+        Returns the removed names.
+        """
+        removed = [name for name, op in self._ops.items() if op.owner is owner]
+        for name in removed:
+            del self._ops[name]
+        return removed
 
     async def call(self, op_name: str, ctx: OpContext, **kwargs) -> OpResult:
         op = self._ops.get(op_name)
@@ -852,7 +1124,8 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
         "follow-up edits or reactions, and use reference_message_id to reply "
         "to a message. Your final text reply is posted to the current channel "
         "automatically — never duplicate it with send_message."),
-    agent=True
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def send_message(ctx: OpContext, channel, content: str = "",
                        reference_message_id: Optional[int] = None,
@@ -899,7 +1172,8 @@ async def send_message(ctx: OpContext, channel, content: str = "",
         OpParam("content", ParamKind.STRING, "Replacement message text."),
     ],
     serialize=lambda m: {"message_id": m.id},
-    agent=True
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def edit_message(ctx: OpContext, message, content: str):
     return await message.edit(content=content)
@@ -914,7 +1188,8 @@ async def edit_message(ctx: OpContext, message, content: str):
     agent_guidance=(
         "delete_message requires the invoking user to be a bot admin; if the "
         "tool returns a permission error, relay that plainly."),
-    agent=True
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def delete_message(ctx: OpContext, message):
     await message.delete()
@@ -934,7 +1209,8 @@ async def delete_message(ctx: OpContext, message):
         "add_reaction needs a literal unicode emoji character (💩, 💨, ❤️) or "
         "name:id for custom emoji — never a word or description. ('fart' and "
         "'-' are invalid; the fart/dash emoji is 💨.)"),
-    agent=True
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def add_reaction(ctx: OpContext, message, emoji: str):
     await message.add_reaction(emoji)
@@ -956,7 +1232,8 @@ async def add_reaction(ctx: OpContext, message, emoji: str):
     agent_guidance=(
         "remove_reaction only removes reactions the bot itself added, and "
         "takes the same literal-emoji form as add_reaction."),
-    agent=True
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def remove_reaction(ctx: OpContext, message, emoji: str):
     await message.remove_reaction(emoji, ctx.bot.user)
@@ -1084,7 +1361,8 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
         "them raw. If the result carries a `note` about a fallback scan, "
         "only the most recent messages were checked — say so instead of "
         "claiming 'never'."),
-    agent=True
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def search_history(ctx: OpContext, guild=None, channels=None,
                           limit: int = 100,
@@ -1145,6 +1423,8 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
         OpParam("member", ParamKind.MEMBER, "Discord user id to grant the role to."),
         OpParam("role", ParamKind.ROLE, "Discord role id to grant."),
     ],
+    scope=OpScope.GUILD,
+    group="roles",
 )
 async def add_role(ctx: OpContext, member, role, guild=None):
     await member.add_roles(role)
@@ -1165,6 +1445,8 @@ async def add_role(ctx: OpContext, member, role, guild=None):
         OpParam("member", ParamKind.MEMBER, "Discord user id to remove the role from."),
         OpParam("role", ParamKind.ROLE, "Discord role id to remove."),
     ],
+    scope=OpScope.GUILD,
+    group="roles",
 )
 async def remove_role(ctx: OpContext, member, role, guild=None):
     await member.remove_roles(role)
@@ -1177,6 +1459,8 @@ async def remove_role(ctx: OpContext, member, role, guild=None):
     "the whole channel and Discord itself caps pins at 50 per channel).",
     PermissionLevel.ADMIN,
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to pin.")],
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def pin_message(ctx: OpContext, message):
     await message.pin()
@@ -1197,6 +1481,8 @@ async def pin_message(ctx: OpContext, message):
                 required=False),
     ],
     serialize=lambda t: {"thread_id": t.id, "name": t.name},
+    scope=OpScope.GUILD,
+    group="messaging",
 )
 async def create_thread(ctx: OpContext, channel, name: str, message=None):
     if message is not None:
@@ -1210,6 +1496,8 @@ async def create_thread(ctx: OpContext, channel, name: str, message=None):
     PermissionLevel.EVERYONE,
     params=[],
     serialize=lambda gs: {"guilds": gs, "count": len(gs)},
+    scope=OpScope.GLOBAL,
+    group="guild",
 )
 async def list_guilds(ctx: OpContext):
     return [{"id": g.id, "name": g.name} for g in ctx.bot.guilds]
@@ -1225,7 +1513,8 @@ async def list_guilds(ctx: OpContext):
         "Channel ids must come from list_channels or the visible context — "
         "NEVER guess or invent an id. When the user names channels (e.g. "
         "'check #memes'), call list_channels first to resolve names to ids."),
-    agent=True
+    scope=OpScope.GUILD,
+    group="guild-info",
 )
 async def list_channels(ctx: OpContext, guild):
     return [
@@ -1255,7 +1544,8 @@ async def list_channels(ctx: OpContext, guild):
                 required=False, default=100, minimum=1, maximum=1000),
     ],
     serialize=lambda ms: {"members": ms, "count": len(ms)},
-    agent=True
+    scope=OpScope.GUILD,
+    group="guild-info",
 )
 async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
                        include_bots: bool = False, limit: int = 100):
@@ -1327,6 +1617,8 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
         "role this server treats as consent) before DMing anyone. A DM "
         "cannot be seen by the channel, so never use it to answer a question "
         "asked in public."),
+    scope=OpScope.DM,
+    group="dm",
 )
 async def send_dm(ctx: OpContext, user, content: str = "",
                   file_paths: Optional[List[str]] = None,
@@ -1391,6 +1683,8 @@ async def send_dm(ctx: OpContext, user, content: str = "",
         "poll for new replies, pass the last row's message_id as "
         "after_message_id and repeat while pages come back full — it never "
         "skips or repeats a message."),
+    scope=OpScope.DM,
+    group="dm",
 )
 async def read_dms(ctx: OpContext, user, since: Optional[str] = None,
                    after_message_id: Optional[int] = None, limit: int = 50):
@@ -1426,6 +1720,8 @@ async def read_dms(ctx: OpContext, user, since: Optional[str] = None,
         "oldest-first within the page; to page backwards through history, "
         "call again with before_message_id set to the first row's "
         "message_id, until a page comes back empty."),
+    scope=OpScope.DM,
+    group="dm",
 )
 async def fetch_dms(ctx: OpContext, user, limit: int = 50,
                     before_message_id: Optional[int] = None):
@@ -1477,6 +1773,8 @@ def _guard_editable(role: Any):
     PermissionLevel.EVERYONE,
     params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
     serialize=lambda rs: {"roles": rs, "count": len(rs)},
+    scope=OpScope.GUILD,
+    group="roles",
 )
 async def list_roles(ctx: OpContext, guild):
     return [serialize_role(r) for r in
@@ -1503,6 +1801,8 @@ async def list_roles(ctx: OpContext, guild):
         "Role ids for list_role_members must come from list_roles — never "
         "guess one. It answers 'who has role X'; list_members answers 'who "
         "can see channel Y'. The two are not interchangeable."),
+    scope=OpScope.GUILD,
+    group="roles",
 )
 async def list_role_members(ctx: OpContext, guild, role,
                             include_bots: bool = False, limit: int = 100):
@@ -1551,6 +1851,8 @@ async def list_role_members(ctx: OpContext, guild, role,
         "create_role returns the new role's id; reuse it for add_role or "
         "edit_role instead of calling list_roles again. Check list_roles "
         "first rather than creating near-duplicate names."),
+    scope=OpScope.GUILD,
+    group="roles",
 )
 async def create_role(ctx: OpContext, guild, name: str, color: Optional[str] = None,
                       hoist: bool = False, mentionable: bool = False):
@@ -1586,6 +1888,8 @@ async def create_role(ctx: OpContext, guild, name: str, color: Optional[str] = N
         "edit_role position values shift the whole hierarchy — after a batch "
         "of moves, call list_roles once to see the settled order instead of "
         "assuming each move landed exactly where requested."),
+    scope=OpScope.GUILD,
+    group="roles",
 )
 async def edit_role(ctx: OpContext, guild, role, name: Optional[str] = None,
                     color: Optional[str] = None, hoist: Optional[bool] = None,
@@ -1623,6 +1927,8 @@ async def edit_role(ctx: OpContext, guild, role, name: Optional[str] = None,
         "delete_role is irreversible and detaches the role from every member "
         "holding it — confirm intent before calling it on a role with a "
         "nonzero member_count."),
+    scope=OpScope.GUILD,
+    group="roles",
 )
 async def delete_role(ctx: OpContext, guild, role):
     _guard_editable(role)
@@ -1718,6 +2024,8 @@ def load_emoji_image(file_path: str) -> bytes:
         "or edit/delete — never guess an id or assume a name is unique. Pass "
         "`reaction_form` (name:id) to add_reaction, and `mention` when writing "
         "the emoji into message content."),
+    scope=OpScope.GUILD,
+    group="emojis",
 )
 async def list_emojis(ctx: OpContext, guild):
     return [serialize_emoji(e) for e in guild.emojis]
@@ -1743,6 +2051,8 @@ async def list_emojis(ctx: OpContext, guild):
         "`mention` — reuse those directly instead of calling list_emojis "
         "again. Guilds have a hard emoji slot limit; if creation fails for a "
         "full guild, say so rather than retrying."),
+    scope=OpScope.GUILD,
+    group="emojis",
 )
 async def create_emoji(ctx: OpContext, guild, name: str, file_path: str):
     # Reads the HOST filesystem, so it carries the same admin gate as
@@ -1771,6 +2081,8 @@ async def create_emoji(ctx: OpContext, guild, name: str, file_path: str):
     agent_guidance=(
         "Renaming an emoji changes the :name: users type but keeps its id, so "
         "existing reactions and messages keep working."),
+    scope=OpScope.GUILD,
+    group="emojis",
 )
 async def edit_emoji(ctx: OpContext, guild, emoji_id: int, name: str):
     emoji = _require_guild_emoji(guild, _as_int(emoji_id, "emoji_id"))
@@ -1796,6 +2108,8 @@ async def edit_emoji(ctx: OpContext, guild, emoji_id: int, name: str):
     agent_guidance=(
         "delete_emoji is irreversible and breaks every existing message and "
         "reaction using that emoji — confirm intent before calling it."),
+    scope=OpScope.GUILD,
+    group="emojis",
 )
 async def delete_emoji(ctx: OpContext, guild, emoji_id: int):
     emoji = _require_guild_emoji(guild, _as_int(emoji_id, "emoji_id"))
@@ -1828,6 +2142,8 @@ async def delete_emoji(ctx: OpContext, guild, emoji_id: int):
         "only — a role with no overwrites simply grants its guild-level "
         "permissions. Filter by role_id when auditing what one role "
         "unlocks; the unfiltered guild-wide dump can be large."),
+    scope=OpScope.GUILD,
+    group="guild-info",
 )
 async def list_channel_overwrites(ctx: OpContext, guild, channel=None, role=None):
     channels = [channel] if channel is not None else guild.channels
@@ -1850,210 +2166,32 @@ async def list_channel_overwrites(ctx: OpContext, guild, channel=None, role=None
     return out
 
 
+
 # ---------------------------------------------------------------------------
-# In-file smoke test — instantiates the module-level registry and lists
-# tools WITHOUT a live bot/Discord connection. Run directly:
+# Offline schema dump — instantiates the module-level registry and prints
+# every op's generated wire schema WITHOUT a live bot/Discord connection.
+# Documented in the README. Run directly:
 #     python3 -m core.ops
+#
+# This is a VIEWER, not a test: the registry's invariants live in
+# tests/test_ops_registry.py (run with `python -m pytest tests/`). Keeping
+# assertions out of here is deliberate — the previous version imported
+# cogs.optional.gpt to assert on panel chunking, inverting the dependency
+# so core depended on a cog. That check now lives in the test file, where
+# importing a cog is fine.
 # ---------------------------------------------------------------------------
 
-def _smoke_test() -> None:
-    expected = {
-        "send_message", "edit_message", "delete_message", "add_reaction",
-        "remove_reaction", "search_history", "add_role", "remove_role", "pin_message",
-        "create_thread", "list_guilds", "list_channels", "list_members",
-        "list_roles", "list_role_members", "create_role", "edit_role",
-        "delete_role", "list_channel_overwrites", "send_dm", "read_dms",
-        "fetch_dms", "list_emojis", "create_emoji", "edit_emoji",
-        "delete_emoji",
-    }
-    names = set(registry.names())
-    missing = expected - names
-    assert not missing, f"Registry is missing expected ops: {missing}"
-
+def _print_schemas() -> None:
     tools = registry.list_tools()
-    assert len(tools) == len(names), "list_tools() count should match names() count"
-
-    for tool in tools:
-        assert tool["name"] in expected
-        assert tool["permission"] in {"EVERYONE", "ADMIN", "SUPERADMIN"}
-        assert isinstance(tool["description"], str) and tool["description"]
-        schema = tool["params"]
-        assert schema["type"] == "object"
-        assert isinstance(schema["properties"], dict)
-        assert isinstance(schema["required"], list)
-
-    # Generated wire schemas: entity params travel as ids; MESSAGE implies
-    # channel_id; INTERNAL params (allowed_mentions) never hit the wire.
-    send = registry.get("send_message").to_json_schema()
-    assert set(send["properties"]) == {
-        "channel_id", "content", "reference_message_id", "file_paths",
-    }, send
-    assert send["required"] == ["channel_id"]  # content optional when attaching
-    assert send["properties"]["file_paths"]["type"] == "array", send
-    assert send["properties"]["file_paths"]["items"] == {"type": "string"}, send
-
-    edit = registry.get("edit_message").to_json_schema()
-    assert set(edit["properties"]) == {"channel_id", "message_id", "content"}, edit
-
-    search = registry.get("search_history").to_json_schema()
-    assert set(search["properties"]) == {"guild_id", "channel_ids", "limit",
-                                         "author_id", "contains"}
-    assert search["required"] == []  # no channel scope => guild-wide search
-    assert search["properties"]["channel_ids"]["type"] == "array"
-    assert search["properties"]["channel_ids"]["items"] == {"type": "string"}
-    assert search["properties"]["limit"]["maximum"] == HISTORY_LIMIT_MAX
-
-    thread = registry.get("create_thread").to_json_schema()
-    assert set(thread["properties"]) == {"channel_id", "name", "message_id"}
-    assert set(thread["required"]) == {"channel_id", "name"}
-
-    roles = registry.get("add_role").to_json_schema()
-    assert set(roles["properties"]) == {"guild_id", "user_id", "role_id"}
-    assert set(roles["required"]) == {"user_id", "role_id"}  # guild from wire OR ambient ctx
-
-    # Snowflakes travel as strings (2**53 — see _SNOWFLAKE_JSON_TYPE); real
-    # scalar ints keep "integer" so clamping still applies.
-    assert roles["properties"]["user_id"]["type"] == "string", roles
-    assert send["properties"]["reference_message_id"]["type"] == "string", send
-    assert search["properties"]["author_id"]["type"] == "string", search
-    assert search["properties"]["limit"]["type"] == "integer", search
-
-    # DM ops resolve a guild-independent USER (one-to-one with the DM API) —
-    # never a raw DM channel id, never an invented guild_id.
-    dm = registry.get("send_dm").to_json_schema()
-    assert set(dm["properties"]) == {"user_id", "content", "file_paths"}, dm
-    assert dm["properties"]["user_id"]["type"] == "string", dm
-    assert "channel_id" not in dm["properties"], dm
-    assert "guild_id" not in dm["properties"], dm
-    assert set(dm["required"]) == {"user_id"}
-
-    read = registry.get("read_dms").to_json_schema()
-    assert set(read["properties"]) == {"user_id", "since",
-                                       "after_message_id", "limit"}
-    assert set(read["required"]) == {"user_id"}
-    assert read["properties"]["after_message_id"]["type"] == "string", read
-
-    fetch = registry.get("fetch_dms").to_json_schema()
-    assert set(fetch["properties"]) == {"user_id", "limit",
-                                        "before_message_id"}
-    assert set(fetch["required"]) == {"user_id"}
-    assert fetch["properties"]["before_message_id"]["type"] == "string", fetch
-
-    rolemem = registry.get("list_role_members").to_json_schema()
-    assert set(rolemem["properties"]) == {"guild_id", "role_id",
-                                          "include_bots", "limit"}
-    assert rolemem["properties"]["role_id"]["type"] == "string", rolemem
-
-    # SNOWFLAKE scalars are coerced centrally in resolve_kwargs (op impls
-    # never have to remember); INTEGER scalars are additionally clamped.
-    import asyncio as _asyncio
-    coerced = _asyncio.run(registry.get("search_history").resolve_kwargs(
-        bot=None, guild=None,
-        raw={"author_id": "1208839321801465886", "limit": 9999},
-        allowed_guild_ids=frozenset()))
-    assert coerced["author_id"] == 1208839321801465886, coerced
-    assert coerced["limit"] == HISTORY_LIMIT_MAX, coerced
-
-    # A no-actor context must fail closed on anything above EVERYONE, and
-    # must never raise — permission failures surface as OpResult.error.
-    empty_ctx = OpContext(bot=None, author=None, guild=None)
-    import asyncio
-
-    result = asyncio.run(registry.call("delete_message", empty_ctx, message=None))
-    assert result.ok is False
-    assert "actor" in (result.error or "").lower()
-
-    unknown = asyncio.run(registry.call("not_a_real_op", empty_ctx))
-    assert unknown.ok is False
-    assert "Unknown op" in (unknown.error or "")
-
-    # call_ids surfaces resolution failures as OpResult errors (never
-    # raises), and rejects unknown params by name.
-    class _FakeBot:
-        def get_channel(self, cid):
-            return None
-        async def fetch_channel(self, cid):
-            raise RuntimeError("no gateway in smoke test")
-
-    no_guild_ctx = OpContext(bot=_FakeBot(), author=None, guild=None)
-    res = asyncio.run(registry.call_ids("send_message", no_guild_ctx,
-                                        channel_id=123, content="hi"))
-    assert res.ok is False and "Could not resolve channel" in res.error
-
-    res = asyncio.run(registry.call_ids("list_guilds", no_guild_ctx, bogus=1))
-    assert res.ok is False and "Unexpected parameter" in res.error
-
-    # Attachment path validation (no Discord needed): good file loads,
-    # missing path and disallowed extension both raise.
-    import os
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmp:
-        tmp.write(b"GIF89a-fake")
-        tmp_path = tmp.name
-    try:
-        files = load_discord_attachments([tmp_path])
-        assert len(files) == 1
-        files[0].close()
-        try:
-            load_discord_attachments(["/no/such/file.gif"])
-            assert False, "expected missing file to raise"
-        except ValueError as exc:
-            assert "not found" in str(exc).lower()
-        # One bad path in a batch must reject BEFORE any file is opened —
-        # a good path listed first must not leave a dangling handle.
-        try:
-            load_discord_attachments([tmp_path, "/no/such/file.gif"])
-            assert False, "expected batch with missing file to raise"
-        except ValueError:
-            pass
-        bad = tmp_path + ".exe"
-        os.rename(tmp_path, bad)
-        tmp_path = bad
-        try:
-            load_discord_attachments([tmp_path])
-            assert False, "expected bad extension to raise"
-        except ValueError as exc:
-            assert "extension" in str(exc).lower()
-    finally:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-
-    # Emoji ops: ids travel as SNOWFLAKE strings (see _SNOWFLAKE_JSON_TYPE)
-    # and are resolved against the guild inside the op, not by the shared
-    # id resolver — so guild confinement lives in _require_guild_emoji.
-    create_emoji_schema = registry.get("create_emoji").to_json_schema()
-    assert set(create_emoji_schema["properties"]) == {
-        "guild_id", "name", "file_path"}, create_emoji_schema
-    edit_emoji_schema = registry.get("edit_emoji").to_json_schema()
-    assert edit_emoji_schema["properties"]["emoji_id"]["type"] == "string", \
-        "emoji_id must be a string on the wire (64-bit snowflake)"
-
-    # Frontends render the op universe into Discord select menus, which
-    # accept at most 25 options EACH. discord.py does not validate this —
-    # an over-long select builds fine and fails with an HTTP 400 when the
-    # panel opens. The /aisettings panel chunks the universe across selects
-    # (see _tool_selects in cogs/optional/gpt.py); this assert is the tripwire
-    # that tells you WHY if that chunking is ever removed.
-    from cogs.optional.gpt import SELECT_MAX_OPTIONS, _tool_selects
-    _selects = _tool_selects(sorted(names), [], None)
-    for _sel in _selects:
-        assert len(_sel.options) <= SELECT_MAX_OPTIONS, (
-            f"select renders {len(_sel.options)} options — Discord's cap is "
-            f"{SELECT_MAX_OPTIONS} and discord.py will NOT catch this")
-    assert sum(len(s.options) for s in _selects) == len(names), \
-        "chunking dropped ops — every op must remain selectable"
-    if len(names) > SELECT_MAX_OPTIONS:
-        print(f"  note: {len(names)} ops exceed Discord's "
-              f"{SELECT_MAX_OPTIONS}-option select cap — /aisettings chunks "
-              f"them across {len(_selects)} selects.")
-
-    print(f"core.ops smoke test OK — {len(names)} ops registered:")
-    for tool in tools:
-        wire = ", ".join(tool["params"]["properties"].keys()) or "-"
-        print(f"  [{tool['permission']:>10}] {tool['name']:<16} wire: {wire}")
+    print(f"core.ops — {len(tools)} ops registered")
+    for gid, label, ops in registry.grouped():
+        print(f"\n{label} ({gid}) — {len(ops)} ops")
+        for op_ in ops:
+            schema = op_.to_json_schema()
+            wire = ", ".join(schema["properties"]) or "-"
+            print(f"  [{op_.permission.name:>10}] [{op_.scope.value:>6}] "
+                  f"{op_.name:<24} wire: {wire}")
 
 
 if __name__ == "__main__":
-    _smoke_test()
+    _print_schemas()
