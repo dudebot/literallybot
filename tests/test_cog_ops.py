@@ -7,10 +7,17 @@ appear on load, vanish on unload, and survive a reload without colliding —
 driven through the same `LiterallyBot.add_cog`/`remove_cog` overrides bot.py
 installs, not by calling the registry directly.
 
-It also pins the two properties that make these ops safe to hand to an agent:
+It also pins the properties that make these ops safe to hand to an agent:
 the danbooru rating policy lives in the service (so no caller can bypass it),
-and the ops never touch an Interaction (issue #64: a tool needing `ctx.send`
-is not headless).
+the ops never touch an Interaction (issue #64: a tool needing `ctx.send` is
+not headless), and every op that returns data declares a serializer.
+
+That last one needs asserting through `Op.result_payload` specifically, NOT
+through `op.impl(...)`. An op with no `serialize` still returns a rich dict
+from its impl while both shipped frontends (core/agent_loop.py,
+core/mcp_server.py) see nothing but `{"ok": true}` — an impl-level assertion
+passes vacuously while the agent gets an empty payload. Every op here has a
+`_payload` test for that reason; new cog ops want one too.
 """
 
 import asyncio
@@ -19,7 +26,8 @@ import logging
 
 import pytest
 
-from core.ops import ORIGIN_COG, OP_GROUPS, OpScope, OpsRegistry, PermissionLevel
+from core.ops import (ORIGIN_COG, OP_GROUPS, OpResult, OpScope, OpsRegistry,
+                      PermissionLevel)
 
 from cogs.optional.danbooru import Danbooru, apply_rating_policy
 from cogs.optional.setrole import SetRole
@@ -425,7 +433,11 @@ def test_op_add_emoji_role_toggle_goes_through_the_same_service(reg):
 
 def test_op_sync_returns_serializable_snowflake_strings(reg):
     """Snowflakes leave as strings for the 2**53 reason (see core/ops.py) —
-    an int here would round in JSON transit and report the wrong message."""
+    an int here would round in JSON transit and report the wrong message.
+
+    Asserted on `result_payload`, the envelope both frontends actually send,
+    so a missing serializer fails here instead of passing against an impl
+    return value nothing downstream ever sees."""
     cog, guild, channel, role = _setrole_env()
     asyncio.run(cog._add_toggle(guild, channel, 42, "\N{THUMBS UP SIGN}", role))
     guild.text_channels = [channel]
@@ -436,10 +448,192 @@ def test_op_sync_returns_serializable_snowflake_strings(reg):
 
     ctx = _Ctx()
     ctx.guild = guild
-    payload = asyncio.run(reg.require("sync_emoji_role_toggles").impl(ctx))
+    o = reg.require("sync_emoji_role_toggles")
+    payload = o.result_payload(OpResult(ok=True, value=asyncio.run(o.impl(ctx))))
+    assert payload["ok"] is True
     assert payload["count"] == 1
     entry = payload["entries"][0]
     for key in ("channel_id", "message_id", "role_id"):
         assert isinstance(entry[key], str), f"{key} must travel as a string"
     assert entry["emoji"] == "\N{THUMBS UP SIGN}"
     assert entry["status"]
+
+
+# --------------------------------------------------------------------------
+# Frontend payloads: what the agent and MCP actually receive.
+#
+# `op.impl(...)` returning a rich dict proves nothing — Op.serialize_result
+# drops it whole when the op declares no serializer, so an impl-level
+# assertion can pass while the frontend gets a bare {"ok": true}. These go
+# through result_payload, which is what core/agent_loop.py and
+# core/mcp_server.py call.
+# --------------------------------------------------------------------------
+
+def test_every_cog_op_that_returns_data_declares_a_serializer(reg):
+    """The blanket rule, so a new cog op cannot ship data-blind. If an op is
+    ever added that genuinely returns nothing, exempt it here BY NAME rather
+    than deleting the check."""
+    returns_nothing = set()
+    for cog_class in COG_CLASSES:
+        cog = cog_class(_FakeBot())
+        for name in reg.register_cog_ops(cog):
+            if name in returns_nothing:
+                continue
+            assert reg.require(name).serialize is not None, (
+                f"op '{name}' returns data but declares no serialize=, so "
+                f"every frontend would see only {{'ok': True}}")
+        reg.unregister_owner(cog)
+
+
+def test_search_danbooru_payload_carries_the_url(reg, bot, monkeypatch):
+    """The op's whole purpose is handing the agent a URL to send itself."""
+    cog = Danbooru(bot)
+    reg.register_cog_ops(cog)
+
+    def fake_get(url, *args, **kwargs):
+        class _Resp:
+            def json(self):
+                return [{"id": 7, "file_url": "https://example.invalid/x.png"}]
+        return _Resp()
+
+    monkeypatch.setattr("cogs.optional.danbooru.requests.get", fake_get)
+    o = reg.require("search_danbooru")
+    value = asyncio.run(o.impl(None, _FakeChannel(nsfw=True), "cat"))
+    payload = o.result_payload(OpResult(ok=True, value=value))
+    assert payload["ok"] is True
+    assert payload["status"] == "ok"
+    assert payload["url"] == "https://example.invalid/x.png"
+    assert payload["post_id"] == "7", "ids travel as strings (2**53)"
+
+
+def test_search_danbooru_payload_carries_suggestions_on_no_results(reg, bot, monkeypatch):
+    """'no_results' is an outcome the agent is told to retry from, so the
+    status and the suggested spellings both have to survive the envelope."""
+    cog = Danbooru(bot)
+    reg.register_cog_ops(cog)
+
+    def fake_get(url, *args, **kwargs):
+        class _Resp:
+            def json(self):
+                return []
+        return _Resp()
+
+    monkeypatch.setattr("cogs.optional.danbooru.requests.get", fake_get)
+
+    async def fake_suggest(first_tag):
+        return ["cat_girl"]
+
+    cog._suggest = fake_suggest
+    o = reg.require("search_danbooru")
+    value = asyncio.run(o.impl(None, _FakeChannel(nsfw=True), "ct"))
+    payload = o.result_payload(OpResult(ok=True, value=value))
+    assert payload["status"] == "no_results"
+    assert payload["suggestions"] == ["cat_girl"]
+    assert "url" not in payload
+
+
+def test_add_toggle_payload_carries_the_exists_conflict(reg):
+    """The op's agent_guidance tells the model to branch on 'exists' (nothing
+    was written). If the status doesn't reach the model, that is unfollowable
+    and the agent reports a binding it never made."""
+    cog, guild, channel, role = _setrole_env()
+    other = _FakeRole(999, "other")
+    reg.register_cog_ops(cog)
+    o = reg.require("add_emoji_role_toggle")
+
+    asyncio.run(o.impl(None, channel, 42, "\N{THUMBS UP SIGN}", role))
+    value = asyncio.run(o.impl(None, channel, 42, "\N{THUMBS UP SIGN}", other))
+    payload = o.result_payload(OpResult(ok=True, value=value))
+    assert payload["ok"] is True
+    assert payload["status"] == "exists"
+    assert payload["role_id"] == str(other.id)
+    assert payload["old_role_id"] == str(role.id)
+    # 'exists' means nothing was written — the stored role must be unchanged.
+    stored = cog.bot.config.values[(guild.id, "emoji_role_toggles")]
+    assert len(stored) == 1 and stored[0]["role_id"] == role.id
+
+
+def test_retarget_reports_a_create_when_the_mapping_vanished_mid_prompt():
+    """The /role add confirm closure re-runs the service rather than committing
+    the entries list it read before the prompt, so a concurrent /role delete
+    can't be clobbered. The cost is that the outcome may no longer be the edit
+    the user was shown — so the status has to come back honestly as 'created',
+    and the command reports the recreate instead of claiming "Updated"."""
+    cog, guild, channel, role = _setrole_env()
+    other = _FakeRole(999, "Other")
+    guild.roles[other.id] = other
+
+    # Admin A: emoji already bound to `role`, retarget to `other` -> conflict.
+    asyncio.run(cog._add_toggle(guild, channel, 42, "\N{THUMBS UP SIGN}", role))
+    conflict = asyncio.run(
+        cog._add_toggle(guild, channel, 42, "\N{THUMBS UP SIGN}", other))
+    assert conflict["status"] == "exists"
+
+    # Admin B deletes the toggle while the confirm prompt sits open.
+    cog._save(guild.id, [])
+
+    # Admin A clicks "Change it": the entry is gone, so this is a CREATE.
+    confirmed = asyncio.run(
+        cog._add_toggle(guild, channel, 42, "\N{THUMBS UP SIGN}", other,
+                        replace_existing=True))
+    assert confirmed["status"] == "created", (
+        "a vanished mapping must be reported as recreated, not as an edit")
+    stored = cog.bot.config.values[(guild.id, "emoji_role_toggles")]
+    assert len(stored) == 1 and stored[0]["role_id"] == other.id
+
+
+def test_retarget_does_not_copy_the_custom_emoji_in_twice():
+    """_add_toggle runs _ensure_guild_emoji before the duplicate check, and the
+    confirm closure calls _add_toggle a second time. Passing the returned
+    `emoji` (the guild-LOCAL copy) rather than the original foreign string is
+    what stops the second pass burning another emoji slot."""
+    cog, guild, channel, role = _setrole_env()
+    other = _FakeRole(999, "Other")
+    guild.roles[other.id] = other
+    foreign, local = "<:foo:1111111111111111>", "<:foo:2222222222222222>"
+    uploads = []
+
+    class _LocalEmoji:
+        id = 2222222222222222
+        name = "foo"
+
+        def __str__(self):
+            return local
+
+    async def fake_create(name, image):
+        uploads.append(name)
+        return _LocalEmoji()
+
+    guild.create_custom_emoji = fake_create
+    # The guild owns the local copy only once it has been created.
+    guild.get_emoji = lambda eid: _LocalEmoji() if (
+        eid == 2222222222222222 and uploads) else None
+
+    async def fake_fetch(_guild, partial_emoji):
+        if not partial_emoji.id or _guild.get_emoji(partial_emoji.id):
+            return partial_emoji
+        return await fake_create(partial_emoji.name, b"")
+
+    cog._ensure_guild_emoji = fake_fetch
+
+    first = asyncio.run(cog._add_toggle(guild, channel, 42, foreign, role))
+    assert uploads == ["foo"], "first call copies the foreign emoji in"
+    conflict = asyncio.run(cog._add_toggle(guild, channel, 42,
+                                           first["emoji"], other))
+    assert conflict["status"] == "exists"
+    # The confirm path passes the LOCAL emoji string back in.
+    asyncio.run(cog._add_toggle(guild, channel, 42, conflict["emoji"], other,
+                                replace_existing=True))
+    assert uploads == ["foo"], (
+        "the retarget re-parsed the original foreign id and uploaded a "
+        "second copy, burning another emoji slot")
+
+
+def test_op_failure_payload_carries_the_error_not_the_value(reg):
+    """The failure envelope is the same shape for every op — no serializer
+    runs, and the reason travels instead."""
+    cog, guild, channel, role = _setrole_env()
+    reg.register_cog_ops(cog)
+    o = reg.require("add_emoji_role_toggle")
+    payload = o.result_payload(OpResult(ok=False, error="unknown message"))
+    assert payload == {"ok": False, "error": "unknown message"}

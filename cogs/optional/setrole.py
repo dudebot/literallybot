@@ -50,6 +50,27 @@ def _emoji_matches(stored: str, other: discord.PartialEmoji) -> bool:
     return other.id is None and other.name == pe.name
 
 
+def _serialize_toggle(result: dict) -> dict:
+    """Wire payload for `add_emoji_role_toggle`. `status` is the whole point:
+    'exists' means NOTHING was written, and without it in the payload the op's
+    agent_guidance is unfollowable. Ids travel as strings for the 2**53 reason
+    (see core/ops.py)."""
+    payload = {"status": result["status"], "emoji": result["emoji"],
+               "message_id": str(result["message_id"]),
+               "role_id": str(result["role_id"])}
+    if result.get("old_role_id") is not None:
+        payload["old_role_id"] = str(result["old_role_id"])
+    if result.get("channel_id") is not None:
+        payload["channel_id"] = str(result["channel_id"])
+    return payload
+
+
+def _serialize_sync(result: dict) -> dict:
+    """Wire payload for `sync_emoji_role_toggles`. The per-entry report IS the
+    op's product, so it passes through whole; the impl already stringifies ids."""
+    return {"count": result["count"], "entries": list(result["entries"])}
+
+
 class _ConfirmEditView(discord.ui.View):
     """Are-you-sure gate when /role add targets an emoji that already has a role."""
 
@@ -303,11 +324,36 @@ class SetRole(commands.Cog):
 
         # status == "exists": a different role is bound. Confirm before retargeting.
         async def apply_edit(button_interaction: discord.Interaction):
-            await self._add_toggle(guild, target_channel, message_id, emoji,
-                                   target_role, replace_existing=True)
-            await button_interaction.response.edit_message(
-                content=f"Updated: {emoji_str} now toggles @{target_role.name} (was @{old_name}).",
-                view=None)
+            # Re-runs the service rather than committing the entries list read
+            # before the prompt, so a concurrent /role delete or retarget is
+            # not clobbered by stale state. The flip side is that the outcome
+            # may no longer be the edit the user was shown, so REPORT the
+            # status actually returned instead of asserting "Updated". Pass
+            # `emoji_str` (the guild-local emoji this guild owns) rather than
+            # the raw `emoji` argument: re-parsing the original foreign id
+            # would make _ensure_guild_emoji upload a second copy and burn
+            # another emoji slot.
+            try:
+                confirmed = await self._add_toggle(
+                    guild, target_channel, message_id, emoji_str, target_role,
+                    replace_existing=True)
+            except RuntimeError as e:
+                await button_interaction.response.edit_message(
+                    content=str(e), view=None)
+                return
+            if confirmed["status"] == "updated":
+                content = (f"Updated: {emoji_str} now toggles "
+                           f"@{target_role.name} (was @{old_name}).")
+            elif confirmed["status"] == "created":
+                # The old mapping was removed while the prompt sat open.
+                content = (f"That mapping was removed while you were deciding, "
+                           f"so it was recreated: {emoji_str} on "
+                           f"{target_channel.mention}/{message_id} now toggles "
+                           f"@{target_role.name}.")
+            else:  # "unchanged" — someone else already retargeted it here.
+                content = (f"Already up to date: {emoji_str} toggles "
+                           f"@{target_role.name}.")
+            await button_interaction.response.edit_message(content=content, view=None)
 
         await interaction.followup.send(
             f"{emoji_str} on that message currently toggles **@{old_name}**. "
@@ -473,6 +519,7 @@ class SetRole(commands.Cog):
                     "Retarget the emoji if it already toggles a different role.",
                     required=False, default=False),
         ],
+        serialize=_serialize_toggle,
         agent_guidance=(
             "Check the returned status: 'exists' means a different role is "
             "already bound and NOTHING was written — report the conflict to "
@@ -495,6 +542,7 @@ class SetRole(commands.Cog):
         "bot reactions, fill in channel ids for legacy entries, and report "
         "broken ones. Never deletes a configured toggle.",
         PermissionLevel.ADMIN,
+        serialize=_serialize_sync,
         agent_guidance=(
             "Entries reported with a status other than 'ok' are broken "
             "(message deleted, channel gone, role missing) — this op "

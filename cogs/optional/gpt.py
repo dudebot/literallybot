@@ -1929,7 +1929,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             self._add_tool_sections(
                 self._sections(), self._mcp_tools(), self._save_mcp_tools)
             self.add_item(self._row(
-                self._preset_button("Clear all", self._save_mcp_tools, []),
+                self._preset_button("Clear all", self._clear_mcp_tools, []),
                 self._mcp_server_toggle_button(),
             ))
 
@@ -2201,6 +2201,26 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         merged = self._merge_stored(stored, selected, exposed_ops())
         self.bot.config.set_global("mcp_tools_enabled", merged)
         self.flash("Saved — MCP changes take effect on next bot restart.")
+        await self.rerender(interaction)
+
+    async def _clear_mcp_tools(self, interaction: discord.Interaction, _selected):
+        """"Clear all" means ALL, so it deliberately bypasses _merge_stored.
+
+        The merge exists to protect names a per-group select could not speak
+        for (their cog is unloaded), but an operator locking the MCP surface
+        down before exposing the loopback port is speaking for everything —
+        carrying an unrenderable name through would leave it silently armed
+        to return on the next restart, with nothing in the UI to reveal it."""
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Requires superadmin.", ephemeral=True)
+            return
+        stored = self.bot.config.get_global("mcp_tools_enabled") or []
+        self.bot.config.set_global("mcp_tools_enabled", [])
+        offline = [n for n in stored if n not in set(exposed_ops())]
+        note = (f" ({len(offline)} name(s) for currently-unloaded cogs also "
+                f"cleared: {', '.join(sorted(offline))})") if offline else ""
+        self.flash(f"Cleared — MCP changes take effect on next bot restart.{note}")
         await self.rerender(interaction)
 
     # --- lifecycle -------------------------------------------------------

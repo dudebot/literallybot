@@ -36,6 +36,23 @@ def apply_rating_policy(tags: list, channel) -> list:
     return [t for t in tags if not t.lower().startswith("rating:")] + ["rating:safe"]
 
 
+def _serialize_search(result: dict) -> dict:
+    """Wire payload for `search_danbooru`. `status` always travels — the agent
+    guidance tells the model to branch on it, and 'no_results' with
+    `suggestions` is a useful outcome, not an error. post_id is a snowflake-ish
+    int id, so it goes out as a string for the same 2**53 JSON reason ids do."""
+    payload = {"status": result.get("status"), "tags": result.get("tags") or []}
+    if result.get("url"):
+        payload["url"] = result["url"]
+    if result.get("post_id") is not None:
+        payload["post_id"] = str(result["post_id"])
+    if result.get("suggestions"):
+        payload["suggestions"] = list(result["suggestions"])
+    if result.get("message"):
+        payload["message"] = result["message"]
+    return payload
+
+
 class Danbooru(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -119,6 +136,9 @@ class Danbooru(commands.Cog):
             await ctx.send("No new image found.")
 
     # --- op -------------------------------------------------------------------
+    #
+    # An op without a serializer sends the frontend nothing but {"ok": true}
+    # (Op.serialize_result), so every op that RETURNS data must declare one.
 
     @op(
         "search_danbooru",
@@ -133,6 +153,7 @@ class Danbooru(commands.Cog):
             OpParam("tags", ParamKind.STRING,
                     "Space-separated Danbooru tags, e.g. 'cat_girl smiling'."),
         ],
+        serialize=_serialize_search,
         agent_guidance=(
             "Returns a URL, it does NOT post the image — send it yourself with "
             "send_message if the user wanted it posted. Pass the channel the "

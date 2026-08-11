@@ -556,6 +556,67 @@ def test_save_preserves_names_whose_op_is_unregistered():
     assert merged.count("ghost_op") == 1
     assert set(merged) == {"ghost_op", "list_channels"}
 
-    # An explicit "clear all" still persists as empty (not "unset").
+    # An explicit "clear all" still persists as empty (not "unset") — but only
+    # for names the universe can render. An OFFLINE name survives a merge of
+    # [], which is exactly why the panel's "Clear all" button must not route
+    # through _merge_stored (see the test below).
     assert AiSettingsView._merge_stored(
         ["search_history"], [], agent_ops()) == []
+    assert AiSettingsView._merge_stored(
+        ["ghost_op"], [], agent_ops()) == ["ghost_op"]
+
+
+def test_clear_all_clears_names_whose_cog_is_unloaded():
+    """"Clear all" on the MCP tab must clear ALL, including names whose cog is
+    currently unloaded. The offline-preserving merge is right for a per-group
+    select edit (it speaks only for rendered options) but wrong here: an
+    operator locking the MCP surface down before exposing the loopback port is
+    speaking for everything, and a carried-through name would sit silently
+    armed to return on the next restart with nothing in the UI revealing it."""
+    import asyncio
+
+    from cogs.optional.gpt import AiSettingsView
+
+    view = AiSettingsView.__new__(AiSettingsView)
+    saved = {}
+
+    class _Config:
+        def get_global(self, key, default=None):
+            return ["ghost_op", "send_message"]
+
+        def set_global(self, key, value):
+            saved[key] = value
+
+    class _Bot:
+        config = _Config()
+
+    view.bot = _Bot()
+    view._flash = None
+    view.flash = lambda text: setattr(view, "_flash", text)
+
+    rendered = []
+
+    async def fake_rerender(interaction):
+        rendered.append(interaction)
+
+    view.rerender = fake_rerender
+
+    class _Interaction:
+        class response:
+            @staticmethod
+            async def send_message(*a, **kw):
+                raise AssertionError("superadmin gate should have passed")
+
+    import cogs.optional.gpt as gpt_mod
+    original = gpt_mod.is_superadmin
+    gpt_mod.is_superadmin = lambda interaction: True
+    try:
+        asyncio.run(view._clear_mcp_tools(_Interaction(), []))
+    finally:
+        gpt_mod.is_superadmin = original
+
+    assert saved["mcp_tools_enabled"] == [], \
+        "clear all must write an empty list, not carry offline names through"
+    # The surviving-name case is the one an operator could never see, so the
+    # flash has to name it rather than reporting a bare success.
+    assert "ghost_op" in (view._flash or "")

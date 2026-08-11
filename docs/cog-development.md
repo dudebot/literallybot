@@ -260,6 +260,19 @@ the registry at import time.
 ```python
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 
+
+def _serialize_toggle(result: dict) -> dict:
+    """Every op that returns data needs one of these, or the frontend sees
+    only {"ok": true}. Snowflakes go out as STRINGS: ids exceed 2**53 and
+    would round in JSON transit, reporting the wrong message or role."""
+    payload = {"status": result["status"], "emoji": result["emoji"],
+               "message_id": str(result["message_id"]),
+               "role_id": str(result["role_id"])}
+    if result.get("old_role_id") is not None:
+        payload["old_role_id"] = str(result["old_role_id"])
+    return payload
+
+
 class SetRole(commands.Cog):
 
     @op(
@@ -282,6 +295,7 @@ class SetRole(commands.Cog):
                     "Retarget the emoji if it already toggles a different role.",
                     required=False, default=False),
         ],
+        serialize=_serialize_toggle,
         agent_guidance=(
             "Check the returned status: 'exists' means a different role is "
             "already bound and NOTHING was written — report the conflict to "
@@ -301,6 +315,14 @@ class SetRole(commands.Cog):
 
 The op impl is a thin adapter: validate, coerce, delegate to the service.
 
+> **`serialize` and `agent_guidance` are a pair.** Guidance that tells the
+> model to branch on a field (`"'exists' means nothing was written"`) is
+> unfollowable unless the serializer actually ships that field. If you write
+> one, check the other — and assert it in a test through
+> `op.result_payload(OpResult(ok=True, value=...))`, never through
+> `op.impl(...)`, which returns the rich dict whether or not a frontend would
+> ever receive it.
+
 #### The fields
 
 | Field | What it does |
@@ -312,7 +334,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | **scope** | `OpScope.GUILD` / `DM` / `GLOBAL`. See below; this is a safety boundary, not a label. |
 | **group** | Kebab-case id from `OP_GROUPS` in `core/ops.py`; decides which panel section renders it. Each group must stay under Discord's 25-option select cap. |
 | **agent_guidance** | Optional. Extra instruction injected for the agent loop — use it for non-obvious result semantics ("status 'exists' means nothing was written"). |
-| **serialize** | Optional callable turning a non-JSON return value into a dict. Unneeded if you already return plain data. |
+| **serialize** | **Required for any op that returns data.** Callable turning the return value into a JSON-safe dict. It is *not* optional-if-you-already-return-a-dict: with no serializer, `Op.serialize_result` returns `{}` and every frontend sees a bare `{"ok": true}` — your return value is discarded, silently. Omit it only for an op that genuinely returns nothing. |
 
 There is deliberately **no `origin` parameter**. Origin is stamped by the
 registration *path* (`'core'` for `core/ops.py`'s inline registrations,
