@@ -582,3 +582,41 @@ def test_select_hands_the_saver_its_render_time_universe():
                                           seen["universe"])
     assert "ghost_tool" in merged
     assert set(merged) == {"ghost_tool", "a", "c"}
+
+
+def test_mcp_tool_refuses_a_swap_during_context_resolution(monkeypatch):
+    """The TOCTOU variant: the entry check passes, then a cog reload lands
+    WHILE resolve_context_guild is awaited. The pre-dispatch re-check must
+    catch it — the entry check alone cannot."""
+    v1, v2 = _RetargetCogV1(), _RetargetCogV2()
+    registry.register_cog_ops(v1)
+    try:
+        captured = registry.require("retarget_probe")
+
+        class _FakeUser:
+            id = 1
+
+        class _FakeBot:
+            user = _FakeUser()
+
+            def get_guild(self, gid):
+                return None
+
+        async def swap_during_resolution(bot, raw, guild_id):
+            # The reload interleaves exactly here, mid-await.
+            registry.unregister_owner(v1)
+            registry.register_cog_ops(v2)
+            return None
+
+        monkeypatch.setattr(mcp_server, "resolve_context_guild",
+                            swap_during_resolution)
+        tool_fn = mcp_server._make_mcp_tool(_FakeBot(), captured)
+        try:
+            with pytest.raises(mcp_server.BotUnavailableError,
+                               match="re-registered"):
+                _asyncio.run(tool_fn(actor_id="1"))
+        finally:
+            registry.unregister_owner(v2)
+    finally:
+        registry.unregister_owner(v1)
+        registry.unregister_owner(v2)

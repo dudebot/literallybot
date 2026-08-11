@@ -211,6 +211,16 @@ def _make_mcp_tool(bot: Any, op: Op):
 
         ctx = _build_context(live_bot, actor_id, guild)
 
+        # Re-check identity HERE, not only at entry: resolve_context_guild
+        # above may await a cache-miss fetch, and a cog reload during that
+        # await would let a name-based dispatch reach the replacement op.
+        # No await sits between this check and call_ids' own synchronous
+        # name lookup, so the window is closed.
+        if registry.get(op.name) is not op:
+            raise BotUnavailableError(
+                f"Op '{op.name}' was re-registered while this call was "
+                "resolving its context (cog reloaded). Call refused; "
+                "restart the bot to rebuild the tool surface.")
         # send_message never pings: enforced by the op itself (see
         # core/ops.py send_message — never-ping is the registry default).
         # allowed_guild_ids stays at its None default: this frontend is
