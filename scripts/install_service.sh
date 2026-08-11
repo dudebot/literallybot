@@ -12,7 +12,7 @@ NC='\033[0m' # No Color
 # Check if script is run with sudo/root
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}Error: This script must be run with sudo${NC}"
-    echo "Usage: sudo ./install_service.sh [service_name]"
+    echo "Usage: sudo ./scripts/install_service.sh [service_name]"
     echo "If no service name is provided, defaults to 'literallybot'"
     exit 1
 fi
@@ -37,7 +37,9 @@ fi
 # Verify bot.py exists
 if [ ! -f "$CURRENT_DIR/bot.py" ]; then
     echo -e "${RED}Error: bot.py not found in $CURRENT_DIR${NC}"
-    echo "Make sure you're running this script from the bot's scripts/ directory"
+    echo "This script resolves the repo root as its own parent directory, so it"
+    echo "must stay inside the bot's scripts/ directory (invoke it by path from"
+    echo "anywhere: sudo /path/to/literallybot/scripts/install_service.sh)"
     exit 1
 fi
 

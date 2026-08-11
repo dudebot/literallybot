@@ -30,8 +30,5 @@ settings.local.json
 # runtime deployment data, never tracked
 /media/
 
-# Legacy - keeping for safety
-cogs/vibes/*
-
 # Folder-level MCP registration (carries the ops bearer token)
 .mcp.json
