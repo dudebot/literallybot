@@ -15,6 +15,13 @@ listeners act only on mappings admins configured.
 
 `whitelist_roles` is a legacy guild-config key from the removed command/panel
 claiming path — stored data is left in place, nothing reads it.
+
+Ops: `add_emoji_role_toggle` and `sync_emoji_role_toggles` are cog-provided
+ops (see `core/ops.py`). Both the slash command and the op call the SAME
+service methods (`_add_toggle` / `_sync_guild`) — the ops never touch an
+Interaction, and the handlers hold no logic the op can't reach. That is the
+rule from issue #64: an op that needs `ctx.send` is not headless, so the
+service returns a plain result and each caller decides how to present it.
 """
 import asyncio
 import time
@@ -24,6 +31,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 from core.utils import is_admin
 
 TOGGLES_KEY = "emoji_role_toggles"
@@ -99,6 +107,84 @@ class SetRole(commands.Cog):
 
     def _save(self, guild_id: int, entries: list):
         self.bot.config.set(guild_id, TOGGLES_KEY, entries)
+
+    # --- services -------------------------------------------------------------
+    #
+    # Headless logic shared by the slash commands and the cog ops. These take
+    # plain Discord objects, return plain data, and never touch an Interaction
+    # or send anything — the caller presents the outcome.
+
+    async def _ensure_guild_emoji(self, guild: discord.Guild,
+                                  partial_emoji: discord.PartialEmoji):
+        """A custom emoji the guild doesn't own can't be reacted with, so copy
+        it in. Returns the usable emoji; raises RuntimeError with a
+        caller-presentable message on failure."""
+        if not partial_emoji.id or guild.get_emoji(partial_emoji.id):
+            return partial_emoji
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(partial_emoji.url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError("Failed to fetch emoji image.")
+                    image_data = await resp.read()
+            return await guild.create_custom_emoji(
+                name=partial_emoji.name, image=image_data)
+        except (discord.HTTPException, aiohttp.ClientError) as e:
+            raise RuntimeError(
+                f"Couldn't copy that custom emoji into this server "
+                f"(emoji slots full, bad image, or missing permission): {e}") from e
+
+    async def _add_toggle(self, guild: discord.Guild, channel, message_id: int,
+                          emoji: str, role: discord.Role,
+                          replace_existing: bool = False) -> dict:
+        """Create (or retarget) one emoji role toggle.
+
+        Returns a status dict: `status` is "created", "updated", "unchanged",
+        or "exists" — the last meaning a different role is already bound to
+        that emoji and `replace_existing` was not set, so nothing was written.
+        Raises RuntimeError with a presentable message when the emoji can't be
+        copied in or the reaction can't be placed.
+        """
+        partial_emoji = await self._ensure_guild_emoji(guild, _parse_emoji(emoji))
+        emoji_str = str(partial_emoji)
+        entries = self._entries(guild.id)
+        existing = next((e for e in entries if e["message_id"] == message_id
+                         and _emoji_matches(e["emoji"], partial_emoji)), None)
+
+        if existing:
+            old_role_id = existing["role_id"]
+            if old_role_id == role.id:
+                return {"status": "unchanged", "emoji": emoji_str,
+                        "message_id": message_id, "role_id": role.id,
+                        "old_role_id": old_role_id}
+            if not replace_existing:
+                return {"status": "exists", "emoji": emoji_str,
+                        "message_id": message_id, "role_id": role.id,
+                        "old_role_id": old_role_id}
+            existing["role_id"] = role.id
+            existing["channel_id"] = channel.id
+            self._save(guild.id, entries)
+            return {"status": "updated", "emoji": emoji_str,
+                    "message_id": message_id, "role_id": role.id,
+                    "old_role_id": old_role_id, "channel_id": channel.id}
+
+        # Pre-populate the reaction on the target message.
+        try:
+            target_message = await channel.fetch_message(message_id)
+            await target_message.add_reaction(partial_emoji)
+        except Exception as e:
+            raise RuntimeError(f"Failed to add reaction to the message: {e}") from e
+
+        entries.append({
+            "channel_id": channel.id,
+            "message_id": message_id,
+            "emoji": emoji_str,
+            "role_id": role.id,
+        })
+        self._save(guild.id, entries)
+        return {"status": "created", "emoji": emoji_str,
+                "message_id": message_id, "role_id": role.id,
+                "channel_id": channel.id}
 
     # --- /role command group --------------------------------------------------
 
@@ -192,72 +278,41 @@ class SetRole(commands.Cog):
         if not guild:
             await interaction.followup.send("This command must be used in a guild.", ephemeral=True)
             return
-        partial_emoji = _parse_emoji(emoji)
-
-        # For custom emoji: if the emoji isn't in the guild, fetch and add it.
-        if partial_emoji.id and not guild.get_emoji(partial_emoji.id):
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(partial_emoji.url) as resp:
-                        if resp.status != 200:
-                            await interaction.followup.send("Failed to fetch emoji image.", ephemeral=True)
-                            return
-                        image_data = await resp.read()
-                partial_emoji = await guild.create_custom_emoji(
-                    name=partial_emoji.name, image=image_data)
-            except (discord.HTTPException, aiohttp.ClientError) as e:
-                await interaction.followup.send(
-                    f"Couldn't copy that custom emoji into this server "
-                    f"(emoji slots full, bad image, or missing permission): {e}",
-                    ephemeral=True)
-                return
-
         target_channel = channel or interaction.channel
-        emoji_str = str(partial_emoji)
-        entries = self._entries(guild.id)
-        existing = next((e for e in entries if e["message_id"] == message_id
-                         and _emoji_matches(e["emoji"], partial_emoji)), None)
-
-        if existing:
-            old_role = guild.get_role(existing["role_id"])
-            old_name = old_role.name if old_role else f"deleted role {existing['role_id']}"
-            if existing["role_id"] == target_role.id:
-                await interaction.followup.send(
-                    f"{emoji_str} on that message already toggles @{old_name}.", ephemeral=True)
-                return
-
-            async def apply_edit(button_interaction: discord.Interaction):
-                existing["role_id"] = target_role.id
-                existing["channel_id"] = target_channel.id
-                self._save(guild.id, entries)
-                await button_interaction.response.edit_message(
-                    content=f"Updated: {emoji_str} now toggles @{target_role.name} (was @{old_name}).",
-                    view=None)
-
-            await interaction.followup.send(
-                f"{emoji_str} on that message currently toggles **@{old_name}**. "
-                f"Change it to **@{target_role.name}**?",
-                view=_ConfirmEditView(apply_edit), ephemeral=True)
-            return
-
-        # Pre-populate the reaction on the target message.
         try:
-            target_message = await target_channel.fetch_message(message_id)
-            await target_message.add_reaction(partial_emoji)
-        except Exception as e:
-            await interaction.followup.send(f"Failed to add reaction to the message: {e}", ephemeral=True)
+            result = await self._add_toggle(guild, target_channel, message_id,
+                                            emoji, target_role)
+        except RuntimeError as e:
+            await interaction.followup.send(str(e), ephemeral=True)
             return
 
-        entries.append({
-            "channel_id": target_channel.id,
-            "message_id": message_id,
-            "emoji": emoji_str,
-            "role_id": target_role.id,
-        })
-        self._save(guild.id, entries)
+        emoji_str = result["emoji"]
+        status = result["status"]
+        if status == "created":
+            await interaction.followup.send(
+                f"Configured: {emoji_str} on {target_channel.mention}/{message_id} toggles @{target_role.name}.",
+                ephemeral=True)
+            return
+
+        old_role = guild.get_role(result["old_role_id"])
+        old_name = old_role.name if old_role else f"deleted role {result['old_role_id']}"
+        if status == "unchanged":
+            await interaction.followup.send(
+                f"{emoji_str} on that message already toggles @{old_name}.", ephemeral=True)
+            return
+
+        # status == "exists": a different role is bound. Confirm before retargeting.
+        async def apply_edit(button_interaction: discord.Interaction):
+            await self._add_toggle(guild, target_channel, message_id, emoji,
+                                   target_role, replace_existing=True)
+            await button_interaction.response.edit_message(
+                content=f"Updated: {emoji_str} now toggles @{target_role.name} (was @{old_name}).",
+                view=None)
+
         await interaction.followup.send(
-            f"Configured: {emoji_str} on {target_channel.mention}/{message_id} toggles @{target_role.name}.",
-            ephemeral=True)
+            f"{emoji_str} on that message currently toggles **@{old_name}**. "
+            f"Change it to **@{target_role.name}**?",
+            view=_ConfirmEditView(apply_edit), ephemeral=True)
 
     @role.command(name="delete", description="Remove a reaction-role toggle")
     @app_commands.describe(
@@ -391,6 +446,80 @@ class SetRole(commands.Cog):
         if changed:
             self._save(guild.id, entries)
         return results
+
+    # --- ops ------------------------------------------------------------------
+    #
+    # Registered against the live cog instance by LiterallyBot.add_cog, and
+    # dropped again on unload. They call the same services the slash commands
+    # do; neither takes an Interaction.
+
+    @op(
+        "add_emoji_role_toggle",
+        "Add an emoji role toggle: reacting to the given message with the "
+        "given emoji grants or removes the role. If that emoji on that "
+        "message already toggles a different role, nothing is written unless "
+        "replace_existing is true.",
+        PermissionLevel.ADMIN,
+        params=[
+            OpParam("channel", ParamKind.CHANNEL,
+                    "Channel containing the target message."),
+            OpParam("message_id", ParamKind.SNOWFLAKE,
+                    "Message users react to."),
+            OpParam("emoji", ParamKind.STRING,
+                    "Emoji to react with: a unicode character, or '<:name:id>' "
+                    "for a custom emoji."),
+            OpParam("role", ParamKind.ROLE, "Role the reaction toggles."),
+            OpParam("replace_existing", ParamKind.BOOLEAN,
+                    "Retarget the emoji if it already toggles a different role.",
+                    required=False, default=False),
+        ],
+        agent_guidance=(
+            "Check the returned status: 'exists' means a different role is "
+            "already bound and NOTHING was written — report the conflict to "
+            "the user rather than silently retrying with replace_existing."),
+        scope=OpScope.GUILD,
+        group="role-automation",
+    )
+    async def op_add_emoji_role_toggle(self, ctx, channel, message_id: int,
+                                       emoji: str, role,
+                                       replace_existing: bool = False) -> dict:
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            raise ValueError("add_emoji_role_toggle requires a guild channel.")
+        return await self._add_toggle(guild, channel, int(message_id), emoji,
+                                      role, replace_existing=bool(replace_existing))
+
+    @op(
+        "sync_emoji_role_toggles",
+        "Reconcile this guild's configured emoji role toggles: re-add missing "
+        "bot reactions, fill in channel ids for legacy entries, and report "
+        "broken ones. Never deletes a configured toggle.",
+        PermissionLevel.ADMIN,
+        agent_guidance=(
+            "Entries reported with a status other than 'ok' are broken "
+            "(message deleted, channel gone, role missing) — this op "
+            "deliberately leaves them in config for a human to decide on."),
+        scope=OpScope.GUILD,
+        group="role-automation",
+    )
+    async def op_sync_emoji_role_toggles(self, ctx) -> dict:
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            raise ValueError("sync_emoji_role_toggles must be called in a guild.")
+        results = await self._sync_guild(guild)
+        return {
+            "count": len(results),
+            "entries": [
+                {
+                    "channel_id": str(entry["channel_id"]) if entry["channel_id"] else None,
+                    "message_id": str(entry["message_id"]),
+                    "emoji": entry["emoji"],
+                    "role_id": str(entry["role_id"]),
+                    "status": status,
+                }
+                for entry, status in results
+            ],
+        }
 
     @tasks.loop(count=1)
     async def startup_sync(self):

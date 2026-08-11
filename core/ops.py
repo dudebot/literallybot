@@ -119,6 +119,11 @@ OP_GROUPS: Dict[str, str] = {
     "guild-info": "Guild info",
     "dm": "Direct messages",
     "guild": "Guild",
+    # Cog-provided groups. Declared here (not invented ad hoc by the cog) so
+    # a panel section keeps a stable order and display label whether or not
+    # the owning cog happens to be loaded.
+    "role-automation": "Role automation",
+    "integrations": "Integrations",
 }
 
 # Where an op came from. Assigned by the REGISTRATION PATH, never accepted
