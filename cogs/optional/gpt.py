@@ -1007,8 +1007,8 @@ class Gpt(commands.Cog):
             if question:  # Ensure there's content
                 # Guild-only, full stop: DM chat is off for everyone until a
                 # deliberate DM story exists (quota control; owner decision
-                # 2026-08-07 — the REDACTED replier/brooder flow is its
-                # own machinery, not this path).
+                # 2026-08-07 — downstream DM machinery elsewhere is its own
+                # thing, not this path).
                 if not ctx.guild:
                     return
                 # Per-guild kill switch (/aisettings → Server config).

@@ -107,6 +107,23 @@ Where new code should land, so seams don't re-greed:
   `cooldown_windows`. Don't reintroduce flat per-message cooldowns, and don't
   document a Cooldowns tab that doesn't exist.
 
+## Restarting the Deployed Bot
+
+The bot runs as a systemd service (`literallybot.service`, `Restart=always`,
+`RestartSec=3`, `User=dudebot`). To restart after a deploy or config change:
+**kill the exact PID — no sudo needed** (the process is ours):
+
+```bash
+kill $(systemctl show literallybot.service -p MainPID --value)
+```
+
+systemd relaunches it in ~3s. Never `pkill -f` (matches its own command line
+and has killed the invoking shell on this box); never `sudo systemctl restart`
+(prompts for a password the session can't supply). Remember the doctrine:
+config edits bind at restart — cogs, MCP tools, MCP enablement alike.
+
 ## Related
 
-The `REDACTED` bot (REDACTED/REDACTED) uses a similar `core/config.py` derived from the same original implementation.
+A private downstream fork consumes this repo as its `upstream` remote and
+periodically merges `main`. Keep that in mind when restructuring core modules —
+and keep this repo's text free of any reference to what that fork is.
