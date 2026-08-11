@@ -327,3 +327,106 @@ apply-my-JSON-edits note in `cogs/optional/setrole.py` (`/role sync` already
 covers that case, through the same `_sync_guild` service), the `disabled_cogs`
 row in `docs/config-system.md`, the superadmin-tier inventory in
 `docs/security.md`, and the README's hot-reload claims.
+
+## #83 — Zero-friction bootstrap: token chain, .env deprecation (2026-08-11)
+
+**Goal.** Clone → run → paste token → bot online, on every platform, without
+disabling any hosting path. The old Quick Start required creating a `.env` by
+hand before the first run and then discovering `!claimsuper` to get any admin
+surface — two undocumentable steps for anyone who isn't already the author.
+
+**The resolution chain is the design; the stdin prompt is sugar.** In
+precedence order (`core/bootstrap.py`):
+
+1. **`DISCORD_TOKEN` env var** — first-class forever. This is the contract for
+   panel hosts (startup-variable field), Docker, and systemd. **Never persisted
+   to disk**: copying a panel-supplied secret into a file surprises the operator
+   (they set it in one place, it lives in two) and doubles the leak surface for
+   a credential they rotate elsewhere.
+2. **`discord_token` global config key** — the self-hosted steady state.
+3. **Interactive `getpass` prompt** — ONLY when stdin is a TTY.
+4. **Neither, and no TTY → exit nonzero with per-platform instructions.**
+
+Point 4 is load-bearing and is the whole reason the chain beats "just prompt".
+A prompt on a panel console or a systemd unit is a **hang**, not a question,
+and a hung bot looks like a crashed bot. `isatty` is checked before anything is
+read, and the check is wrapped: a detached/closed stdin raises from `isatty`
+rather than returning False, and that must fail fast, not propagate an
+unrelated `ValueError` out of startup.
+
+**Verify before persisting.** A typo'd token written to `global.json` converts
+a one-line fix into a "why does it fail *with a token configured*" debugging
+session. The verification boundary is discord.py's own login: `bot.run()`
+raises `LoginFailure` before the gateway connects, and reaches `setup_hook`
+only after the REST login succeeded. So the candidate token is staged on the
+bot and written from inside `setup_hook`, cleared after the write so a
+reconnect can't re-persist. `LoginFailure` on a *prompted* token re-prompts (3
+attempts) and writes nothing.
+
+Retry is deliberately **prompt-only**. A rejected env or stored token exits
+with a message naming which source failed, rather than falling through to a
+prompt — silently prompting past a broken panel variable would hide the actual
+misconfiguration and produce a bot that works once and fails on every restart.
+
+**No separate `secrets.json`** (owner decision). Provider API keys already live
+in `global.json` as a documented accepted risk; a second plaintext file is
+separation without a distinct threat model — same process, same disk, same
+blast radius. The hardening that actually does the work is filesystem
+permissions: `configs/` 0700, every config file 0600. The temp file in the
+existing atomic tmp+rename is *created* 0600 via `os.open` rather than chmod'd
+after writing, so the content is never briefly on disk under the umask default.
+Both chmods are best-effort — a filesystem that can't represent POSIX modes is
+a downgrade in hardening, not a reason to refuse to start.
+
+**First-run superadmin, empty-list-gated.** On a first successful login with
+`superadmins` empty or absent, the application owner is granted it and the
+grant is logged plainly. The empty-list gate is the safety property, not an
+optimization: an established deployment always has a non-empty list, so this
+can never re-seat ownership on one. It is re-checked *after* the
+`application_info()` await — cogs load in `setup_hook`, so commands are already
+dispatchable while that call is in flight, and a `!claimsuper` landing in that
+window must win. A failed `application_info()` logs and falls back to
+`!claimsuper` rather than taking startup down.
+
+Team-owned apps read **`Team.owner_id`**. This was wrong in review: the code
+first read `team.owner_user_id`, which is the raw JSON key discord.py parses
+*from* (`discord/team.py`: `self.owner_id = _get_as_snowflake(data,
+'owner_user_id')`), never an attribute on the object. The bug failed silently —
+the `Team.owner` fallback is a `utils.get` over `members` and returns None when
+the owner isn't in that list, so a team-owned app would have started with no
+superadmin and no error. The regression test builds a **real** `discord.team.Team`
+rather than a hand-made double, because a double would have cheerfully agreed
+with the wrong attribute name.
+
+**`.env` deprecated, not removed.** Still loaded when present so existing
+deployments keep working untouched; dropped from documented setup. `load_dotenv`
+only fills env vars that aren't already set, so a real `DISCORD_TOKEN` still
+wins over a stale `.env` entry.
+
+**`start.sh` / `start.bat`** build the venv, install requirements only when
+`requirements.txt` is newer than a stamp file, and exec the bot. They are
+deliberately dumb and readable: they're evangelism artifacts, and anyone should
+be able to see exactly what they do to their machine before running them.
+`start_bot.sh` was deleted rather than kept — it was a near-duplicate of
+`start.sh` whose first act was to refuse to run without a `.env`, which is
+precisely the friction this issue removes.
+
+**Found in cold review (and fixed here), beyond the team-owner bug above:**
+
+- **Secrets could be written under a loose mode.** The temp file in the atomic
+  tmp+rename was created 0600 but chmod'd only after `json.dump`. O_CREAT's
+  mode is ignored when the file already exists, so a `.tmp` left by a previous
+  crash kept its old world-readable mode *while the new secret was written into
+  it*. Now `fchmod`'d on the open descriptor before any content is written. The
+  test samples the mode from inside `json.dump`; asserting the landed file's
+  mode cannot catch this, since the post-rename chmod fixes the end state
+  either way.
+- **A crashed bot exited zero.** `bot.py`'s `except Exception` logged and fell
+  through to a 0 exit (pre-existing on main). That is precisely the confusion
+  this issue removes — a panel host shows a green "stopped normally" for a bot
+  that crashed. Now exits 1.
+
+**Correction to an earlier record.** The README's `!autoresponse` line claimed
+"weighted responses". Responses are a uniform `random.choice`, and the
+short-lived `[text, weight]` shape is stripped on read by `_response_texts`.
+The line now says what the code does; weighting was not implemented.

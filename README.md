@@ -8,25 +8,44 @@ Also: a boot-fixed cog set with a per-deployment enable/disable switch, a three-
 
 ## 🚀 Quick Start
 
-**Copy-paste these commands** (replace `your_bot_token_here` with your actual Discord bot token):
-
 ```bash
 git clone https://github.com/dudebot/literallybot.git
 cd literallybot
-echo "DISCORD_TOKEN=your_bot_token_here" > .env
-./start_bot.sh
+./start.sh          # Windows: start.bat
 ```
 
-The start script will:
-- Create a virtual environment automatically
-- Install all dependencies
-- Start the bot
+It builds the venv, installs dependencies, then asks for your bot token and
+pastes-and-goes. Grab one at
+[discord.com/developers/applications](https://discord.com/developers/applications)
+(**New Application** → **Bot** → **Reset Token**). The token isn't echoed as you
+type, and it's saved only after it successfully logs in — so a typo just asks
+again instead of leaving you with a broken config file.
 
-**First-time setup:**
-1. Invite the bot to your Discord server
-2. Run `!claimsuper` in any channel to become a superadmin
+Then invite the bot to your server. You're already its superadmin: on a first
+run the bot grants that to the application owner automatically, so there's no
+`!claimsuper` incantation to discover.
 
-That's it! Your bot is now running with all core features available.
+### Installing it somewhere else
+
+Four paths, one precedence chain. The bot resolves its token as
+**`DISCORD_TOKEN` env var → saved config → interactive prompt**, and if there's
+no token *and* nowhere to prompt, it exits immediately with instructions rather
+than hanging a console waiting for input that can't arrive.
+
+| Where | What to do |
+|-------|-----------|
+| **Linux / macOS** | `./start.sh` and paste the token at the prompt. Saved to `configs/global.json` (mode 0600); later starts need nothing. |
+| **Windows** | `start.bat` — same prompt, same one-time paste. Needs [Python 3](https://python.org) with "Add Python to PATH" checked at install. |
+| **Game/hosting panel** (Pterodactyl, Pelican, most others) | Add a **`DISCORD_TOKEN` startup variable** in the panel's Startup tab, then run `./start.sh`. There's no terminal to prompt on a panel, so the env var *is* the setup — and the bot telling you exactly that when the variable is missing is the intended behavior, not an error to work around. |
+| **Docker / systemd** | Pass the token as an environment variable: `docker run -e DISCORD_TOKEN=... `, or `Environment="DISCORD_TOKEN=..."` (or an `EnvironmentFile=` pointing at a 0600 file) in the unit. |
+
+An env-supplied token is **never written to disk** — where you set it is where
+it stays, so rotating it in your panel or unit file is the whole operation.
+
+> **`.env` is deprecated.** It's still loaded if present, so existing
+> deployments keep working untouched, but it's no longer part of setup: use the
+> prompt or the `DISCORD_TOKEN` environment variable. A real environment
+> variable wins over a stale `.env` entry.
 
 ## ✨ Key Features
 
@@ -237,7 +256,7 @@ and browse the listing with file sizes.
 
 **Panels** (single-invoker interactive Views):
 - `!aisettings` — AI provider/model/keys/personality/agentic tools/cooldowns/MCP (admin; superadmin tabs hidden from admins)
-- `!autoresponse` — per-guild trigger→response entries, weighted responses, automod-style deletion (admin)
+- `!autoresponse` — per-guild trigger→response entries, uniform-random response pick, automod-style deletion (admin)
 - `!media` — this guild's media library (admin)
 - `!cogs` — enable/disable cogs bot-wide, plus a restart button (superadmin)
 - `!config` — global-config editor (superadmin)
@@ -260,7 +279,9 @@ Errors are rate-limited globally to avoid spam. See `docs/error-handling.md`.
 ## 🔧 Optional Integrations
 
 ### Image Search (Danbooru)
-`!danbooru <tags>` (alias `!db`). Keys go in global config or `.env`:
+`!danbooru <tags>` (alias `!db`). Keys go in `configs/global.json`
+(`DANBOORU_API_KEY`, `DANBOORU_LOGIN`), or as environment variables of the same
+names:
 ```bash
 DANBOORU_API_KEY=your_danbooru_key
 DANBOORU_LOGIN=your_danbooru_username

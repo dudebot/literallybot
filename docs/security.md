@@ -174,14 +174,57 @@ admin/superadmin list.
 
 ## API Keys and Secrets
 
-- **Discord token** comes from `.env` (`DISCORD_TOKEN`), loaded via `dotenv`.
-  `.env` and `.env.*` are gitignored.
+- **Discord token** resolves through a fixed chain (`core/bootstrap.py`, #83):
+  the **`DISCORD_TOKEN` env var** first, then the **`discord_token` global
+  config key**, then an **interactive `getpass` prompt** (no echo) when stdin is
+  a TTY, and otherwise an immediate **nonzero exit** with per-platform
+  instructions. Two properties carry the security weight:
+  - **An env-supplied token is never persisted.** Copying a panel- or
+    systemd-supplied secret into a file would surprise the operator (set in one
+    place, living in two) and doubles the leak surface for a credential they
+    rotate elsewhere.
+  - **A prompted token is written only after discord.py confirms the login.**
+    The verification boundary is `setup_hook`, which is reached only after the
+    REST login succeeded; a `LoginFailure` re-prompts (3 attempts) and writes
+    nothing, so a typo'd token never reaches disk. A rejected *env* or *stored*
+    token exits instead of looping — re-prompting there would paper over a
+    broken panel variable rather than surfacing it.
+
+  Stored tokens live in `configs/global.json` as plaintext, protected by the
+  store's 0600/0700 modes (below). **`.env` is deprecated** — still loaded when
+  present so existing deployments keep working, no longer part of documented
+  setup. `load_dotenv` only fills env vars that aren't already set, so a real
+  `DISCORD_TOKEN` wins over a stale `.env` entry. `.env` and `.env.*` are
+  gitignored.
+- **Config store file permissions.** `configs/` is chmod 0700 at every startup
+  and every config file lands 0600 — the temp file in the atomic tmp+rename is
+  created 0600 (`os.open`) *and* `fchmod`'d on the open descriptor before any
+  content is written, so a secret is never on disk under a looser mode. Both
+  are required: O_CREAT's mode is umask-masked and ignored entirely when the
+  temp file already exists, so a `.tmp` left by a previous crash would
+  otherwise keep its old world-readable mode while the new secret is written
+  into it. Best-effort: `OSError` is swallowed
+  so a filesystem without POSIX modes (Windows, some volume mounts) still runs.
+  This is the control that replaces a separate secrets file — there deliberately
+  is none (owner decision, #83): provider keys already shared `global.json` as
+  an accepted risk, and a second plaintext file is separation without a distinct
+  threat model.
+- **First-run superadmin.** On a first successful login with an empty/absent
+  `superadmins` list, the Discord application owner (the *team owner* for
+  team-owned apps, read from `Team.owner_id` — `application_info().owner` on a
+  team app is a pseudo-user) is granted superadmin and the grant is logged
+  plainly. The empty-list gate is the safety property: an established
+  deployment's superadmin list is never rewritten, so this cannot be used to
+  re-seat ownership. The gate is re-checked **after** the `application_info()`
+  await, because cogs are loaded before `on_ready` and a `!claimsuper` racing
+  that window must not be silently overwritten. `!claimsuper` remains the
+  fallback when the application-info lookup fails.
 - **Provider API keys** are entered through the `!aisettings` → Models &
   Providers key modal (superadmin-gated; a modal, never a slash parameter, so the
   key is never in a command log) and stored in `global.json` under
   `<PROVIDER>_API_KEY` — **plaintext on disk**. Environment variables of the same
-  name are honored as a fallback. Protect the `configs/` directory's filesystem
-  permissions accordingly.
+  name are honored as a fallback. The store's 0700/0600 modes (above) are what
+  protects them at rest.
 - **The MCP bearer token** follows the same config-first-with-env-fallback
   pattern: the `mcp_ops_token` global config key, else `MCP_OPS_TOKEN`. It moved
   out of env-only into config in 2026-08 so the server is operable without shell
@@ -192,7 +235,8 @@ admin/superadmin list.
   the secret. **The value is never logged** — only the fact that one was
   generated and which key holds it; read it out of `configs/global.json` to
   connect a client. It is plaintext on disk like the provider keys, and it is a
-  full-privilege credential for the ops surface: treat `configs/` accordingly.
+  full-privilege credential for the ops surface, protected at rest by the same
+  0700/0600 modes as the Discord token.
 - **`configs/` is gitignored in full**, so no per-guild data, memories, admin
   lists, or stored keys are committed. Verified: `git ls-files configs/` is empty.
 - **Keys never appear in-channel.** The key is typed into a Discord **modal**

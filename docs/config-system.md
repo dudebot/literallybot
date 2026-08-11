@@ -89,7 +89,8 @@ illustration; they are not real.)
 
 | Key | Shape | Written by | Notes |
 |-----|-------|-----------|-------|
-| `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin` (any key also editable via the `!config` panel, superadmin) | Read through `core.utils.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes" |
+| `discord_token` | `str` | `core.bootstrap` first-run prompt only (no command surface; never a panel field) | The bot's own Discord token. Resolution order is **`DISCORD_TOKEN` env var → this key → interactive prompt → exit with instructions**; the env var is **NEVER persisted here** (a panel-supplied secret belongs only where the operator set it). Written only *after* discord.py confirms the login, so a typo'd token never lands on disk. Plaintext, protected by the store's 0600/0700 modes — see the hardening note below |
+| `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin`, plus the first-run bootstrap in `core.bootstrap` (any key also editable via the `!config` panel, superadmin) | Read through `core.utils.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes". On a first successful login with this list **empty or absent**, the Discord application owner (the team owner for team-owned apps) is added automatically and logged, retiring `!claimsuper` for new installs. Empty-list gate ONLY: an existing deployment is never touched |
 | `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?}}}}` | `!aisettings` → Models & Providers (superadmin) | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
 | `<PROVIDER>_API_KEY` | `str` (e.g. `XAI_API_KEY`) | `!aisettings` → Models & Providers key modal | Env var of the same name is the fallback; removed with its provider. Keys are entered ONLY via the panel modal (no slash parameter) |
 | `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
@@ -129,6 +130,30 @@ Currently **unused** — the API supports it but no live code writes user files.
 - Bare-int ctx is the idiom for context-free access: `config.set(guild_id, key, value)` resolves guild scope from the int (used by panels, migrations, raw-reaction handlers).
 - `config.set(None, key, value, scope="global")` (or `set_global`) is the global-write idiom.
 - Iterating all guilds goes through `config.guild_ids()` — the public enumeration API (guild configs are the digit-named files; the global config is `"global"`, user configs are `"user_<digits>"`). Never scan `config._configs` directly; the layout is private to `core/config.py`.
+
+### File permissions (hardening, #83)
+
+The global store holds **plaintext secrets** — the Discord token, provider API
+keys, and the MCP bearer token — so the store is owner-only on disk:
+
+- `configs/` is chmod **0700** at `Config.__init__`, on every start. That
+  re-tightens an existing install too: `os.makedirs(mode=...)` is ignored when
+  the directory already exists, so the mode is set explicitly either way.
+- Every config file lands **0600**. The atomic tmp+rename is unchanged; the
+  temp file is *created* with `os.open(..., 0o600)` **and `fchmod`'d on the
+  open descriptor before any content is written**, so a secret is never on
+  disk under a looser mode. Both steps are needed: O_CREAT's mode is masked by
+  umask, and is ignored outright when the temp file already exists — a
+  leftover `.tmp` from a previous crash keeps its old, possibly
+  world-readable, mode. The landed file's mode is re-pinned after the rename.
+- Both calls are **best-effort**: a filesystem that can't represent POSIX modes
+  (a Windows share, some container volume mounts) is a downgrade in hardening,
+  not a reason to refuse to start, so `OSError` is swallowed.
+
+There is deliberately **no separate `secrets.json`** (owner decision, #83).
+Provider API keys already lived in `global.json` as a documented accepted risk;
+a second plaintext file would be separation without a distinct threat model.
+Filesystem permissions are the control that actually does the work.
 
 ## Gotchas
 
