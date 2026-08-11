@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import os
 from core.config import Config
 from core.dm_log import log_dm, row_from_message
+from core.ops import registry as ops_registry
 from core.error_handler import (
     log_error_to_discord, ErrorCategory, ErrorSeverity,
     handle_command_error, handle_app_command_error, handle_event_error
@@ -65,6 +66,49 @@ class LiterallyBot(commands.Bot):
         """
         await load_cogs()
 
+    async def add_cog(self, cog, **kwargs):
+        """Register the cog's `@op(...)` methods as it loads.
+
+        Mirrors discord.py's own CogMeta/_eject lifecycle: a cog's ops live
+        exactly as long as the cog does, so `!reload` swaps an extension's
+        op batch atomically (discord.py tears the old cog down — and its ops
+        with it — before the new one is added, and restores the old cog if
+        the reload fails, which re-registers its old batch through this same
+        path).
+
+        Registration is all-or-none inside the registry. If it raises (a
+        duplicate op name, a malformed declaration), the cog is ejected
+        again before the error propagates: discord.py must not end up
+        holding a loaded cog whose ops silently aren't there.
+        """
+        await super().add_cog(cog, **kwargs)
+        try:
+            names = ops_registry.register_cog_ops(cog)
+        except Exception:
+            await super().remove_cog(cog.qualified_name)
+            raise
+        if names:
+            logger.info(f"Registered {len(names)} op(s) from {cog.qualified_name}: "
+                        f"{', '.join(names)}")
+
+    async def remove_cog(self, name, **kwargs):
+        """Drop the cog's ops as it unloads.
+
+        The unregistration runs in a `finally` so a cog whose own teardown
+        raises still leaves no orphaned ops behind — a registered op whose
+        owning cog is gone would fail at call time with a confusing error
+        and would keep its name reserved against the reload.
+        """
+        cog = self.get_cog(name)
+        try:
+            return await super().remove_cog(name, **kwargs)
+        finally:
+            if cog is not None:
+                removed = ops_registry.unregister_owner(cog)
+                if removed:
+                    logger.info(f"Unregistered {len(removed)} op(s) from {name}: "
+                                f"{', '.join(removed)}")
+
 
 bot = LiterallyBot(command_prefix=get_prefix, intents=discord.Intents.all())
 # Attach central logger to bot for use in cogs
@@ -115,12 +159,14 @@ async def on_ready():
         await bot.tree.sync()
         bot._synced = True
 
-    # MCP ops server — OFF unless the `mcp_ops_enabled` global config bool is set
-    # (plus MCP_OPS_TOKEN in env; all gates fail closed). Loopback-only.
-    # See mcp_ops/run_mcp_server.py.
+    # MCP ops server — OFF unless the `mcp_ops_enabled` global config bool is
+    # set; loopback-only, bearer auth mandatory (a token is generated and
+    # stored in global config if none is configured). See core/mcp_server.py.
+    # Started here, not in setup_hook, so its tool surface is built from a
+    # registry that already has every cog's ops in it.
     if getattr(bot, '_mcp_ops_task', None) is None:
         try:
-            from mcp_ops.run_mcp_server import maybe_start_in_bot
+            from core.mcp_server import maybe_start_in_bot
             bot._mcp_ops_task = maybe_start_in_bot(bot)
         except Exception as e:
             logger.error(f"Failed to start MCP ops server: {e}", exc_info=True)

@@ -147,28 +147,32 @@ Press the button on your Hue Bridge, then run:
 
 ## 🔌 MCP Ops Server
 
-`mcp_ops/` exposes the bot's ops registry (`core/ops.py` — permission-checked,
-typed Discord actions like `send_message`, `search_history`, `send_dm`,
-`create_role`) over [MCP](https://modelcontextprotocol.io/) so an external
-agent can drive the bot the same way an in-bot command would, without either
-frontend re-implementing Discord plumbing or permission logic.
+`core/mcp_server.py` exposes the bot's ops registry (`core/ops.py` —
+permission-checked, typed Discord actions like `send_message`,
+`search_history`, `send_dm`, `create_role`) over
+[MCP](https://modelcontextprotocol.io/) so an external agent can drive the bot
+the same way an in-bot command would, without either frontend re-implementing
+Discord plumbing or permission logic.
 
-**This is OFF by default.** Two ways to run it, sharing the same guardrails:
-
-1. **In-process with the bot** — `bot.py` starts it automatically after
-   ready when the `mcp_ops_enabled` global config bool is true (toggle in
-   `!aisettings` → MCP tab; binds on restart). Tools act through the live
-   bot. When the flag is unset/false, running the normal bot never starts it.
-2. **Standalone** — `python3 -m mcp_ops.run_mcp_server` runs a separate
-   process with a minimal cog-less Discord client on the same token.
+**This is OFF by default.** There is exactly one way to run it: in-process
+with the bot. `bot.py` starts it automatically after ready when the
+`mcp_ops_enabled` global config bool is true (toggle in `!aisettings` → MCP
+tab; binds on restart), and the tools act through the live bot. When the flag
+is unset/false, running the normal bot never starts it. (A standalone runner
+existed until 2026-08; it logged a *second* Discord client into the same bot
+account and could not see ops registered by cogs, so it was deleted rather
+than fixed.)
 
 **Security model (all gates fail closed):**
 - **Off by default** — refuses to start unless the `mcp_ops_enabled` global
   config boolean is true.
-- **Auth required** — refuses to start unless `MCP_OPS_TOKEN` is set to a
-  non-empty shared secret. Every request must send
-  `Authorization: Bearer <token>`; requests without a matching token get a
-  `401`.
+- **Auth required** — every request must send `Authorization: Bearer <token>`;
+  requests without a matching token get a `401` (compared constant-time with
+  `hmac.compare_digest`). The token is read config-first: the `mcp_ops_token`
+  global config key, else the `MCP_OPS_TOKEN` env var. If neither is set when
+  an operator enables the server, one is generated
+  (`secrets.token_urlsafe(32)`) and stored in `configs/global.json` — the
+  server is never unauthenticated, and the value is never logged.
 - **Loopback only** — binds to `127.0.0.1`, no host override. Every tool
   call is a live, authenticated Discord bot action; do not tunnel this port
   off-host casually.
@@ -184,17 +188,19 @@ frontend re-implementing Discord plumbing or permission logic.
   purposes. Fine for localhost self-use; add real actor auth before any
   wider exposure.
 
-**Run it (standalone):**
+**Run it:** turn it on, then restart the bot.
+
 ```bash
 # enable the server in global config (or via !aisettings -> MCP tab):
 python3 -c "import json;p='configs/global.json';d=json.load(open(p));d['mcp_ops_enabled']=True;json.dump(d,open(p,'w'),indent=4)"
-# in your .env or exported in the shell:
-export MCP_OPS_TOKEN=$(openssl rand -hex 32)   # generate a real secret
-export DISCORD_TOKEN=your_bot_token_here        # same token the bot uses
-
-python3 -m mcp_ops.run_mcp_server
-# -> serves streamable-HTTP MCP at http://127.0.0.1:8765/mcp  (port: MCP_OPS_PORT)
+# optional — set your own token/port instead of the generated ones:
+#   global config `mcp_ops_token` / `mcp_ops_port`, or MCP_OPS_TOKEN / MCP_OPS_PORT
 ```
+
+On the next start the bot serves streamable-HTTP MCP at
+`http://127.0.0.1:8765/mcp`. If no token was configured, the bot generates one
+into `configs/global.json` under `mcp_ops_token` and logs *that it did so* —
+read the value out of that file to connect a client.
 
 **Connect to it** (e.g. from an MCP-capable client config):
 ```json
@@ -203,14 +209,15 @@ python3 -m mcp_ops.run_mcp_server
     "literallybot-ops": {
       "url": "http://127.0.0.1:8765/mcp",
       "headers": {
-        "Authorization": "Bearer <your MCP_OPS_TOKEN value>"
+        "Authorization": "Bearer <your mcp_ops_token value>"
       }
     }
   }
 }
 ```
 
-**Exposed tools:** by default the full ops registry — messaging
+**Exposed tools:** by default the full ops registry, queried live when the
+server starts (so ops registered by a cog are included) — messaging
 (`send_message`, `edit_message`, `delete_message`, `add_reaction`,
 `remove_reaction`, `pin_message`, `create_thread`, `search_history`), DMs
 (`send_dm`, `read_dms`, `fetch_dms`), roles (`add_role`, `remove_role`,
@@ -218,7 +225,10 @@ python3 -m mcp_ops.run_mcp_server
 `list_channels`, `list_members`, `list_roles`, `list_role_members`,
 `list_channel_overwrites`). The served subset is trimmable at runtime via the
 `mcp_tools_enabled` global config list, managed from the `!aisettings` → MCP
-tab — what the panel shows is what gets served.
+tab — what the panel shows is what gets served. The tool surface is built once
+per bot start: allowlist edits and newly loaded cog ops bind on the next
+restart (MCP's `tools/list_changed` notification is not reliably deliverable
+to live streamable-HTTP sessions on mcp 1.x).
 
 Exact per-tool schemas are served live via MCP `tools/list`; offline, run
 `python3 -m core.ops` to print the full ops registry.

@@ -53,7 +53,7 @@ Where new code should land, so seams don't re-greed:
 - **Message splitting**: `core.utils.recursive_split` is the one Discord
   2000-char splitter. Don't write another accumulator/slicer.
 - **Discord actions for agents/frontends**: register an op in `core/ops.py`;
-  frontends (`core/agent_loop.py`, `mcp_ops/server.py`) generate their surface
+  frontends (`core/agent_loop.py`, `core/mcp_server.py`) generate their surface
   from the registry and must stay thin. `call_ids` gates permissions before
   resolving ids — keep that ordering.
 - **One cog per purpose** (owner standard, 2026-08): cogs of the same purpose
@@ -79,7 +79,7 @@ Where new code should land, so seams don't re-greed:
   adding keys. One data model per concept: never add a parallel key for an
   existing concept (reaction-role mappings are `emoji_role_toggles`, full stop).
 - **Rate limiting** is the nested-window ladder in gpt.py
-  (`cooldown_config`/`_check_cooldown`, tunable via `/ai settings` →
+  (`cooldown_config`/`_check_cooldown`, tunable via `!aisettings` →
   Cooldowns). Don't reintroduce flat per-message cooldowns.
 
 ## Related

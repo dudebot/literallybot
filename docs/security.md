@@ -40,7 +40,7 @@ member with the Discord **Administrator** permission, or the guild owner.
 The ops registry (`core/ops.py`) is the single place every atomic Discord action
 is defined, each with a declared `PermissionLevel` (EVERYONE / ADMIN / SUPERADMIN).
 Two frontends call into it: the in-bot agent loop (`core/agent_loop.py`, used by
-`!gpt` when agentic mode is on) and the MCP server (`mcp_ops/server.py`).
+`!gpt` when agentic mode is on) and the MCP server (`core/mcp_server.py`).
 
 Security properties enforced centrally, so no frontend can skip them:
 
@@ -69,7 +69,7 @@ Security properties enforced centrally, so no frontend can skip them:
   plain-chat answer, never a canned failure string.
 - **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
   allowlist (default empty, meaning `!gpt` is plain chat with no tools), managed
-  from the `/ai settings` panel. The MCP server consumes its own global
+  from the `!aisettings` panel. The MCP server consumes its own global
   `mcp_tools_enabled` allowlist at build time.
 - **Every executed op is logged** at INFO (op name, params, actor id, ok/error).
 
@@ -85,18 +85,25 @@ callers that bypass `call_ids` and resolved nothing through the registry.
 
 ## MCP Ops Server
 
-`mcp_ops/server.py` exposes a subset of the ops registry over HTTP. All gates are
-fail-closed and independently required (`mcp_ops/run_mcp_server.py`):
+`core/mcp_server.py` exposes a subset of the ops registry over HTTP, in-process
+with the bot (the standalone runner was deleted in 2026-08 — it opened a second
+Discord session on the same account and could not see cog-registered ops). All
+gates are fail-closed and independently required:
 
 - **Off by default.** Refuses to start unless the `mcp_ops_enabled` global
-  config boolean is true (toggled from `/ai settings` → MCP tab; moved out of
+  config boolean is true (toggled from `!aisettings` → MCP tab; moved out of
   `.env` 2026-08 so it's operable without shell access; binds on restart).
 - **Loopback-only bind.** Hard-coded `127.0.0.1`; there is no host parameter. A
   legacy `MCP_OPS_HOST` set to any non-loopback value refuses startup rather than
   rebinding.
 - **Bearer token required.** Every request must carry
-  `Authorization: Bearer <MCP_OPS_TOKEN>`; the token is compared with
-  `hmac.compare_digest` (constant-time). No token configured → refuses to start.
+  `Authorization: Bearer <token>`; the token is compared with
+  `hmac.compare_digest` (constant-time). The token resolves config-first
+  (`mcp_ops_token` global key) with an `MCP_OPS_TOKEN` env fallback; when an
+  operator enables the server with neither set, one is generated
+  (`secrets.token_urlsafe(32)`) and written to global config. Generating is
+  still fail-closed — the server is never reachable without a secret — and the
+  token value is never logged, only its storage location.
 - **Mentions suppressed** on `send_message`, same as the agent loop.
 - **Full guild reach by design** (owner decision 2026-08; the former
   `MCP_OPS_GUILD_ALLOWLIST` gate was removed). MCP tools act as raw
@@ -123,7 +130,7 @@ admin/superadmin list.
 - **Discord token** comes from `.env` (`DISCORD_TOKEN`), loaded via `dotenv`.
   `.env` and `.env.*` are gitignored.
 - **Provider API keys** are set with `/ai setapikey` (superadmin-gated, ephemeral
-  response) or from the `/ai settings` Providers tab, and stored in `global.json`
+  response) or from the `!aisettings` Providers tab, and stored in `global.json`
   under `<PROVIDER>_API_KEY` — **plaintext on disk**. Environment variables of the
   same name are also honored as a fallback. Protect the `configs/` directory's
   filesystem permissions accordingly.
@@ -142,7 +149,7 @@ admin/superadmin list.
   a local provider (`requires_api_key: false`, e.g. a self-hosted model) keeps data
   on-box.
 - **Persona is guild-admin-settable.** The personality editor in the
-  `/ai settings` panel (admin-gated) sets the system persona for that guild's
+  `!aisettings` panel (admin-gated) sets the system persona for that guild's
   `!gpt`. Any guild admin can rewrite the bot's system prompt.
 - **Output mention filter is narrow, backed by AllowedMentions.**
   `check_message_compliance` blocks only the literal substrings `@everyone` /

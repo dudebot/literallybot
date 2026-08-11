@@ -12,7 +12,7 @@ from core.utils import InvokerOnlyView, app_is_admin, is_admin, is_superadmin, r
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import registry
 from core.agent_loop import agent_ops, resolve_bot_tools
-from mcp_ops.server import _EXPOSED_OPS, resolve_mcp_tools
+from core.mcp_server import ENABLE_CONFIG_KEY, exposed_ops, resolve_mcp_tools
 
 # HISTORICAL SNAPSHOT — not a live gate. What an old
 # `gpt_agentic_enabled=True` guild is migrated to, frozen as a literal: the
@@ -226,10 +226,10 @@ class Gpt(commands.Cog):
         return models.get(pc["model"], {}) or {}
 
     def _resolve_bot_tools(self, ctx) -> List[str]:
-        """The guild's enabled bot-agent tools — a subset of AGENT_OPS.
+        """The guild's enabled bot-agent tools — a subset of agent_ops().
 
         Empty (the default) means the plain-chat path runs: no tools, no
-        agent loop. Stale op names left over from an older AGENT_OPS are
+        agent loop. Stale op names whose op is not currently registered are
         dropped by intersecting with the current universe.
         """
         if not getattr(ctx, "guild", None):
@@ -1861,13 +1861,13 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                                   opener=lambda: _RemoveProviderModal(self)),
             ))
         elif self.page == "mcp":
-            for sel in _tool_selects(list(_EXPOSED_OPS), self._mcp_tools(),
+            for sel in _tool_selects(exposed_ops(), self._mcp_tools(),
                                      self._save_mcp_tools):
                 self.add_item(self._row(sel))
             self.add_item(self._row(
                 self._preset_button("Clear all", self._save_mcp_tools, []),
                 self._preset_button("Enable read-only set", self._save_mcp_tools,
-                                    [o for o in _EXPOSED_OPS
+                                    [o for o in exposed_ops()
                                      if o.startswith(("search", "list"))]),
                 self._mcp_server_toggle_button(),
             ))
@@ -1946,7 +1946,6 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         )
 
     def _mcp_text(self):
-        from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
         mcp_on = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
         return (
             "## AI settings — MCP\n"
@@ -2077,7 +2076,6 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         """On/off switch for the MCP ops server itself — the global config
         boolean `mcp_ops_enabled` (moved out of .env 2026-08 so it's operable
         from this panel). Like the tool set, it binds on the next restart."""
-        from mcp_ops.run_mcp_server import ENABLE_CONFIG_KEY
         enabled = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
         btn = discord.ui.Button(
             label=f"🔌 MCP server: {'ON' if enabled else 'OFF'}",
@@ -2110,7 +2108,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             await interaction.response.send_message(
                 "Requires superadmin.", ephemeral=True)
             return
-        cleaned = [n for n in selected if n in _EXPOSED_OPS]
+        cleaned = [n for n in selected if n in set(exposed_ops())]
         self.bot.config.set_global("mcp_tools_enabled", cleaned)
         self.flash("Saved — MCP changes take effect on next bot restart.")
         await self.rerender(interaction)

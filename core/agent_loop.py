@@ -1,6 +1,6 @@
 """In-bot agent-loop frontend over the ops registry ("world pattern").
 
-The second frontend next to mcp_ops/server.py: generates pydantic-ai
+The second frontend next to core/mcp_server.py: generates pydantic-ai
 `Tool`s mechanically from the registry's typed op declarations so a
 tool-calling model invoked via `!gpt` can ACTUALLY perform Discord actions
 instead of narrating them. All resolution/permission/serialization comes
@@ -91,7 +91,7 @@ def build_agent_tools(ctx: Any, logger: logging.Logger,
     user's real Member, in their real guild.
 
     `op_names` is the guild's resolved bot-tool allowlist (a subset of
-    AGENT_OPS). An empty list yields no tools — callers should route those
+    agent_ops()). An empty list yields no tools — callers should route those
     runs through the plain-chat path instead (see gpt.py process_askgpt).
 
     All tools from one call share a `tool_budget` counter (see the

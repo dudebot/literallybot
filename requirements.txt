@@ -7,6 +7,6 @@ pydantic-ai-slim[openai,anthropic]==2.5.0
 yt-dlp
 requests
 
-# MCP ops server (spike, opt-in — see mcp_ops/ and README's "MCP Ops Server" section)
+# MCP ops server (opt-in — see core/mcp_server.py and README's "MCP Ops Server" section)
 mcp>=1.28,<2
 uvicorn

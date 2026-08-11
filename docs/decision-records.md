@@ -40,7 +40,7 @@ API). Since then:
   surface is the in-bot agent loop.
 - Codex authz finding #4 (caller-supplied `actor_id` not credential-bound)
   was consciously downgraded to a documented accepted risk for loopback
-  self-use (`mcp_ops/server.py`). Reopen it only if the server is ever
+  self-use (`core/mcp_server.py`). Reopen it only if the server is ever
   exposed beyond localhost.
 - Sole unshipped lane from the epic body: pytest scaffolding + CI smoke
   workflow. `tests/test_llm_keyless.py` is the first step of that lane; a CI
@@ -56,8 +56,8 @@ conflict, this entry wins:
 - `gpt_agentic_enabled` + `!setagentic`/`/ai setagentic` are GONE. Agentic
   mode is per-tool: a per-guild `bot_tools_enabled` allowlist (empty/default
   ⇒ plain-chat path, guaranteed single model turn) plus a global
-  `mcp_tools_enabled` allowlist consumed by `mcp_ops/server.py` at build
-  time (restart-gated). Both are edited via the `/ai settings` panel
+  `mcp_tools_enabled` allowlist consumed by `core/mcp_server.py` at build
+  time (restart-gated). Both are edited via the `!aisettings` panel
   (`cogs/optional/ai_admin.py`), which also runs the one-shot flag→allowlist
   migration on cog load.
 - The narration-guard regex + retry nudge (`NARRATED_ACTION_RE`) was removed:

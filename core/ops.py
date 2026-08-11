@@ -51,7 +51,7 @@ already use via `@commands.check(...)`. Those helpers expect a duck-typed
 ctx with `.author`, `.guild`, and `.bot.config` — `OpContext` below mirrors
 that shape so the existing helpers work unmodified.
 
-Frontends: mcp_ops/server.py (MCP) and core/agent_loop.py (in-bot agent
+Frontends: core/mcp_server.py (MCP) and core/agent_loop.py (in-bot agent
 loop) both generate their tool surfaces from this registry.
 
 `python3 -m core.ops` prints the offline JSON schemas for every registered
@@ -247,7 +247,7 @@ class OpResult:
 
 # ---------------------------------------------------------------------------
 # Shared resolvers: cache-then-fetch, with guild confinement. Lifted out of
-# mcp_ops/server.py so every id-based frontend resolves identically.
+# core/mcp_server.py so every id-based frontend resolves identically.
 # ---------------------------------------------------------------------------
 
 def check_guild_allowed(guild: Any, allowed_guild_ids: Optional[frozenset],
@@ -470,7 +470,7 @@ class Op:
             if wp.json_type == "array":
                 # Both array wire kinds (CHANNEL_LIST snowflake ids, plain
                 # STRING_LIST) carry string items, so one items type serves —
-                # and mcp_ops/server.py's _JSON_TYPE_TO_PY "array" -> List[str]
+                # and core/mcp_server.py's _JSON_TYPE_TO_PY "array" -> List[str]
                 # stays a single mapping. An array kind with NON-string items
                 # must grow an items-type facet on WireParam.
                 prop["items"] = {"type": "string"}
