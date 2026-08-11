@@ -7,6 +7,9 @@ literallybot/
 ├── bot.py              # Main entry point, event handlers
 ├── core/
 │   ├── config.py       # JSON config system (read docs/config-system.md)
+│   ├── ops.py          # Ops registry — every Discord action, declared once
+│   ├── agent_loop.py   # Frontend: in-chat agent tools (guild-scoped ops)
+│   ├── mcp_server.py   # Frontend: MCP over loopback HTTP (whole registry)
 │   ├── error_handler.py # Error logging to Discord channels
 │   └── utils.py        # Permission helpers (is_admin, is_superadmin)
 ├── cogs/
@@ -52,10 +55,24 @@ Where new code should land, so seams don't re-greed:
   a gate — every hand-rolled copy found so far had drifted from policy.
 - **Message splitting**: `core.utils.recursive_split` is the one Discord
   2000-char splitter. Don't write another accumulator/slicer.
-- **Discord actions for agents/frontends**: register an op in `core/ops.py`;
-  frontends (`core/agent_loop.py`, `core/mcp_server.py`) generate their surface
-  from the registry and must stay thin. `call_ids` gates permissions before
-  resolving ids — keep that ordering.
+- **Discord actions for agents/frontends**: register an op — two paths, same
+  registry. A generic primitive goes inline in `core/ops.py` via
+  `@registry.op(...)` (stamped `origin='core'`). A capability that belongs to a
+  cog goes on a cog method via the module-level `@op(...)` decorator from
+  `core.ops` (stamped `origin='cog'` by `bot.py`'s `add_cog`/`remove_cog`
+  wiring); factor the logic into a headless service method both the command and
+  the op call, and never expose an interaction handler as an op. Origin is
+  stamped by the registration PATH, never a decorator argument. Frontends
+  (`core/agent_loop.py`, `core/mcp_server.py`, the `!aisettings` panel) generate
+  their surface from the registry and must stay thin. See
+  `docs/cog-development.md` → "Registering ops from a cog".
+- **No code-level op subsets.** There is no `agent=True` flag; an op declares
+  `scope` (GUILD/DM/GLOBAL) and the in-guild agent universe IS the guild-scoped
+  set. Query the registry LIVE (`guild_agent_names()`, `ops()`, `grouped()`) —
+  never freeze a module-level tuple, because cog ops come and go with cog
+  load/unload. `call_ids` gates permissions before resolving ids — keep that
+  ordering. Admin config is an EXPOSURE filter; authorization is the per-call
+  `PermissionLevel` gate.
 - **One cog per purpose** (owner standard, 2026-08): cogs of the same purpose
   are coupled into one file. gpt.py owns ALL AI surface — chat paths, `_do_*`
   helpers, and the `/aisettings` panel (the former ai_admin.py was merged
@@ -79,8 +96,10 @@ Where new code should land, so seams don't re-greed:
   adding keys. One data model per concept: never add a parallel key for an
   existing concept (reaction-role mappings are `emoji_role_toggles`, full stop).
 - **Rate limiting** is the nested-window ladder in gpt.py
-  (`cooldown_config`/`_check_cooldown`, tunable via `!aisettings` →
-  Cooldowns). Don't reintroduce flat per-message cooldowns.
+  (`cooldown_config`/`_check_cooldown`). No panel surface since the 2026-08 UX
+  pass — tuned by hand via the global config keys `cooldown_tier_bases` /
+  `cooldown_windows`. Don't reintroduce flat per-message cooldowns, and don't
+  document a Cooldowns tab that doesn't exist.
 
 ## Related
 

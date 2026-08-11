@@ -67,11 +67,57 @@ Security properties enforced centrally, so no frontend can skip them:
   the model always authors its own final reply. pydantic-ai's hard cap sits at
   2x (16) as a runaway backstop; even that path degrades to a model-authored
   plain-chat answer, never a canned failure string.
+- **Scope is a structural boundary.** Every op declares an `OpScope`, and the
+  in-guild agent's tool universe is *derived* as exactly the `GUILD`-scoped ops
+  (`registry.guild_agent_names()`), queried live. DM-scoped ops (`send_dm`,
+  `read_dms`, `fetch_dms`) and global ops (`list_guilds`) are therefore never
+  offerable to a guild's agent surface at all — not by config, not by mistake.
+  There is no hand-maintained "agent tools" list to drift (the former
+  `agent=True` flag was removed in the 2026-08 refactor).
 - **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
   allowlist (default empty, meaning `!gpt` is plain chat with no tools), managed
   from the `!aisettings` panel. The MCP server consumes its own global
   `mcp_tools_enabled` allowlist at build time.
 - **Every executed op is logged** at INFO (op name, params, actor id, ok/error).
+
+### Allowlists are exposure filters, not authorization
+
+This distinction is the whole security model of the ops layer, and it explains
+why the defaults look permissive:
+
+| | Decides | Set by | Default |
+|---|---------|--------|---------|
+| **`PermissionLevel`** (per op, in code) | **Whether a given actor may run it** | The op's declaration; not configurable at runtime | enforced always |
+| **`bot_tools_enabled`** (per guild) | Whether the guild's agent is *offered* it | any bot admin of that guild | empty ⇒ plain chat |
+| **`mcp_tools_enabled`** (global) | Whether the MCP server *serves* it | superadmin | absent ⇒ **whole registry** |
+
+Enabling an op grants **exposure**, never **authorization**. Every call still
+passes the op's own `PermissionLevel` gate against the invoking actor, before any
+Discord id is resolved. So an admin who enables `delete_message` for their guild
+has not granted anyone the ability to delete messages — non-admin users who try
+get the same permission error they would have gotten anyway.
+
+That is why **`mcp_tools_enabled` fails open to the full registry** rather than
+closed to nothing. It is a deliberate owner decision, not an oversight: the MCP
+surface's actual security boundary is the set of gates that are *not*
+configurable — loopback-only bind, mandatory bearer token, and the per-call
+permission checks. A config list that an operator must populate before the
+server is useful would add friction without adding a boundary. The guild-side
+default is the opposite (empty ⇒ no tools) because there the exposure decision
+is also a *behavioral* one: a guild that hasn't opted in should get plain chat.
+
+**`bot_tools_enabled` is guild-admin-savable** (relaxed from superadmin in
+2026-08). Not an escalation path, for the structural reason above plus scope:
+the universe a guild admin picks from is guild-scoped ops only, so there is
+nothing in it that reaches outside the guild they already administer.
+
+**Cog-registered ops** enter these universes the moment their cog loads and
+leave when it unloads, carrying the same declared `PermissionLevel` as any core
+op — the registration path stamps `origin='cog'`, which a cog cannot forge, but
+origin affects only how the panel renders it, never what it may do. A stored
+allowlist name whose op is currently unregistered is retained in config and
+dropped only from the effective set, so an unloaded cog cannot cause a silent
+permission change on the next panel save.
 
 ### Ordering (exposed-op selection)
 
@@ -129,16 +175,31 @@ admin/superadmin list.
 
 - **Discord token** comes from `.env` (`DISCORD_TOKEN`), loaded via `dotenv`.
   `.env` and `.env.*` are gitignored.
-- **Provider API keys** are set with `/ai setapikey` (superadmin-gated, ephemeral
-  response) or from the `!aisettings` Providers tab, and stored in `global.json`
-  under `<PROVIDER>_API_KEY` — **plaintext on disk**. Environment variables of the
-  same name are also honored as a fallback. Protect the `configs/` directory's
-  filesystem permissions accordingly.
+- **Provider API keys** are entered through the `!aisettings` → Models &
+  Providers key modal (superadmin-gated; a modal, never a slash parameter, so the
+  key is never in a command log) and stored in `global.json` under
+  `<PROVIDER>_API_KEY` — **plaintext on disk**. Environment variables of the same
+  name are honored as a fallback. Protect the `configs/` directory's filesystem
+  permissions accordingly.
+- **The MCP bearer token** follows the same config-first-with-env-fallback
+  pattern: the `mcp_ops_token` global config key, else `MCP_OPS_TOKEN`. It moved
+  out of env-only into config in 2026-08 so the server is operable without shell
+  access. If an operator enables the server with neither set, the bot
+  **generates** one (`secrets.token_urlsafe(32)`) and persists it to
+  `global.json`. Generating rather than refusing keeps the server fail-closed
+  (it is never unauthenticated) without stranding an operator who has no UI for
+  the secret. **The value is never logged** — only the fact that one was
+  generated and which key holds it; read it out of `configs/global.json` to
+  connect a client. It is plaintext on disk like the provider keys, and it is a
+  full-privilege credential for the ops surface: treat `configs/` accordingly.
 - **`configs/` is gitignored in full**, so no per-guild data, memories, admin
   lists, or stored keys are committed. Verified: `git ls-files configs/` is empty.
-- **Keys never appear in-channel.** `/ai setapikey` takes the key as a slash
-  argument and replies ephemerally; the old prefix `!setapikey` (which posted the
-  key into chat and then raced to delete it) has been removed.
+- **Keys never appear in-channel.** The key is typed into a Discord **modal**
+  from the `!aisettings` → Models & Providers tab, which the panel answers
+  ephemerally. It is deliberately not a slash-command parameter (a slash
+  argument is visible while typing and lands in the interaction log), and the old
+  prefix `!setapikey` — which posted the key into chat and then raced to delete
+  it — has been removed.
 
 ## Prompt-Injection and Data Surfaces (`!gpt`)
 
@@ -198,9 +259,12 @@ admin/superadmin list.
 - [x] **The console REPL cog was removed** (2026-07-05) — it read host stdin
   and could send messages as the bot to any channel with no auth, and was dead
   under systemd anyway (blocking `input()` on a non-tty).
-- [ ] **Review unauthenticated read commands** (`/ai status`, `!listmedia`) —
-  they disclose configuration state (which providers have keys configured, model
-  lists) to any user. Low impact; gate if that matters.
+- [x] **Unauthenticated config-disclosure reads are gone.** The former `/ai
+  status` and `!listmedia` — which showed any member which providers had keys
+  configured, the model catalog, and the media inventory — no longer exist. That
+  state now lives only inside the admin-gated `!aisettings` / `!media` panels,
+  which additionally answer ephemerally in their slash form, so a bystander
+  cannot even read a panel someone else opened.
 
 Fixed in the 2026-07-05 consistency sweep (see git history for details):
 `!echo` is admin-gated (was open bot-impersonation), `!sethuebridgeip` is

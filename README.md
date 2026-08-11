@@ -1,6 +1,10 @@
 # LiterallyBot
 
-A modular Discord bot built with discord.py that's designed to be a "jack of all trades" — from AI chat to utilities and entertainment. Built with developer experience in mind: hot-reloadable cogs, a three-scope JSON config system, and a shared ops registry that lets both an in-bot agent loop and an external MCP client drive the same permission-checked Discord actions. Actively developed.
+A modular Discord bot built with discord.py that's designed to be a "jack of all trades" — from AI chat to utilities and entertainment.
+
+Its organizing idea: **every Discord action the bot can take is declared exactly once**, in a permission-checked ops registry, and every way of driving the bot is generated from that declaration. Write one op and it becomes an AI tool your members can use in chat, an MCP tool your own agents can call over loopback, and a toggle in the admin panel — no per-frontend plumbing, no duplicated auth check, no hand-maintained tool lists. Cogs can contribute ops too, registering and unregistering with the cog itself.
+
+Also: hot-reloadable cogs, a three-scope JSON config system with atomic saves and live external-edit reload, and provider-agnostic AI. Actively developed.
 
 ## 🚀 Quick Start
 
@@ -26,15 +30,125 @@ That's it! Your bot is now running with all core features available.
 
 ## ✨ Key Features
 
-- **🧩 Modular Cog System** — load/unload/hot-reload features without restarts; disable cogs globally without deleting them
+- **🧭 One Ops Layer, Many Frontends** — 26 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
+- **🧩 Modular Cog System** — load/unload/hot-reload features without restarts; disable cogs globally without deleting them; cogs can register their own ops
 - **🤖 AI Integration** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory, personality, and an optional agentic mode that performs real Discord actions
+- **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
 - **⚙️ Smart Configuration** — per-server, per-user, and global JSON settings with write buffering, atomic saves, and live reload on external edits
 - **🎲 Utilities & Fun** — dice rolling, random choices, reminders with snooze buttons, auto-responses, per-guild media libraries, reaction roles
 - **🛠️ Developer Friendly** — hot-reload cogs, comprehensive logging, error routing to Discord channels
 
+## 🏛️ Architecture: one ops layer, many frontends
+
+The interesting thing about this bot is not any one feature — it is that
+**every atomic Discord action is defined exactly once**, in a registry, with
+its permission requirement and its typed parameters declared alongside it.
+Everything that can drive the bot is *generated* from that one declaration.
+
+Add an op, and it simultaneously becomes an AI tool the in-chat agent can
+call, an MCP tool an external agent can call, and a row in the admin panel —
+with no per-frontend plumbing, no duplicated permission check, and no
+hand-maintained tool list anywhere.
+
+```mermaid
+flowchart TB
+    subgraph SRC["Where ops come from"]
+        CORE["core/ops.py<br/><i>26 core primitives</i><br/>@registry.op(...) · origin=core"]
+        COG["Any cog<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
+    end
+
+    REG{{"<b>Ops Registry</b> — core/ops.py<br/>name · description · PermissionLevel<br/>typed params · scope · group · origin<br/><br/>generates JSON schema · resolves ids<br/>· enforces permissions · serializes results"}}
+
+    CORE -->|"registered at import"| REG
+    COG -->|"registered at add_cog<br/>dropped at remove_cog"| REG
+
+    subgraph FE["Generated frontends"]
+        AGENT["<b>In-chat agent loop</b><br/>core/agent_loop.py<br/>@mention the bot<br/><br/>acts as the INVOKING USER<br/>confined to {ctx.guild.id}<br/>8-call soft tool budget"]
+        MCP["<b>MCP server</b><br/>core/mcp_server.py<br/>loopback HTTP + bearer token<br/><br/>acts as a host-side operator<br/>full guild reach<br/>surface built at startup"]
+    end
+
+    REG -->|"scope == GUILD, live"| AGENT
+    REG -->|"whole registry, live"| MCP
+
+    subgraph CFG["The only filter — admin config"]
+        BT["<code>bot_tools_enabled</code><br/>per guild · <code>!aisettings</code> → Server<br/>empty ⇒ plain chat"]
+        MT["<code>mcp_tools_enabled</code><br/>global · <code>!aisettings</code> → MCP<br/>absent ⇒ everything"]
+    end
+
+    BT -.->|"intersect"| AGENT
+    MT -.->|"intersect"| MCP
+
+    AGENT --> OUT(["Live, permission-checked Discord actions"])
+    MCP --> OUT
+```
+
+**What each piece buys you:**
+
+- **The registry is the only source of truth.** There is no code-level "which
+  ops are agent tools" list. The in-guild agent's universe is *derived*: every
+  op whose `scope` is `GUILD`, queried live. Add a guild-scoped op and it is
+  offerable to the agent the moment it registers.
+- **Cogs contribute ops.** A cog decorates a method with `@op(...)`; the ops
+  register when the cog loads and unregister when it unloads, all-or-none, so
+  `!reload` swaps a cog's op batch atomically. `origin` is stamped by the
+  registration *path*, never claimed by a decorator argument — a cog cannot
+  pass itself off as a core primitive.
+- **Config is an exposure filter, not the authorization.** Turning an op on in
+  the panel only decides whether it's *offered*. Every call still passes the
+  op's own `PermissionLevel` gate against the real invoking user, before any
+  Discord id is even resolved.
+- **`scope` is the safety boundary.** Guild-scoped ops are the only ones a
+  guild-confined, user-actored agent loop can be offered; DM and global ops
+  (`send_dm`, `list_guilds`) never appear in a guild's agent surface at all.
+
+### The MCP story
+
+Today the bot is an MCP **server**: your own agents drive your Discord bot
+through the same permission-checked ops a member's `@mention` would.
+
+```mermaid
+flowchart LR
+    subgraph TODAY["Today — bot as MCP SERVER"]
+        direction LR
+        EXT["External agent<br/><i>Claude Code, an IDE,<br/>any MCP client</i>"]
+        EXT -->|"MCP over<br/>127.0.0.1 + bearer token"| SRV["core/mcp_server.py"]
+        SRV --> R1{{"Ops registry"}}
+        R1 --> DIS["Discord"]
+    end
+
+    subgraph PLANNED["Planned (#59) — bot as MCP CLIENT"]
+        direction LR
+        R2{{"Ops registry"}} --> LOOP["Agent loop"]
+        TOOLSRV["External MCP tool servers<br/><i>search, filesystem, APIs…</i>"] -.->|"tools folded into<br/>the same loop"| LOOP
+        LOOP --> USR["Chat reply in Discord"]
+    end
+
+    TODAY ~~~ PLANNED
+```
+
+The two directions are independent and compose: an external agent can drive
+the bot while the bot's own in-chat agent reaches out to external tools.
+
 ## 🧭 Command Surface Philosophy
 
-The public slash picker is kept deliberately tiny: `/help` and `/role` are the only slash commands. Everything administrative is a **prefix-launched panel** (`!aisettings`, `!autoresponse`, `!media`, `!cogs`, `!config`) — single-invoker interactive Views gated by the bot's own admin concept (`is_admin` / `is_superadmin`), independent of the invoker's Discord permissions. Regular members never see admin machinery in the slash picker; `/help` and `!help` show each invoker exactly the commands they can use.
+Administrative surfaces are **single-invoker interactive panels**, gated by the
+bot's own admin concept (`is_admin` / `is_superadmin`) rather than by the
+invoker's Discord permissions — the bot's admins do not necessarily hold
+Discord's Administrator bit, and gating on it caused a real lockout.
+
+Each panel exists twice on purpose: a hidden prefix command (`!aisettings`,
+`!autoresponse`, `!media`, `!cogs`, `!config`) and an **ephemeral slash twin**
+(`/aisettings`, `/autoresponse`, `/media`, `/cogs`, `/config`). Ephemeral is a
+property of an interaction response, so only the slash form can keep a guild's
+model/provider/tool configuration from being read by everyone in the channel.
+Neither form uses `app_commands.default_permissions` — the check is the bot's
+own gate, evaluated at invoke time, and a non-admin who runs one gets an
+ephemeral refusal.
+
+Beyond the panels, the public surface is small: `/help` and `/role`. `/help`
+and `!help` show each invoker exactly the commands they can actually run, and
+superadmin-only controls are *omitted* from a panel's render for non-superadmins
+rather than merely disabled.
 
 ## 📋 Everyday Commands
 
@@ -82,15 +196,21 @@ token budget "thinking" can be tamed with `"reasoning_effort": "none"` per model
 
 ### Agentic AI (experimental)
 
-When enabled, the AI can **perform real Discord actions** — send/edit
-messages, add reactions, search history, manage roles — instead of only
-describing them. It runs a tool-calling loop over a shared **ops registry**
-(`core/ops.py`), acting as the **invoking user** (never the bot), confined to
-the current guild, with mentions suppressed and a per-run tool-call cap.
+When enabled, the AI can **perform real Discord actions** — send/edit messages,
+add reactions, search history, manage roles and emojis, plus anything a loaded
+cog contributes — instead of only describing them. It runs a tool-calling loop
+over the shared **ops registry** (`core/ops.py`), acting as the **invoking
+user** (never the bot), confined to the current guild, with mentions suppressed
+and a per-run tool-call budget.
 
-Agentic mode is per-tool: each guild has a tool allowlist (default empty, so
-chat stays plain chat and nothing changes) managed from the `!aisettings`
-panel. See `docs/security.md` for the full model.
+Agentic mode is per-tool: each guild has a `bot_tools_enabled` allowlist
+(default empty, so chat stays plain chat and nothing changes), managed from the
+`!aisettings` → Server config tab by any bot admin. The *universe* that
+allowlist draws from isn't a hand-maintained list — it's every registered op
+whose `scope` is `GUILD`, queried live, which is why a guild admin choosing
+from it can't escalate past their own guild. Ops belonging to an unloaded cog
+stay in the stored allowlist and simply drop out of the effective set until the
+cog comes back. See `docs/security.md` for the full model.
 
 ## 🎬 Media Libraries
 
@@ -198,11 +318,16 @@ python3 -c "import json;p='configs/global.json';d=json.load(open(p));d['mcp_ops_
 ```
 
 On the next start the bot serves streamable-HTTP MCP at
-`http://127.0.0.1:8765/mcp`. If no token was configured, the bot generates one
-into `configs/global.json` under `mcp_ops_token` and logs *that it did so* —
-read the value out of that file to connect a client.
+`http://127.0.0.1:<port>/mcp`. The port resolves config-first: the
+`mcp_ops_port` global config key, else the `MCP_OPS_PORT` env var, else the
+default **8765** — so a deployment running more than one bot gives each its own
+port in config, and the URL below must match whatever *that* deployment
+resolved. If no token was configured, the bot generates one into
+`configs/global.json` under `mcp_ops_token` and logs *that it did so* (never
+the value) — read it out of that file to connect a client.
 
-**Connect to it** (e.g. from an MCP-capable client config):
+**Connect to it** (e.g. from an MCP-capable client config — substitute your own
+port if you set `mcp_ops_port`):
 ```json
 {
   "mcpServers": {
@@ -217,18 +342,29 @@ read the value out of that file to connect a client.
 ```
 
 **Exposed tools:** by default the full ops registry, queried live when the
-server starts (so ops registered by a cog are included) — messaging
-(`send_message`, `edit_message`, `delete_message`, `add_reaction`,
-`remove_reaction`, `pin_message`, `create_thread`, `search_history`), DMs
-(`send_dm`, `read_dms`, `fetch_dms`), roles (`add_role`, `remove_role`,
-`create_role`, `edit_role`, `delete_role`), and introspection (`list_guilds`,
-`list_channels`, `list_members`, `list_roles`, `list_role_members`,
-`list_channel_overwrites`). The served subset is trimmable at runtime via the
-`mcp_tools_enabled` global config list, managed from the `!aisettings` → MCP
-tab — what the panel shows is what gets served. The tool surface is built once
-per bot start: allowlist edits and newly loaded cog ops bind on the next
-restart (MCP's `tools/list_changed` notification is not reliably deliverable
-to live streamable-HTTP sessions on mcp 1.x).
+server starts — so ops a cog registered are included too. The 26 core
+primitives, by group:
+
+| Group | Ops |
+|-------|-----|
+| **Messaging** | `send_message`, `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`, `search_history`, `pin_message`, `create_thread` |
+| **Roles** | `add_role`, `remove_role`, `list_roles`, `list_role_members`, `create_role`, `edit_role`, `delete_role` |
+| **Emojis** | `list_emojis`, `create_emoji`, `edit_emoji`, `delete_emoji` |
+| **Guild info** | `list_channels`, `list_members`, `list_channel_overwrites` |
+| **Direct messages** | `send_dm`, `read_dms`, `fetch_dms` |
+| **Guild** | `list_guilds` |
+
+Loaded cogs add their own on top (e.g. `add_emoji_role_toggle` and
+`sync_emoji_role_toggles` from `setrole`, `search_danbooru` from `danbooru`),
+rendered in the panel under their own groups and visibly separated from the
+core primitives.
+
+The served subset is trimmable at runtime via the `mcp_tools_enabled` global
+config list, managed from the `!aisettings` → MCP tab — what the panel shows is
+what gets served. The tool surface is built once per bot start: allowlist edits
+and newly loaded cog ops bind on the next restart (MCP's `tools/list_changed`
+notification is not reliably deliverable to live streamable-HTTP sessions on
+mcp 1.x).
 
 Exact per-tool schemas are served live via MCP `tools/list`; offline, run
 `python3 -m core.ops` to print the full ops registry.
@@ -263,6 +399,46 @@ async def setup(bot):
 Load with `!load my_feature` — no restart needed! It shows up in `/help`
 automatically, grouped under its cog.
 
+### Giving a Cog an Op
+
+Any cog can contribute to the ops registry, which makes its capability
+available to the in-chat agent, the MCP server, and the admin panel at once.
+Factor the logic into a plain service method, then let both the command and the
+op call it:
+
+```python
+from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+
+class MyFeature(commands.Cog):
+    async def _do_thing(self, guild, target: str) -> dict:
+        """Service function: plain objects in, plain data out. No Interaction,
+        no ctx.send — the caller presents the outcome."""
+        ...
+        return {"status": "ok", "target": target}
+
+    @commands.command()
+    async def thing(self, ctx, target: str):
+        result = await self._do_thing(ctx.guild, target)
+        await ctx.send(f"Done: {result['status']}")
+
+    @op(
+        "do_thing",
+        "Does the thing to a target and reports the resulting status.",
+        PermissionLevel.ADMIN,
+        params=[OpParam("target", ParamKind.STRING, "What to act on.")],
+        scope=OpScope.GUILD,
+        group="integrations",
+    )
+    async def op_do_thing(self, ctx, target: str) -> dict:
+        return await self._do_thing(ctx.guild, target)
+```
+
+The ops register when the cog loads and unregister when it unloads — `!reload`
+swaps the batch atomically, and a batch is all-or-none so a malformed op means
+zero ops registered rather than half. See `docs/cog-development.md` →
+"Registering ops from a cog" for the full contract, and `cogs/optional/setrole.py`
+for a live example.
+
 ### Config Quick Reference
 LiterallyBot's config helper is available as `self.bot.config` in every cog:
 
@@ -293,9 +469,9 @@ immediately.
 - `docs/decision-records.md` — durable architecture decision records
 
 ### Production Deployment
-For Linux servers, run `./install_service.sh` from the repo root (interactive
-systemd installer), or start from the unit template in
-`scripts/literallybot.service.example`.
+For Linux servers, run `sudo ./scripts/install_service.sh [service_name]`
+(interactive systemd installer — detects the repo directory and its venv), or
+start from the unit template in `scripts/literallybot.service.example`.
 
 ## Contributing
 

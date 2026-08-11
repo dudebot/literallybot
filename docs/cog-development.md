@@ -197,6 +197,210 @@ async def superadmin_only(self, ctx):
     await ctx.send("Superadmin command executed!")
 ```
 
+## Registering ops from a cog
+
+An **op** is one atomic Discord-affecting capability, declared once in the ops
+registry (`core/ops.py`) with its permission requirement and typed parameters.
+Every frontend — the in-chat agent loop, the MCP server, the `!aisettings`
+panel — is *generated* from those declarations. Registering an op from your cog
+therefore exposes your capability to all of them at once, without writing any
+frontend code.
+
+Register an op when the capability is something an agent or an external
+operator should be able to *invoke*. Keep it a plain command when it is a piece
+of interactive UI (a panel, a modal flow, a paginated browser).
+
+### The service-function pattern (required)
+
+**Factor the logic so both the command and the op call it.** Never expose an
+interaction handler as an op.
+
+A command handler and an op have incompatible contracts: the command handler
+owns presentation (it sends messages, edits embeds, answers an
+`Interaction` exactly once), while an op must return plain data and send
+nothing. Calling a command handler from an op means an agent's tool call
+side-effects a message into the channel, and an `Interaction`-typed handler
+simply cannot be called at all without one.
+
+So the logic goes in a third place both can call:
+
+```python
+class SetRole(commands.Cog):
+
+    # --- services ---------------------------------------------------------
+    # Headless logic shared by the slash commands and the cog ops. These take
+    # plain Discord objects, return plain data, and never touch an Interaction
+    # or send anything — the caller presents the outcome.
+
+    async def _add_toggle(self, guild, channel, message_id: int, emoji: str,
+                          role, replace_existing: bool = False) -> dict:
+        ...
+        return {"status": "created", "emoji": emoji_str,
+                "message_id": message_id, "role_id": role.id}
+```
+
+Three rules for a service function:
+
+1. **Plain objects in, plain data out.** Discord objects (`Guild`, `Member`,
+   `Role`, channel) and scalars in; a JSON-serializable `dict` out.
+2. **It sends nothing.** No `ctx.send`, no `interaction.response`. The caller
+   decides how to present the result.
+3. **Failures are raises or status fields, not messages.** Raise
+   `RuntimeError` with a caller-presentable message for a hard failure; use a
+   `status` field for expected outcomes the caller must branch on (`"created"`
+   vs `"exists"` vs `"unchanged"`). The registry turns a raise into
+   `OpResult(ok=False, error=...)` for every frontend identically.
+
+### Declaring the op
+
+Import the module-level `op` decorator from `core.ops` and decorate an **async**
+method. The decorator only *attaches* a spec to the function — it does not touch
+the registry at import time.
+
+```python
+from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+
+class SetRole(commands.Cog):
+
+    @op(
+        "add_emoji_role_toggle",
+        "Add an emoji role toggle: reacting to the given message with the "
+        "given emoji grants or removes the role. If that emoji on that "
+        "message already toggles a different role, nothing is written unless "
+        "replace_existing is true.",
+        PermissionLevel.ADMIN,
+        params=[
+            OpParam("channel", ParamKind.CHANNEL,
+                    "Channel containing the target message."),
+            OpParam("message_id", ParamKind.SNOWFLAKE,
+                    "Message users react to."),
+            OpParam("emoji", ParamKind.STRING,
+                    "Emoji to react with: a unicode character, or "
+                    "'<:name:id>' for a custom emoji."),
+            OpParam("role", ParamKind.ROLE, "Role the reaction toggles."),
+            OpParam("replace_existing", ParamKind.BOOLEAN,
+                    "Retarget the emoji if it already toggles a different role.",
+                    required=False, default=False),
+        ],
+        agent_guidance=(
+            "Check the returned status: 'exists' means a different role is "
+            "already bound and NOTHING was written — report the conflict to "
+            "the user rather than silently retrying with replace_existing."),
+        scope=OpScope.GUILD,
+        group="role-automation",
+    )
+    async def op_add_emoji_role_toggle(self, ctx, channel, message_id: int,
+                                       emoji: str, role,
+                                       replace_existing: bool = False) -> dict:
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            raise ValueError("add_emoji_role_toggle requires a guild channel.")
+        return await self._add_toggle(guild, channel, int(message_id), emoji,
+                                      role, replace_existing=bool(replace_existing))
+```
+
+The op impl is a thin adapter: validate, coerce, delegate to the service.
+
+#### The fields
+
+| Field | What it does |
+|-------|--------------|
+| **name** | Unique registry-wide (core ops included). A collision fails the whole cog's batch — pick something specific. This is the literal tool name a model sees. |
+| **description** | Written *for a model*, not a changelog. State what it does, what it returns, and what it does **not** do. |
+| **permission** | `PermissionLevel.EVERYONE` / `ADMIN` / `SUPERADMIN`, checked against the **invoking user** on every call, before any Discord id is resolved. Config never overrides this. |
+| **params** | Typed `OpParam`s. The registry generates the JSON schema *and* resolves Discord entities from ids — see the kinds below. |
+| **scope** | `OpScope.GUILD` / `DM` / `GLOBAL`. See below; this is a safety boundary, not a label. |
+| **group** | Kebab-case id from `OP_GROUPS` in `core/ops.py`; decides which panel section renders it. Each group must stay under Discord's 25-option select cap. |
+| **agent_guidance** | Optional. Extra instruction injected for the agent loop — use it for non-obvious result semantics ("status 'exists' means nothing was written"). |
+| **serialize** | Optional callable turning a non-JSON return value into a dict. Unneeded if you already return plain data. |
+
+There is deliberately **no `origin` parameter**. Origin is stamped by the
+registration *path* (`'core'` for `core/ops.py`'s inline registrations,
+`'cog'` for this one), so a cog cannot claim to be a core primitive.
+
+#### Choosing `scope`
+
+`scope` answers *where the op acts*, and it is what makes each frontend's
+universe derivable instead of hand-listed:
+
+- **`OpScope.GUILD`** — acts on or inside a guild (channels, members, roles,
+  emojis). **The in-guild agent universe is exactly this set**, queried live.
+  This is what almost every cog op should be.
+- **`OpScope.DM`** — acts on a one-to-one DM conversation, no guild involved.
+  Never offered to the guild-confined agent loop.
+- **`OpScope.GLOBAL`** — acts on the bot itself across guilds (`list_guilds`).
+  Also never offered to the agent loop.
+
+Declaring `GUILD` is what puts your op in front of a guild's members, so an op
+that can reach outside the invoking guild must not claim it.
+
+#### Param kinds
+
+Discord entities travel as **ids on the wire** and are resolved to live objects
+before your impl runs, with guild confinement applied. Snowflakes are carried as
+decimal *strings* (they exceed 2**53 and would round as JSON numbers).
+
+| Kind | Wire param | Your impl receives |
+|------|-----------|--------------------|
+| `CHANNEL` | `channel_id` | channel object |
+| `MESSAGE` | `channel_id` + `message_id` | `discord.Message` |
+| `MEMBER` / `USER` | `user_id` | `Member` / `User` |
+| `ROLE` | `role_id` | `discord.Role` |
+| `GUILD` | `guild_id` | `discord.Guild` |
+| `STRING`, `INTEGER`, `BOOLEAN` | same name | the scalar |
+| `SNOWFLAKE` | same name (string) | an id you handle yourself — *not* resolved |
+| `INTERNAL` | never on the wire | only object-based callers pass it |
+
+### Lifecycle
+
+You do not call the registry yourself. `LiterallyBot.add_cog` /
+`remove_cog` (in `bot.py`) wrap the discord.py cog lifecycle:
+
+- **On load** — `registry.register_cog_ops(cog)` scans the instance's bound
+  methods for specs and registers the batch **all-or-none**. A duplicate name or
+  a malformed declaration registers *zero* ops and ejects the cog, so a loaded
+  cog never has half its ops missing.
+- **On unload** — `registry.unregister_owner(cog)` drops the batch, in a
+  `finally`, so a cog whose own teardown raises still leaves no orphaned ops
+  (an op whose owner is gone would fail confusingly at call time and keep its
+  name reserved against the reload).
+- **On `!reload`** — discord.py's reload is atomic: it tears the old cog down
+  (dropping its ops) before adding the new one, and **restores the old cog if
+  the new one fails to load**, which re-registers the old batch through the same
+  path. A broken edit leaves the previous ops working.
+
+Ops are bound methods, so they see cog state (`self.bot`, caches, config
+helpers) exactly as your commands do.
+
+### Config keeps your op's name across an unload
+
+Every frontend queries the registry **live** — never a snapshot taken at import
+— so your ops appear in the panel the moment the cog loads.
+
+When a cog is unloaded, its op names stay in the stored `bot_tools_enabled` /
+`mcp_tools_enabled` config lists and are simply filtered out of the *effective*
+set. Reloading the cog restores the guild's choice instead of silently losing
+it. Don't write code that prunes unknown names out of stored config.
+
+One caveat: the **MCP** tool surface is built once at server start, so a cog
+loaded afterwards contributes its ops to MCP only on the next bot restart. The
+in-chat agent loop and the panel pick them up immediately.
+
+### Checklist
+
+- [ ] Logic lives in a service method; command and op both call it
+- [ ] Op impl is `async`, returns a JSON-serializable dict, sends nothing
+- [ ] Name is unique registry-wide and reads as a tool name
+- [ ] Description written for a model, including what it does *not* do
+- [ ] `permission` is the tier you'd require of a human running it
+- [ ] `scope=OpScope.GUILD` only if it genuinely cannot act outside the guild
+- [ ] `group` exists in `OP_GROUPS` (add it there if you need a new one)
+- [ ] `!reload <cog>` twice in a row still works (no duplicate-name error)
+
+Live examples: `cogs/optional/setrole.py` (two ops sharing the slash commands'
+services) and `cogs/optional/danbooru.py` (one op sharing the prefix command's
+search service).
+
 ## Advanced Features
 
 ### Event Listeners
