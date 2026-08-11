@@ -209,7 +209,9 @@ holding a stale tool list with no way to learn better. `requirements.txt` pins
 ### Panel doctrine: derived, grouped, admin-savable
 
 The `!aisettings` Server tab renders the **live** guild-scoped universe as one
-select per group, visibly split into core primitives vs cog-provided ops. The
+select per group, visibly split into **API primitives** (core/ops.py) vs
+**behavioral primitives** (cog-registered) — the owner's terms for the two
+kinds, used across README, docs and the panel headings. The
 MCP tab (superadmin, unchanged) renders the whole live registry the same way.
 Both re-query the registry at render time, so a cog load/unload changes the
 panel on the next rerender without a restart.

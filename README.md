@@ -50,11 +50,18 @@ call, an MCP tool an external agent can call, and a row in the admin panel —
 with no per-frontend plumbing, no duplicated permission check, and no
 hand-maintained tool list anywhere.
 
+Two kinds of op live in one registry: **API primitives** — raw, one-to-one
+Discord actions declared in `core/ops.py` — and **behavioral primitives** —
+capabilities a cog registers that carry the bot's own intelligence (set up an
+emoji role toggle, run a policy-filtered image search). Same declaration
+shape, same calling convention, same permission gates; only their origin
+differs, and the panel shows them as separate sections.
+
 ```mermaid
 flowchart TB
     subgraph SRC["Where ops come from"]
-        CORE["core/ops.py<br/><i>26 core primitives</i><br/>@registry.op(...) · origin=core"]
-        COG["Any cog<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
+        CORE["core/ops.py<br/><i>26 API primitives</i><br/>@registry.op(...) · origin=core"]
+        COG["Any cog — behavioral primitives<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
     end
 
     REG{{"<b>Ops Registry</b> — core/ops.py<br/>name · description · PermissionLevel<br/>typed params · scope · group · origin<br/><br/>generates JSON schema · resolves ids<br/>· enforces permissions · serializes results"}}
@@ -92,7 +99,7 @@ flowchart TB
   register when the cog loads and unregister when it unloads, all-or-none, so
   `!reload` swaps a cog's op batch atomically. `origin` is stamped by the
   registration *path*, never claimed by a decorator argument — a cog cannot
-  pass itself off as a core primitive.
+  pass itself off as an API primitive.
 - **Config is an exposure filter, not the authorization.** Turning an op on in
   the panel only decides whether it's *offered*. Every call still passes the
   op's own `PermissionLevel` gate against the real invoking user, before any
@@ -336,7 +343,7 @@ port if you set `mcp_ops_port`):
 ```
 
 **Exposed tools:** by default the full ops registry, queried live when the
-server starts — so ops a cog registered are included too. The 26 core
+server starts — so ops a cog registered are included too. The 26 API
 primitives, by group:
 
 | Group | Ops |
@@ -348,10 +355,10 @@ primitives, by group:
 | **Direct messages** | `send_dm`, `read_dms`, `fetch_dms` |
 | **Guild** | `list_guilds` |
 
-Loaded cogs add their own on top (e.g. `add_emoji_role_toggle` and
-`sync_emoji_role_toggles` from `setrole`, `search_danbooru` from `danbooru`),
-rendered in the panel under their own groups and visibly separated from the
-core primitives.
+Loaded cogs add their own behavioral primitives on top (e.g.
+`add_emoji_role_toggle` and `sync_emoji_role_toggles` from `setrole`,
+`search_danbooru` from `danbooru`), rendered in the panel under their own
+groups and visibly separated from the API primitives.
 
 The served subset is trimmable at runtime via the `mcp_tools_enabled` global
 config list, managed from the `!aisettings` → MCP tab — what the panel shows is

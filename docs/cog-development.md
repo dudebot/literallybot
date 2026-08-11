@@ -206,6 +206,12 @@ panel — is *generated* from those declarations. Registering an op from your co
 therefore exposes your capability to all of them at once, without writing any
 frontend code.
 
+Two kinds share the registry: **API primitives** (raw Discord actions, declared
+inline in `core/ops.py`) and **behavioral primitives** (what YOU are writing
+here — a capability with the bot's own intelligence behind it, like wiring up
+an emoji role toggle). The declaration shape and calling convention are
+identical; only the registration path differs.
+
 Register an op when the capability is something an agent or an external
 operator should be able to *invoke*. Keep it a plain command when it is a piece
 of interactive UI (a panel, a modal flow, a paginated browser).
@@ -338,7 +344,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 
 There is deliberately **no `origin` parameter**. Origin is stamped by the
 registration *path* (`'core'` for `core/ops.py`'s inline registrations,
-`'cog'` for this one), so a cog cannot claim to be a core primitive.
+`'cog'` for this one), so a cog cannot claim to be an API primitive.
 
 #### Choosing `scope`
 

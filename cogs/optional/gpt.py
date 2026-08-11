@@ -1337,8 +1337,8 @@ def _grouped_tool_sections(sections, current, on_save):
 
     `sections` is [(section_label, [(group_id, group_label, [Op, ...]), ...])]
     — i.e. registry.grouped() output already partitioned by origin, so the
-    panel can show core primitives and cog-provided ops as visibly separate
-    territory. Yields (kind, payload) pairs: ("heading", markdown) and
+    panel can show API primitives and behavioral primitives as visibly
+    separate territory. Yields (kind, payload) pairs: ("heading", markdown) and
     ("select", _ToolSelect), which the caller wraps in the Components-V2
     containers it needs.
 
@@ -1809,13 +1809,15 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         return row
 
     def _sections(self, *, scope=None):
-        """Live op universe for a tab, split into the two visible sections:
-        core primitives first, then cog-provided ops. Both come from the
+        """Live op universe for a tab, split into the two visible sections
+        (owner's terms): API primitives — raw Discord actions from
+        core/ops.py — first, then behavioral primitives — capabilities cogs
+        register with internal intelligence of their own. Both come from the
         registry at RENDER time, so a cog load/unload changes the panel on
         the next rerender without a restart."""
         return [
-            ("**Core tools**", registry.grouped(scope=scope, origin=ORIGIN_CORE)),
-            ("**Cog tools**", registry.grouped(scope=scope, origin=ORIGIN_COG)),
+            ("**API primitives**", registry.grouped(scope=scope, origin=ORIGIN_CORE)),
+            ("**Behavioral primitives**", registry.grouped(scope=scope, origin=ORIGIN_COG)),
         ]
 
     def _add_tool_sections(self, sections, current, on_save):

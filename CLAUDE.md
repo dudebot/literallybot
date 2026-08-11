@@ -56,12 +56,14 @@ Where new code should land, so seams don't re-greed:
 - **Message splitting**: `core.utils.recursive_split` is the one Discord
   2000-char splitter. Don't write another accumulator/slicer.
 - **Discord actions for agents/frontends**: register an op — two paths, same
-  registry. A generic primitive goes inline in `core/ops.py` via
-  `@registry.op(...)` (stamped `origin='core'`). A capability that belongs to a
-  cog goes on a cog method via the module-level `@op(...)` decorator from
-  `core.ops` (stamped `origin='cog'` by `bot.py`'s `add_cog`/`remove_cog`
-  wiring); factor the logic into a headless service method both the command and
-  the op call, and never expose an interaction handler as an op. Origin is
+  registry, and the owner's terms for the two kinds are load-bearing: an **API
+  primitive** (raw Discord action) goes inline in `core/ops.py` via
+  `@registry.op(...)` (stamped `origin='core'`); a **behavioral primitive** (a
+  capability with the bot's own intelligence) goes on a cog method via the
+  module-level `@op(...)` decorator from `core.ops` (stamped `origin='cog'` by
+  `bot.py`'s `add_cog`/`remove_cog` wiring); factor the logic into a headless
+  service method both the command and the op call, and never expose an
+  interaction handler as an op. Origin is
   stamped by the registration PATH, never a decorator argument. Frontends
   (`core/agent_loop.py`, `core/mcp_server.py`, the `!aisettings` panel) generate
   their surface from the registry and must stay thin. See
