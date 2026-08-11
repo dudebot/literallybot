@@ -44,7 +44,9 @@ literallybot/
 ### Cog Development
 - New cogs go in `cogs/optional/`. `cogs/core/` is only for the recovery
   surface — the commands that turn things back on (`control.py`, `admin.py`)
-- Use `!reload cogname` for hot-reload during development
+- **The cog set is fixed at boot (#86).** There is no live load/unload/reload
+  surface. Restart the bot to pick up a code change or a `disabled_cogs` edit
+  (`!restart`, or the `!cogs` panel's Restart button — same exit path).
 - See `docs/cog-development.md` for structure and examples
 
 ## Architecture Seams (from the 2026-07 seam-machine pass)
@@ -71,8 +73,10 @@ Where new code should land, so seams don't re-greed:
 - **No code-level op subsets.** There is no `agent=True` flag; an op declares
   `scope` (GUILD/DM/GLOBAL) and the in-guild agent universe IS the guild-scoped
   set. Query the registry LIVE (`guild_agent_names()`, `ops()`, `grouped()`) —
-  never freeze a module-level tuple, because cog ops come and go with cog
-  load/unload. `call_ids` gates permissions before resolving ids — keep that
+  never freeze a module-level tuple, because cog ops arrive with their cog at
+  boot and leave at shutdown, and which cogs those are is a config decision
+  (`disabled_cogs`), not an import-time constant. `call_ids` gates permissions
+  before resolving ids — keep that
   ordering. Admin config is an EXPOSURE filter; authorization is the per-call
   `PermissionLevel` gate.
 - **One cog per purpose** (owner standard, 2026-08): cogs of the same purpose
