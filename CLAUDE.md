@@ -122,8 +122,3 @@ and has killed the invoking shell on this box); never `sudo systemctl restart`
 (prompts for a password the session can't supply). Remember the doctrine:
 config edits bind at restart — cogs, MCP tools, MCP enablement alike.
 
-## Related
-
-A private downstream fork consumes this repo as its `upstream` remote and
-periodically merges `main`. Keep that in mind when restructuring core modules —
-and keep this repo's text free of any reference to what that fork is.
