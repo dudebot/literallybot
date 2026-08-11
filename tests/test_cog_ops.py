@@ -2,8 +2,10 @@
 
 tests/test_ops_registry.py already proves the registry machinery against
 synthetic cogs. This file proves the shipped cogs actually participate: that
-`cogs/optional/setrole.py` and `cogs/optional/danbooru.py` declare ops which
-appear on load, vanish on unload, and survive a reload without colliding.
+`cogs/optional/setrole.py`, `cogs/optional/danbooru.py`,
+`cogs/optional/auto_response.py` and `cogs/optional/media.py` declare ops
+which appear on load, vanish on unload, and survive a reload without
+colliding.
 Most tests here drive the registry API directly for isolation; the
 `test_real_literallybot_add_cog_*` pair at the bottom exercises the actual
 `LiterallyBot.add_cog`/`remove_cog` overrides bot.py installs, against the
@@ -31,13 +33,18 @@ import pytest
 from core.ops import (ORIGIN_COG, OP_GROUPS, OpResult, OpScope, OpsRegistry,
                       PermissionLevel)
 
+from cogs.optional.auto_response import AutoResponse, find_response
 from cogs.optional.danbooru import Danbooru, apply_rating_policy
+from cogs.optional.media import Media
 from cogs.optional.setrole import SetRole
 
-COG_CLASSES = [SetRole, Danbooru]
+COG_CLASSES = [SetRole, Danbooru, AutoResponse, Media]
 COG_OP_NAMES = {
     SetRole: {"add_emoji_role_toggle", "sync_emoji_role_toggles"},
     Danbooru: {"search_danbooru"},
+    AutoResponse: {"list_autoresponses", "add_autoresponse",
+                   "remove_autoresponse"},
+    Media: {"list_media", "post_media"},
 }
 
 
@@ -642,6 +649,386 @@ def test_op_failure_payload_carries_the_error_not_the_value(reg):
 
 
 # --------------------------------------------------------------------------
+# AutoResponse: the ops and the panel share one service.
+#
+# The panel modal used to hold validation, normalization and the cap check
+# inline; they live in _add_entry now, so these assertions cover BOTH callers.
+# --------------------------------------------------------------------------
+
+def _autoresponse_env():
+    cog = AutoResponse(_FakeBot())
+    return cog, 100  # cog, guild_id
+
+
+def test_add_entry_lowercases_triggers_outside_regex_mode():
+    cog, gid = _autoresponse_env()
+    result = cog._add_entry(gid, ["PING", " Pong "], ["hi"], match="full")
+    assert result["entry"]["triggers"] == ["ping", "pong"]
+    assert cog.bot.config.values[(gid, "auto_responses")] == [result["entry"]]
+
+
+def test_add_entry_preserves_case_for_regex_triggers():
+    r"""Lowercasing a pattern mangles \bT\b and [A-Z] — matching is already
+    case-insensitive at search time, so the stored pattern must be untouched."""
+    cog, gid = _autoresponse_env()
+    result = cog._add_entry(gid, [r"\bThink\b"], ["hm"], match="regex")
+    assert result["entry"]["triggers"] == [r"\bThink\b"]
+
+
+def test_add_entry_rejects_an_invalid_regex_without_storing():
+    """find_response SKIPS a bad pattern rather than raising, so an unvalidated
+    entry would be stored and silently never fire."""
+    cog, gid = _autoresponse_env()
+    with pytest.raises(ValueError, match="Invalid regex"):
+        cog._add_entry(gid, ["[unclosed"], ["hi"], match="regex")
+    assert (gid, "auto_responses") not in cog.bot.config.values
+
+
+def test_add_entry_rejects_an_unknown_match_mode():
+    cog, gid = _autoresponse_env()
+    with pytest.raises(ValueError, match="match must be one of"):
+        cog._add_entry(gid, ["ping"], ["pong"], match="fuzzy")
+
+
+def test_add_entry_requires_a_trigger_and_a_response():
+    cog, gid = _autoresponse_env()
+    with pytest.raises(ValueError, match="at least one trigger"):
+        cog._add_entry(gid, ["  "], ["pong"])
+    with pytest.raises(ValueError, match="at least one trigger"):
+        cog._add_entry(gid, ["ping"], [""])
+
+
+def test_add_entry_enforces_the_25_entry_cap():
+    """The cap is the panel dropdown's hard limit; an agent appending past it
+    would build a table the panel cannot render."""
+    from cogs.optional.auto_response import MAX_ENTRIES
+
+    cog, gid = _autoresponse_env()
+    for i in range(MAX_ENTRIES):
+        cog._add_entry(gid, [f"t{i}"], ["r"])
+    with pytest.raises(ValueError, match="cap"):
+        cog._add_entry(gid, ["one-too-many"], ["r"])
+    assert len(cog.bot.config.values[(gid, "auto_responses")]) == MAX_ENTRIES
+
+
+def test_add_entry_at_an_index_overwrites_rather_than_appends():
+    """The panel's Edit button passes index=; the op never does."""
+    cog, gid = _autoresponse_env()
+    cog._add_entry(gid, ["a"], ["1"])
+    cog._add_entry(gid, ["b"], ["2"])
+    result = cog._add_entry(gid, ["b2"], ["2b"], index=1)
+    assert result["status"] == "updated" and result["index"] == 1
+    stored = cog.bot.config.values[(gid, "auto_responses")]
+    assert [e["triggers"] for e in stored] == [["a"], ["b2"]]
+
+
+def test_remove_entry_returns_what_it_dropped_and_rejects_a_bad_index():
+    cog, gid = _autoresponse_env()
+    cog._add_entry(gid, ["a"], ["1"])
+    cog._add_entry(gid, ["b"], ["2"])
+    result = cog._remove_entry(gid, 0)
+    assert result["status"] == "removed"
+    assert result["entry"]["triggers"] == ["a"]
+    assert result["count"] == 1
+    with pytest.raises(ValueError, match="No entry at index"):
+        cog._remove_entry(gid, 5)
+
+
+def test_entries_written_by_the_service_match_at_runtime():
+    """The whole point of sharing the service: what add_autoresponse stores is
+    what the on_message matcher actually fires on."""
+    cog, gid = _autoresponse_env()
+    cog._add_entry(gid, ["PING"], ["pong"], match="full")
+    cog._add_entry(gid, ["cope"], ["seethe"], match="contains")
+    cog._add_entry(gid, [r"\bthink\b"], ["hmm"], match="regex")
+    entries = cog._entries(gid)
+
+    assert find_response(entries, "ping")[1] == "pong"
+    assert find_response(entries, "PING") [1] == "pong"
+    assert find_response(entries, "well ping there") is None, "full mode is exact"
+    assert find_response(entries, "I cope daily")[1] == "seethe"
+    assert find_response(entries, "think about it")[1] == "hmm"
+    assert find_response(entries, "rethinking it") is None, \
+        r"\bthink\b must not fire inside 'rethinking'"
+
+
+def test_find_response_picks_from_every_response(monkeypatch):
+    """Responses are picked uniformly at random — the [text, weight] shape is
+    tolerated by _response_texts but the weight is deliberately ignored."""
+    cog, gid = _autoresponse_env()
+    cog._add_entry(gid, ["ping"], ["a", "b", "c"])
+    entries = cog._entries(gid)
+    picks = {find_response(entries, "ping")[1] for _ in range(200)}
+    assert picks == {"a", "b", "c"}
+
+
+def test_first_matching_entry_wins_in_config_order():
+    """list_autoresponses reports the index precisely because order is
+    precedence — an agent reordering by removing/re-adding changes behaviour."""
+    cog, gid = _autoresponse_env()
+    cog._add_entry(gid, ["hi"], ["first"], match="contains")
+    cog._add_entry(gid, ["hi"], ["second"], match="contains")
+    assert find_response(cog._entries(gid), "hi there")[1] == "first"
+
+
+def test_list_autoresponses_payload_carries_indexed_entries(reg):
+    """Asserted through result_payload, the envelope the frontends send — an
+    impl-level assertion would pass even with no serializer at all."""
+    cog, gid = _autoresponse_env()
+    cog._add_entry(gid, ["ping"], ["pong"], match="contains", auto_delete=True)
+    reg.register_cog_ops(cog)
+    o = reg.require("list_autoresponses")
+    assert o.permission == PermissionLevel.ADMIN
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.guild = _FakeGuild(gid)
+    payload = o.result_payload(OpResult(ok=True, value=asyncio.run(o.impl(ctx))))
+    assert payload["ok"] is True and payload["count"] == 1
+    entry = payload["entries"][0]
+    assert entry == {"index": 0, "triggers": ["ping"], "responses": ["pong"],
+                     "match": "contains", "auto_delete": True}
+
+
+def test_add_autoresponse_payload_carries_the_stored_entry(reg):
+    cog, gid = _autoresponse_env()
+    reg.register_cog_ops(cog)
+    o = reg.require("add_autoresponse")
+    assert o.permission == PermissionLevel.ADMIN
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.guild = _FakeGuild(gid)
+    value = asyncio.run(o.impl(ctx, ["PING"], ["pong"], "full", False))
+    payload = o.result_payload(OpResult(ok=True, value=value))
+    assert payload["status"] == "added"
+    assert payload["index"] == 0 and payload["count"] == 1
+    assert payload["entry"]["triggers"] == ["ping"]
+    assert payload["entry"]["match"] == "full"
+
+
+def test_remove_autoresponse_payload_reports_the_dropped_entry(reg):
+    cog, gid = _autoresponse_env()
+    cog._add_entry(gid, ["a"], ["1"])
+    cog._add_entry(gid, ["b"], ["2"])
+    reg.register_cog_ops(cog)
+    o = reg.require("remove_autoresponse")
+    assert o.permission == PermissionLevel.ADMIN
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.guild = _FakeGuild(gid)
+    value = asyncio.run(o.impl(ctx, 0))
+    payload = o.result_payload(OpResult(ok=True, value=value))
+    assert payload["status"] == "removed"
+    assert payload["entry"]["triggers"] == ["a"]
+    assert payload["count"] == 1
+    assert [e["triggers"] for e in cog._entries(gid)] == [["b"]]
+
+
+def test_autoresponse_ops_refuse_to_run_outside_a_guild(reg):
+    """Guild-scoped config with no guild would write under a None key."""
+    cog, _ = _autoresponse_env()
+    reg.register_cog_ops(cog)
+
+    class _Ctx:
+        guild = None
+
+    for name, args in (("list_autoresponses", ()),
+                       ("add_autoresponse", (["a"], ["b"])),
+                       ("remove_autoresponse", (0,))):
+        with pytest.raises(ValueError, match="guild"):
+            asyncio.run(reg.require(name).impl(_Ctx(), *args))
+
+
+# --------------------------------------------------------------------------
+# Media: post_media and !<name> resolve a name the same way.
+# --------------------------------------------------------------------------
+
+class _SentMessage:
+    def __init__(self, message_id, file):
+        self.id = message_id
+        self.file = file
+
+
+class _SendingChannel:
+    """A channel that records what was sent, so a service that posts can be
+    told apart from one that merely returns a path."""
+
+    def __init__(self, guild, channel_id=200):
+        self.id = channel_id
+        self.guild = guild
+        self.sent = []
+
+    async def send(self, content=None, *, file=None, **kwargs):
+        self.sent.append(file)
+        return _SentMessage(9007199254740993, file)
+
+
+def _media_env(tmp_path, names=("poggers.mp4", "wow.mp3")):
+    cog = Media(_FakeBot())
+    guild = _FakeGuild(100)
+    guild_dir = tmp_path / "media" / str(guild.id)
+    guild_dir.mkdir(parents=True)
+    for name in names:
+        (guild_dir / name).write_bytes(b"x")
+    cog._guild_dir = staticmethod(lambda g, _root=tmp_path: str(
+        _root / "media" / str(g.id)))
+    channel = _SendingChannel(guild)
+    return cog, guild, channel
+
+
+def test_find_file_matches_by_prefix_like_the_bang_command(tmp_path):
+    cog, guild, _ = _media_env(tmp_path)
+    assert cog._find_file(guild, "pog") == "poggers.mp4"
+    assert cog._find_file(guild, "POGGERS") == "poggers.mp4"
+    assert cog._find_file(guild, "nope") is None
+
+
+def test_find_file_refuses_a_one_character_name(tmp_path):
+    """The 2-char floor is what stops `!p` sweeping the library — the op
+    inherits it by sharing the service."""
+    cog, guild, _ = _media_env(tmp_path)
+    assert cog._find_file(guild, "p") is None
+    assert cog._find_file(guild, "") is None
+
+
+def test_find_file_does_not_strip_so_the_bang_listener_is_unchanged(tmp_path):
+    """`!pog ` was inert before the refactor because the listener lowered but
+    never stripped. Keeping that means the refactor moved logic without
+    changing what a real Discord message does."""
+    cog, guild, _ = _media_env(tmp_path)
+    assert cog._find_file(guild, "pog ") is None
+    assert cog._find_file(guild, " pog") is None
+
+
+def test_post_media_op_strips_its_own_argument(reg, tmp_path):
+    """A stray space in a tool argument is a caller typo, not a message the
+    user chose to send — so the op strips where the listener does not."""
+    cog, guild, channel = _media_env(tmp_path)
+    reg.register_cog_ops(cog)
+    value = asyncio.run(reg.require("post_media").impl(None, channel, "  pog "))
+    assert value["name"] == "poggers.mp4"
+
+
+def test_listener_lets_a_send_failure_reach_the_error_handler(tmp_path):
+    """The listener branches on _find_file rather than catching _post_file's
+    ValueError: an unmatched name is 'not a media command', but a ValueError
+    out of File()/channel.send() is a real failure that must NOT be swallowed."""
+    cog, guild, channel = _media_env(tmp_path)
+
+    async def boom(*args, **kwargs):
+        raise ValueError("attachment too large")
+
+    channel.send = boom
+
+    class _Msg:
+        def __init__(self):
+            self.guild = guild
+            self.channel = channel
+            self.content = "!pog"
+            self.author = type("A", (), {"bot": False})()
+
+    with pytest.raises(ValueError, match="attachment too large"):
+        asyncio.run(cog.on_message(_Msg()))
+
+
+def test_listener_ignores_a_bang_message_that_names_nothing(tmp_path):
+    """Every other command in the bot also starts with `!`, so a non-matching
+    name must be a silent no-op, not an error."""
+    cog, guild, channel = _media_env(tmp_path)
+
+    class _Msg:
+        def __init__(self, content):
+            self.guild = guild
+            self.channel = channel
+            self.content = content
+            self.author = type("A", (), {"bot": False})()
+
+    for content in ("!", "!help", "!x"):
+        asyncio.run(cog.on_message(_Msg(content)))
+    assert channel.sent == []
+
+
+def test_guild_without_a_library_reads_as_empty_not_an_error(tmp_path):
+    cog, _, _ = _media_env(tmp_path)
+    other = _FakeGuild(999)
+    assert cog._guild_files(other) == []
+    assert cog._find_file(other, "pog") is None
+
+
+def test_post_file_sends_the_matched_item(tmp_path):
+    cog, guild, channel = _media_env(tmp_path)
+    result = asyncio.run(cog._post_file(guild, channel, "pog"))
+    assert result["status"] == "posted"
+    assert result["name"] == "poggers.mp4"
+    assert len(channel.sent) == 1, "post_media acts — it must actually send"
+
+
+def test_post_file_raises_when_nothing_matches(tmp_path):
+    """An unmatched name is an error, not a silent no-op: the agent guidance
+    tells the model to list first, and a quiet success would be a lie."""
+    cog, guild, channel = _media_env(tmp_path)
+    with pytest.raises(ValueError, match="No media file matching"):
+        asyncio.run(cog._post_file(guild, channel, "absent"))
+    assert channel.sent == []
+
+
+def test_list_media_payload_carries_names_only(reg, tmp_path):
+    """Names, never host paths: the path-carrying surface is admin-gated in
+    core/ops.py, and this op is EVERYONE."""
+    cog, guild, _ = _media_env(tmp_path)
+    reg.register_cog_ops(cog)
+    o = reg.require("list_media")
+    assert o.permission == PermissionLevel.EVERYONE
+
+    class _Ctx:
+        pass
+
+    ctx = _Ctx()
+    ctx.guild = guild
+    payload = o.result_payload(OpResult(ok=True, value=asyncio.run(o.impl(ctx))))
+    assert payload["ok"] is True
+    assert payload["names"] == ["poggers.mp4", "wow.mp3"]
+    assert payload["count"] == 2
+    assert "/" not in "".join(payload["names"]), "no host paths on the wire"
+
+
+def test_post_media_payload_carries_the_matched_name_and_a_string_id(reg, tmp_path):
+    """The caller may have passed a prefix, so the name that actually matched
+    has to travel. message_id is > 2**53 here on purpose."""
+    cog, guild, channel = _media_env(tmp_path)
+    reg.register_cog_ops(cog)
+    o = reg.require("post_media")
+    assert o.permission == PermissionLevel.EVERYONE
+
+    value = asyncio.run(o.impl(None, channel, "pog"))
+    payload = o.result_payload(OpResult(ok=True, value=value))
+    assert payload["status"] == "posted"
+    assert payload["name"] == "poggers.mp4"
+    assert payload["message_id"] == "9007199254740993", \
+        "ids travel as strings (2**53)"
+
+
+def test_post_media_requires_a_guild_channel(reg, tmp_path):
+    cog, _, _ = _media_env(tmp_path)
+    reg.register_cog_ops(cog)
+
+    class _DMChannel:
+        id = 1
+        guild = None
+
+    with pytest.raises(ValueError, match="guild channel"):
+        asyncio.run(reg.require("post_media").impl(None, _DMChannel(), "pog"))
+
+
+# --------------------------------------------------------------------------
 # The REAL wiring: bot.py's add_cog/remove_cog overrides, not registry calls.
 # --------------------------------------------------------------------------
 
@@ -674,6 +1061,33 @@ def test_real_literallybot_add_cog_registers_and_remove_cog_drops():
         finally:
             await b.remove_cog(cog.qualified_name)
         assert set(shared.names()) == before
+
+    asyncio.run(flow())
+
+
+@pytest.mark.parametrize("cog_class", [AutoResponse, Media],
+                         ids=lambda c: c.__name__)
+def test_real_literallybot_add_cog_wires_the_behavioral_primitives(cog_class):
+    """Issue #85's cogs through the production path, not a registry call —
+    the override pair is the only thing stamping origin='cog', so a cog that
+    loads fine can still contribute zero ops if this wiring breaks."""
+    from core.ops import registry as shared
+
+    async def flow():
+        b = _fresh_literallybot()
+        before = set(shared.names())
+        cog = cog_class(b)
+        await b.add_cog(cog)
+        try:
+            assert COG_OP_NAMES[cog_class] <= set(shared.names())
+            # Guild-scoped, so they join the live agent universe on load.
+            assert COG_OP_NAMES[cog_class] <= set(shared.guild_agent_names())
+            for name in COG_OP_NAMES[cog_class]:
+                assert shared.require(name).owner is cog
+        finally:
+            await b.remove_cog(cog.qualified_name)
+        assert set(shared.names()) == before, \
+            "unload must leave no ops behind"
 
     asyncio.run(flow())
 

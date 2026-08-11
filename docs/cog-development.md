@@ -426,8 +426,12 @@ in-chat agent loop and the panel pick them up immediately.
 - [ ] `!reload <cog>` twice in a row still works (no duplicate-name error)
 
 Live examples: `cogs/optional/setrole.py` (two ops sharing the slash commands'
-services) and `cogs/optional/danbooru.py` (one op sharing the prefix command's
-search service).
+services), `cogs/optional/danbooru.py` (one op sharing the prefix command's
+search service), `cogs/optional/auto_response.py` (three ops sharing the admin
+panel's services — the modal was carrying the validation until they were
+factored out) and `cogs/optional/media.py` (`post_media` ACTS rather than
+returning data, because the `!<name>` surface it mirrors is public while a
+returned host path would be the admin-gated attachment surface in disguise).
 
 ## Advanced Features
 
