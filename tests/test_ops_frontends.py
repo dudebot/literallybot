@@ -36,7 +36,6 @@ from core.ops import (
 from core.agent_loop import agent_ops, resolve_bot_tools
 from cogs.optional.gpt import (
     SELECT_MAX_OPTIONS,
-    AGENT_OPS_DEFAULT_ON,
     AiSettingsView,
     _grouped_tool_sections,
 )
@@ -322,38 +321,6 @@ def test_a_failed_batch_leaves_the_shared_registry_untouched():
 # registry at 58526e2 (the commit before the flag was deleted). Written here
 # as the historical FACT it is, so the assertions below can state how the
 # shipped seed relates to it rather than restating the seed itself.
-HISTORICAL_AGENT_OPS = frozenset({
-    "add_reaction", "delete_message", "edit_message", "list_channels",
-    "list_members", "remove_reaction", "search_history", "send_message",
-})
-
-
-def test_migration_seed_is_a_frozen_historical_snapshot():
-    """AGENT_OPS_DEFAULT_ON migrates pre-panel guilds to an explicit
-    allowlist. It must stay a literal: recomputing it from the live registry
-    would retroactively change what past guilds were migrated to, and every
-    op added later would silently become default-on."""
-    assert isinstance(AGENT_OPS_DEFAULT_ON, tuple)
-    # No duplicates — a repeated name would double-write the migrated list.
-    assert len(set(AGENT_OPS_DEFAULT_ON)) == len(AGENT_OPS_DEFAULT_ON)
-    # The snapshot is historical, but it may not name an op that never
-    # existed — that would migrate guilds to a permanently dead entry.
-    assert set(AGENT_OPS_DEFAULT_ON) <= set(registry.names())
-    assert set(AGENT_OPS_DEFAULT_ON) <= set(agent_ops()), \
-        "every migrated name must be guild-scoped"
-
-
-def test_migration_seed_is_the_historical_set_minus_send_message():
-    """The seed is DELIBERATELY narrower than the old `agent=True` set: it
-    withholds send_message, which can post into arbitrary channels and was
-    never default-on for the in-bot agent (see the comment above the literal
-    in gpt.py). Pinned because the difference is a safety decision — a future
-    edit "restoring the historical set" would silently grant every migrated
-    guild the ability to post anywhere."""
-    assert set(AGENT_OPS_DEFAULT_ON) == HISTORICAL_AGENT_OPS - {"send_message"}
-    assert "send_message" not in AGENT_OPS_DEFAULT_ON
-
-
 # --------------------------------------------------------------------------
 # 4. MCP settings: config first, env fallback, generate as a last resort.
 # --------------------------------------------------------------------------

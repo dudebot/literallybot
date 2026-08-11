@@ -14,19 +14,6 @@ from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
 from core.agent_loop import agent_ops, resolve_bot_tools
 from core.mcp_server import ENABLE_CONFIG_KEY, exposed_ops, resolve_mcp_tools
 
-# HISTORICAL SNAPSHOT — not a live gate. What an old
-# `gpt_agentic_enabled=True` guild is migrated to, frozen as a literal: the
-# 8 ops that carried the former `agent=True` flag, minus send_message (which
-# was never default-on for the in-bot agent because it can post into
-# arbitrary channels). This is a one-shot migration seed that must keep
-# meaning the same thing forever, so it must NOT be recomputed from the live
-# registry — a later op addition would retroactively change what past guilds
-# were migrated to.
-AGENT_OPS_DEFAULT_ON = (
-    "edit_message", "delete_message", "add_reaction", "remove_reaction",
-    "search_history", "list_channels", "list_members",
-)
-
 PANEL_TIMEOUT = 180
 
 # Rate limiting is a nested-window ladder, not a flat per-message cooldown.
@@ -1216,31 +1203,7 @@ class Gpt(commands.Cog):
     # only via the panel's modal (never as a command argument).
 
     async def cog_load(self):
-        self._migrate_agentic_flag()
         self._seed_model_costs()
-
-    def _migrate_agentic_flag(self):
-        """Map the removed per-guild agentic flag onto the tool allowlist.
-
-        Idempotent: guarded on `bot_tools_enabled` already existing, and the
-        old key is removed either way, so a second run is a no-op.
-        """
-        config = self.bot.config
-        _missing = object()
-        migrated = 0
-        for gid in config.guild_ids():
-            flag = config.get(gid, "gpt_agentic_enabled", _missing)
-            if flag is _missing:
-                continue
-            if flag and config.get(gid, "bot_tools_enabled", _missing) is _missing:
-                config.set(gid, "bot_tools_enabled", list(AGENT_OPS_DEFAULT_ON))
-                migrated += 1
-            config.rem(gid, "gpt_agentic_enabled")
-        config.flush()                        # beat the delayed-save timer (no-op when clean)
-        if migrated:
-            self.logger.info(
-                "gpt: migrated %d guild(s) from gpt_agentic_enabled to "
-                "bot_tools_enabled=%s", migrated, list(AGENT_OPS_DEFAULT_ON))
 
     def _seed_model_costs(self):
         """Backfill `cost_per_mtok_output` on existing models from known prices.

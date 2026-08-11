@@ -234,11 +234,13 @@ panel on the next rerender without a restart.
   across group-partitioned selects: a Discord select only reports its own
   options, so without merging, saving one select would clear every other one's
   choices.
-- `AGENT_OPS_DEFAULT_ON` is frozen as a literal list of the 8 former
-  `agent=True` names, commented as a **historical snapshot**. It seeds the
-  one-shot `gpt_agentic_enabled` → allowlist migration and must keep meaning the
-  same thing forever, so it must never be recomputed from the live registry — a
-  later op addition would retroactively change what past guilds were migrated to.
+- `AGENT_OPS_DEFAULT_ON` and the `gpt_agentic_enabled` → allowlist migration
+  are **deleted entirely** (same day, owner decision). The migration was one-shot
+  and had completed: no live config carried `gpt_agentic_enabled` any more, so
+  the seed and the machinery served no remaining purpose. A migration that has
+  finished migrating is dead code, not heritage — if the legacy key ever
+  resurfaces from a restored backup, the guild simply lands in the modern
+  default (empty allowlist ⇒ plain chat) and gets configured via the panel.
 
 ### Exposure vs authorization (the doctrine both frontends encode)
 
