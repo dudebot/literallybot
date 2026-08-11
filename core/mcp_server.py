@@ -130,8 +130,8 @@ def resolve_mcp_tools(config) -> List[str]:
     resolve through it, so what the panel shows is what gets served.
 
     Dropping here is an effective-set filter only: a name stays in stored
-    config even while its op is unregistered (a cog unloaded), so reloading
-    the cog restores the choice instead of silently losing it."""
+    config even while its op is unregistered (its cog disabled), so
+    re-enabling the cog restores the choice instead of silently losing it."""
     universe = exposed_ops()
     if config is None:
         return universe
@@ -186,15 +186,16 @@ def _make_mcp_tool(bot: Any, op: Op):
     async def tool_fn(**raw) -> dict:
         # Fail closed FIRST if the op changed since this surface was built.
         # The MCP surface is restart-bound: this tool's schema was generated
-        # from `op` at server start, but dispatch resolves by name — after a
-        # cog reload re-registers the same name with a different
-        # declaration, serving the old schema against the new op would be a
-        # silent mismatch (scope included).
+        # from `op` at server start, but dispatch resolves by NAME — if
+        # anything re-registered that name with a different declaration,
+        # serving the old schema against the new op would be a silent
+        # mismatch (scope included). Since #86 the cog set is fixed at boot
+        # too, so this guard should never fire; it is deliberately kept as
+        # the structural belt against dynamism being reintroduced.
         if registry.get(op.name) is not op:
             raise BotUnavailableError(
                 f"Op '{op.name}' was re-registered after this MCP surface "
-                "was built (cog reloaded). Restart the bot to rebuild the "
-                "tool surface.")
+                "was built. Restart the bot to rebuild the tool surface.")
         live_bot = _require_bot(bot)
         # Snowflake-as-string on the wire (see _SNOWFLAKE_JSON_TYPE in
         # core/ops.py); coerce before it reaches guild.get_member().
@@ -212,15 +213,17 @@ def _make_mcp_tool(bot: Any, op: Op):
         ctx = _build_context(live_bot, actor_id, guild)
 
         # Re-check identity HERE, not only at entry: resolve_context_guild
-        # above may await a cache-miss fetch, and a cog reload during that
-        # await would let a name-based dispatch reach the replacement op.
-        # No await sits between this check and call_ids' own synchronous
-        # name lookup, so the window is closed.
+        # above may await a cache-miss fetch, and a re-registration during
+        # that await would let a name-based dispatch reach the replacement
+        # op. No await sits between this check and call_ids' own synchronous
+        # name lookup, so the window is closed. Same belt as the entry check
+        # above — inert while the cog set is fixed at boot (#86), kept
+        # because closing the window is what makes name dispatch sound.
         if registry.get(op.name) is not op:
             raise BotUnavailableError(
                 f"Op '{op.name}' was re-registered while this call was "
-                "resolving its context (cog reloaded). Call refused; "
-                "restart the bot to rebuild the tool surface.")
+                "resolving its context. Call refused; restart the bot to "
+                "rebuild the tool surface.")
         # send_message never pings: enforced by the op itself (see
         # core/ops.py send_message — never-ping is the registry default).
         # allowed_guild_ids stays at its None default: this frontend is

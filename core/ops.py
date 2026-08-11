@@ -34,8 +34,10 @@ is never a decorator argument, so a cog cannot claim to be core.
 
 There is deliberately no code-level "agent" subset flag. Frontends query
 the registry LIVE (`guild_agent_names()`, `ops(...)`, `grouped(...)`) rather
-than freezing a module-level tuple at import: cog ops come and go with cog
-load/unload, so any import-time snapshot is stale after the first reload.
+than freezing a module-level tuple at import: cog ops arrive with their cogs
+during startup and leave at shutdown, and WHICH cogs load is a runtime config
+decision (`disabled_cogs`) — so an import-time snapshot is wrong before the
+bot has even finished booting.
 
 This module is frontend-agnostic on purpose: it does not import
 `discord.ext.commands`, and it does not get wired into `bot.py`. Cogs are
@@ -867,8 +869,8 @@ class OpsRegistry:
     #
     # Every one of these reads self._ops at CALL time. Frontends must query
     # them per use and must not freeze the result into a module-level tuple:
-    # cog ops appear and disappear with cog load/unload, so an import-time
-    # snapshot is wrong the moment any cog is reloaded.
+    # cog ops appear as their cogs load during startup, so an import-time
+    # snapshot is wrong before the bot has finished booting.
 
     def ops(self, *, scope: Optional[OpScope] = None,
             origin: Optional[str] = None,
@@ -905,7 +907,7 @@ class OpsRegistry:
         """Live listing partitioned by group, as (group_id, label, ops).
 
         Ordered by OP_GROUPS declaration order so a panel's sections keep a
-        stable order across reloads; empty groups are omitted. Any group id
+        stable order across restarts; empty groups are omitted. Any group id
         not in OP_GROUPS (a cog inventing its own) sorts after the known
         ones and falls back to its raw id as the label."""
         selected = self.ops(scope=scope, origin=origin)

@@ -408,9 +408,10 @@ def test_registration_is_all_or_none_on_duplicate_within_one_cog(reg):
     assert reg.names() == [], "a failed batch must register zero ops"
 
 
-def test_reload_cycle_restores_the_batch(reg):
-    """discord.py's extension reload is atomic: a failed reload restores the
-    old cog, which must re-register its old batch cleanly."""
+def test_register_unregister_register_restores_the_batch(reg):
+    """unregister_owner must free every name it took, so the same owner can
+    register its batch again cleanly. That is what makes cog teardown safe:
+    a name left reserved would fail the next registration of that cog."""
     cog = _FakeCog()
     reg.register_cog_ops(cog)
     reg.unregister_owner(cog)

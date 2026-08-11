@@ -70,13 +70,11 @@ class LiterallyBot(commands.Bot):
         """Register the cog's `@op(...)` methods as it loads.
 
         Mirrors discord.py's own CogMeta/_eject lifecycle: a cog's ops live
-        exactly as long as the cog does. `reload_extension` is atomic — it
-        tears the old cog down (and its ops with it) before adding the new
-        one, and on failure restores the old cog, which re-registers its
-        old batch through this same path. NOTE: the `!reload` command in
-        cogs/core/control.py is unload-then-load, NOT reload_extension, so
-        a failed load there leaves the cog absent — which still fails
-        CLOSED for ops (they were unregistered at unload; nothing leaks).
+        exactly as long as the cog does. In practice that means the whole
+        process lifetime — the cog set is fixed at boot (#86), so this runs
+        during startup and its `remove_cog` twin at shutdown teardown. The
+        pairing is kept general anyway: it is what makes ops fail CLOSED if
+        a cog ever goes away mid-run.
 
         Registration is all-or-none inside the registry. If it raises (a
         duplicate op name, a malformed declaration), the cog is ejected
@@ -99,7 +97,7 @@ class LiterallyBot(commands.Bot):
         The unregistration runs in a `finally` so a cog whose own teardown
         raises still leaves no orphaned ops behind — a registered op whose
         owning cog is gone would fail at call time with a confusing error
-        and would keep its name reserved against the reload.
+        and would keep its name reserved against the next registration.
         """
         cog = self.get_cog(name)
         try:

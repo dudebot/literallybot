@@ -571,8 +571,9 @@ class SetRole(commands.Cog):
 
     @tasks.loop(count=1)
     async def startup_sync(self):
-        """Reconcile every guild once on load. Because cog reload re-runs this,
-        a reload doubles as the apply-my-JSON-edits refresh path."""
+        """Reconcile every guild once on load, i.e. once per boot (the cog set
+        is fixed at boot, #86). To apply hand-edits to the stored JSON without
+        a restart, use `/role sync` — it runs the same reconciliation."""
         for guild in self.bot.guilds:
             if not self._entries(guild.id):
                 continue

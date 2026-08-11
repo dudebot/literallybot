@@ -458,10 +458,16 @@ def test_settings_load_refuses_before_generating_a_token(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# 5. Reload races (Codex review, 2026-08-11): a tool built before a cog
-#    reload must fail CLOSED when its op was re-registered under the same
-#    name, and a panel rendered before a cog load must not delete stored
-#    names on save.
+# 5. Op-identity races (Codex review, 2026-08-11): a tool built from one Op
+#    object must fail CLOSED when that name is later re-registered against a
+#    different Op, and a panel rendered before a cog registers must not
+#    delete stored names on save.
+#
+#    Since #86 the cog set is fixed at boot, so nothing in production
+#    re-registers a name mid-run. These stay as the regression lock on the
+#    fail-closed belt itself: name dispatch is only sound because identity
+#    is re-checked, and that must survive any future reintroduction of
+#    dynamism.
 # --------------------------------------------------------------------------
 
 import asyncio as _asyncio
@@ -499,23 +505,23 @@ class _FakeCtx:
 
 def test_agent_tool_refuses_when_its_op_is_reregistered_mid_run():
     """The tool closure captures the Op (schema, serializer, SCOPE) but
-    dispatches by name. A cog reload that re-registers the name must refuse
-    the stale tool rather than silently retarget it — the replacement could
-    declare a different scope than the one the guild agent's universe was
-    built from."""
+    dispatches by name. Re-registering that name must refuse the stale tool
+    rather than silently retarget it — the replacement could declare a
+    different scope than the one the guild agent's universe was built
+    from."""
     v1, v2 = _RetargetCogV1(), _RetargetCogV2()
     registry.register_cog_ops(v1)
     try:
         tool_fn = None
         captured = registry.require("retarget_probe")
-        # Build the tool from the pre-reload op, as build_agent_tools would.
+        # Build the tool from the original op, as build_agent_tools would.
         from core import agent_loop as _al
         budget = {"used": 0, "cap": 8}
         tool = _make_agent_tool(captured, _FakeCtx(), frozenset({1}),
                                 _logging.getLogger("test"), budget)
         tool_fn = tool.function
 
-        # Simulate !reload: same name, new op object.
+        # Same name, new op object.
         registry.unregister_owner(v1)
         registry.register_cog_ops(v2)
         try:
@@ -585,9 +591,9 @@ def test_select_hands_the_saver_its_render_time_universe():
 
 
 def test_mcp_tool_refuses_a_swap_during_context_resolution(monkeypatch):
-    """The TOCTOU variant: the entry check passes, then a cog reload lands
-    WHILE resolve_context_guild is awaited. The pre-dispatch re-check must
-    catch it — the entry check alone cannot."""
+    """The TOCTOU variant: the entry check passes, then the re-registration
+    lands WHILE resolve_context_guild is awaited. The pre-dispatch re-check
+    must catch it — the entry check alone cannot."""
     v1, v2 = _RetargetCogV1(), _RetargetCogV2()
     registry.register_cog_ops(v1)
     try:
@@ -603,7 +609,7 @@ def test_mcp_tool_refuses_a_swap_during_context_resolution(monkeypatch):
                 return None
 
         async def swap_during_resolution(bot, raw, guild_id):
-            # The reload interleaves exactly here, mid-await.
+            # The re-registration interleaves exactly here, mid-await.
             registry.unregister_owner(v1)
             registry.register_cog_ops(v2)
             return None
