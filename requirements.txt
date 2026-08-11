@@ -1,5 +1,4 @@
 discord.py
-phue
 python-dotenv
 beautifulsoup4
 openai

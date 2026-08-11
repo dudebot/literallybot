@@ -259,12 +259,6 @@ DANBOORU_API_KEY=your_danbooru_key
 DANBOORU_LOGIN=your_danbooru_username
 ```
 
-### Smart Lights (Philips Hue)
-Press the button on your Hue Bridge, then run:
-```
-!sethuebridgeip [IP of your Hue Bridge]
-```
-
 ## 🔌 MCP Ops Server
 
 `core/mcp_server.py` exposes the bot's ops registry (`core/ops.py` —

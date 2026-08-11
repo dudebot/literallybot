@@ -267,8 +267,9 @@ admin/superadmin list.
   cannot even read a panel someone else opened.
 
 Fixed in the 2026-07-05 consistency sweep (see git history for details):
-`!echo` is admin-gated (was open bot-impersonation), `!sethuebridgeip` is
-superadmin-gated (was an ungated global-config write), `!addmedia` and the
+`!echo` is admin-gated (was open bot-impersonation), `!sethuebridgeip` was
+superadmin-gated (was an ungated global-config write; the whole Hue/signal cog
+was later removed, 2026-08-11), `!addmedia` and the
 `!errorlog` group route through the shared `is_admin` gate (each previously
 used a divergent hand-rolled check), and the global-mutating provider commands
 (`setapikey`/`addmodel`/`removemodel`/`addprovider`) were made superadmin-only
