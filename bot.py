@@ -70,11 +70,13 @@ class LiterallyBot(commands.Bot):
         """Register the cog's `@op(...)` methods as it loads.
 
         Mirrors discord.py's own CogMeta/_eject lifecycle: a cog's ops live
-        exactly as long as the cog does, so `!reload` swaps an extension's
-        op batch atomically (discord.py tears the old cog down — and its ops
-        with it — before the new one is added, and restores the old cog if
-        the reload fails, which re-registers its old batch through this same
-        path).
+        exactly as long as the cog does. `reload_extension` is atomic — it
+        tears the old cog down (and its ops with it) before adding the new
+        one, and on failure restores the old cog, which re-registers its
+        old batch through this same path. NOTE: the `!reload` command in
+        cogs/core/control.py is unload-then-load, NOT reload_extension, so
+        a failed load there leaves the cog absent — which still fails
+        CLOSED for ops (they were unregistered at unload; nothing leaks).
 
         Registration is all-or-none inside the registry. If it raises (a
         duplicate op name, a malformed declaration), the cog is ejected

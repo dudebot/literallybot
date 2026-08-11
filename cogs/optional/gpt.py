@@ -1401,9 +1401,14 @@ class _ToolSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         # This select only speaks for its own chunk. Anything enabled in
-        # another chunk/group stays enabled.
+        # another chunk/group stays enabled. The universe passed to the
+        # saver is the one CAPTURED AT RENDER — merging against the live
+        # universe instead would delete a stored name whose cog loaded
+        # between render and save (live says "selectable", but no select
+        # in this stale panel ever spoke for it).
         kept = [n for n in self._current if n in self._elsewhere]
-        await self._on_save(interaction, kept + list(self.values))
+        await self._on_save(interaction, kept + list(self.values),
+                            self._chunk + self._elsewhere)
 
 
 class _ProviderSelect(discord.ui.Select):
@@ -2143,7 +2148,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 merged.append(name)
         return merged
 
-    async def _save_bot_tools(self, interaction: discord.Interaction, selected):
+    async def _save_bot_tools(self, interaction: discord.Interaction, selected,
+                              universe=None):
         # Guild admins configure their OWN guild's agent surface. This is not
         # an escalation path: the universe rendered here is guild-scoped ops
         # only, each of which still enforces its own PermissionLevel against
@@ -2153,17 +2159,24 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 "Requires admin.", ephemeral=True)
             return
         stored = self.bot.config.get(self._cfg_ctx(), "bot_tools_enabled")
-        merged = self._merge_stored(stored, selected, agent_ops())
+        # `universe` is the select's render-time capture (see
+        # _ToolSelect.callback); fall back to live only when no capture
+        # exists. Merging against live would drop names whose cog loaded
+        # after this panel rendered.
+        merged = self._merge_stored(stored, selected,
+                                    agent_ops() if universe is None else universe)
         self.bot.config.set(self._cfg_ctx(), "bot_tools_enabled", merged)
         await self.rerender(interaction)
 
-    async def _save_mcp_tools(self, interaction: discord.Interaction, selected):
+    async def _save_mcp_tools(self, interaction: discord.Interaction, selected,
+                              universe=None):
         if not is_superadmin(interaction):
             await interaction.response.send_message(
                 "Requires superadmin.", ephemeral=True)
             return
         stored = self.bot.config.get_global("mcp_tools_enabled")
-        merged = self._merge_stored(stored, selected, exposed_ops())
+        merged = self._merge_stored(stored, selected,
+                                    exposed_ops() if universe is None else universe)
         self.bot.config.set_global("mcp_tools_enabled", merged)
         self.flash("Saved — MCP changes take effect on next bot restart.")
         await self.rerender(interaction)

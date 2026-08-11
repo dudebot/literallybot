@@ -117,6 +117,21 @@ def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
                 op.name, ctx.author.id, budget["cap"],
             )
             return {"ok": False, "error": BUDGET_EXHAUSTED_ERROR}
+        # Fail closed if the op changed under this run: the tool's schema,
+        # serializer and (crucially) SCOPE were captured from `op` when the
+        # run started, but dispatch resolves by name — a cog reload that
+        # re-registers the same name with a different declaration would
+        # otherwise let a guild-scoped tool silently retarget to (say) a DM
+        # op the guild agent must never reach.
+        if registry.get(op.name) is not op:
+            logger.info(
+                "agent-op %s actor=%s REFUSED (op re-registered mid-run)",
+                op.name, ctx.author.id,
+            )
+            return {"ok": False,
+                    "error": f"Tool '{op.name}' changed while this run was in "
+                             "flight (its cog was reloaded). Call refused; "
+                             "ask again to use the updated tool."}
         # send_message never pings: enforced by the op itself (see
         # core/ops.py send_message — never-ping is the registry default).
         result = await registry.call_ids(op.name, ctx, allowed_guild_ids=allowed,

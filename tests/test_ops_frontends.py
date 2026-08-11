@@ -455,3 +455,130 @@ def test_settings_load_refuses_before_generating_a_token(monkeypatch):
     with pytest.raises(RuntimeError, match="loopback"):
         mcp_server._load_settings(config)
     assert config.writes == []
+
+
+# --------------------------------------------------------------------------
+# 5. Reload races (Codex review, 2026-08-11): a tool built before a cog
+#    reload must fail CLOSED when its op was re-registered under the same
+#    name, and a panel rendered before a cog load must not delete stored
+#    names on save.
+# --------------------------------------------------------------------------
+
+import asyncio as _asyncio
+import logging as _logging
+
+from core.agent_loop import _make_agent_tool
+from core.ops import Op as _Op
+from cogs.optional.gpt import _ToolSelect
+
+
+class _RetargetCogV1:
+    @op("retarget_probe", "First registration.", PermissionLevel.EVERYONE,
+        group="messaging")
+    async def probe(self, ctx):
+        return "v1"
+
+
+class _RetargetCogV2:
+    @op("retarget_probe", "Same name, different op object.",
+        PermissionLevel.EVERYONE, group="messaging")
+    async def probe(self, ctx):
+        return "v2"
+
+
+class _FakeCtx:
+    class _Author:
+        id = 1
+
+    class _Guild:
+        id = 1
+
+    author = _Author()
+    guild = _Guild()
+
+
+def test_agent_tool_refuses_when_its_op_is_reregistered_mid_run():
+    """The tool closure captures the Op (schema, serializer, SCOPE) but
+    dispatches by name. A cog reload that re-registers the name must refuse
+    the stale tool rather than silently retarget it — the replacement could
+    declare a different scope than the one the guild agent's universe was
+    built from."""
+    v1, v2 = _RetargetCogV1(), _RetargetCogV2()
+    registry.register_cog_ops(v1)
+    try:
+        tool_fn = None
+        captured = registry.require("retarget_probe")
+        # Build the tool from the pre-reload op, as build_agent_tools would.
+        from core import agent_loop as _al
+        budget = {"used": 0, "cap": 8}
+        tool = _make_agent_tool(captured, _FakeCtx(), frozenset({1}),
+                                _logging.getLogger("test"), budget)
+        tool_fn = tool.function
+
+        # Simulate !reload: same name, new op object.
+        registry.unregister_owner(v1)
+        registry.register_cog_ops(v2)
+        try:
+            result = _asyncio.run(tool_fn())
+            assert result["ok"] is False
+            assert "changed" in result["error"]
+        finally:
+            registry.unregister_owner(v2)
+    finally:
+        registry.unregister_owner(v1)
+        registry.unregister_owner(v2)
+
+
+def test_mcp_tool_refuses_when_its_op_is_reregistered_after_build():
+    """Same race on the MCP side: the surface is restart-bound, so a stale
+    tool must raise loudly instead of serving the old schema against the new
+    op's implementation."""
+    v1, v2 = _RetargetCogV1(), _RetargetCogV2()
+    registry.register_cog_ops(v1)
+    try:
+        captured = registry.require("retarget_probe")
+        tool_fn = mcp_server._make_mcp_tool(None, captured)
+
+        registry.unregister_owner(v1)
+        registry.register_cog_ops(v2)
+        try:
+            with pytest.raises(mcp_server.BotUnavailableError,
+                               match="re-registered"):
+                _asyncio.run(tool_fn(actor_id="1"))
+        finally:
+            registry.unregister_owner(v2)
+    finally:
+        registry.unregister_owner(v1)
+        registry.unregister_owner(v2)
+
+
+def test_select_hands_the_saver_its_render_time_universe():
+    """The stale-panel save race: a name whose cog loads AFTER the panel
+    rendered is live at save time but was never rendered, so merging against
+    the LIVE universe would delete it from stored config. The select must
+    hand the saver the universe it was BUILT with; _merge_stored then
+    preserves the newly-live name as an offline one."""
+    seen = {}
+
+    async def spy_on_save(interaction, selected, universe):
+        seen["selected"] = selected
+        seen["universe"] = universe
+
+    select = _ToolSelect(["a", "b"], ["b", "c"], spy_on_save,
+                         universe=["a", "b", "c"])
+    select._values = ["a"]  # what the user picked in THIS select
+    _asyncio.run(select.callback(interaction=None))
+
+    assert seen["universe"] == ["a", "b", "c"], \
+        "saver must receive the render-time capture, not query live"
+    # 'c' (enabled in another select of this panel) is carried through.
+    assert set(seen["selected"]) == {"a", "c"}
+
+    # End to end through the merge: ghost_tool's cog loaded after render, so
+    # it is OUTSIDE the captured universe and must survive even though a
+    # live-universe merge would classify it as selectable-but-unselected.
+    stored = ["ghost_tool", "b"]
+    merged = AiSettingsView._merge_stored(stored, seen["selected"],
+                                          seen["universe"])
+    assert "ghost_tool" in merged
+    assert set(merged) == {"ghost_tool", "a", "c"}

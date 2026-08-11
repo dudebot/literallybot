@@ -184,6 +184,17 @@ def _make_mcp_tool(bot: Any, op: Op):
     """
 
     async def tool_fn(**raw) -> dict:
+        # Fail closed FIRST if the op changed since this surface was built.
+        # The MCP surface is restart-bound: this tool's schema was generated
+        # from `op` at server start, but dispatch resolves by name — after a
+        # cog reload re-registers the same name with a different
+        # declaration, serving the old schema against the new op would be a
+        # silent mismatch (scope included).
+        if registry.get(op.name) is not op:
+            raise BotUnavailableError(
+                f"Op '{op.name}' was re-registered after this MCP surface "
+                "was built (cog reloaded). Restart the bot to rebuild the "
+                "tool surface.")
         live_bot = _require_bot(bot)
         # Snowflake-as-string on the wire (see _SNOWFLAKE_JSON_TYPE in
         # core/ops.py); coerce before it reaches guild.get_member().

@@ -3,9 +3,11 @@
 tests/test_ops_registry.py already proves the registry machinery against
 synthetic cogs. This file proves the shipped cogs actually participate: that
 `cogs/optional/setrole.py` and `cogs/optional/danbooru.py` declare ops which
-appear on load, vanish on unload, and survive a reload without colliding —
-driven through the same `LiterallyBot.add_cog`/`remove_cog` overrides bot.py
-installs, not by calling the registry directly.
+appear on load, vanish on unload, and survive a reload without colliding.
+Most tests here drive the registry API directly for isolation; the
+`test_real_literallybot_add_cog_*` pair at the bottom exercises the actual
+`LiterallyBot.add_cog`/`remove_cog` overrides bot.py installs, against the
+shared registry, so the wiring itself is covered too.
 
 It also pins the properties that make these ops safe to hand to an agent:
 the danbooru rating policy lives in the service (so no caller can bypass it),
@@ -637,3 +639,67 @@ def test_op_failure_payload_carries_the_error_not_the_value(reg):
     o = reg.require("add_emoji_role_toggle")
     payload = o.result_payload(OpResult(ok=False, error="unknown message"))
     assert payload == {"ok": False, "error": "unknown message"}
+
+
+# --------------------------------------------------------------------------
+# The REAL wiring: bot.py's add_cog/remove_cog overrides, not registry calls.
+# --------------------------------------------------------------------------
+
+def _fresh_literallybot():
+    """A real LiterallyBot, offline. Importing bot has module-level side
+    effects (a logs/ dir, a Config over ./configs) that are acceptable in the
+    worktree; the instance never logs in."""
+    import discord
+    from bot import LiterallyBot
+    b = LiterallyBot(command_prefix="!", intents=discord.Intents.none())
+    b.config = _FakeConfig()
+    b.logger = logging.getLogger("test")
+    return b
+
+
+def test_real_literallybot_add_cog_registers_and_remove_cog_drops():
+    """The override pair is the ONLY thing stamping origin='cog' in
+    production — if this wiring breaks, every behavioral primitive silently
+    disappears while the cogs keep loading fine."""
+    from core.ops import registry as shared
+
+    async def flow():
+        b = _fresh_literallybot()
+        before = set(shared.names())
+        cog = Danbooru(b)
+        await b.add_cog(cog)
+        try:
+            assert "search_danbooru" in shared.names()
+            assert shared.require("search_danbooru").owner is cog
+        finally:
+            await b.remove_cog(cog.qualified_name)
+        assert set(shared.names()) == before
+
+    asyncio.run(flow())
+
+
+def test_real_literallybot_add_cog_ejects_the_cog_on_a_rejected_batch():
+    """All-or-none reaches through to discord.py: a cog whose batch is
+    rejected (name collision with a core op) must not stay loaded — a loaded
+    cog whose ops silently aren't there is the failure bot.py documents."""
+    from core.ops import registry as shared
+    from core.ops import PermissionLevel as _PL
+    from core.ops import op as _op
+    from discord.ext import commands as _commands
+
+    class _CollidingCog(_commands.Cog):
+        @_op("search_history", "Collides with a core op.", _PL.EVERYONE,
+             group="messaging")
+        async def clash(self, ctx):
+            return None
+
+    async def flow():
+        b = _fresh_literallybot()
+        before = set(shared.names())
+        with pytest.raises(ValueError):
+            await b.add_cog(_CollidingCog())
+        assert b.get_cog("_CollidingCog") is None, \
+            "a rejected batch must eject the cog from discord.py too"
+        assert set(shared.names()) == before
+
+    asyncio.run(flow())
