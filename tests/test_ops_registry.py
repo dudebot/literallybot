@@ -41,6 +41,7 @@ from core.ops import (
     op,
     registry,
 )
+from core.agent_loop import agent_ops
 
 ALL_OPS = sorted(registry.names())
 
@@ -477,3 +478,84 @@ def test_each_group_fits_in_one_select():
         assert len(ops) <= SELECT_MAX_OPTIONS, (
             f"group '{gid}' has {len(ops)} ops, over Discord's "
             f"{SELECT_MAX_OPTIONS}-option select cap — split the group")
+
+
+def _panel_sections(scope=None):
+    return [
+        ("**Core tools**", registry.grouped(scope=scope, origin=ORIGIN_CORE)),
+        ("**Cog tools**", registry.grouped(scope=scope, origin=ORIGIN_COG)),
+    ]
+
+
+def test_grouped_sections_render_whole_universe_once():
+    """Every op in a tab's universe must be selectable exactly once — a
+    missing op cannot be enabled, a duplicated one makes the cross-select
+    merge ambiguous."""
+    from cogs.optional.gpt import _grouped_tool_sections
+
+    for scope in (None, OpScope.GUILD):
+        rendered = [
+            o.value
+            for kind, payload in _grouped_tool_sections(
+                _panel_sections(scope), [], None)
+            if kind == "select"
+            for o in payload.options
+        ]
+        expected = registry.op_names(scope=scope)
+        assert sorted(rendered) == sorted(expected)
+        assert len(rendered) == len(set(rendered))
+
+
+def test_server_tab_universe_is_exactly_guild_scope():
+    """The server tab is the in-guild agent surface: guild-scoped ops only.
+    A DM or GLOBAL op leaking in would let a guild admin enable an op that
+    reaches outside their guild."""
+    from cogs.optional.gpt import _grouped_tool_sections
+
+    rendered = {
+        o.value
+        for kind, payload in _grouped_tool_sections(
+            _panel_sections(OpScope.GUILD), [], None)
+        if kind == "select"
+        for o in payload.options
+    }
+    assert rendered == set(agent_ops())
+    assert not rendered & set(registry.op_names(scope=OpScope.DM))
+    assert not rendered & set(registry.op_names(scope=OpScope.GLOBAL))
+
+
+def test_cross_select_merge_keeps_other_groups_enabled():
+    """Each select speaks only for its own group. Saving one must carry
+    through names enabled in every other group — the allowlist-editor bug
+    that chunking exists to prevent, now across groups."""
+    from cogs.optional.gpt import _grouped_tool_sections
+
+    current = list(agent_ops())
+    selects = [p for k, p in _grouped_tool_sections(
+        _panel_sections(OpScope.GUILD), current, None) if k == "select"]
+    assert len(selects) > 1, "need multiple groups to test the merge"
+
+    target = selects[0]
+    mine = {o.value for o in target.options}
+    # What `callback` carries through when the user clears this select
+    # entirely (values == []): everything enabled outside this group.
+    kept = [n for n in target._current if n in target._elsewhere]
+    assert set(kept) == set(current) - mine, \
+        "clearing one group's select dropped ops owned by other groups"
+
+
+def test_save_preserves_names_whose_op_is_unregistered():
+    """A name stored while its cog was loaded must survive a panel save made
+    while that cog is unloaded — the select cannot render it, so a naive
+    filter would silently and permanently destroy the guild's choice."""
+    from cogs.optional.gpt import AiSettingsView
+
+    merged = AiSettingsView._merge_stored(
+        ["ghost_op", "search_history"], ["list_channels"], agent_ops())
+    assert "ghost_op" in merged
+    assert merged.count("ghost_op") == 1
+    assert set(merged) == {"ghost_op", "list_channels"}
+
+    # An explicit "clear all" still persists as empty (not "unset").
+    assert AiSettingsView._merge_stored(
+        ["search_history"], [], agent_ops()) == []

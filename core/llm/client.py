@@ -489,7 +489,7 @@ class LLMClient:
                     if model_id not in models_dict:
                         # Discovery can't know pricing, so cost_per_mtok_output
                         # is left unset -> the pricy cooldown tier until an
-                        # operator annotates a cost via /ai settings. Safe
+                        # operator annotates a cost via !aisettings. Safe
                         # default: over-throttle an unknown model rather than
                         # under-throttle it.
                         models_dict[model_id] = {}

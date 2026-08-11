@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Any
 
 from core.utils import InvokerOnlyView, app_is_admin, is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
-from core.ops import registry
+from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
 from core.agent_loop import agent_ops, resolve_bot_tools
 from core.mcp_server import ENABLE_CONFIG_KEY, exposed_ops, resolve_mcp_tools
 
@@ -1350,12 +1350,16 @@ SELECT_MAX_OPTIONS = 25
 
 
 def _tool_selects(universe, current, on_save):
-    """Build one _ToolSelect per 25-op chunk of `universe`.
+    """Build one _ToolSelect per 25-op chunk of a FLAT `universe`.
 
     Chunking (rather than truncating) matters because this is an ALLOWLIST
     editor: an op that isn't rendered is one nobody can enable, and — worse —
     a naive save would read only the visible select's values and silently
     drop the enabled ops living in the other chunks.
+
+    `_grouped_tool_sections` is what the panel actually renders; this stays
+    as the flat-universe primitive it builds on (and the chunking tripwire
+    test's entry point).
     """
     universe = list(universe)
     chunks = [universe[i:i + SELECT_MAX_OPTIONS]
@@ -1365,14 +1369,50 @@ def _tool_selects(universe, current, on_save):
             for i, chunk in enumerate(chunks)]
 
 
+def _grouped_tool_sections(sections, current, on_save):
+    """Render an op universe as labelled sections of grouped selects.
+
+    `sections` is [(section_label, [(group_id, group_label, [Op, ...]), ...])]
+    — i.e. registry.grouped() output already partitioned by origin, so the
+    panel can show core primitives and cog-provided ops as visibly separate
+    territory. Yields (kind, payload) pairs: ("heading", markdown) and
+    ("select", _ToolSelect), which the caller wraps in the Components-V2
+    containers it needs.
+
+    The CROSS-SELECT MERGE is the load-bearing part. Every select is handed
+    the full universe as `universe`, so on save it carries through names
+    enabled in any other group/chunk. Names whose op is currently
+    unregistered live outside the universe entirely and are preserved by the
+    saver (see `_save_bot_tools`), not here.
+    """
+    universe = [op.name for _label, groups in sections
+                for _gid, _glabel, ops in groups for op in ops]
+    for section_label, groups in sections:
+        if not groups:
+            continue
+        yield "heading", section_label
+        for _gid, group_label, ops in groups:
+            names = [op.name for op in ops]
+            # A group over the cap is a registry-design bug (there is a test
+            # for it), but chunk rather than silently drop options.
+            chunks = [names[i:i + SELECT_MAX_OPTIONS]
+                      for i in range(0, len(names), SELECT_MAX_OPTIONS)]
+            for i, chunk in enumerate(chunks):
+                label = group_label
+                if len(chunks) > 1:
+                    label = f"{group_label} ({i + 1}/{len(chunks)})"
+                yield "select", _ToolSelect(chunk, current, on_save, universe,
+                                            label=label)
+
+
 class _ToolSelect(discord.ui.Select):
     """A multi-select over one chunk of the op universe, wired to save on
     change. Saves merge across chunks — see `callback`."""
 
     def __init__(self, chunk, current, on_save, universe=None,
-                 page=1, pages=1):
+                 page=1, pages=1, label=None):
         self._on_save = on_save
-        # Ops shown in OTHER chunks, whose enabled state this select must
+        # Ops shown in OTHER selects, whose enabled state this select must
         # carry through untouched rather than clobber.
         self._chunk = list(chunk)
         self._elsewhere = [n for n in (universe or chunk)
@@ -1383,11 +1423,14 @@ class _ToolSelect(discord.ui.Select):
             discord.SelectOption(label=name, value=name, default=(name in current_set))
             for name in self._chunk
         ]
-        placeholder = "Select enabled tools (none = off)"
-        if pages > 1:
+        if label is not None:
+            placeholder = f"{label} — none = off"
+        elif pages > 1:
             placeholder = f"Enabled tools ({page}/{pages}) — none = off"
+        else:
+            placeholder = "Select enabled tools (none = off)"
         super().__init__(
-            placeholder=placeholder,
+            placeholder=placeholder[:150],
             min_values=0,
             max_values=max(1, len(options)),
             options=options,
@@ -1395,7 +1438,7 @@ class _ToolSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         # This select only speaks for its own chunk. Anything enabled in
-        # another chunk stays enabled.
+        # another chunk/group stays enabled.
         kept = [n for n in self._current if n in self._elsewhere]
         await self._on_save(interaction, kept + list(self.values))
 
@@ -1802,6 +1845,24 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             row.add_item(item)
         return row
 
+    def _sections(self, *, scope=None):
+        """Live op universe for a tab, split into the two visible sections:
+        core primitives first, then cog-provided ops. Both come from the
+        registry at RENDER time, so a cog load/unload changes the panel on
+        the next rerender without a restart."""
+        return [
+            ("**Core tools**", registry.grouped(scope=scope, origin=ORIGIN_CORE)),
+            ("**Cog tools**", registry.grouped(scope=scope, origin=ORIGIN_COG)),
+        ]
+
+    def _add_tool_sections(self, sections, current, on_save):
+        """Add the section headings + per-group selects for a tool tab."""
+        for kind, payload in _grouped_tool_sections(sections, current, on_save):
+            if kind == "heading":
+                self.add_item(discord.ui.TextDisplay(payload))
+            else:
+                self.add_item(self._row(payload))
+
     def _tab_button(self, label, page):
         style = (discord.ButtonStyle.primary if self.page == page
                  else discord.ButtonStyle.secondary)
@@ -1830,9 +1891,11 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         if self.page == "server":
             self.add_item(self._row(_ProviderSelect(self)))
             self.add_item(self._row(_ModelSelect(self)))
-            for sel in _tool_selects(agent_ops(), self._bot_tools(),
-                                     self._save_bot_tools):
-                self.add_item(self._row(sel))
+            # The server tab's universe is the LIVE guild-scoped set — the
+            # same ceiling agent_ops() gives the loop, rendered per group.
+            self._add_tool_sections(
+                self._sections(scope=OpScope.GUILD),
+                self._bot_tools(), self._save_bot_tools)
             self.add_item(self._row(self._ai_toggle_button(),
                                     self._personality_button(),
                                     self._nickname_button()))
@@ -1861,14 +1924,12 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                                   opener=lambda: _RemoveProviderModal(self)),
             ))
         elif self.page == "mcp":
-            for sel in _tool_selects(exposed_ops(), self._mcp_tools(),
-                                     self._save_mcp_tools):
-                self.add_item(self._row(sel))
+            # MCP serves the WHOLE live registry (every scope) — an MCP
+            # caller is a host-side operator, not a guild member.
+            self._add_tool_sections(
+                self._sections(), self._mcp_tools(), self._save_mcp_tools)
             self.add_item(self._row(
                 self._preset_button("Clear all", self._save_mcp_tools, []),
-                self._preset_button("Enable read-only set", self._save_mcp_tools,
-                                    [o for o in exposed_ops()
-                                     if o.startswith(("search", "list"))]),
                 self._mcp_server_toggle_button(),
             ))
 
@@ -1951,7 +2012,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             "## AI settings — MCP\n"
             "The functions external agent harnesses can call when this bot "
             "runs as an MCP server (loopback-only, bearer-token auth). The "
-            "dropdown below picks which ops are served.\n"
+            "dropdowns below pick which ops are served, one per op group.\n"
             f"**MCP server:** {'ON' if mcp_on else 'OFF'} — changes take "
             "effect on the next bot restart."
         )
@@ -2093,14 +2154,42 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         btn.callback = cb
         return btn
 
-    # --- saves (superadmin-gated) ----------------------------------------
+    # --- saves ------------------------------------------------------------
+    @staticmethod
+    def _merge_stored(stored, selected, universe):
+        """What to write back for an allowlist edit.
+
+        `selected` speaks only for ops the panel could render — the live
+        universe. Names in STORED config whose op is currently unregistered
+        (a cog is unloaded) are invisible to every select, so they are
+        carried through verbatim: dropping them would silently destroy a
+        guild's choice on the next panel save and never restore it when the
+        cog comes back. The effective set is separately narrowed at read
+        time by resolve_bot_tools / resolve_mcp_tools."""
+        live = set(universe)
+        merged, seen = [], set()
+        # Offline names first so their relative order is stable, then the
+        # live selection. Deduped: a name can reach `selected` twice when a
+        # select's carried-through set overlaps its own values.
+        for name in [n for n in (stored or []) if n not in live] + \
+                    [n for n in selected if n in live]:
+            if name not in seen:
+                seen.add(name)
+                merged.append(name)
+        return merged
+
     async def _save_bot_tools(self, interaction: discord.Interaction, selected):
-        if not is_superadmin(interaction):
+        # Guild admins configure their OWN guild's agent surface. This is not
+        # an escalation path: the universe rendered here is guild-scoped ops
+        # only, each of which still enforces its own PermissionLevel against
+        # the invoking user at call time.
+        if not is_admin(interaction):
             await interaction.response.send_message(
-                "Requires superadmin.", ephemeral=True)
+                "Requires admin.", ephemeral=True)
             return
-        cleaned = [n for n in selected if n in set(agent_ops())]
-        self.bot.config.set(self._cfg_ctx(), "bot_tools_enabled", cleaned)
+        stored = self.bot.config.get(self._cfg_ctx(), "bot_tools_enabled")
+        merged = self._merge_stored(stored, selected, agent_ops())
+        self.bot.config.set(self._cfg_ctx(), "bot_tools_enabled", merged)
         await self.rerender(interaction)
 
     async def _save_mcp_tools(self, interaction: discord.Interaction, selected):
@@ -2108,8 +2197,9 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             await interaction.response.send_message(
                 "Requires superadmin.", ephemeral=True)
             return
-        cleaned = [n for n in selected if n in set(exposed_ops())]
-        self.bot.config.set_global("mcp_tools_enabled", cleaned)
+        stored = self.bot.config.get_global("mcp_tools_enabled")
+        merged = self._merge_stored(stored, selected, exposed_ops())
+        self.bot.config.set_global("mcp_tools_enabled", merged)
         self.flash("Saved — MCP changes take effect on next bot restart.")
         await self.rerender(interaction)
 

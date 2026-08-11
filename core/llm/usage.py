@@ -62,7 +62,7 @@ def _match_prices(provider: str, model: str) -> Optional[tuple]:
 
 def known_output_price(provider: str, model: str) -> Optional[float]:
     """Best-effort $/Mtok OUTPUT price, or None if unknown. The public seam
-    for cost-tier seeding (/ai settings cooldown tiers) — same matching
+    for cost-tier seeding (!aisettings cooldown tiers) — same matching
     rules as estimate_cost, so the seeded tier and the usage estimate can
     never disagree about a model's price. Local providers bill no tokens:
     free by definition, which maps to the cheap tier."""
