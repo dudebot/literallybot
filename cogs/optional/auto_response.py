@@ -22,6 +22,12 @@ order. Capped at 25 entries per guild — the panel dropdown's hard limit.
 Loop safety: ALL bot-authored messages are ignored (message.author.bot),
 not just our own — two bots both running this cog once replied to each
 other's replies forever (the cope->seethe incident, 2026-08-07).
+
+Ops: `list_autoresponses`, `add_autoresponse` and `remove_autoresponse` are
+cog-provided behavioral primitives (see docs/cog-development.md). They call
+the same services (`_list_entries` / `_add_entry` / `_remove_entry`) the
+panel does — the panel holds presentation only, so an agent and an admin
+clicking buttons write the identical `auto_responses` shape.
 """
 from discord.ext import commands
 
@@ -30,6 +36,7 @@ from discord import app_commands
 import random
 import re
 
+from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 from core.utils import InvokerOnlyView, app_is_admin, is_admin
 
 MAX_ENTRIES = 25  # Discord select-menu option cap
@@ -94,6 +101,59 @@ def find_response(entries, content):
     return None
 
 
+def normalize_triggers(triggers, mode):
+    """Trim and (outside regex mode) case-fold trigger strings.
+
+    Regex triggers keep their case: matching is case-insensitive at search
+    time, but lowercasing here would mangle patterns like `\\bT\\b` or
+    `[A-Z]`. Shared by the panel modal and the add_autoresponse op so both
+    write identically-shaped entries."""
+    return [t.strip() if mode == MATCH_REGEX else t.strip().lower()
+            for t in triggers if str(t).strip()]
+
+
+def invalid_patterns(triggers):
+    """['`pat` (reason)', ...] for triggers that aren't compilable regexes.
+
+    Validation, not matching: `find_response` skips a bad pattern at runtime
+    rather than raising, so without this an invalid regex would be stored and
+    silently never fire."""
+    bad = []
+    for pattern in triggers:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            bad.append(f"`{pattern}` ({exc.msg})")
+    return bad
+
+
+def _serialize_entry_list(result: dict) -> dict:
+    """Wire payload for `list_autoresponses`. Without a serializer every
+    frontend would see a bare {"ok": true} (Op.serialize_result), so the
+    entries have to be copied out explicitly. `index` is positional, not an
+    id, and stays an int — it is not a snowflake."""
+    entries = list(result.get("entries") or [])
+    return {"entries": entries, "count": len(entries)}
+
+
+def _serialize_entry_change(result: dict) -> dict:
+    """Wire payload for `add_autoresponse` / `remove_autoresponse`. `status`
+    travels because the agent guidance branches on it, and `count` lets a
+    caller see how close the guild is to the 25-entry cap."""
+    entry = result.get("entry") or {}
+    return {
+        "status": result.get("status"),
+        "index": result.get("index"),
+        "count": result.get("count"),
+        "entry": {
+            "triggers": list(entry.get("triggers", [])),
+            "responses": _response_texts(entry.get("responses")),
+            "match": entry_match_mode(entry) if entry else None,
+            "auto_delete": bool(entry.get("auto_delete", False)),
+        },
+    }
+
+
 class AutoResponse(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -101,6 +161,88 @@ class AutoResponse(commands.Cog):
 
     def _entries(self, guild_id):
         return self.bot.config.get(guild_id, "auto_responses", []) or []
+
+    def _save(self, guild_id, entries):
+        self.bot.config.set(guild_id, "auto_responses", entries)
+        self.logger.info(
+            f"auto_responses updated in guild {guild_id}: {len(entries)} entries")
+
+    # --- services ---------------------------------------------------------
+    #
+    # Headless logic shared by the panel and the cog ops. Plain values in,
+    # plain data out; they never touch an Interaction or send anything —
+    # the caller presents the outcome.
+
+    def _list_entries(self, guild_id):
+        """Every configured entry, in config order (first match wins, so the
+        order IS the precedence the caller needs to see)."""
+        return [
+            {
+                "index": i,
+                "triggers": [str(t) for t in entry.get("triggers", [])],
+                "responses": _response_texts(entry.get("responses")),
+                "match": entry_match_mode(entry),
+                "auto_delete": bool(entry.get("auto_delete", False)),
+            }
+            for i, entry in enumerate(self._entries(guild_id))
+        ]
+
+    def _build_entry(self, triggers, responses, match, auto_delete):
+        """Validate and normalize one entry. Raises ValueError with a
+        caller-presentable message; returns the dict to store."""
+        mode = str(match or MATCH_FULL).lower()
+        if mode not in (MATCH_FULL, MATCH_CONTAINS, MATCH_REGEX):
+            raise ValueError(
+                f"match must be one of {MATCH_FULL}, {MATCH_CONTAINS}, {MATCH_REGEX}.")
+        trigger_list = normalize_triggers(triggers, mode)
+        response_list = [str(r).strip() for r in responses if str(r).strip()]
+        if not trigger_list or not response_list:
+            raise ValueError("Need at least one trigger and one response.")
+        if mode == MATCH_REGEX:
+            bad = invalid_patterns(trigger_list)
+            if bad:
+                raise ValueError("Invalid regex: " + ", ".join(bad))
+        return {
+            "triggers": trigger_list,
+            "responses": response_list,
+            "match": mode,
+            "auto_delete": bool(auto_delete),
+        }
+
+    def _add_entry(self, guild_id, triggers, responses, match=MATCH_FULL,
+                   auto_delete=False, index=None):
+        """Append a new entry, or overwrite the one at `index`.
+
+        Returns {"status": "added"|"updated", "index": int, "entry": {...},
+        "count": int}. Raises ValueError on invalid input or a full table."""
+        entry = self._build_entry(triggers, responses, match, auto_delete)
+        entries = self._entries(guild_id)
+        if index is None:
+            if len(entries) >= MAX_ENTRIES:
+                raise ValueError(
+                    f"Entry cap ({MAX_ENTRIES}) reached — remove one first.")
+            entries.append(entry)
+            status, position = "added", len(entries) - 1
+        else:
+            if not 0 <= index < len(entries):
+                raise ValueError(f"No entry at index {index}.")
+            entries[index] = entry
+            status, position = "updated", index
+        self._save(guild_id, entries)
+        return {"status": status, "index": position, "entry": entry,
+                "count": len(entries)}
+
+    def _remove_entry(self, guild_id, index):
+        """Drop the entry at `index`. Returns
+        {"status": "removed", "index": int, "entry": {...}, "count": int}.
+        Raises ValueError when there is nothing at that index."""
+        entries = self._entries(guild_id)
+        if not 0 <= index < len(entries):
+            raise ValueError(f"No entry at index {index}.")
+        removed = entries.pop(index)
+        self._save(guild_id, entries)
+        return {"status": "removed", "index": index, "entry": removed,
+                "count": len(entries)}
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -155,6 +297,94 @@ class AutoResponse(commands.Cog):
         /autoresponse for a private one (#76)."""
         view = AutoResponseView(self, ctx.author, ctx.guild)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
+
+    # --- ops --------------------------------------------------------------
+    #
+    # Registered against the live cog instance by LiterallyBot.add_cog and
+    # dropped on unload. They call the same services the panel does; neither
+    # takes an Interaction.
+
+    @op(
+        "list_autoresponses",
+        "List this guild's configured auto-responses in config order. The "
+        "index of each entry is what remove_autoresponse takes, and the order "
+        "is the precedence: the FIRST matching entry wins.",
+        PermissionLevel.ADMIN,
+        serialize=_serialize_entry_list,
+        agent_guidance=(
+            "Indexes shift when an entry is removed — list again before a "
+            "second removal rather than reusing a stale index."),
+        scope=OpScope.GUILD,
+        group="auto-response",
+    )
+    async def op_list_autoresponses(self, ctx) -> dict:
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            raise ValueError("list_autoresponses must be called in a guild.")
+        return {"entries": self._list_entries(guild.id)}
+
+    @op(
+        "add_autoresponse",
+        "Add an auto-response to this guild: when a message matches one of "
+        "the triggers, the bot replies with one of the responses picked at "
+        "random. Appends a new entry; it never edits or replaces an existing "
+        "one. Capped at 25 entries per guild.",
+        PermissionLevel.ADMIN,
+        params=[
+            OpParam("triggers", ParamKind.STRING_LIST,
+                    "Trigger strings (case-insensitive except in regex mode)."),
+            OpParam("responses", ParamKind.STRING_LIST,
+                    "Reply texts; one is picked at random per match."),
+            OpParam("match", ParamKind.STRING,
+                    "Match mode: 'full' (whole message equals a trigger), "
+                    "'contains' (trigger appears anywhere), or 'regex' "
+                    "(trigger is a case-insensitive Python pattern, e.g. "
+                    r"'\bthink\b' for whole words).",
+                    required=False, default=MATCH_FULL),
+            OpParam("auto_delete", ParamKind.BOOLEAN,
+                    "Delete the triggering message as well as replying.",
+                    required=False, default=False),
+        ],
+        serialize=_serialize_entry_change,
+        agent_guidance=(
+            "'contains' fires on any message containing the trigger, so a "
+            "short trigger becomes very noisy — prefer 'full', or 'regex' "
+            r"with \bword\b, unless the user asked for substring "
+            "matching. An invalid regex is rejected outright, nothing is "
+            "stored."),
+        scope=OpScope.GUILD,
+        group="auto-response",
+    )
+    async def op_add_autoresponse(self, ctx, triggers, responses,
+                                  match: str = MATCH_FULL,
+                                  auto_delete: bool = False) -> dict:
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            raise ValueError("add_autoresponse must be called in a guild.")
+        return self._add_entry(guild.id, list(triggers), list(responses),
+                               match=match, auto_delete=bool(auto_delete))
+
+    @op(
+        "remove_autoresponse",
+        "Remove one of this guild's auto-responses by its index, as reported "
+        "by list_autoresponses. Removing shifts every later index down by one.",
+        PermissionLevel.ADMIN,
+        params=[
+            OpParam("index", ParamKind.INTEGER,
+                    "Zero-based index from list_autoresponses.", minimum=0),
+        ],
+        serialize=_serialize_entry_change,
+        agent_guidance=(
+            "Call list_autoresponses first and remove by the index you just "
+            "read — indexes are positional, not stable ids."),
+        scope=OpScope.GUILD,
+        group="auto-response",
+    )
+    async def op_remove_autoresponse(self, ctx, index: int) -> dict:
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            raise ValueError("remove_autoresponse must be called in a guild.")
+        return self._remove_entry(guild.id, int(index))
 
 
 class _EntryModal(discord.ui.Modal):
@@ -222,46 +452,23 @@ class _EntryModal(discord.ui.Modal):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
         mode = (self.match.values[0] if self.match.values else self._MATCH_FULL)
-        # Regex triggers keep their case: matching is case-insensitive at search
-        # time, but lowercasing here would mangle patterns like \bT\b or [A-Z].
-        trigger_list = [t.strip() if mode == self._MATCH_REGEX else t.strip().lower()
-                        for t in str(self.triggers.value).split(",") if t.strip()]
-        if mode == self._MATCH_REGEX:
-            bad = []
-            for pattern in trigger_list:
-                try:
-                    re.compile(pattern)
-                except re.error as exc:
-                    bad.append(f"`{pattern}` ({exc.msg})")
-            if bad:
-                self._panel.flash("⚠ Invalid regex — nothing saved: " + ", ".join(bad))
-                await self._panel.rerender(interaction)
-                return
-        response_list = [r.strip()
-                         for r in str(self.responses.value).split(",") if r.strip()]
-        if not trigger_list or not response_list:
-            self._panel.flash("⚠ Need at least one trigger and one response — nothing saved.")
+        auto_delete = (self.action.values[0] if self.action.values
+                       else self._ACT_REPLY) == self._ACT_DELETE
+        # Validation, normalization and the cap check all live in the service
+        # the ops call, so the panel and an agent cannot drift apart on what
+        # a valid entry is.
+        try:
+            result = self._panel.cog._add_entry(
+                self._panel.guild.id,
+                str(self.triggers.value).split(","),
+                str(self.responses.value).split(","),
+                match=mode, auto_delete=auto_delete, index=self._index)
+        except ValueError as e:
+            self._panel.flash(f"⚠ {e} — nothing saved.")
             await self._panel.rerender(interaction)
             return
-        entry = {
-            "triggers": trigger_list,
-            "responses": response_list,
-            "match": mode,
-            "auto_delete": (self.action.values[0] if self.action.values
-                            else self._ACT_REPLY) == self._ACT_DELETE,
-        }
-        entries = self._panel.entries()
-        if self._index is None:
-            if len(entries) >= MAX_ENTRIES:
-                self._panel.flash(f"⚠ Entry cap ({MAX_ENTRIES}) reached — remove one first.")
-                await self._panel.rerender(interaction)
-                return
-            entries.append(entry)
-            self._panel.flash(f"Added: {', '.join(trigger_list)}")
-        else:
-            entries[self._index] = entry
-            self._panel.flash(f"Saved: {', '.join(trigger_list)}")
-        self._panel.save(entries)
+        verb = "Added" if result["status"] == "added" else "Saved"
+        self._panel.flash(f"{verb}: {', '.join(result['entry']['triggers'])}")
         await self._panel.rerender(interaction)
 
 
@@ -307,11 +514,6 @@ class AutoResponseView(InvokerOnlyView, discord.ui.View):
     def entries(self):
         return self.cog._entries(self.guild.id)
 
-    def save(self, entries):
-        self.cog.bot.config.set(self.guild.id, "auto_responses", entries)
-        self.cog.logger.info(
-            f"auto_responses updated in guild {self.guild.id}: {len(entries)} entries")
-
     def flash(self, text):
         self._flash = text
 
@@ -349,14 +551,16 @@ class AutoResponseView(InvokerOnlyView, discord.ui.View):
             if not is_admin(interaction):
                 await interaction.response.send_message("Admins only.", ephemeral=True)
                 return
-            entries = self.entries()
-            if self.selected is None or self.selected >= len(entries):
+            if self.selected is None or self.selected >= len(self.entries()):
                 await interaction.response.send_message("Select an entry first.", ephemeral=True)
                 return
-            removed = entries.pop(self.selected)
-            self.save(entries)
+            try:
+                result = self.cog._remove_entry(self.guild.id, self.selected)
+            except ValueError as e:
+                await interaction.response.send_message(str(e), ephemeral=True)
+                return
             self.selected = None
-            self.flash(f"Removed: {', '.join(removed.get('triggers', []))}")
+            self.flash(f"Removed: {', '.join(result['entry'].get('triggers', []))}")
             await self.rerender(interaction)
 
         add_btn.callback = add_cb

@@ -1,3 +1,16 @@
+"""Per-guild media library.
+
+Ops: `list_media` and `post_media` are cog-provided behavioral primitives
+(see docs/cog-development.md). Both call the same services the `!<name>`
+listener does (`_guild_files` / `_find_file` / `_post_file`), so an agent
+posting a library item and a user typing `!poggers` resolve the name by the
+identical prefix rule.
+
+`post_media` deliberately SENDS rather than returning a host path: the
+library is public (any member can post any item with `!<name>`), whereas
+handing back a filesystem path would be the admin-gated attachment surface
+in disguise (`_require_admin_for_attachments` in core/ops.py).
+"""
 import os
 import glob
 import subprocess
@@ -7,7 +20,23 @@ from discord import File, app_commands
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
+from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 from core.utils import InvokerOnlyView, app_is_admin, is_admin
+
+
+def _serialize_media_list(result: dict) -> dict:
+    """Wire payload for `list_media`. Names only — the host paths behind them
+    are deliberately not exposed (see the module docstring)."""
+    names = list(result.get("names") or [])
+    return {"names": names, "count": len(names)}
+
+
+def _serialize_posted_media(result: dict) -> dict:
+    """Wire payload for `post_media`. `name` is what actually matched (the
+    caller may have passed a prefix), and message_id travels as a string for
+    the 2**53 reason ids do (see core/ops.py)."""
+    return {"status": result["status"], "name": result["name"],
+            "message_id": str(result["message_id"])}
 
 
 def _format_size(num_bytes):
@@ -50,9 +79,45 @@ class Media(commands.Cog):
         if ctx.guild is None or not ctx.message.content.startswith('!'):
             return False
         file_name = ctx.message.content[1:].split()[0].lower()
-        if len(file_name) < 2:
-            return False
-        return any(f.startswith(file_name) for f in self._guild_files(ctx.guild))
+        return self._find_file(ctx.guild, file_name) is not None
+
+    # --- services ---------------------------------------------------------
+    #
+    # Headless logic shared by the `!<name>` listener and the cog ops. Plain
+    # objects in, plain data out; the ops never touch an Interaction.
+
+    def _find_file(self, guild, name):
+        """Filename in this guild's library matching `name` by prefix, or
+        None. The 2-character floor is what stops `!a` sweeping the library
+        (and it also keeps `!` itself inert).
+
+        Deliberately does NOT strip: the `!<name>` listener never did, so
+        `!pog ` with a trailing space is inert and stays inert. The op strips
+        its own argument before calling in, where a stray space is a caller
+        typo rather than a message the user chose to send."""
+        name = str(name).lower()
+        if len(name) < 2:
+            return None
+        for file in self._guild_files(guild):
+            if file.startswith(name):
+                return file
+        return None
+
+    async def _post_file(self, guild, channel, name):
+        """Send the library item matching `name` into `channel`.
+
+        Returns {"status": "posted", "name": <matched filename>,
+        "message_id": int}. Raises ValueError when nothing matches — the
+        library is per guild, so a name from another guild is simply absent.
+        """
+        file = self._find_file(guild, name)
+        if file is None:
+            raise ValueError(
+                f"No media file matching '{name}' in this server's library.")
+        sent = await channel.send(
+            file=File(os.path.join(self._guild_dir(guild), file)))
+        return {"status": "posted", "name": file,
+                "message_id": getattr(sent, "id", 0)}
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -62,14 +127,15 @@ class Media(commands.Cog):
             return
 
         if message.content.startswith('!'):
-            file_name = message.content[1:].lower()
-            if len(file_name) < 2:
+            # Branch on _find_file rather than catching _post_file's ValueError:
+            # a `!` message that names nothing is simply not a media command
+            # (every other command in the bot starts the same way), while a
+            # ValueError raised by File()/channel.send() is a real failure that
+            # must keep reaching the error handler.
+            if self._find_file(message.guild, message.content[1:]) is None:
                 return
-            for file in self._guild_files(message.guild):
-                if file.startswith(file_name):
-                    await message.channel.send(
-                        file=File(os.path.join(self._guild_dir(message.guild), file)))
-                    return
+            await self._post_file(message.guild, message.channel,
+                                  message.content[1:])
 
     def _cleanup_media_files(self, media_dir, file_name):
         """Remove any media files matching the given base name, including temp files."""
@@ -229,6 +295,58 @@ class Media(commands.Cog):
         private one (#76)."""
         view = MediaView(self, ctx.author, ctx.guild)
         view.message = await ctx.send(embed=view.render_embed(), view=view)
+
+    # --- ops --------------------------------------------------------------
+    #
+    # Registered against the live cog instance by LiterallyBot.add_cog and
+    # dropped on unload. EVERYONE, matching `!<name>`: the library is a
+    # public surface, and adding/deleting items stays behind the admin panel.
+
+    @op(
+        "list_media",
+        "List the names of the media files in this guild's library. Any of "
+        "them can be posted with post_media (or by a user typing !<name>). "
+        "Returns names only, not file paths, and does not post anything.",
+        PermissionLevel.EVERYONE,
+        serialize=_serialize_media_list,
+        agent_guidance=(
+            "The library is per guild — a name from another server is not "
+            "here. Adding or deleting library files is not available as a "
+            "tool; that is the admin `!media` panel."),
+        scope=OpScope.GUILD,
+        group="media",
+    )
+    async def op_list_media(self, ctx) -> dict:
+        guild = getattr(ctx, "guild", None)
+        if guild is None:
+            raise ValueError("list_media must be called in a guild.")
+        return {"names": sorted(self._guild_files(guild), key=str.lower)}
+
+    @op(
+        "post_media",
+        "Post a file from this guild's media library into a channel. The name "
+        "matches by prefix, the same way !<name> does, and must be at least 2 "
+        "characters. This SENDS the file — do not also send_message with it.",
+        PermissionLevel.EVERYONE,
+        params=[
+            OpParam("channel", ParamKind.CHANNEL, "Channel to post the file in."),
+            OpParam("name", ParamKind.STRING,
+                    "Library item name, or a prefix of it (as with !<name>)."),
+        ],
+        serialize=_serialize_posted_media,
+        agent_guidance=(
+            "This posts the file itself; the returned name is the item that "
+            "actually matched, which may be longer than the prefix you asked "
+            "for. Call list_media first if unsure what exists — a name that "
+            "matches nothing is an error, not an empty post."),
+        scope=OpScope.GUILD,
+        group="media",
+    )
+    async def op_post_media(self, ctx, channel, name: str) -> dict:
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            raise ValueError("post_media requires a guild channel.")
+        return await self._post_file(guild, channel, str(name).strip())
 
 
 class _AddMediaModal(discord.ui.Modal, title="Add media file"):

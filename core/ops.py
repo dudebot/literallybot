@@ -124,6 +124,8 @@ OP_GROUPS: Dict[str, str] = {
     # the owning cog happens to be loaded.
     "role-automation": "Role automation",
     "integrations": "Integrations",
+    "auto-response": "Auto-responses",   # auto_response.py
+    "media": "Media library",            # media.py
 }
 
 # Where an op came from. Assigned by the REGISTRATION PATH, never accepted
