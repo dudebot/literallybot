@@ -2,10 +2,34 @@ import os, json
 import time
 from threading import Timer, Lock
 
+# Config files hold plaintext secrets (the Discord token since #83, provider
+# API keys, the MCP bearer token), so the store is owner-only on disk: the
+# directory 0700, every file 0600. Best-effort — on Windows os.chmod only
+# moves the read-only bit and the calls are harmless no-ops there.
+DIR_MODE = 0o700
+FILE_MODE = 0o600
+
+
+def _harden(path, mode):
+    """chmod that never breaks a working bot over a permissions nicety.
+
+    A config store on a filesystem that can't represent POSIX modes (a Windows
+    share, some container volume mounts) is a downgrade in hardening, not a
+    reason to refuse to start.
+    """
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
+
+
 class Config:
     def __init__(self, config_dir='configs'):
         self.config_dir = config_dir
-        os.makedirs(self.config_dir, exist_ok=True)
+        os.makedirs(self.config_dir, mode=DIR_MODE, exist_ok=True)
+        # makedirs' mode is ignored when the directory already exists (and is
+        # masked by umask when it doesn't), so set it explicitly either way.
+        _harden(self.config_dir, DIR_MODE)
         self._configs = {}  # maps config_id (str) to config dict
         self._dirty_configs = set()  # Track what needs saving
         self._file_mtimes = {}  # Track file modification times
@@ -66,10 +90,22 @@ class Config:
         
         self._writing = True  # Set flag to prevent reload during write
         try:
-            # Atomic write
-            with open(temp_path, 'w') as f:
+            # Atomic write, tmp+rename. These files carry plaintext secrets,
+            # so the temp file is opened 0600 up front.
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
+            with os.fdopen(fd, 'w') as f:
+                # Tighten BEFORE writing any content. O_CREAT's mode is masked
+                # by umask, and is ignored outright when the temp file already
+                # exists (a leftover from a previous crash keeps its old, maybe
+                # world-readable, mode) — so a chmod after json.dump would
+                # leave the secret briefly readable. fchmod targets the open
+                # descriptor, so it can't be redirected by a swapped path.
+                try:
+                    os.fchmod(f.fileno(), FILE_MODE)
+                except (OSError, AttributeError):
+                    pass  # best-effort: Windows has no fchmod
                 json.dump(self._configs.get(config_id, {}), f, indent=4)
-            
+
             # Cross-platform atomic rename
             if os.name == 'nt':  # Windows
                 # On Windows, need to remove target first
@@ -78,7 +114,8 @@ class Config:
                 os.rename(temp_path, path)
             else:  # Unix/Linux - supports atomic replace
                 os.rename(temp_path, path)
-            
+            _harden(path, FILE_MODE)
+
             # Update modification time after successful write
             self._file_mtimes[config_id] = os.path.getmtime(path)
                 

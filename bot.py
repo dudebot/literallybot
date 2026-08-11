@@ -11,7 +11,9 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 import os
+import sys
 from core.config import Config
+from core import bootstrap
 from core.dm_log import log_dm, row_from_message
 from core.ops import registry as ops_registry
 from core.error_handler import (
@@ -63,7 +65,23 @@ class LiterallyBot(commands.Bot):
         perform via bot.add_view / bot.add_dynamic_items) must be in place
         before any component interaction can arrive — on_ready is too late
         and fires again on every reconnect.
+
+        It is also the token-verification boundary (#83): discord.py reaches
+        setup_hook only after the REST login succeeded, so a token typed at the
+        first-run prompt is written to disk here and nowhere earlier. An env-
+        supplied token is never a candidate (core.bootstrap.run_bot leaves
+        `_pending_token` None for it), and the attribute is cleared after the
+        write so a reconnect can't re-persist.
         """
+        pending = getattr(self, "_pending_token", None)
+        if pending:
+            self._pending_token = None
+            try:
+                bootstrap.persist_token(self.config, pending)
+            except Exception:
+                logger.error("Login succeeded but saving the token failed; "
+                             "the bot is running, you will be prompted again "
+                             "next start.", exc_info=True)
         await load_cogs()
 
     async def add_cog(self, cog, **kwargs):
@@ -152,6 +170,19 @@ async def on_ready():
     arrives; status rotation lives in cogs/optional/status.py."""
 
     logger.info(f'{bot.user.name} is online and ready!')
+
+    # First-run superadmin (#83): on a fresh install the `superadmins` list is
+    # empty, and the application owner is granted it automatically instead of
+    # having to discover the `!claimsuper` incantation. Gated on the empty
+    # list ONLY, so an existing deployment is never touched. Guarded by the
+    # same once-per-process flag family as the tree sync — on_ready refires.
+    if not getattr(bot, "_superadmin_bootstrapped", False):
+        bot._superadmin_bootstrapped = True
+        try:
+            await bootstrap.bootstrap_superadmin(bot)
+        except Exception:
+            logger.error("Superadmin bootstrap failed; use !claimsuper.",
+                         exc_info=True)
 
     # on_ready refires on reconnect — only sync the command tree once per
     # process (Control's !sync command handles manual re-syncs).
@@ -273,14 +304,25 @@ async def on_error(event, *args, **kwargs):
     await handle_event_error(bot, event, *args, **kwargs)
 
 if __name__ == "__main__":
-    #Grab token from the token.txt file
+    # .env is DEPRECATED (#83) but still loaded when present, so existing
+    # deployments keep working untouched: load_dotenv only populates env vars
+    # that aren't already set, which leaves a real DISCORD_TOKEN env var (the
+    # panel/Docker/systemd contract) winning over a stale file.
     load_dotenv()
-    TOKEN = os.getenv('DISCORD_TOKEN')
 
     try:
-        bot.run(TOKEN)
+        # Resolves env -> config -> interactive prompt -> exit-with-instructions,
+        # and runs the bot. See core/bootstrap.py for the full chain.
+        bootstrap.run_bot(bot)
+    except SystemExit:
+        raise
     except Exception:
         logger.critical('Bot terminated unexpectedly', exc_info=True)
+        # Exit NONZERO. A crashed bot that reports success is the exact
+        # confusion #83 exists to remove: a panel host shows a green "stopped
+        # normally", and `./start.sh && echo ok` prints ok. (Previously this
+        # fell through to a 0 exit.)
+        sys.exit(1)
     finally:
         # Properly shutdown config system
         bot.config.shutdown()
