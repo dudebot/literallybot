@@ -565,7 +565,17 @@ class Gpt(commands.Cog):
         # command and the mention/reply path in on_message) share one gate.
         remaining = self._check_cooldown(ctx)
         if remaining is not None:
-            await ctx.send(f"You are on cooldown. Try again in {remaining:.1f}s")
+            # Self-deleting, and it outlives the cooldown by a couple of
+            # seconds so it is gone by the time retrying would work. A
+            # permanent "you are on cooldown" is worse than the rate limit it
+            # explains: it litters the channel with scolding that stays
+            # readable long after it stopped being true, and the person it is
+            # aimed at already knows they were told no.
+            await ctx.send(
+                f"Give me {remaining:.0f}s.",
+                delete_after=remaining + 2,
+                mention_author=False,
+            )
             return
 
         async with ctx.typing():
