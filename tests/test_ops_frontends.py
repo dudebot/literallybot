@@ -152,11 +152,19 @@ def test_registry_has_a_plausible_floor_of_ops():
 # 2. Scope doctrine at the frontend boundary.
 # --------------------------------------------------------------------------
 
+def _all_on():
+    """A whitelist enabling every registered op — the ceiling wide open, so
+    tests that predate the two-tier model still exercise the guild-scope
+    universe rule (the whitelist ceiling has its own dedicated tests)."""
+    return {n: True for n in registry.names()}
+
+
 def test_guild_agent_universe_is_exactly_guild_scope_including_cog_ops(
         crowded_registry):
     """The live-query doctrine: guild-scoped ops registered by a COG join the
-    agent universe automatically, with no code-level subset to update."""
-    universe = set(agent_ops())
+    agent universe automatically, with no code-level subset to update. With
+    the whitelist fully open, the universe is exactly the guild-scoped set."""
+    universe = set(agent_ops(_all_on(), None))
     assert universe == set(registry.op_names(scope=OpScope.GUILD))
     assert {n for n in universe if n.startswith("crowd_op_")}, \
         "cog-registered guild ops must join the agent universe live"
@@ -169,7 +177,7 @@ def test_non_guild_scopes_never_reach_the_guild_agent_surface(scope):
     DM or global op is covered the day it is written."""
     off_limits = set(registry.op_names(scope=scope))
     assert off_limits, f"no {scope.value}-scoped ops — is the assignment gone?"
-    assert not off_limits & set(agent_ops())
+    assert not off_limits & set(agent_ops(_all_on(), None))
 
     server_tab = {o.value for sel in _rendered_selects(OpScope.GUILD)
                   for o in sel.options}
@@ -182,7 +190,7 @@ def test_mcp_tab_universe_is_the_whole_registry():
     so unlike the server tab it spans every scope."""
     rendered = {o.value for sel in _rendered_selects(None) for o in sel.options}
     assert rendered == set(registry.names())
-    assert rendered > set(agent_ops()), \
+    assert rendered > set(agent_ops(_all_on(), None)), \
         "the MCP tab must be strictly wider than the guild agent universe"
 
 
@@ -228,27 +236,28 @@ class _FakeGlobalConfig:
 
 
 def test_unregistered_name_drops_from_effective_set_but_not_from_config():
-    """The whole point of resolving through the live registry: a guild that
-    enabled a cog's op keeps that choice in config while the cog is unloaded,
-    and simply doesn't get the tool until it comes back."""
-    stored = ["search_history", "ghost_tool"]
+    """The live-registry doctrine, in the two-tier model: a whitelist that
+    enables a cog's op keeps that choice while the cog is unloaded, and the
+    op simply isn't offered to the agent until it comes back. The whitelist
+    dict is never mutated by resolution."""
+    whitelist = {"search_history": True, "ghost_tool": True}
 
     # Cog unloaded: ghost_tool is not live, so it is not offered to the agent.
-    assert resolve_bot_tools(stored) == ["search_history"]
-    assert stored == ["search_history", "ghost_tool"], \
-        "resolution must not mutate the stored list"
+    assert resolve_bot_tools(whitelist, None) == ["search_history"]
+    assert whitelist == {"search_history": True, "ghost_tool": True}, \
+        "resolution must not mutate the whitelist"
 
-    # Cog loaded: the stored choice takes effect with no config write.
+    # Cog loaded: the whitelisted choice takes effect with no config write.
     cog = _GhostCog()
     registry.register_cog_ops(cog)
     try:
-        assert resolve_bot_tools(stored) == ["search_history", "ghost_tool"]
+        assert set(resolve_bot_tools(whitelist, None)) == {"search_history", "ghost_tool"}
     finally:
         registry.unregister_owner(cog)
 
-    # Unloaded again: back to the effective subset, config still intact.
-    assert resolve_bot_tools(stored) == ["search_history"]
-    assert stored == ["search_history", "ghost_tool"]
+    # Unloaded again: back to the effective subset, whitelist still intact.
+    assert resolve_bot_tools(whitelist, None) == ["search_history"]
+    assert whitelist == {"search_history": True, "ghost_tool": True}
 
 
 def test_mcp_effective_set_follows_the_same_rule():
@@ -268,19 +277,25 @@ def test_mcp_effective_set_follows_the_same_rule():
 
 
 def test_a_panel_save_while_the_cog_is_unloaded_preserves_the_ghost():
-    """The destructive case: an admin opens the panel while a cog is down and
-    toggles something unrelated. The unrenderable name must survive, or the
-    guild's choice is silently and permanently destroyed."""
+    """The destructive case, now on the super-admin whitelist: a super-admin
+    opens the Agent Ops tab while a cog is down and toggles something
+    unrelated. The unrenderable whitelisted name must survive the save, or the
+    ceiling is silently and permanently destroyed. (This property moved off
+    the per-guild bot_tools_enabled list — which no longer exists — onto
+    agent_ops_whitelist; the whitelist universe is the whole registry.)"""
     stored = ["ghost_tool", "search_history"]
-    merged = AiSettingsView._merge_stored(stored, ["list_channels"], agent_ops())
+    merged = AiSettingsView._merge_stored(
+        stored, ["list_channels"], registry.names())
     assert "ghost_tool" in merged
     assert set(merged) == {"ghost_tool", "list_channels"}
 
-    # And once the cog returns, the preserved name resolves live again.
+    # And once the cog returns, the preserved whitelisted name resolves live
+    # again for the agent (resolve_bot_tools takes the {name: True} whitelist).
+    whitelist = {n: True for n in merged}
     cog = _GhostCog()
     registry.register_cog_ops(cog)
     try:
-        assert "ghost_tool" in resolve_bot_tools(merged)
+        assert "ghost_tool" in resolve_bot_tools(whitelist, None)
     finally:
         registry.unregister_owner(cog)
 
@@ -315,6 +330,289 @@ def test_a_failed_batch_leaves_the_shared_registry_untouched():
     assert set(registry.names()) == before
     assert registry.get("good_tool") is None, \
         "a rejected batch must not leave its earlier ops behind"
+
+
+# --------------------------------------------------------------------------
+# 3b. The two-tier agent permission panel: the Server tab's per-op gate and
+#     the super-admin Agent Ops whitelist tab. These exercise the save PATHS
+#     end to end against a recording config, so the panel and the resolver
+#     agree on what config the model reads.
+# --------------------------------------------------------------------------
+
+class _TwoTierConfig:
+    """Records guild-scoped and global config writes so the panel's save
+    paths can be asserted. Guild scope is keyed by the bare guild id the
+    panel passes as ctx (see AiSettingsView._cfg_ctx)."""
+
+    def __init__(self, guild_values=None, global_values=None):
+        self.guild = dict(guild_values or {})
+        self.globals = dict(global_values or {})
+        self.guild_writes = []
+        self.global_writes = []
+
+    def get(self, ctx, key, default=None, scope="guild"):
+        if scope == "global":
+            return self.globals.get(key, default)
+        return self.guild.get(key, default)
+
+    def set(self, ctx, key, value, scope="guild"):
+        self.guild[key] = value
+        self.guild_writes.append((key, value))
+
+    def get_global(self, key, default=None):
+        return self.globals.get(key, default)
+
+    def set_global(self, key, value):
+        self.globals[key] = value
+        self.global_writes.append((key, value))
+
+
+def _panel(config, *, is_super):
+    """A bare AiSettingsView with just the fields its save paths touch.
+
+    `is_super` is a LIVE property (reads is_superadmin from config), so we drive
+    it by seeding the invoker into the global superadmins list rather than by
+    assigning the attribute — the same path production uses, which also keeps
+    the "demoted superadmin loses the tab live" behavior under test."""
+    view = AiSettingsView.__new__(AiSettingsView)
+
+    class _Bot:
+        pass
+    bot = _Bot()
+    bot.config = config
+    view.bot = bot
+    view.invoker_id = 77
+    view.guild = type("G", (), {"id": 4242})()
+    if is_super:
+        config.set_global("superadmins", [77])
+    view._flash = None
+    view.flash = lambda text: setattr(view, "_flash", text)
+
+    async def fake_rerender(interaction):
+        pass
+    view.rerender = fake_rerender
+    return view
+
+
+class _OkInteraction:
+    """Interaction whose response.send_message fails the test if the panel
+    tries to reject the actor — used when the gate is expected to PASS."""
+
+    class response:
+        @staticmethod
+        async def send_message(*a, **kw):
+            raise AssertionError("permission gate rejected an allowed actor")
+
+
+class _DenyRecordingInteraction:
+    """Records the ephemeral rejection a gate sends when it refuses."""
+
+    def __init__(self):
+        self.denied = []
+        outer = self
+
+        class _Resp:
+            @staticmethod
+            async def send_message(msg, *a, **kw):
+                outer.denied.append(msg)
+        self.response = _Resp()
+
+
+def _patch_gates(monkeypatch, *, admin, superadmin):
+    import cogs.optional.gpt as gpt_mod
+    monkeypatch.setattr(gpt_mod, "is_admin", lambda *a, **k: admin)
+    # is_superadmin is called both as (ctx) and (config, user_id) in the cog —
+    # accept any args so both the panel's live is_super property and the gate
+    # helpers resolve to the intended value.
+    monkeypatch.setattr(gpt_mod, "is_superadmin", lambda *a, **k: superadmin)
+
+
+def test_server_gate_roundtrips_through_guild_config(monkeypatch):
+    """Setting a whitelisted op's gate to off/admin/everyone on the Server tab
+    writes agent_ops_gate for THIS guild, and each value survives the round
+    trip back through the gate resolver the agent loop uses."""
+    from core.agent_gate import GATE_KEY, guild_gate
+
+    # search_history is a real registered guild-scoped op; whitelist it so the
+    # Server tab will accept a gate write for it.
+    config = _TwoTierConfig(global_values={"agent_ops_whitelist": {"search_history": True}})
+    view = _panel(config, is_super=False)
+    _patch_gates(monkeypatch, admin=True, superadmin=False)
+
+    op = registry.require("search_history")
+    import asyncio
+    for state in ("off", "admin", "everyone"):
+        asyncio.run(view._save_op_gate(_OkInteraction(), "search_history", state))
+        stored = config.guild[GATE_KEY]
+        assert stored["search_history"] == state
+        # The resolver the loop consults reads back the same decision.
+        assert guild_gate(op, stored) == state
+
+
+def test_server_gate_refuses_a_non_whitelisted_op(monkeypatch):
+    """The Server tab must never write a gate for an op the super-admin
+    whitelist does not enable — that op is disabled everywhere and should not
+    be reachable even from a stale panel."""
+    from core.agent_gate import GATE_KEY
+
+    config = _TwoTierConfig(global_values={"agent_ops_whitelist": {}})
+    view = _panel(config, is_super=False)
+    _patch_gates(monkeypatch, admin=True, superadmin=False)
+
+    import asyncio
+    asyncio.run(view._save_op_gate(_OkInteraction(), "search_history", "everyone"))
+    assert GATE_KEY not in config.guild, "no gate should be written"
+    assert "not an enabled agent op" in (view._flash or "")
+
+
+def test_server_gate_requires_admin(monkeypatch):
+    """A non-admin cannot write the guild's agent gate."""
+    from core.agent_gate import GATE_KEY
+
+    config = _TwoTierConfig(global_values={"agent_ops_whitelist": {"search_history": True}})
+    view = _panel(config, is_super=False)
+    _patch_gates(monkeypatch, admin=False, superadmin=False)
+
+    interaction = _DenyRecordingInteraction()
+    import asyncio
+    asyncio.run(view._save_op_gate(interaction, "search_history", "everyone"))
+    assert GATE_KEY not in config.guild
+    assert interaction.denied and "admin" in interaction.denied[0].lower()
+
+
+def test_whitelist_tab_writes_global_config(monkeypatch):
+    """The super-admin Agent Ops tab writes agent_ops_whitelist GLOBALLY, as a
+    {name: True} map, and a saved op then resolves live for the agent."""
+    from core.agent_gate import WHITELIST_KEY
+
+    config = _TwoTierConfig()
+    view = _panel(config, is_super=True)
+    _patch_gates(monkeypatch, admin=True, superadmin=True)
+
+    import asyncio
+    # Save with search_history selected; universe is the whole registry.
+    asyncio.run(view._save_whitelist(
+        _OkInteraction(), ["search_history"], registry.names()))
+    assert config.globals[WHITELIST_KEY] == {"search_history": True}
+    assert ("agent_ops_whitelist", {"search_history": True}) in config.global_writes
+    # The loop's resolver now offers it.
+    assert "search_history" in resolve_bot_tools(config.globals[WHITELIST_KEY], None)
+
+
+def test_whitelist_save_preserves_offline_names(monkeypatch):
+    """A whitelisted op whose cog is unloaded stays whitelisted across a save
+    made while it is invisible to every select — the ceiling is not silently
+    destroyed. (The ghost invariant, exercised through the real save path.)"""
+    from core.agent_gate import WHITELIST_KEY
+
+    config = _TwoTierConfig(
+        global_values={WHITELIST_KEY: {"search_history": True, "ghost_tool": True}})
+    view = _panel(config, is_super=True)
+    _patch_gates(monkeypatch, admin=True, superadmin=True)
+
+    import asyncio
+    # The panel can only render live ops; it re-selects the live one and the
+    # offline ghost_tool is invisible — it must still survive.
+    asyncio.run(view._save_whitelist(
+        _OkInteraction(), ["search_history"], registry.names()))
+    assert config.globals[WHITELIST_KEY] == {
+        "search_history": True, "ghost_tool": True}
+
+
+def test_whitelist_tab_requires_superadmin(monkeypatch):
+    """A non-superadmin (even a guild admin) cannot save the global whitelist.
+    The tab is also omitted from their panel render — asserted separately via
+    is_super gating in _build — but the save path must fail closed regardless
+    of what a crafted interaction claims."""
+    from core.agent_gate import WHITELIST_KEY
+
+    config = _TwoTierConfig()
+    view = _panel(config, is_super=False)
+    _patch_gates(monkeypatch, admin=True, superadmin=False)
+
+    interaction = _DenyRecordingInteraction()
+    import asyncio
+    asyncio.run(view._save_whitelist(
+        interaction, ["search_history"], registry.names()))
+    assert WHITELIST_KEY not in config.globals
+    assert interaction.denied and "superadmin" in interaction.denied[0].lower()
+
+
+def test_non_superadmin_panel_omits_the_agent_ops_tab(monkeypatch):
+    """The Agent Ops (whitelist) tab is a global-config surface: a guild admin
+    who is not a bot super-admin must not even see it, and navigating to it
+    (e.g. a stale button) redirects to the Server tab rather than rendering
+    the whitelist editor. Driven through the real _build so the redirect guard
+    and the tab-bar construction are both exercised."""
+    import discord
+    _patch_gates(monkeypatch, admin=True, superadmin=False)
+
+    config = _TwoTierConfig(
+        global_values={"agent_ops_whitelist": {"search_history": True}})
+    view = _build_server_view(monkeypatch, config, is_super=False, page="agentops")
+    # A non-super was redirected off the whitelist page.
+    assert view.page == "server"
+    # No tab button advertises the whitelist editor.
+    labels = _tab_button_labels(view)
+    assert labels, "tab bar rendered no buttons"
+    assert not any("Agent Ops" in l for l in labels)
+
+
+def test_superadmin_panel_shows_the_agent_ops_tab(monkeypatch):
+    """The counterpart: a bot super-admin DOES get the Agent Ops tab button."""
+    _patch_gates(monkeypatch, admin=True, superadmin=True)
+    config = _TwoTierConfig()
+    view = _build_server_view(monkeypatch, config, is_super=True, page="server")
+    labels = _tab_button_labels(view)
+    assert any("Agent Ops" in l for l in labels)
+
+
+def _build_server_view(monkeypatch, config, *, is_super, page):
+    """Construct an AiSettingsView far enough to run _build() for the tab-bar
+    assertions, without a live gpt cog. LayoutView.__init__ needs a running
+    loop, so the init + build run inside asyncio.run."""
+    import asyncio
+    import discord
+
+    async def _make():
+        view = _panel(config, is_super=is_super)
+        discord.ui.LayoutView.__init__(view, timeout=1)
+        view.page = page
+        view.provider = "openai"
+        view.model = "gpt"
+        view._whitelist = lambda: config.globals.get("agent_ops_whitelist", {})
+        view._gate_cfg = lambda: {}
+        view._bot_tools = lambda: []
+        view._whitelist_names = lambda: [
+            n for n, on in view._whitelist().items() if on]
+        monkeypatch.setattr(AiSettingsView, "_text", lambda self: "text")
+        monkeypatch.setattr(AiSettingsView, "_add_gate_sections", lambda self: None)
+        monkeypatch.setattr(
+            AiSettingsView, "_add_tool_sections",
+            lambda self, *a, **k: None)
+        stub = lambda *a, **k: discord.ui.Button(label="x")
+        import cogs.optional.gpt as gpt_mod
+        monkeypatch.setattr(gpt_mod, "_ProviderSelect", stub)
+        monkeypatch.setattr(gpt_mod, "_ModelSelect", stub)
+        monkeypatch.setattr(AiSettingsView, "_ai_toggle_button", stub)
+        monkeypatch.setattr(AiSettingsView, "_personality_button", stub)
+        monkeypatch.setattr(AiSettingsView, "_nickname_button", stub)
+        monkeypatch.setattr(AiSettingsView, "_preset_button", stub)
+        view._build()
+        return view
+
+    return asyncio.run(_make())
+
+
+def _tab_button_labels(view):
+    import discord
+    labels = []
+    for child in view.children:
+        if isinstance(child, discord.ui.ActionRow):
+            for item in child.children:
+                if isinstance(item, discord.ui.Button) and item.label:
+                    labels.append(item.label)
+    return labels
 
 
 # The `agent=True` flag that this seed snapshots, read off the pre-refactor
@@ -533,6 +831,50 @@ def test_agent_tool_refuses_when_its_op_is_reregistered_mid_run():
     finally:
         registry.unregister_owner(v1)
         registry.unregister_owner(v2)
+
+
+def test_agent_gate_is_evaluated_live_at_dispatch_not_snapshotted():
+    """Codex review 2026-08-20: an admin tightening an op to 'admin only'
+    mid-run must bind on the NEXT call. The gate is a callback re-read at
+    dispatch, not a boolean captured at build time — so flipping the policy
+    between calls changes the outcome for the same non-admin invoker."""
+    v1 = _RetargetCogV1()
+    registry.register_cog_ops(v1)
+    try:
+        captured = registry.require("retarget_probe")
+        # A mutable policy the gate_check closes over — stands in for live config.
+        policy = {"admin_only": False}
+        def gate_check(_op_name):
+            return policy["admin_only"]   # non-admin invoker; admin-only ⇒ refuse
+
+        budget = {"used": 0, "cap": 8}
+        tool = _make_agent_tool(captured, _FakeCtx(), frozenset({1}),
+                                _logging.getLogger("test"), budget,
+                                gate_check=gate_check)
+        tool_fn = tool.function
+
+        # The gate is consulted FRESH on every dispatch: flip the policy to
+        # "admin only" and the call is refused before any budget is spent or
+        # any Discord work happens — the refusal short-circuits at the top of
+        # tool_fn. (A snapshotted boolean would have frozen the build-time
+        # value and let this through.)
+        policy["admin_only"] = True
+        refused = _asyncio.run(tool_fn())
+        assert refused["ok"] is False
+        assert "admin-only" in refused["error"].lower()
+        assert budget["used"] == 0, \
+            "a gate refusal must short-circuit before spending budget"
+
+        # And with the policy relaxed, the SAME tool no longer refuses AT THE
+        # GATE — it proceeds past the gate into dispatch (which then fails on
+        # this bare fake ctx, proving only that the gate let it through). A
+        # snapshotted boolean would have frozen the tightened value and kept
+        # refusing here.
+        policy["admin_only"] = False
+        with pytest.raises(AttributeError):
+            _asyncio.run(tool_fn())   # got past the gate, died in real dispatch
+    finally:
+        registry.unregister_owner(v1)
 
 
 def test_mcp_tool_refuses_when_its_op_is_reregistered_after_build():
