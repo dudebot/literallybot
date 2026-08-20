@@ -118,10 +118,10 @@ class OpScope(str, Enum):
 # per group, so each group must stay under Discord's 25-option select cap.
 OP_GROUPS: Dict[str, str] = {
     "messaging": "Messaging",
-    # Thread-family ops live in their own group, NOT "messaging": messaging
-    # already carries 20 ops and each group must fit one 25-option Discord
-    # select (see test_each_group_fits_in_one_select) — the thread ops would
-    # have pushed it over the cap.
+    # Thread-family ops live in their own group, NOT "messaging": each group
+    # must fit one 25-option Discord select (see
+    # test_each_group_fits_in_one_select), and messaging is the group closest
+    # to that cap — the thread ops would have pushed it over.
     "threads": "Threads",
     "roles": "Roles",
     # Stickers joined this group in the 2026-08 expressive-domain pass —

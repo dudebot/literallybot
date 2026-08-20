@@ -206,25 +206,12 @@ The config system watches for external file changes every 2 seconds. If you edit
 This enables patterns like:
 - Hot-editing config without restarting the bot
 - External tools writing to config files
-- Two cogs communicating via a shared user config file
 
-### Inter-Cog Communication Example
-
-Two cogs can coordinate by writing to shared config keys (illustrative
-pattern — nothing in the current codebase uses it):
-
-```python
-# Cog A: Producer
-config.set_user(user_id, "pending_action", {"type": "verify", "data": "..."})
-
-# Cog B: Consumer (on next command or event)
-action = config.get_user(user_id, "pending_action")
-if action:
-    # Process it
-    config.rem_user(user_id, "pending_action")
-```
-
-Since both cogs share the same `bot.config` instance, changes are immediately visible in memory. The file write is just for persistence.
+It is NOT a channel for cog-to-cog communication: cogs never consume each
+other, and a config-key mailbox between two cogs is exactly the dependency
+edge that doctrine forbids (a producer whose consumer is in `disabled_cogs`
+strands data silently). Shared capability between cogs belongs in a headless
+module — see `docs/cog-development.md` § Composing cogs (#88).
 
 ## Working with Lists
 

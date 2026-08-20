@@ -196,14 +196,17 @@ one interface: xAI (Grok), OpenAI, Anthropic (Claude), and any local
 OpenAI-compatible server such as [Ollama](https://ollama.com/).
 
 **Talking to it:** @mention the bot or reply to its messages. Chat is
-guild-only, has a per-guild kill switch, and is rate-limited by a
-nested-window cooldown ladder — all tunable from the panel.
+guild-only, has a per-guild kill switch (panel-tunable), and is rate-limited
+by a nested-window cooldown ladder.
 
 **Configuring it:** `!aisettings` (admin-only, hidden from `/help` for
 non-admins) opens the AI settings panel — pick provider/model, set API keys,
-edit the personality, manage per-tool agentic allowlists, tune cooldowns,
-and (superadmin) add/remove providers and models. Superadmin-only controls
-are omitted from the panel entirely for non-superadmins.
+edit the personality, manage per-tool agentic allowlists, and (superadmin)
+add/remove providers and models, including each model's price bracket (which
+sets its rate-limit tier). The cooldown ladder itself has no panel surface —
+it's hand-edited global config (`cooldown_tier_bases` / `cooldown_windows`).
+Superadmin-only controls are omitted from the panel entirely for
+non-superadmins.
 
 **API keys** live in global config (`configs/global.json`) or environment
 variables — set them from the panel, or directly:
@@ -255,7 +258,7 @@ and browse the listing with file sizes.
 - `!listadmins` — show this server's bot admins and the global superadmins
 
 **Panels** (single-invoker interactive Views):
-- `!aisettings` — AI provider/model/keys/personality/agentic tools/cooldowns/MCP (admin; superadmin tabs hidden from admins)
+- `!aisettings` — AI provider/model/keys/personality/agentic tools/MCP (admin; superadmin tabs hidden from admins)
 - `!autoresponse` — per-guild trigger→response entries, uniform-random response pick, automod-style deletion (admin)
 - `!media` — this guild's media library (admin)
 - `!cogs` — enable/disable cogs bot-wide, plus a restart button (superadmin)

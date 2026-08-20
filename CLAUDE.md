@@ -6,20 +6,21 @@
 literallybot/
 ├── bot.py              # Main entry point, event handlers
 ├── core/
+│   ├── bootstrap.py    # Token resolution chain + first-run superadmin (#83)
 │   ├── config.py       # JSON config system (read docs/config-system.md)
 │   ├── ops.py          # Ops registry — every Discord action, declared once
 │   ├── agent_loop.py   # Frontend: in-chat agent tools (guild-scoped ops)
 │   ├── mcp_server.py   # Frontend: MCP over loopback HTTP (whole registry)
 │   ├── error_handler.py # Error logging to Discord channels
+│   ├── dm_log.py       # DM transcript JSONL store
+│   ├── llm/            # Provider-agnostic LLM client (pydantic-ai)
 │   └── utils.py        # Permission helpers (is_admin, is_superadmin)
 ├── cogs/
 │   ├── core/           # Recovery surface — never disableable (control, admin)
 │   └── optional/       # Everything else; deployment picks via disabled_cogs
 ├── configs/            # Runtime JSON storage (guild, user, global)
-├── docs/               # Developer documentation
-│   ├── cog-development.md
-│   ├── config-system.md
-│   └── error-handling.md
+├── docs/               # Developer documentation — the canonical per-file
+│                       # index is README.md § Documentation (six files)
 └── media/              # Audio/video files for !play and dynamic commands
 ```
 

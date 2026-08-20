@@ -351,8 +351,11 @@ admin/superadmin list.
   gate; other members' directive-shaped messages are ignored. Non-directive
   memory types (names, preferences, reminders) are still captured from anyone,
   which only affects how the bot talks *about* that user.
-- [ ] **Restrict filesystem access to `configs/`** so plaintext API keys and admin
-  lists aren't world-readable.
+- [x] **Restrict filesystem access to `configs/`** so plaintext API keys and admin
+  lists aren't world-readable — `configs/` is chmod 0700 at every startup and
+  every config file lands 0600; the atomic-save temp file is created 0600 and
+  `fchmod`'d before content is written (#83). Best-effort on non-POSIX
+  filesystems.
 - [ ] **Keep the MCP server loopback-only.** Never front it with a reverse proxy or
   bind it publicly without first replacing caller-supplied `actor_id` with real
   actor authentication.
@@ -378,8 +381,9 @@ was later removed, 2026-08-11), `!addmedia` and the
 used a divergent hand-rolled check), and the global-mutating provider commands
 (`setapikey`/`addmodel`/`removemodel`/`addprovider`) were made superadmin-only
 because they alter configuration shared by every guild — their prefix variants
-have since been removed entirely in favor of the `/ai` surfaces, which keep the
-superadmin gate.
+have since been removed entirely in favor of the `!aisettings` panel (and its
+ephemeral `/aisettings` slash twin), which keeps the superadmin gate on the
+Models & Providers tab.
 `delete_message` is exposed to the agent loop and MCP — it remains ADMIN-gated
 per-call, and `call_ids` now checks permissions *before* resolving any Discord
 targets.

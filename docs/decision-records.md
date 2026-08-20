@@ -114,6 +114,14 @@ window. The cost thresholds (<$1, <$5, catch-all) are unchanged. Tunable via the
 global keys `cooldown_tier_bases` / `cooldown_windows`; there is no panel
 surface for them since the 2026-08 UX pass.
 
+### Correction: ai_admin.py merged into gpt.py (2026-08)
+
+The 2026-07-10 amendment (and other historical references) locate the
+`!aisettings` panel in `cogs/optional/ai_admin.py`. That file no longer
+exists — it was merged back into `cogs/optional/gpt.py` under the
+one-cog-per-purpose standard (gpt.py owns ALL AI surface: chat paths, `_do_*`
+helpers, and the panel). Read historical `ai_admin.py` references accordingly.
+
 ## Ops-registry refactor: derived frontends + cog-registered ops (2026-08-11)
 
 Closes the loop opened by #58's "world pattern". Issues #64, #65, #77, #78 are
@@ -135,7 +143,9 @@ those a guild enables is per-guild config, not a constant in `core/ops.py`.
 
 Assignments: `send_dm`/`read_dms`/`fetch_dms` = DM; `list_guilds` = GLOBAL; the
 other 22 core ops = GUILD. (2026-08: `delete_dm` — user-keyed retract of
-bot-authored DMs, #90 — later joined the DM set.)
+bot-authored DMs, #90 — later joined the DM set. The whole arithmetic is
+superseded as *inventory* by the API cross-reference campaign entry below;
+the scope-replaces-agent-flag decision itself is unchanged.)
 
 **Live queries are mandatory, not stylistic.** Cog ops appear and disappear with
 cog load/unload, so any import-time tuple is stale after the first `!reload`.
@@ -431,3 +441,23 @@ precisely the friction this issue removes.
 "weighted responses". Responses are a uniform `random.choice`, and the
 short-lived `[text, weight]` shape is stripped on read by `_response_texts`.
 The line now says what the code does; weighting was not implemented.
+
+## Discord API cross-reference campaign: 27 → 89 core ops (2026-08-20)
+
+Commit `4dc7caa` (preceded by `2a0dc02`: the #71 `search_history` permission
+fix, #90 `delete_dm`, and the #88 composing-cogs doctrine — primary text for
+that lives in `docs/cog-development.md` § Composing cogs). The registry now
+holds **89 API primitives across 6 domains: 78 GUILD / 9 DM / 2 GLOBAL**
+(`get_user` is GLOBAL now, alongside `list_guilds`). This supersedes the
+"22 core ops = GUILD" arithmetic in the ops-registry refactor entry above as
+inventory; the scope-replaces-agent-flag DECISION recorded there is unchanged.
+
+**Method:** a systematic diff of the full discord.py surface against the op
+registry (`delete_dm` had been one hand-found instance of that gap), with the
+resulting ops auto-exposed over MCP and the agent loop via the registry — no
+per-frontend wiring.
+
+**Shipped vs owner decision:** destructive, permission-expanding, and
+privacy-sensitive candidates (irreversible ejection — kick/ban/unban/prune —
+and guild-settings writes) were deliberately routed to owner decision instead
+of shipped — see the "deliberately NOT ops" bullets in `docs/security.md`.
