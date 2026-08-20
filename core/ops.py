@@ -455,20 +455,13 @@ class Op:
     # and can't drift out of sync with the enabled-tool set. Distinct from
     # `description`, which rides inside the function schema itself.
     agent_guidance: Optional[str] = None
-    # DEFAULT per-guild agent gate for this op: "everyone" | "admin". Seeds
-    # the three-state Off/Admin/Everyone control a server admin sees, before
-    # they override it. The question it answers: "would a regular server
-    # member reasonably ask the bot to do this?" — reads/harmless → everyone,
-    # state-changing/abusable → admin. This governs the AGENT path only; the
-    # `permission` field above stays the hard floor for MCP/direct calls and
-    # is also the call-time floor an "everyone" gate cannot lower. Falls back
-    # to permission (EVERYONE→"everyone", else "admin") when unset.
-    agent_default: Optional[str] = None
 
     def default_gate(self) -> str:
-        """The Off/Admin/Everyone default for this op's agent exposure."""
-        if self.agent_default in ("everyone", "admin"):
-            return self.agent_default
+        """The Off/Admin/Everyone default for this op's agent exposure, derived
+        from its permission floor: an EVERYONE-floor op defaults to everyone,
+        anything gated defaults to admin. (There is deliberately no per-op
+        override — see the two-tier gate in core/agent_gate; add one only when
+        an op genuinely needs a default that diverges from its floor.)"""
         return "everyone" if self.permission == PermissionLevel.EVERYONE else "admin"
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
@@ -804,7 +797,6 @@ class OpSpec:
     agent_guidance: Optional[str] = None
     scope: OpScope = OpScope.GUILD
     group: str = "messaging"
-    agent_default: Optional[str] = None
 
 
 # Attribute an OpSpec rides on. Mirrors how discord.py's CogMeta finds
@@ -818,8 +810,7 @@ def op(name: str, description: str, permission: PermissionLevel,
        serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
        agent_guidance: Optional[str] = None,
        scope: OpScope = OpScope.GUILD,
-       group: str = "messaging",
-       agent_default: Optional[str] = None):
+       group: str = "messaging"):
     """Declare a cog method as an op, WITHOUT registering it.
 
         class MyCog(commands.Cog):
@@ -841,7 +832,6 @@ def op(name: str, description: str, permission: PermissionLevel,
             name=name, description=description, permission=permission,
             params=tuple(params or []), serialize=serialize,
             agent_guidance=agent_guidance, scope=scope, group=group,
-            agent_default=agent_default,
         ))
         return func
     return decorator
@@ -851,7 +841,7 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
               impl: Callable[..., Any], params: Optional[List[OpParam]],
               serialize: Optional[Callable[[Any], Dict[str, Any]]],
               agent_guidance: Optional[str], scope: OpScope, group: str,
-              origin: str, owner: Any, agent_default: Optional[str] = None) -> Op:
+              origin: str, owner: Any) -> Op:
     """Validate and construct an Op. Shared by both registration paths so a
     cog op and a core op are held to exactly the same rules."""
     if not inspect.iscoroutinefunction(impl):
@@ -860,13 +850,11 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
         raise TypeError(f"Op '{name}' scope must be an OpScope, got {scope!r}.")
     if not group or not isinstance(group, str):
         raise ValueError(f"Op '{name}' must declare a non-empty group id.")
-    if agent_default not in (None, "everyone", "admin"):
-        raise ValueError(f"Op '{name}' agent_default must be 'everyone', 'admin', or None.")
     return Op(
         name=name, description=description, permission=permission,
         impl=impl, params=list(params or []), serialize=serialize,
         agent_guidance=agent_guidance, scope=scope, group=group,
-        origin=origin, owner=owner, agent_default=agent_default,
+        origin=origin, owner=owner,
     )
 
 
@@ -883,8 +871,7 @@ class OpsRegistry:
            serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
            agent_guidance: Optional[str] = None,
            scope: OpScope = OpScope.GUILD,
-           group: str = "messaging",
-           agent_default: Optional[str] = None):
+           group: str = "messaging"):
         """Decorator: `@registry.op("name", "...", PermissionLevel.ADMIN)`
         registers an `async def impl(ctx, **kwargs)` under `name`.
 
@@ -898,7 +885,7 @@ class OpsRegistry:
                 name=name, description=description, permission=permission,
                 impl=func, params=params, serialize=serialize,
                 agent_guidance=agent_guidance, scope=scope, group=group,
-                origin=ORIGIN_CORE, owner=None, agent_default=agent_default,
+                origin=ORIGIN_CORE, owner=None,
             ))
             return func
         return decorator
@@ -1030,7 +1017,6 @@ class OpsRegistry:
                 params=list(spec.params), serialize=spec.serialize,
                 agent_guidance=spec.agent_guidance, scope=spec.scope,
                 group=spec.group, origin=ORIGIN_COG, owner=cog,
-                agent_default=spec.agent_default,
             ))
         # Preflight passed — commit.
         for built in batch:
@@ -5250,8 +5236,9 @@ async def list_automod_rules(ctx: OpContext, guild=None):
 #   - edit_guild_settings, bulk_ban and purge_messages are SUPERADMIN —
 #     server-wide blast radius (guild identity, 200-member ban, unbounded
 #     mass delete);
-#   - every one passes agent_default="admin" so the per-guild agent gate
-#     never defaults a destructive op to "everyone".
+#   - because every one is at least ADMIN, default_gate() derives "admin" for
+#     all of them automatically — the per-guild agent gate never defaults a
+#     destructive op to "everyone".
 #
 # Snowflake-input rule as everywhere: ids on the wire are strings, results
 # keep ids as ints. Bulk operations cap their batch (bulk_ban <=200 per the
@@ -5308,7 +5295,6 @@ def _serialize_channel_ref(ch: Any) -> Dict[str, Any]:
         "than calling list_channels again."),
     scope=OpScope.GUILD,
     group="channels",
-    agent_default="admin",
 )
 async def create_channel(ctx: OpContext, guild, name: str,
                          kind: str = "text", category=None,
@@ -5351,7 +5337,6 @@ async def create_channel(ctx: OpContext, guild, name: str,
         "never on a busy channel without explicit confirmation."),
     scope=OpScope.GUILD,
     group="channels",
-    agent_default="admin",
 )
 async def delete_channel(ctx: OpContext, channel):
     info = {"deleted_channel_id": channel.id,
@@ -5376,7 +5361,6 @@ async def delete_channel(ctx: OpContext, channel):
     serialize=_serialize_channel_ref,
     scope=OpScope.GUILD,
     group="channels",
-    agent_default="admin",
 )
 async def clone_channel(ctx: OpContext, channel, name: Optional[str] = None):
     if isinstance(channel, discord.Thread):
@@ -5414,7 +5398,6 @@ async def clone_channel(ctx: OpContext, channel, name: Optional[str] = None):
         "order rather than assuming each landed exactly where requested."),
     scope=OpScope.GUILD,
     group="channels",
-    agent_default="admin",
 )
 async def move_channel(ctx: OpContext, channel, position: Optional[int] = None,
                        category_id: Optional[int] = None):
@@ -5493,7 +5476,6 @@ def _overwrite_target(guild, target_type: str, target_id: int):
         "here writes an all-inherit overwrite, not a removal)."),
     scope=OpScope.GUILD,
     group="channels",
-    agent_default="admin",
 )
 async def set_channel_overwrite(ctx: OpContext, channel, target_type: str,
                                 target_id: int,
@@ -5546,7 +5528,6 @@ async def set_channel_overwrite(ctx: OpContext, channel, target_type: str,
     serialize=lambda payload: payload,
     scope=OpScope.GUILD,
     group="channels",
-    agent_default="admin",
 )
 async def delete_channel_overwrite(ctx: OpContext, channel, target_type: str,
                                    target_id: int):
@@ -5584,7 +5565,6 @@ async def delete_channel_overwrite(ctx: OpContext, channel, target_type: str,
         "archived=true, which preserves the conversation and can be reopened."),
     scope=OpScope.GUILD,
     group="threads",
-    agent_default="admin",
 )
 async def delete_thread(ctx: OpContext, channel):
     thread = _require_thread(channel)
@@ -5607,7 +5587,6 @@ async def delete_thread(ctx: OpContext, channel):
     serialize=lambda payload: payload,
     scope=OpScope.GUILD,
     group="threads",
-    agent_default="admin",
 )
 async def add_thread_member(ctx: OpContext, channel, member):
     thread = _require_thread(channel)
@@ -5629,7 +5608,6 @@ async def add_thread_member(ctx: OpContext, channel, member):
     serialize=lambda payload: payload,
     scope=OpScope.GUILD,
     group="threads",
-    agent_default="admin",
 )
 async def remove_thread_member(ctx: OpContext, channel, member):
     thread = _require_thread(channel)
@@ -5654,7 +5632,6 @@ async def remove_thread_member(ctx: OpContext, channel, member):
     serialize=lambda payload: payload,
     scope=OpScope.GUILD,
     group="threads",
-    agent_default="admin",
 )
 async def list_private_archived_threads(ctx: OpContext, channel,
                                         limit: int = 100):
@@ -5696,7 +5673,6 @@ BAN_DELETE_MESSAGE_SECONDS_MAX = 604800  # 7 days
         "silencing, timeout_member is the softer tool."),
     scope=OpScope.GUILD,
     group="members",
-    agent_default="admin",
 )
 async def kick_member(ctx: OpContext, member, reason: Optional[str] = None,
                       guild=None):
@@ -5736,7 +5712,6 @@ async def kick_member(ctx: OpContext, member, reason: Optional[str] = None,
         "the ban, but deleted messages are gone."),
     scope=OpScope.GUILD,
     group="members",
-    agent_default="admin",
 )
 async def ban_member(ctx: OpContext, member, reason: Optional[str] = None,
                      delete_message_seconds: int = 0, guild=None):
@@ -5767,7 +5742,6 @@ async def ban_member(ctx: OpContext, member, reason: Optional[str] = None,
     serialize=lambda payload: payload,
     scope=OpScope.GUILD,
     group="members",
-    agent_default="admin",
 )
 async def unban_member(ctx: OpContext, user, reason: Optional[str] = None,
                        guild=None):
@@ -5807,7 +5781,6 @@ async def unban_member(ctx: OpContext, user, reason: Optional[str] = None,
         "bans up to 200 people irreversibly."),
     scope=OpScope.GUILD,
     group="members",
-    agent_default="admin",
 )
 async def bulk_ban(ctx: OpContext, user_ids: List[str],
                    reason: Optional[str] = None,
@@ -5856,7 +5829,6 @@ async def bulk_ban(ctx: OpContext, user_ids: List[str],
         "the user before pruning."),
     scope=OpScope.GUILD,
     group="members",
-    agent_default="admin",
 )
 async def prune_members(ctx: OpContext, days: int,
                         reason: Optional[str] = None, guild=None):
@@ -5892,7 +5864,6 @@ async def prune_members(ctx: OpContext, days: int,
         "roles are refused."),
     scope=OpScope.GUILD,
     group="members",
-    agent_default="admin",
 )
 async def edit_member_roles(ctx: OpContext, member,
                             add_role_ids: Optional[List[str]] = None,
@@ -5955,7 +5926,6 @@ BULK_DELETE_MAX = 100
         "than 14 days and batches over 100."),
     scope=OpScope.GUILD,
     group="message-mod",
-    agent_default="admin",
 )
 async def bulk_delete_messages(ctx: OpContext, channel,
                                message_ids: List[str]):
@@ -5998,7 +5968,6 @@ async def bulk_delete_messages(ctx: OpContext, channel,
         "channel, the count, and any author filter explicitly before calling."),
     scope=OpScope.GUILD,
     group="message-mod",
-    agent_default="admin",
 )
 async def purge_messages(ctx: OpContext, channel, limit: int, author=None):
     if not hasattr(channel, "purge"):
@@ -6030,7 +5999,6 @@ async def purge_messages(ctx: OpContext, channel, limit: int, author=None):
         "and note the 10/hour rate limit."),
     scope=OpScope.GUILD,
     group="message-mod",
-    agent_default="admin",
 )
 async def publish_message(ctx: OpContext, message):
     await message.publish()
@@ -6054,7 +6022,6 @@ async def publish_message(ctx: OpContext, message):
         "ordinary reply (that is send_message)."),
     scope=OpScope.GUILD,
     group="message-mod",
-    agent_default="admin",
 )
 async def send_tts(ctx: OpContext, channel, content: str):
     if not str(content).strip():
@@ -6078,7 +6045,6 @@ async def send_tts(ctx: OpContext, channel, content: str):
     serialize=_serialize_sent_message,
     scope=OpScope.GUILD,
     group="message-mod",
-    agent_default="admin",
 )
 async def send_sticker(ctx: OpContext, channel, sticker_id: int):
     guild = getattr(channel, "guild", None)
@@ -6112,7 +6078,6 @@ async def send_sticker(ctx: OpContext, channel, sticker_id: int):
         "emoji with the user first."),
     scope=OpScope.GUILD,
     group="message-mod",
-    agent_default="admin",
 )
 async def remove_reaction_other(ctx: OpContext, message, member, emoji: str):
     await message.remove_reaction(emoji, member)
@@ -6139,7 +6104,6 @@ async def remove_reaction_other(ctx: OpContext, message, member, emoji: str):
         "that one."),
     scope=OpScope.GUILD,
     group="message-mod",
-    agent_default="admin",
 )
 async def clear_reactions(ctx: OpContext, message, emoji: Optional[str] = None):
     if emoji is not None and str(emoji).strip():
@@ -6192,7 +6156,6 @@ def _serialize_webhook_ref(w: Any) -> Dict[str, Any]:
         "from Server Settings — never try to surface it."),
     scope=OpScope.GUILD,
     group="webhooks",
-    agent_default="admin",
 )
 async def create_webhook(ctx: OpContext, channel, name: str):
     if not hasattr(channel, "create_webhook"):
@@ -6221,7 +6184,6 @@ async def create_webhook(ctx: OpContext, channel, name: str):
     serialize=_serialize_webhook_ref,
     scope=OpScope.GUILD,
     group="webhooks",
-    agent_default="admin",
 )
 async def edit_webhook(ctx: OpContext, guild, webhook_id: int,
                        name: Optional[str] = None, channel=None):
@@ -6262,7 +6224,6 @@ async def edit_webhook(ctx: OpContext, guild, webhook_id: int,
         "from list_webhooks) before deleting."),
     scope=OpScope.GUILD,
     group="webhooks",
-    agent_default="admin",
 )
 async def delete_webhook(ctx: OpContext, guild, webhook_id: int):
     webhook = await _resolve_guild_webhook(
@@ -6296,7 +6257,6 @@ async def delete_webhook(ctx: OpContext, guild, webhook_id: int):
         "webhook-authored message, and it never pings anyone."),
     scope=OpScope.GUILD,
     group="webhooks",
-    agent_default="admin",
 )
 async def execute_webhook(ctx: OpContext, guild, webhook_id: int,
                           content: str, username: Optional[str] = None,
@@ -6344,7 +6304,6 @@ async def execute_webhook(ctx: OpContext, guild, webhook_id: int,
         "applying; raising verification_level can lock out new members."),
     scope=OpScope.GUILD,
     group="guild-info",
-    agent_default="admin",
 )
 async def edit_guild_settings(ctx: OpContext, guild,
                               name: Optional[str] = None,
@@ -6449,7 +6408,6 @@ def _serialize_automod_ref(rule: Any) -> Dict[str, Any]:
         "list_automod_rules to review existing rules first."),
     scope=OpScope.GUILD,
     group="automod",
-    agent_default="admin",
 )
 async def create_automod_rule(ctx: OpContext, guild, name: str,
                               trigger_type: str,
@@ -6493,7 +6451,6 @@ async def create_automod_rule(ctx: OpContext, guild, name: str,
     serialize=_serialize_automod_ref,
     scope=OpScope.GUILD,
     group="automod",
-    agent_default="admin",
 )
 async def edit_automod_rule(ctx: OpContext, guild, rule_id: int,
                             name: Optional[str] = None,
@@ -6550,7 +6507,6 @@ async def edit_automod_rule(ctx: OpContext, guild, rule_id: int,
         "first."),
     scope=OpScope.GUILD,
     group="automod",
-    agent_default="admin",
 )
 async def delete_automod_rule(ctx: OpContext, guild, rule_id: int):
     rule = await guild.fetch_automod_rule(_as_int(rule_id, "rule_id"))
@@ -6581,7 +6537,6 @@ async def delete_automod_rule(ctx: OpContext, guild, rule_id: int):
         "event, edit_scheduled_event with status='completed' preserves it."),
     scope=OpScope.GUILD,
     group="events",
-    agent_default="admin",
 )
 async def delete_scheduled_event(ctx: OpContext, event_id: int, guild=None):
     guild = guild or ctx.guild
@@ -6632,7 +6587,6 @@ def _serialize_stage_instance(inst: Any) -> Dict[str, Any]:
         "send_notification=true."),
     scope=OpScope.GUILD,
     group="voice",
-    agent_default="admin",
 )
 async def create_stage(ctx: OpContext, channel, topic: str,
                        send_notification: bool = False):
@@ -6655,7 +6609,6 @@ async def create_stage(ctx: OpContext, channel, topic: str,
     serialize=_serialize_stage_instance,
     scope=OpScope.GUILD,
     group="voice",
-    agent_default="admin",
 )
 async def edit_stage(ctx: OpContext, channel, topic: str):
     stage = _require_stage_channel(channel)
@@ -6687,7 +6640,6 @@ async def edit_stage(ctx: OpContext, channel, topic: str):
         "audience — confirm with the user before ending an active stage."),
     scope=OpScope.GUILD,
     group="voice",
-    agent_default="admin",
 )
 async def end_stage(ctx: OpContext, channel):
     stage = _require_stage_channel(channel)
@@ -6723,7 +6675,6 @@ async def end_stage(ctx: OpContext, channel):
     serialize=lambda payload: payload,
     scope=OpScope.GUILD,
     group="invites",
-    agent_default="admin",
 )
 async def delete_invite(ctx: OpContext, guild, code: str):
     wanted = str(code).strip().rstrip("/").rsplit("/", 1)[-1]

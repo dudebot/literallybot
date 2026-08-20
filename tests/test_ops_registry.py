@@ -3746,7 +3746,7 @@ def test_list_automod_rules_serializes_defensively():
 #
 # 36 ops filling the deliberately-omitted destructive half of each domain.
 # These freeze the inventory (the exact 36 names), the permission FLOOR
-# (ADMIN, with three SUPERADMIN), the agent_default="admin" seed, the new
+# (ADMIN, with three SUPERADMIN), the derived 'admin' agent gate, the new
 # group ids, and one impl behavior per op.
 # ==========================================================================
 
@@ -3812,17 +3812,15 @@ def test_owner_tier_ops_all_registered():
 
 
 @pytest.mark.parametrize("name", sorted(OWNER_TIER_OPS))
-def test_owner_tier_permission_floor_and_agent_default(name):
+def test_owner_tier_permission_floor(name):
     """Every owner-tier op is at least ADMIN (three are SUPERADMIN), guild
-    scope, and seeds the per-guild agent gate at 'admin' — none is ever
-    'everyone'."""
+    scope, so its agent gate derives 'admin' — never 'everyone'."""
     o = registry.require(name)
     expected = (PermissionLevel.SUPERADMIN if name in OWNER_TIER_SUPERADMIN
                 else PermissionLevel.ADMIN)
     assert o.permission == expected, f"{name} floor {o.permission}"
     assert o.scope == OpScope.GUILD
-    assert o.agent_default == "admin", f"{name} agent_default {o.agent_default}"
-    assert o.default_gate() == "admin"
+    assert o.default_gate() == "admin"  # derived from the ADMIN+ floor
 
 
 @pytest.mark.parametrize("name,group", sorted(OWNER_TIER_GROUPS.items()))

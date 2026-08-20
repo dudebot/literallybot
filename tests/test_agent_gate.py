@@ -12,15 +12,12 @@ from core.ops import OpScope, PermissionLevel
 
 class _FakeOp:
     def __init__(self, name, scope=OpScope.GUILD,
-                 permission=PermissionLevel.ADMIN, agent_default=None):
+                 permission=PermissionLevel.ADMIN):
         self.name = name
         self.scope = scope
         self.permission = permission
-        self.agent_default = agent_default
 
     def default_gate(self):
-        if self.agent_default in ("everyone", "admin"):
-            return self.agent_default
         return "everyone" if self.permission == PermissionLevel.EVERYONE else "admin"
 
 
@@ -46,10 +43,6 @@ def test_default_gate_from_permission():
     assert _FakeOp("x", permission=PermissionLevel.ADMIN).default_gate() == "admin"
 
 
-def test_agent_default_overrides_permission_derived_default():
-    # a read-permission op the owner still wants admin-gated for the agent
-    op = _FakeOp("x", permission=PermissionLevel.EVERYONE, agent_default="admin")
-    assert op.default_gate() == "admin"
 
 
 # ---- per-guild override, bounded by whitelist ----
@@ -69,7 +62,7 @@ def test_guild_override_ignored_when_not_whitelisted():
 
 
 def test_invalid_guild_gate_value_falls_back_to_default():
-    op = _FakeOp("kick_member", agent_default="admin")
+    op = _FakeOp("kick_member")  # ADMIN floor ⇒ default_gate admin
     assert ag.guild_gate(op, {"kick_member": "banana"}) == "admin"
 
 

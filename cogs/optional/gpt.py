@@ -222,7 +222,7 @@ class Gpt(commands.Cog):
         return models.get(pc["model"], {}) or {}
 
     def _resolve_bot_tools(self, ctx) -> List[str]:
-        """The guild's enabled bot-agent tools — a subset of agent_ops().
+        """The guild's enabled bot-agent tools (resolved live from the whitelist + per-guild gate; this IS agent_ops() now).
 
         Empty (the default) means the plain-chat path runs: no tools, no
         agent loop. Stale op names whose op is not currently registered are
