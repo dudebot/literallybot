@@ -1,10 +1,8 @@
 # LiterallyBot
 
-A modular Discord bot built with discord.py that's designed to be a "jack of all trades" — from AI chat to utilities and entertainment.
+A modular Discord bot built with discord.py — AI chat, moderation, utilities, and entertainment in one "jack of all trades."
 
-Its organizing idea: **every Discord action the bot can take is declared exactly once**, in a permission-checked ops registry, and every way of driving the bot is generated from that declaration. Write one op and it becomes an AI tool your members can use in chat, an MCP tool your own agents can call over loopback, and a toggle in the admin panel — no per-frontend plumbing, no duplicated auth check, no hand-maintained tool lists. Cogs can contribute ops too, registering and unregistering with the cog itself.
-
-Also: a boot-fixed cog set with a per-deployment enable/disable switch, a three-scope JSON config system with atomic saves and live external-edit reload, and provider-agnostic AI. Actively developed.
+Its organizing idea: **every Discord action the bot can take is declared exactly once**, in a permission-checked ops registry, and every way of driving the bot is generated from that declaration. Write one op and it is simultaneously an AI tool your members can invoke in chat, an MCP tool your own agents can call over loopback, and a togglable row in the admin panel — no per-frontend plumbing, no duplicated auth check, no hand-maintained tool lists. Cogs contribute ops too, registering and unregistering with the cog itself. Around that sit a boot-fixed cog set with a per-deployment enable/disable switch, a three-scope JSON config system, and provider-agnostic AI. Actively developed.
 
 ## 🚀 Quick Start
 
@@ -49,32 +47,38 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 
 ## ✨ Key Features
 
-- **🧭 One Ops Layer, Many Frontends** — 125 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
-- **🧩 Modular Cog System** — features are self-contained cogs; disable them globally without deleting them (binds at restart); cogs can register their own ops
-- **🤖 AI Integration** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory, personality, and an optional agentic mode that performs real Discord actions
+- **🧭 One Ops Layer, Many Frontends** — 125 permission-checked Discord primitives declared once, driving the in-chat AI agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
+- **🤖 AI Chat + Agent** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory and personality, plus an optional agentic mode that performs real Discord actions under a two-tier permission model
+- **🧩 Modular Cogs** — self-contained features; disable any globally without deleting it (binds at restart); cogs can register their own ops
 - **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
-- **⚙️ Smart Configuration** — per-server, per-user, and global JSON settings with write buffering, atomic saves, and live reload on external edits
-- **🎲 Utilities & Fun** — dice rolling, random choices, reminders with snooze buttons, auto-responses, per-guild media libraries, reaction roles
+- **⚙️ Smart Config** — per-server, per-user, and global JSON settings with write buffering, atomic saves, and live reload on external edits
+- **🎲 Utilities & Fun** — dice, random picks, reminders with snooze buttons, auto-responses, per-guild media libraries, reaction roles
 - **🛠️ Developer Friendly** — comprehensive logging, error routing to Discord channels, one-command restart
 
 ## 🏛️ Architecture: one ops layer, many frontends
 
-The interesting thing about this bot is not any one feature — it is that
-**every atomic Discord action is defined exactly once**, in a registry, with
-its permission requirement and its typed parameters declared alongside it.
-Everything that can drive the bot is *generated* from that one declaration.
+**Every atomic Discord action is defined exactly once**, in a registry, with
+its permission floor and typed parameters declared alongside it. Everything that
+drives the bot — the in-chat AI agent, the MCP server, the admin panel — is
+*generated* from that one declaration, with no per-frontend plumbing, no
+duplicated permission check, and no hand-maintained tool list anywhere.
 
-Add an op, and it simultaneously becomes an AI tool the in-chat agent can
-call, an MCP tool an external agent can call, and a row in the admin panel —
-with no per-frontend plumbing, no duplicated permission check, and no
-hand-maintained tool list anywhere.
-
-Two kinds of op live in one registry: **API primitives** — raw, one-to-one
-Discord actions declared in `core/ops.py` — and **behavioral primitives** —
+Two kinds of op share the registry: **API primitives** — raw, one-to-one Discord
+actions declared inline in `core/ops.py` — and **behavioral primitives** —
 capabilities a cog registers that carry the bot's own intelligence (set up an
-emoji role toggle, run a policy-filtered image search). Same declaration
-shape, same calling convention, same permission gates; only their origin
-differs, and the panel shows them as separate sections.
+emoji role toggle, run a policy-filtered image search). Same declaration shape,
+same calling convention, same permission gates; only their `origin` differs
+(stamped by the registration *path*, so a cog can't pass itself off as core),
+and the panel shows them as separate sections. Cog ops register when the cog
+loads and unregister when it unloads, all-or-none — a cog never runs with half
+its ops missing.
+
+**The rest of the bot are cogs, leaves of this tree.** `cogs/core/` is the
+recovery surface (the commands that turn things back on) and is never
+disableable; everything else lives in `cogs/optional/` and can be switched off
+per deployment. **The cog set is fixed at boot** — there is no live
+load/unload/reload; a restart binds a code change, a `disabled_cogs` edit, and
+newly registered ops alike.
 
 ```mermaid
 flowchart TB
@@ -96,36 +100,38 @@ flowchart TB
     REG -->|"scope == GUILD, live"| AGENT
     REG -->|"whole registry, live"| MCP
 
-    subgraph CFG["The only filter — admin config"]
-        BT["<code>bot_tools_enabled</code><br/>per guild · <code>!aisettings</code> → Server<br/>empty ⇒ plain chat"]
-        MT["<code>mcp_tools_enabled</code><br/>global · <code>!aisettings</code> → MCP<br/>absent ⇒ everything"]
+    subgraph CFG["Exposure filters — admin config"]
+        WL["<b>Agent, two-tier</b><br/><code>agent_ops_whitelist</code> (owner, global)<br/>× <code>agent_ops_gate</code> (admin, per-guild:<br/>off / admin / everyone)<br/>both in the <code>/aisettings</code> panel"]
+        MT["<b>MCP</b><br/><code>mcp_tools_enabled</code> (global)<br/><code>/aisettings</code> → MCP · absent ⇒ everything"]
     end
 
-    BT -.->|"intersect"| AGENT
-    MT -.->|"intersect"| MCP
+    WL -.->|"filters"| AGENT
+    MT -.->|"filters"| MCP
 
     AGENT --> OUT(["Live, permission-checked Discord actions"])
     MCP --> OUT
 ```
 
-**What each piece buys you:**
+**Three independent gates decide what the agent will do — and they compose:**
 
-- **The registry is the only source of truth.** There is no code-level "which
-  ops are agent tools" list. The in-guild agent's universe is *derived*: every
-  op whose `scope` is `GUILD`, queried live. Add a guild-scoped op and it is
-  offerable to the agent the moment it registers.
-- **Cogs contribute ops.** A cog decorates a method with `@op(...)`; the ops
-  register when the cog loads and unregister when it unloads, all-or-none, so
-  a cog never runs with half its ops missing. `origin` is stamped by the
-  registration *path*, never claimed by a decorator argument — a cog cannot
-  pass itself off as an API primitive.
-- **Config is an exposure filter, not the authorization.** Turning an op on in
-  the panel only decides whether it's *offered*. Every call still passes the
-  op's own `PermissionLevel` gate against the real invoking user, before any
-  Discord id is even resolved.
-- **`scope` is the safety boundary.** Guild-scoped ops are the only ones a
-  guild-confined, user-actored agent loop can be offered; DM and global ops
-  (`send_dm`, `list_guilds`) never appear in a guild's agent surface at all.
+1. **Owner whitelist** (`agent_ops_whitelist`, global) — the bot owner opts each
+   op into the agent surface. An op that's off here never reaches any guild's
+   agent or panel; this is the context-budget ceiling, since every exposed op
+   costs prompt tokens.
+2. **Per-guild gate** (`agent_ops_gate`, set by each server's admins) — a
+   whitelisted op is set **off / admin / everyone** per guild. "off" hides it;
+   "admin" restricts agent use to bot admins; "everyone" opens it to any member
+   (still bounded by gate 3). Both tiers live in the `/aisettings` panel.
+3. **The op's own `PermissionLevel` floor** — enforced at call time against the
+   *real invoking user*, before any Discord id is resolved. The per-guild gate
+   can widen exposure but never below what the op itself demands, so an
+   "everyone" gate can't hand a member a SUPERADMIN-only op.
+
+`scope` is the outer safety boundary: the guild-confined, user-actored agent
+loop is only ever offered `GUILD`-scoped ops — DM and global ops (`send_dm`,
+`list_guilds`) never appear in a guild's agent surface at all. The MCP surface
+is deliberately *not* governed by the per-guild gate — a host-side operator sees
+the whole registry, filtered only by `mcp_tools_enabled`.
 
 ### The MCP story
 
@@ -162,24 +168,22 @@ bot's own admin concept (`is_admin` / `is_superadmin`) rather than by the
 invoker's Discord permissions — the bot's admins do not necessarily hold
 Discord's Administrator bit, and gating on it caused a real lockout.
 
-Each panel exists twice on purpose: a hidden prefix command (`!aisettings`,
-`!autoresponse`, `!media`, `!cogs`, `!config`) and an **ephemeral slash twin**
-(`/aisettings`, `/autoresponse`, `/media`, `/cogs`, `/config`). Ephemeral is a
-property of an interaction response, so only the slash form can keep a guild's
-model/provider/tool configuration from being read by everyone in the channel.
-Neither form uses `app_commands.default_permissions` — the check is the bot's
-own gate, evaluated at invoke time, and a non-admin who runs one gets an
-ephemeral refusal.
+Each panel exists twice: a hidden prefix command (`!aisettings`, `!autoresponse`,
+`!media`, `!cogs`, `!config`) and an **ephemeral slash twin** (`/aisettings`, …).
+Ephemeral is a property of an interaction response, so only the slash form keeps
+a guild's configuration from being read by everyone in the channel. Neither uses
+`app_commands.default_permissions` — the check is the bot's own gate at invoke
+time, and a non-admin gets an ephemeral refusal. Superadmin-only controls are
+*omitted* from a panel's render for non-superadmins rather than merely disabled.
 
-Beyond the panels, the public surface is small: `/help` and `/role`. `/help`
-and `!help` show each invoker exactly the commands they can actually run, and
-superadmin-only controls are *omitted* from a panel's render for non-superadmins
-rather than merely disabled.
+Beyond the panels, the public surface is deliberately small — `/help` and
+`/role` — and `/help`/`!help` show each invoker exactly the commands they can run.
 
 ## 📋 Everyday Commands
 
 - `/help` or `!help` — one embed of the bot's commands, grouped by cog, filtered to what you can actually run
 - **Chat with the AI** — @mention the bot or reply to one of its messages (no command needed; guild channels only)
+- `!gpt <question>` — same AI chat as a mention, when you'd rather type a command (guild-only)
 - `!dice <NdX>` — roll dice, e.g. `!dice 2d20`
 - `!random <choices>` / `!order <choices>` — pick or shuffle
 - `!remindme <duration> <message>` — e.g. `!remindme 10 minutes Check the oven`, `!remindme 1d12h Ship it` (aliases: `!r`, `!reminder`); deliveries come with snooze buttons scaled to the original duration
@@ -195,18 +199,17 @@ The AI layer lives in `core/llm/` (provider-agnostic client built on
 one interface: xAI (Grok), OpenAI, Anthropic (Claude), and any local
 OpenAI-compatible server such as [Ollama](https://ollama.com/).
 
-**Talking to it:** @mention the bot or reply to its messages. Chat is
-guild-only, has a per-guild kill switch (panel-tunable), and is rate-limited
-by a nested-window cooldown ladder.
+**Talking to it:** @mention the bot, reply to its messages, or use `!gpt`. Chat
+is guild-only, has a per-guild kill switch, and is rate-limited by a
+nested-window cooldown ladder.
 
-**Configuring it:** `!aisettings` (admin-only, hidden from `/help` for
-non-admins) opens the AI settings panel — pick provider/model, set API keys,
-edit the personality, manage per-tool agentic allowlists, and (superadmin)
-add/remove providers and models, including each model's price bracket (which
-sets its rate-limit tier). The cooldown ladder itself has no panel surface —
-it's hand-edited global config (`cooldown_tier_bases` / `cooldown_windows`).
-Superadmin-only controls are omitted from the panel entirely for
-non-superadmins.
+**Configuring it:** `/aisettings` (or hidden `!aisettings`; admin-only) opens
+the AI settings panel — pick provider/model, set API keys, edit the personality,
+govern the agent's per-op gates, and (superadmin) add/remove providers and
+models, each with a price bracket that sets its rate-limit tier. The cooldown
+ladder has no panel surface — it's hand-edited global config
+(`cooldown_tier_bases` / `cooldown_windows`). Superadmin-only controls are
+omitted from the panel entirely for non-superadmins.
 
 **API keys** live in global config (`configs/global.json`) or environment
 variables — set them from the panel, or directly:
@@ -225,21 +228,21 @@ token budget "thinking" can be tamed with `"reasoning_effort": "none"` per model
 
 ### Agentic AI (experimental)
 
-When enabled, the AI can **perform real Discord actions** — send/edit messages,
-add reactions, search history, manage roles and emojis, plus anything a loaded
-cog contributes — instead of only describing them. It runs a tool-calling loop
-over the shared **ops registry** (`core/ops.py`), acting as the **invoking
-user** (never the bot), confined to the current guild, with mentions suppressed
-and a per-run tool-call budget.
+When enabled, the AI can **perform real Discord actions** — spanning the full
+125-op registry: messaging, channels, roles, members, moderation, threads,
+voice, events, emoji/stickers, invites, webhooks, automod, and DMs — plus
+anything a loaded cog contributes, instead of only describing them. It runs a
+tool-calling loop over the shared **ops registry** (`core/ops.py`), acting as
+the **invoking user** (never the bot), confined to the current guild, with
+mentions suppressed and a per-run tool-call budget.
 
-Agentic mode is per-tool: each guild has a `bot_tools_enabled` allowlist
-(default empty, so chat stays plain chat and nothing changes), managed from the
-`!aisettings` → Server config tab by any bot admin. The *universe* that
-allowlist draws from isn't a hand-maintained list — it's every registered op
-whose `scope` is `GUILD`, queried live, which is why a guild admin choosing
-from it can't escalate past their own guild. Ops belonging to an unloaded cog
-stay in the stored allowlist and simply drop out of the effective set until the
-cog comes back. See `docs/security.md` for the full model.
+Access is the two-tier model from [Architecture](#️-architecture-one-ops-layer-many-frontends):
+the bot owner whitelists which ops the agent may *ever* see (`agent_ops_whitelist`,
+global), and each server's admins set every whitelisted op to **off / admin /
+everyone** for their guild (`agent_ops_gate`) — both from the `/aisettings`
+panel. Nothing is on by default, so plain chat stays plain chat until someone
+opts ops in. Every call still passes the op's own `PermissionLevel` floor
+against the real user. See `docs/security.md` for the full model.
 
 ## 🎬 Media Libraries
 
@@ -292,49 +295,31 @@ DANBOORU_LOGIN=your_danbooru_username
 
 ## 🔌 MCP Ops Server
 
-`core/mcp_server.py` exposes the bot's ops registry (`core/ops.py` —
-permission-checked, typed Discord actions like `send_message`,
-`search_history`, `send_dm`, `create_role`) over
-[MCP](https://modelcontextprotocol.io/) so an external agent can drive the bot
-the same way an in-bot command would, without either frontend re-implementing
-Discord plumbing or permission logic.
+`core/mcp_server.py` exposes the ops registry over
+[MCP](https://modelcontextprotocol.io/) so an external agent (Claude Code, an
+IDE, any MCP client) drives the bot the same way an in-bot command would.
 
-**This is OFF by default.** There is exactly one way to run it: in-process
-with the bot. `bot.py` starts it automatically after ready when the
-`mcp_ops_enabled` global config bool is true (toggle in `!aisettings` → MCP
-tab; binds on restart), and the tools act through the live bot. When the flag
-is unset/false, running the normal bot never starts it. (A standalone runner
-existed until 2026-08; it logged a *second* Discord client into the same bot
-account and could not see ops registered by cogs, so it was deleted rather
-than fixed.)
+**Off by default, and in-process only.** `bot.py` starts it after ready when the
+`mcp_ops_enabled` global config bool is true (toggle in `/aisettings` → MCP tab;
+binds on restart), and the tools act through the live bot. When the flag is
+unset/false, the normal bot never starts it. (A standalone runner was deleted in
+2026-08 — it logged a second Discord client into the same account and couldn't
+see cog-registered ops.)
 
 **Security model (all gates fail closed):**
-- **Off by default** — refuses to start unless the `mcp_ops_enabled` global
-  config boolean is true.
-- **Auth required** — every request must send `Authorization: Bearer <token>`;
-  requests without a matching token get a `401` (compared constant-time with
-  `hmac.compare_digest`). The token is read config-first: the `mcp_ops_token`
-  global config key, else the `MCP_OPS_TOKEN` env var. If neither is set when
-  an operator enables the server, one is generated
-  (`secrets.token_urlsafe(32)`) and stored in `configs/global.json` — the
-  server is never unauthenticated, and the value is never logged.
-- **Loopback only** — binds to `127.0.0.1`, no host override. Every tool
-  call is a live, authenticated Discord bot action; do not tunnel this port
+- **Off by default** — refuses to start unless `mcp_ops_enabled` is true.
+- **Auth + loopback** — binds `127.0.0.1` only, and every request needs
+  `Authorization: Bearer <token>` (constant-time compared; missing/wrong → 401).
+  The token comes from `mcp_ops_token` config or `MCP_OPS_TOKEN` env; if neither
+  is set when you enable the server, one is generated into `configs/global.json`
+  and never logged. Every call is a live Discord action — don't tunnel this port
   off-host casually.
-- `send_message` always sends with `allowed_mentions` = none (no pings);
-  `search_history` clamps `limit` to 200.
-- **Full guild reach by design** — tools act as raw primitives: every guild
-  the bot account is in is addressable. DMs flow through the dedicated
-  user-keyed DM ops (`send_dm`, `read_dms`, `fetch_dms`, `delete_dm`,
-  `edit_dm`, `list_dm_conversations`, `add_dm_reaction`,
-  `remove_dm_reaction`, `list_dm_pins`), never through id-based channel
-  calls.
-  Access control belongs upstream in the MCP caller; the only guild-confined
-  surface is the in-bot agent loop (pinned to its invoking guild).
-- **Accepted risk:** `actor_id` is caller-supplied and not bound to the
-  bearer token, so any token-holder can act as any user id for permission
-  purposes. Fine for localhost self-use; add real actor auth before any
-  wider exposure.
+- **Full guild reach by design** — the MCP operator addresses every guild the
+  bot is in; per-guild confinement is the in-bot agent loop's job, not this
+  surface's. Access control belongs upstream in the MCP caller.
+- **Accepted risk:** `actor_id` is caller-supplied and not bound to the bearer
+  token, so any token-holder can act as any user id for permission purposes.
+  Fine for localhost self-use; add real actor auth before wider exposure.
 
 **Run it:** turn it on, then restart the bot.
 
@@ -370,45 +355,31 @@ port if you set `mcp_ops_port`):
 ```
 
 **Exposed tools:** by default the full ops registry, queried live when the
-server starts — so ops a cog registered are included too. The 125 API
-primitives, by group:
+server starts — so ops a cog registered are included too. The 125 API primitives
+span every corner of the Discord API surface, grouped in the registry as:
 
-| Group | Ops |
-|-------|-----|
-| **Messaging** | `send_message`, `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`, `search_history`, `get_message`, `read_history`, `pin_message`, `unpin_message`, `list_pins`, `create_thread`, `list_reactions`, `trigger_typing`, `forward_message`, `suppress_embeds`, `send_embed`, `send_poll`, `get_poll_results`, `end_poll`, `get_poll_voters` |
-| **Message moderation** | `bulk_delete_messages`, `purge_messages`¹, `publish_message`, `send_tts`, `send_sticker`, `remove_reaction_other`, `clear_reactions` |
-| **Threads** | `list_threads`, `list_thread_members`, `join_thread`, `leave_thread`, `edit_thread`, `create_forum_post`, `delete_thread`, `add_thread_member`, `remove_thread_member`, `list_private_archived_threads` |
-| **Channels** | `create_channel`, `delete_channel`, `clone_channel`, `move_channel`, `set_channel_overwrite`, `delete_channel_overwrite` |
-| **Roles** | `add_role`, `remove_role`, `list_roles`, `list_role_members`, `create_role`, `edit_role`, `delete_role` |
-| **Emojis & stickers** | `list_emojis`, `create_emoji`, `edit_emoji`, `delete_emoji`, `list_stickers`, `create_sticker`, `edit_sticker`, `delete_sticker`, `download_emoji` |
-| **Guild info** | `list_channels`, `list_members`, `list_channel_overwrites`, `get_channel_info`, `set_slowmode`, `edit_channel`, `get_member_permissions`, `get_member`, `get_guild_info`, `search_members`, `fetch_audit_logs`, `estimate_prune`, `list_integrations`, `edit_guild_settings`¹ |
-| **Members** | `set_nickname`, `timeout_member`, `remove_timeout`, `kick_member`, `ban_member`, `unban_member`, `bulk_ban`¹, `prune_members`, `edit_member_roles` |
-| **Moderation** | `list_bans`, `list_automod_rules` |
-| **AutoMod** | `create_automod_rule`, `edit_automod_rule`, `delete_automod_rule` |
-| **Voice** | `get_voice_state`, `list_voice_states`, `move_member`, `disconnect_member`, `set_voice_mute`, `set_voice_deafen`, `set_stage_suppress`, `get_stage_instance`, `create_stage`, `edit_stage`, `end_stage` |
-| **Scheduled events** | `list_scheduled_events`, `get_scheduled_event`, `list_scheduled_event_users`, `create_scheduled_event`, `edit_scheduled_event`, `delete_scheduled_event` |
-| **Invites** | `list_invites`, `create_invite`, `revoke_invite`, `delete_invite` |
-| **Webhooks** | `create_webhook`, `edit_webhook`, `delete_webhook`, `execute_webhook` |
-| **Direct messages** | `send_dm`, `read_dms`, `fetch_dms`, `delete_dm`, `edit_dm`, `list_dm_conversations`, `add_dm_reaction`, `remove_dm_reaction`, `list_dm_pins` |
-| **Guild** | `list_guilds`, `get_user` |
-| **Integrations** | `list_webhooks` |
+> **messaging** · **message-mod** · **threads** · **channels** · **roles** ·
+> **members** · **moderation** · **automod** · **emojis & stickers** ·
+> **voice** · **scheduled events** · **invites** · **webhooks** ·
+> **guild info** · **direct messages** · **integrations**
 
-¹ SUPERADMIN-gated (server-wide blast radius); every other op above `bulk_delete_messages`/`create_channel`/etc. in the NEEDS_OWNER destructive tier is ADMIN. The 2026-08 owner-tier pass added 36 destructive/privileged primitives (channel & webhook & automod CRUD, member ejection, mass delete, publish/TTS/sticker sends, stage lifecycle) — each admin-defaulted in the per-guild agent gate, never `everyone`.
+Reads (`list_*`, `get_*`, `search_*`) are mostly EVERYONE-gated; state writes are
+ADMIN; a handful with server-wide blast radius (`purge_messages`, `bulk_ban`,
+`edit_guild_settings`) are SUPERADMIN. **This list is never hand-maintained** —
+it's the live registry. See the exact ops, groups, params, and permission floors
+by running `python3 -m core.ops`, or over MCP via `tools/list`; the `/aisettings`
+panel renders them for toggling.
 
 Loaded cogs add their own behavioral primitives on top (e.g.
-`add_emoji_role_toggle` and `sync_emoji_role_toggles` from `setrole`,
-`search_danbooru` from `danbooru`), rendered in the panel under their own
-groups and visibly separated from the API primitives.
+`add_emoji_role_toggle` / `sync_emoji_role_toggles` from `setrole`,
+`search_danbooru` from `danbooru`), rendered under their own groups and visibly
+separated from the API primitives.
 
-The served subset is trimmable at runtime via the `mcp_tools_enabled` global
-config list, managed from the `!aisettings` → MCP tab — what the panel shows is
-what gets served. The tool surface is built once per bot start: allowlist edits
-and newly loaded cog ops bind on the next restart (MCP's `tools/list_changed`
-notification is not reliably deliverable to live streamable-HTTP sessions on
-mcp 1.x).
-
-Exact per-tool schemas are served live via MCP `tools/list`; offline, run
-`python3 -m core.ops` to print the full ops registry.
+The served subset is trimmable via the `mcp_tools_enabled` global config list
+(`/aisettings` → MCP tab) — what the panel shows is what gets served. The surface
+is built once per bot start: allowlist edits and newly loaded cog ops bind on the
+next restart (MCP's `tools/list_changed` is not reliably deliverable to live
+streamable-HTTP sessions on mcp 1.x).
 
 `actor_id` is the Discord user id the call is made on behalf of — the
 registry runs the same permission check it would for an in-bot command,
