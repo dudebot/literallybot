@@ -24,6 +24,7 @@ importing a cog is fine; the module under test doing it is not.
 
 import asyncio
 
+import discord
 import pytest
 
 from core.ops import (
@@ -131,15 +132,20 @@ def test_guild_agent_universe_is_exactly_the_guild_scoped_ops():
     assert universe == {o.name for o in registry.ops() if o.scope == OpScope.GUILD}
     # DM and global ops are guild-confinement-incompatible and must not leak
     # into a guild-confined, user-actored loop.
-    for name in ("send_dm", "read_dms", "fetch_dms", "delete_dm",
-                 "list_guilds"):
+    for name in ("send_dm", "read_dms", "fetch_dms", "delete_dm", "edit_dm",
+                 "list_dm_conversations", "add_dm_reaction",
+                 "remove_dm_reaction", "list_dm_pins",
+                 "list_guilds", "get_user"):
         assert name not in universe
 
 
 def test_scope_assignments():
     assert {o.name for o in registry.ops(scope=OpScope.DM)} == {
-        "send_dm", "read_dms", "fetch_dms", "delete_dm"}
-    assert {o.name for o in registry.ops(scope=OpScope.GLOBAL)} == {"list_guilds"}
+        "send_dm", "read_dms", "fetch_dms", "delete_dm", "edit_dm",
+        "list_dm_conversations", "add_dm_reaction", "remove_dm_reaction",
+        "list_dm_pins"}
+    assert {o.name for o in registry.ops(scope=OpScope.GLOBAL)} == {
+        "list_guilds", "get_user"}
 
 
 def test_grouped_partitions_every_op_exactly_once():
@@ -168,10 +174,12 @@ def test_message_param_implies_channel_id():
 def test_send_message_shape():
     send = registry.get("send_message").to_json_schema()
     assert set(send["properties"]) == {
-        "channel_id", "content", "reference_message_id", "file_paths"}
-    # content is optional: a message may be attachment-only.
+        "channel_id", "content", "reference_message_id", "file_paths",
+        "sticker_id"}
+    # content is optional: a message may be attachment- or sticker-only.
     assert send["required"] == ["channel_id"]
     assert send["properties"]["file_paths"]["type"] == "array"
+    assert send["properties"]["sticker_id"]["type"] == "string"
 
 
 def test_search_history_is_guild_wide_by_default():
@@ -195,6 +203,10 @@ def test_role_ops_take_guild_from_wire_or_ambient_context():
     ("read_dms", {"user_id"}),
     ("fetch_dms", {"user_id"}),
     ("delete_dm", {"user_id", "message_id"}),
+    ("edit_dm", {"user_id", "message_id", "content"}),
+    ("add_dm_reaction", {"user_id", "message_id", "emoji"}),
+    ("remove_dm_reaction", {"user_id", "message_id", "emoji"}),
+    ("list_dm_pins", {"user_id"}),
 ])
 def test_dm_ops_take_a_user_id_and_nothing_guild_shaped(name, required):
     """DM ops resolve a guild-independent USER, one-to-one with the DM API.
@@ -208,6 +220,44 @@ def test_dm_ops_take_a_user_id_and_nothing_guild_shaped(name, required):
     assert "channel_id" not in schema["properties"]
     assert "guild_id" not in schema["properties"]
     assert set(schema["required"]) == required
+
+
+def test_forward_message_destination_is_a_snowflake_not_a_channel_param():
+    """A second CHANNEL param would collide with MESSAGE's implied channel_id
+    wire name (same dodge delete_dm documents), so the destination travels as
+    its own snowflake string and is resolved + guild-confined in-impl."""
+    schema = registry.get("forward_message").to_json_schema()
+    assert set(schema["properties"]) == {
+        "channel_id", "message_id", "destination_channel_id"}
+    assert schema["properties"]["destination_channel_id"]["type"] == "string"
+    assert set(schema["required"]) == {
+        "channel_id", "message_id", "destination_channel_id"}
+
+
+def test_read_history_shape_and_clamps():
+    """Plain chronological read: cursor pagination like fetch_dms, limit
+    clamped to the shared history cap."""
+    schema = registry.get("read_history").to_json_schema()
+    assert set(schema["properties"]) == {
+        "channel_id", "limit", "before_message_id", "after_message_id"}
+    assert schema["required"] == ["channel_id"]
+    assert schema["properties"]["limit"]["maximum"] == HISTORY_LIMIT_MAX
+    assert schema["properties"]["before_message_id"]["type"] == "string"
+
+
+def test_list_pins_limit_clamps_to_discords_pin_cap():
+    schema = registry.get("list_pins").to_json_schema()
+    assert set(schema["properties"]) == {"channel_id", "limit"}
+    assert schema["properties"]["limit"]["maximum"] == 50
+
+
+def test_send_poll_shape():
+    schema = registry.get("send_poll").to_json_schema()
+    assert set(schema["properties"]) == {
+        "channel_id", "question", "answers", "duration_hours", "multiselect"}
+    assert schema["properties"]["answers"]["type"] == "array"
+    assert schema["properties"]["duration_hours"]["maximum"] == 168
+    assert set(schema["required"]) == {"channel_id", "question", "answers"}
 
 
 def test_emoji_ids_are_snowflake_strings():
@@ -828,3 +878,2830 @@ def test_delete_dm_refuses_the_other_participants_message():
     with pytest.raises(ValueError, match="bot's own"):
         asyncio.run(delete_dm(ctx, user, 123))
     assert not msg.deleted
+
+
+# --------------------------------------------------------------------------
+# edit_dm implementation: bot-author-only edit + transcript update note.
+# --------------------------------------------------------------------------
+
+class _FakeEditableDMMessage(_FakeDMMessage):
+    def __init__(self, author_id):
+        super().__init__(author_id)
+        import datetime as _dt
+        self.id = 123
+        self.content = "original"
+        self.attachments = []
+        self.created_at = _dt.datetime.now(_dt.timezone.utc)
+
+    async def edit(self, *, content):
+        self.content = content
+        return self
+
+
+def test_edit_dm_edits_a_bot_authored_message_and_logs_a_note(monkeypatch):
+    import core.ops as ops_module
+    from core.ops import edit_dm
+    logged = []
+    monkeypatch.setattr(ops_module, "log_dm",
+                        lambda uid, row: logged.append((uid, row)))
+    msg = _FakeEditableDMMessage(author_id=555)
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    user.id = 42
+    edited = asyncio.run(edit_dm(ctx, user, 123, "fixed"))
+    assert edited.content == "fixed"
+    # Transcript gains an update note marked edited:true (the original row
+    # stays as the audit record of what was first sent).
+    assert len(logged) == 1
+    uid, row = logged[0]
+    assert uid == 42
+    assert row["edited"] is True
+    assert row["content"] == "fixed"
+    assert row["direction"] == "out"
+
+
+def test_edit_dm_refuses_the_other_participants_message(monkeypatch):
+    import core.ops as ops_module
+    from core.ops import edit_dm
+    monkeypatch.setattr(ops_module, "log_dm",
+                        lambda uid, row: pytest.fail("must not log a refusal"))
+    msg = _FakeEditableDMMessage(author_id=999)
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    user.id = 42
+    with pytest.raises(ValueError, match="bot's own"):
+        asyncio.run(edit_dm(ctx, user, 123, "hijack"))
+    assert msg.content == "original"
+
+
+def test_edit_dm_requires_nonempty_content():
+    from core.ops import edit_dm
+    msg = _FakeEditableDMMessage(author_id=555)
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    with pytest.raises(ValueError, match="non-empty"):
+        asyncio.run(edit_dm(ctx, user, 123, "   "))
+    assert msg.content == "original"
+
+
+# --------------------------------------------------------------------------
+# Users & DMs domain pass (2026-08): DM reactions/pins/conversation listing
+# and the global get_user read. Impl behavior with fakes (no Discord needed).
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("name", [
+    "list_dm_conversations", "add_dm_reaction", "remove_dm_reaction",
+    "list_dm_pins", "get_user",
+])
+def test_users_dms_domain_ops_are_admin_gated(name):
+    """Same privacy class as the existing DM ops: everything that reads or
+    touches a private conversation — or looks up arbitrary user ids — is
+    ADMIN, keeping enumeration off the EVERYONE surface."""
+    assert registry.require(name).permission == PermissionLevel.ADMIN
+
+
+def test_list_dm_conversations_shape():
+    schema = registry.get("list_dm_conversations").to_json_schema()
+    assert set(schema["properties"]) == {"limit"}
+    assert schema["required"] == []
+    assert schema["properties"]["limit"]["default"] == 100
+
+
+def test_get_user_shape():
+    schema = registry.get("get_user").to_json_schema()
+    assert set(schema["properties"]) == {"user_id"}
+    assert schema["required"] == ["user_id"]
+    assert schema["properties"]["user_id"]["type"] == "string"
+
+
+class _ReactableDMMessage(_FakeDMMessage):
+    def __init__(self, author_id):
+        super().__init__(author_id)
+        self.added = []
+        self.removed = []
+
+    async def add_reaction(self, emoji):
+        self.added.append(emoji)
+
+    async def remove_reaction(self, emoji, member):
+        self.removed.append((emoji, member))
+
+
+def test_add_dm_reaction_reacts_to_the_dm_message():
+    from core.ops import add_dm_reaction
+    msg = _ReactableDMMessage(author_id=42)  # the USER's message — allowed
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    assert asyncio.run(add_dm_reaction(ctx, user, 123, "💨")) is True
+    assert msg.added == ["💨"]
+
+
+def test_remove_dm_reaction_removes_only_the_bots_own_reaction():
+    """The bot's user object is passed to remove_reaction, so the API call
+    is structurally incapable of touching the other participant's side."""
+    from core.ops import remove_dm_reaction
+    msg = _ReactableDMMessage(author_id=42)
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    assert asyncio.run(remove_dm_reaction(ctx, user, 123, "💨")) is True
+    assert len(msg.removed) == 1
+    emoji, member = msg.removed[0]
+    assert emoji == "💨"
+    assert member is ctx.bot.user
+
+
+class _PinnedDMChannel(_FakeDMChannel):
+    def pins(self):
+        message = self._message
+
+        async def gen():
+            yield message
+        return gen()
+
+
+def test_list_dm_pins_returns_transcript_shaped_rows():
+    from core.ops import list_dm_pins
+    msg = _FakeEditableDMMessage(author_id=42)  # has id/content/created_at
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    user.dm_channel = _PinnedDMChannel(msg)
+    user.id = 42
+    rows = asyncio.run(list_dm_pins(ctx, user))
+    assert len(rows) == 1
+    # Same row shape as read_dms/fetch_dms: direction derived from author.
+    assert rows[0]["message_id"] == 123
+    assert rows[0]["content"] == "original"
+    assert rows[0]["direction"] == "in"
+    payload = registry.get("list_dm_pins").serialize_result(rows)
+    assert payload == {"messages": rows, "count": 1}
+
+
+def test_list_dm_conversations_reads_storage_and_annotates_names(monkeypatch):
+    import core.ops as ops_module
+    from core.ops import list_dm_conversations
+    monkeypatch.setattr(ops_module, "list_dm_users", lambda: [42, 77])
+    monkeypatch.setattr(
+        ops_module, "load_dms",
+        lambda uid, limit=None: (
+            [{"message_id": 9, "timestamp": "2026-08-19T10:00:00"}]
+            if uid == 42 else []))
+    known = type("U", (), {"name": "alice"})()
+    bot = type("B", (), {
+        "get_user": staticmethod(lambda uid: known if uid == 42 else None)})()
+    ctx = OpContext(bot=bot, author=None, guild=None)
+    payload = asyncio.run(list_dm_conversations(ctx))
+    assert payload["count"] == 2
+    assert payload["conversations"][0] == {
+        "user_id": 42, "user_name": "alice",
+        "last_message_at": "2026-08-19T10:00:00"}
+    # Uncached user: name null, conversation still listed (the transcript
+    # is the source of truth, not the gateway cache).
+    assert payload["conversations"][1] == {
+        "user_id": 77, "user_name": None, "last_message_at": None}
+
+
+def test_list_dm_conversations_respects_the_limit(monkeypatch):
+    import core.ops as ops_module
+    from core.ops import list_dm_conversations
+    monkeypatch.setattr(ops_module, "list_dm_users", lambda: [1, 2, 3])
+    monkeypatch.setattr(ops_module, "load_dms", lambda uid, limit=None: [])
+    bot = type("B", (), {"get_user": staticmethod(lambda uid: None)})()
+    ctx = OpContext(bot=bot, author=None, guild=None)
+    payload = asyncio.run(list_dm_conversations(ctx, limit=2))
+    assert payload["count"] == 2
+    assert [c["user_id"] for c in payload["conversations"]] == [1, 2]
+
+
+class _FakeGlobalUser:
+    """Cache-resolved user: no banner/accent (the gateway never sends them)."""
+
+    def __init__(self, uid=42):
+        self.id = uid
+        self.name = "alice"
+
+
+def test_get_user_refetches_for_the_full_profile():
+    from core.ops import get_user
+    resolved = _FakeGlobalUser()
+    fetched = _FakeGlobalUser()
+
+    class _Bot:
+        async def fetch_user(self, uid):
+            assert uid == 42
+            return fetched
+
+    ctx = OpContext(bot=_Bot(), author=None, guild=None)
+    assert asyncio.run(get_user(ctx, resolved)) is fetched
+
+
+def test_get_user_falls_back_to_the_resolved_user_when_fetch_fails():
+    from core.ops import get_user
+    resolved = _FakeGlobalUser()
+
+    class _Bot:
+        async def fetch_user(self, uid):
+            raise RuntimeError("REST down")
+
+    ctx = OpContext(bot=_Bot(), author=None, guild=None)
+    assert asyncio.run(get_user(ctx, resolved)) is resolved
+
+
+def test_get_user_serializer_ships_the_global_profile_fields():
+    import datetime as _dt
+
+    _flag = type("F", (), {"name": "hypesquad"})()
+    _flags = type("PF", (), {"all": lambda self: [_flag]})()
+    _accent = type("C", (), {"value": 0x5865F2})()
+    _asset = type("As", (), {"__str__": lambda self: "https://cdn/u/42.png"})()
+    _guild = type("G", (), {"id": 7, "name": "The Guild"})()
+
+    class _User:
+        id = 42
+        name = "alice"
+        global_name = "Alice"
+        display_name = "Alice"
+        bot = False
+        system = False
+        created_at = _dt.datetime(2020, 6, 7, 8, 9, 10)
+        display_avatar = _asset
+        banner = _asset
+        accent_colour = _accent
+        public_flags = _flags
+        mutual_guilds = [_guild]
+
+    payload = registry.get("get_user").serialize_result(_User())
+    assert payload["id"] == 42
+    assert payload["global_name"] == "Alice"
+    assert payload["system"] is False
+    assert payload["created_at"] == "2020-06-07T08:09:10"
+    assert payload["avatar_url"] == "https://cdn/u/42.png"
+    assert payload["banner_url"] == "https://cdn/u/42.png"
+    assert payload["accent_color"] == "#5865F2"
+    assert payload["public_flags"] == ["hypesquad"]
+    assert payload["mutual_guilds"] == [{"id": 7, "name": "The Guild"}]
+
+
+def test_get_user_serializer_tolerates_a_bare_cache_user():
+    """A cache-built user (fetch failed) has no banner/accent/flags — the
+    serializer must not blow up, it degrades to nulls/empties."""
+    payload = registry.get("get_user").serialize_result(_FakeGlobalUser())
+    assert payload["banner_url"] is None
+    assert payload["accent_color"] is None
+    assert payload["public_flags"] == []
+    assert payload["mutual_guilds"] == []
+
+
+def test_get_member_serializer_ships_the_presence_fields():
+    """The users&DMs pass folded the get_member_info spec into get_member's
+    serializer: global_name, top_role, per-platform client_status,
+    activities, and the per-guild avatar override."""
+    _top = type("R", (), {"id": 2, "name": "Mods"})()
+    _atype = type("AT", (), {"name": "playing"})()
+    _activity = type("Act", (), {
+        "type": _atype, "name": "Factorio", "details": "1.1"})()
+    _guild_av = type("Av", (), {
+        "__str__": lambda self: "https://cdn/guilds/1/users/42.png"})()
+
+    class _Member:
+        id = 42
+        name = "alice"
+        global_name = "Alice"
+        display_name = "Alice"
+        nick = None
+        bot = False
+        roles = []
+        top_role = _top
+        joined_at = None
+        created_at = None
+        premium_since = None
+        timed_out_until = None
+        status = "online"
+        desktop_status = "online"
+        mobile_status = "idle"
+        web_status = "offline"
+        activities = [_activity]
+        display_avatar = None
+        guild_avatar = _guild_av
+        pending = False
+
+    payload = registry.get("get_member").serialize_result(_Member())
+    assert payload["global_name"] == "Alice"
+    assert payload["top_role"] == {"id": 2, "name": "Mods"}
+    assert payload["client_status"] == {
+        "desktop": "online", "mobile": "idle", "web": "offline"}
+    assert payload["activities"] == [
+        {"type": "playing", "name": "Factorio", "details": "1.1"}]
+    assert payload["guild_avatar_url"].endswith("/users/42.png")
+
+
+# --------------------------------------------------------------------------
+# Messaging read/write ops added in the 2026-08 gap pass (no Discord needed).
+# --------------------------------------------------------------------------
+
+class _NoActorCtx:
+    """Bare ctx for direct-impl calls where the gate is not under test."""
+
+    def __init__(self, bot=None):
+        self.bot = bot
+        self.author = None
+        self.guild = None
+
+
+def test_get_message_serializer_ships_the_inspection_fields():
+    class _Att:
+        filename = "a.png"
+        url = "https://cdn/a.png"
+
+    class _Msg:
+        id = 7
+        channel = type("C", (), {"id": 8})()
+        author = type("A", (), {"id": 9})()
+        content = "hello"
+        created_at = None
+        attachments = [_Att()]
+        embeds = [object(), object()]
+        pinned = True
+        jump_url = "https://discord.com/channels/1/8/7"
+
+    payload = registry.get("get_message").serialize_result(_Msg())
+    assert payload["content"] == "hello"
+    assert payload["attachments"] == [{"filename": "a.png",
+                                       "url": "https://cdn/a.png"}]
+    assert payload["embeds"] == 2
+    assert payload["pinned"] is True
+    assert payload["jump_url"].endswith("/1/8/7")
+
+
+class _HistoryChannel(_FakeChannel):
+    """_FakeChannel whose history() honors the read_history signature and
+    yields newest-first, like Discord's default."""
+
+    def history(self, limit=100, before=None, after=None):
+        self.history_calls += 1
+        self.seen_cursors = (before, after)
+        messages = self._messages[:limit]
+
+        async def gen():
+            for m in messages:
+                yield m
+        return gen()
+
+
+def test_read_history_returns_oldest_first():
+    guild = _FakeGuild(1, [])
+    chan = _HistoryChannel(10, _Perms(True, True), guild=guild)
+    chan._messages = [_FakeMessage(3, chan, "newest"),
+                      _FakeMessage(2, chan, "mid"),
+                      _FakeMessage(1, chan, "oldest")]
+    guild._channels = {10: chan}
+    res = asyncio.run(registry.call("read_history", _search_ctx(guild),
+                                    channel=chan, limit=50))
+    assert res.ok
+    assert [m["id"] for m in res.value["messages"]] == [1, 2, 3]
+    assert res.value["count"] == 3
+
+
+def test_read_history_refuses_history_denied_actor():
+    """Same #71 policy as search_history's fallback: the generic gate only
+    checks read_messages, so the op itself must enforce Read Message History
+    — and the channel's history must never be iterated on a refusal."""
+    guild = _FakeGuild(1, [])
+    denied = _HistoryChannel(20, _Perms(True, False), guild=guild)
+    guild._channels = {20: denied}
+    res = asyncio.run(registry.call("read_history", _search_ctx(guild),
+                                    channel=denied))
+    assert res.ok is False
+    assert "Read Message History" in res.error
+    assert denied.history_calls == 0
+
+
+def test_unpin_message_unpins():
+    from core.ops import unpin_message
+
+    class _Msg:
+        unpinned = False
+
+        async def unpin(self):
+            self.unpinned = True
+
+    msg = _Msg()
+    assert asyncio.run(unpin_message(_NoActorCtx(), msg)) is True
+    assert msg.unpinned
+
+
+class _PinsChannel(_FakeChannel):
+    def pins(self, limit=50):
+        self.pins_limit = limit
+        messages = self._messages[:limit]
+
+        async def gen():
+            for m in messages:
+                yield m
+        return gen()
+
+
+def test_list_pins_returns_rows_with_pinned_at():
+    import datetime as _dt
+    guild = _FakeGuild(1, [])
+    chan = _PinsChannel(10, _Perms(True, True), guild=guild)
+    pinned = _FakeMessage(1, chan, "keep me")
+    pinned.pinned_at = _dt.datetime(2026, 8, 20, 12, 0, 0)
+    chan._messages = [pinned]
+    guild._channels = {10: chan}
+    res = asyncio.run(registry.call("list_pins", _search_ctx(guild),
+                                    channel=chan, limit=50))
+    assert res.ok
+    assert res.value["count"] == 1
+    row = res.value["messages"][0]
+    assert row["content"] == "keep me"
+    assert row["pinned_at"] == "2026-08-20T12:00:00"
+
+
+def test_list_pins_refuses_history_denied_actor():
+    """Discord gates the pins endpoint on Read Message History; the actor
+    must hold it too (the bot reads with its own broader perms)."""
+    guild = _FakeGuild(1, [])
+    denied = _PinsChannel(20, _Perms(True, False), guild=guild)
+    guild._channels = {20: denied}
+    res = asyncio.run(registry.call("list_pins", _search_ctx(guild),
+                                    channel=denied))
+    assert res.ok is False
+    assert "Read Message History" in res.error
+
+
+class _FakeReaction:
+    def __init__(self, emoji, count, me, user_ids=()):
+        self.emoji = emoji
+        self.count = count
+        self.me = me
+        self._user_ids = list(user_ids)
+
+    def users(self, limit=None):
+        ids = self._user_ids[:limit]
+
+        async def gen():
+            for uid in ids:
+                yield type("U", (), {"id": uid})()
+        return gen()
+
+
+def test_list_reactions_tallies_and_enumerates_reactors():
+    from core.ops import list_reactions
+
+    class _Msg:
+        reactions = [_FakeReaction("👍", 2, True, [111, 222]),
+                     _FakeReaction("👎", 1, False, [333])]
+
+    tallies = asyncio.run(list_reactions(_NoActorCtx(), _Msg()))
+    assert tallies == {"reactions": [
+        {"emoji": "👍", "count": 2, "me": True},
+        {"emoji": "👎", "count": 1, "me": False}]}
+
+    picked = asyncio.run(list_reactions(_NoActorCtx(), _Msg(), emoji="👍"))
+    assert picked["users"] == [111, 222]
+    # An emoji nobody used still answers, with an empty reactor list.
+    none = asyncio.run(list_reactions(_NoActorCtx(), _Msg(), emoji="🤷"))
+    assert none["users"] == []
+
+
+def test_list_reactions_matches_custom_emoji_by_reaction_form():
+    """Callers hold custom emoji as either '<:name:id>' (str form) or
+    'name:id' (add_reaction's form); both must select the same reaction."""
+    from core.ops import list_reactions
+
+    class _CustomEmoji:
+        name = "blob"
+        id = 42
+
+        def __str__(self):
+            return "<:blob:42>"
+
+    class _Msg:
+        reactions = [_FakeReaction(_CustomEmoji(), 1, False, [777])]
+
+    for form in ("<:blob:42>", "blob:42"):
+        res = asyncio.run(list_reactions(_NoActorCtx(), _Msg(), emoji=form))
+        assert res["users"] == [777], form
+
+
+def test_trigger_typing_awaits_the_indicator():
+    from core.ops import trigger_typing
+
+    class _Chan:
+        typed = 0
+
+        async def typing(self):
+            self.typed += 1
+
+    chan = _Chan()
+    assert asyncio.run(trigger_typing(_NoActorCtx(), chan)) is True
+    assert chan.typed == 1
+
+
+class _ForwardBot:
+    def __init__(self, dest):
+        self._dest = dest
+
+    def get_channel(self, cid):
+        return self._dest if cid == self._dest.id else None
+
+
+class _ForwardDest:
+    def __init__(self, cid, guild):
+        self.id = cid
+        self.guild = guild
+
+
+class _ForwardMsg:
+    def __init__(self, guild):
+        self.guild = guild
+        self.channel = type("C", (), {"id": 10, "guild": guild})()
+        self.forwarded_to = None
+
+    async def forward(self, destination):
+        self.forwarded_to = destination
+        return type("M", (), {
+            "id": 999, "channel": type("C", (), {"id": destination.id})()})()
+
+
+def test_forward_message_forwards_within_the_guild():
+    guild = type("G", (), {"id": 1})()
+    dest = _ForwardDest(20, guild)
+    msg = _ForwardMsg(guild)
+    from core.ops import forward_message
+    result = asyncio.run(forward_message(
+        _NoActorCtx(bot=_ForwardBot(dest)), msg, 20))
+    assert msg.forwarded_to is dest
+    payload = registry.get("forward_message").serialize_result(result)
+    assert payload == {"message_id": 999, "channel_id": 20}
+
+
+def test_forward_message_refuses_a_cross_guild_destination():
+    """The destination is a bare snowflake, so guild confinement is enforced
+    in-impl: it must belong to the SOURCE message's guild."""
+    from core.ops import GuildNotAllowedError, forward_message
+    source_guild = type("G", (), {"id": 1})()
+    other_guild = type("G", (), {"id": 2})()
+    dest = _ForwardDest(20, other_guild)
+    msg = _ForwardMsg(source_guild)
+    with pytest.raises(GuildNotAllowedError):
+        asyncio.run(forward_message(
+            _NoActorCtx(bot=_ForwardBot(dest)), msg, 20))
+    assert msg.forwarded_to is None
+
+
+def test_suppress_embeds_toggles_both_ways():
+    from core.ops import suppress_embeds
+
+    class _Msg:
+        seen = None
+
+        async def edit(self, *, suppress):
+            self.seen = suppress
+
+    msg = _Msg()
+    assert asyncio.run(suppress_embeds(_NoActorCtx(), msg)) is True
+    assert msg.seen is True
+    asyncio.run(suppress_embeds(_NoActorCtx(), msg, suppress=False))
+    assert msg.seen is False
+
+
+class _SendCaptureChannel:
+    def __init__(self):
+        self.kwargs = None
+
+    async def send(self, content=None, **kwargs):
+        self.kwargs = kwargs
+        return type("M", (), {"id": 1, "attachments": []})()
+
+
+def test_send_embed_builds_the_embed_and_never_pings():
+    import discord
+    from core.ops import send_embed
+    chan = _SendCaptureChannel()
+    asyncio.run(send_embed(_NoActorCtx(), chan, title="T",
+                           description="D", color="#5865F2",
+                           image_url="https://x/i.png", footer="F"))
+    embed = chan.kwargs["embed"]
+    assert embed.title == "T" and embed.description == "D"
+    assert embed.colour.value == 0x5865F2
+    assert embed.image.url == "https://x/i.png"
+    assert embed.footer.text == "F"
+    assert chan.kwargs["allowed_mentions"].everyone is False
+
+
+def test_send_embed_requires_some_visible_content():
+    from core.ops import send_embed
+    chan = _SendCaptureChannel()
+    with pytest.raises(ValueError, match="at least one"):
+        asyncio.run(send_embed(_NoActorCtx(), chan, url="https://x",
+                               footer="only chrome"))
+    assert chan.kwargs is None
+
+
+def test_send_poll_builds_a_native_poll():
+    from core.ops import send_poll
+    chan = _SendCaptureChannel()
+    asyncio.run(send_poll(_NoActorCtx(), chan, "Best snack?",
+                          ["chips", "fruit", "cheese"],
+                          duration_hours=48, multiselect=True))
+    poll = chan.kwargs["poll"]
+    assert poll.question == "Best snack?"
+    assert [a.text for a in poll.answers] == ["chips", "fruit", "cheese"]
+    assert poll.duration.total_seconds() == 48 * 3600
+    assert poll.multiple is True
+
+
+@pytest.mark.parametrize("answers", [[], ["solo"], [str(i) for i in range(11)]])
+def test_send_poll_rejects_bad_answer_counts(answers):
+    from core.ops import send_poll
+    chan = _SendCaptureChannel()
+    with pytest.raises(ValueError, match="2-10"):
+        asyncio.run(send_poll(_NoActorCtx(), chan, "Q?", answers))
+    assert chan.kwargs is None
+
+
+def test_send_poll_rejects_an_over_long_question():
+    from core.ops import send_poll
+    with pytest.raises(ValueError, match="300"):
+        asyncio.run(send_poll(_NoActorCtx(), _SendCaptureChannel(),
+                              "x" * 301, ["a", "b"]))
+
+
+class _FakePoll:
+    def __init__(self, finalized=False):
+        self.question = "Best snack?"
+        self.answers = [type("A", (), {"text": "chips", "vote_count": 3})(),
+                        type("A", (), {"text": "fruit", "vote_count": 1})()]
+        self.expires_at = None
+        self._finalized = finalized
+
+    def is_finalized(self):
+        return self._finalized
+
+
+def test_get_poll_results_reads_the_tallies():
+    from core.ops import get_poll_results
+
+    class _Msg:
+        poll = _FakePoll()
+
+    res = asyncio.run(get_poll_results(_NoActorCtx(), _Msg()))
+    assert res == {"question": "Best snack?",
+                   "answers": [{"text": "chips", "count": 3},
+                               {"text": "fruit", "count": 1}],
+                   "expires_at": None, "finalized": False}
+
+
+def test_get_poll_results_refuses_a_poll_less_message():
+    from core.ops import get_poll_results
+
+    class _Msg:
+        poll = None
+
+    with pytest.raises(ValueError, match="no poll"):
+        asyncio.run(get_poll_results(_NoActorCtx(), _Msg()))
+
+
+def _poll_msg(author_id):
+    class _Msg:
+        poll = _FakePoll()
+        author = type("A", (), {"id": author_id})()
+        ended = False
+
+        async def end_poll(self):
+            self.ended = True
+            return type("M", (), {"id": 5})()
+
+    return _Msg()
+
+
+def _bot_ctx(bot_id=555):
+    bot = type("B", (), {"user": type("U", (), {"id": bot_id})()})()
+    return _NoActorCtx(bot=bot)
+
+
+def test_end_poll_ends_the_bots_own_poll():
+    from core.ops import end_poll
+    msg = _poll_msg(author_id=555)
+    result = asyncio.run(end_poll(_bot_ctx(555), msg))
+    assert msg.ended
+    assert registry.get("end_poll").serialize_result(result) == {"message_id": 5}
+
+
+def test_end_poll_refuses_someone_elses_poll():
+    """Mirrors edit_message's own-message discipline — the refusal is a
+    local pre-check, never an attempted API call."""
+    from core.ops import end_poll
+    msg = _poll_msg(author_id=999)
+    with pytest.raises(ValueError, match="bot's own"):
+        asyncio.run(end_poll(_bot_ctx(555), msg))
+    assert not msg.ended
+
+
+# --------------------------------------------------------------------------
+# Channels & threads ops added in the 2026-08 channels-domain gap pass.
+# Wire shapes first (decisions worth locking), then impl behavior with
+# fakes (no Discord needed). Thread/forum fakes SUBCLASS the real discord.py
+# types without calling their __init__, because the ops' isinstance guards
+# are part of the behavior under test.
+# --------------------------------------------------------------------------
+
+def test_get_channel_info_shape():
+    schema = registry.get("get_channel_info").to_json_schema()
+    assert set(schema["properties"]) == {"channel_id"}
+    assert schema["required"] == ["channel_id"]
+
+
+def test_list_threads_shape():
+    schema = registry.get("list_threads").to_json_schema()
+    assert set(schema["properties"]) == {
+        "guild_id", "channel_id", "include_archived", "limit"}
+    assert set(schema["required"]) == {"guild_id"}
+    assert schema["properties"]["limit"]["maximum"] == 500
+
+
+@pytest.mark.parametrize("name", ["list_thread_members", "join_thread",
+                                  "leave_thread"])
+def test_thread_membership_ops_take_one_channel_id(name):
+    """Threads are channels on the wire — one channel_id, nothing else."""
+    schema = registry.get(name).to_json_schema()
+    assert set(schema["properties"]) == {"channel_id"}
+    assert schema["required"] == ["channel_id"]
+    assert schema["properties"]["channel_id"]["type"] == "string"
+
+
+def test_edit_thread_shape():
+    schema = registry.get("edit_thread").to_json_schema()
+    assert set(schema["properties"]) == {
+        "channel_id", "name", "archived", "locked", "slowmode_delay",
+        "auto_archive_duration"}
+    assert schema["required"] == ["channel_id"]
+    assert schema["properties"]["slowmode_delay"]["maximum"] == 21600
+
+
+def test_set_slowmode_shape():
+    schema = registry.get("set_slowmode").to_json_schema()
+    assert set(schema["properties"]) == {"channel_id", "seconds"}
+    assert set(schema["required"]) == {"channel_id", "seconds"}
+    assert schema["properties"]["seconds"]["minimum"] == 0
+    assert schema["properties"]["seconds"]["maximum"] == 21600
+
+
+def test_edit_channel_shape():
+    schema = registry.get("edit_channel").to_json_schema()
+    assert set(schema["properties"]) == {"channel_id", "name", "topic", "nsfw"}
+    assert schema["required"] == ["channel_id"]
+
+
+def test_get_member_permissions_shape():
+    schema = registry.get("get_member_permissions").to_json_schema()
+    assert set(schema["properties"]) == {"channel_id", "user_id"}
+    assert set(schema["required"]) == {"channel_id", "user_id"}
+
+
+def test_create_forum_post_shape():
+    schema = registry.get("create_forum_post").to_json_schema()
+    assert set(schema["properties"]) == {
+        "channel_id", "name", "content", "tag_ids"}
+    assert set(schema["required"]) == {"channel_id", "name", "content"}
+    assert schema["properties"]["tag_ids"]["type"] == "array"
+
+
+class _AuthorCtx(_NoActorCtx):
+    """Ctx with an author (for ops that stamp an audit reason string) but no
+    real Member, so the visibility gate stays out of the way."""
+
+    def __init__(self, bot=None):
+        super().__init__(bot=bot)
+        self.author = type("A", (), {
+            "id": 321, "__str__": lambda self: "tester"})()
+
+
+class _FakeThread(discord.Thread):
+    """A real discord.Thread (isinstance guards must pass) with none of the
+    gateway state — __init__ is deliberately not chained."""
+
+    def __init__(self, **attrs):  # noqa: D107 - test fake
+        defaults = {"id": 111, "name": "topic-drift", "parent_id": 10,
+                    "owner_id": 42, "archived": False, "locked": False,
+                    "member_count": 2, "message_count": 5,
+                    "slowmode_delay": 0, "auto_archive_duration": 1440,
+                    "guild": None,
+                    # Thread.type is a property over the _type slot.
+                    "_type": "public_thread"}
+        defaults.update(attrs)
+        for key, value in defaults.items():
+            setattr(self, key, value)
+        self.joined = False
+        self.left = False
+        self.edit_kwargs = None
+        self._thread_members = []
+
+    async def join(self):
+        self.joined = True
+
+    async def leave(self):
+        self.left = True
+
+    async def edit(self, *, reason=None, **kwargs):
+        self.edit_kwargs = dict(kwargs)
+        self.edit_reason = reason
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        return self
+
+    async def fetch_members(self):
+        return list(self._thread_members)
+
+
+class _NotAThread:
+    id = 999
+
+
+def test_get_channel_info_reads_a_text_channel():
+    import datetime as _dt
+    from core.ops import get_channel_info
+
+    _category = type("Cat", (), {"name": "Main"})()
+
+    class _Chan:
+        # NOTE: `type` the builtin is shadowed by the `type` attribute from
+        # here on in this class body — build helper objects above.
+        id = 10
+        name = "general"
+        type = "text"
+        topic = "the topic"
+        nsfw = False
+        category_id = 5
+        category = _category
+        position = 3
+        created_at = _dt.datetime(2026, 1, 2, 3, 4, 5)
+        slowmode_delay = 15
+        default_auto_archive_duration = 1440
+
+    payload = asyncio.run(get_channel_info(_NoActorCtx(), _Chan()))
+    assert payload["id"] == 10
+    assert payload["topic"] == "the topic"
+    assert payload["category_name"] == "Main"
+    assert payload["created_at"] == "2026-01-02T03:04:05"
+    assert payload["slowmode_delay"] == 15
+    # Facets a text channel doesn't carry must be absent, not null.
+    assert "bitrate" not in payload
+    assert "available_tags" not in payload
+    assert "thread_parent_id" not in payload
+
+
+def test_get_channel_info_carries_type_specific_facets():
+    from core.ops import get_channel_info
+
+    class _Voice:
+        id = 11
+        name = "voice"
+        type = "voice"
+        bitrate = 64000
+        user_limit = 5
+
+    voice = asyncio.run(get_channel_info(_NoActorCtx(), _Voice()))
+    assert voice["bitrate"] == 64000 and voice["user_limit"] == 5
+
+    _solved_tag = type("T", (), {"id": 1, "name": "solved"})()
+
+    class _Forum:
+        id = 12
+        name = "help"
+        type = "forum"
+        available_tags = [_solved_tag]
+
+    forum = asyncio.run(get_channel_info(_NoActorCtx(), _Forum()))
+    assert forum["available_tags"] == [{"id": 1, "name": "solved"}]
+
+    thread = asyncio.run(get_channel_info(
+        _NoActorCtx(), _FakeThread(parent_id=10)))
+    assert thread["thread_parent_id"] == 10
+
+
+class _ThreadGuild(_FakeGuild):
+    def __init__(self, gid, channels, threads):
+        super().__init__(gid, channels)
+        self._threads = list(threads)
+
+    async def active_threads(self):
+        return list(self._threads)
+
+
+def test_list_threads_guild_wide_drops_hidden_parents():
+    """A real Member must not see threads whose parent channel they cannot
+    read — mirror of search_history's per-hit visibility policy."""
+    guild = _ThreadGuild(1, [], [])
+    visible_parent = _FakeChannel(10, _Perms(True, True), guild=guild)
+    hidden_parent = _FakeChannel(20, _Perms(False, False), guild=guild)
+    guild._channels = {10: visible_parent, 20: hidden_parent}
+    guild._threads = [_FakeThread(id=111, parent_id=10),
+                      _FakeThread(id=222, parent_id=20)]
+
+    res = asyncio.run(registry.call("list_threads", _search_ctx(guild),
+                                    guild=guild))
+    assert res.ok
+    assert [t["id"] for t in res.value["threads"]] == [111]
+    assert res.value["count"] == 1
+
+
+class _ThreadParentChannel(_FakeChannel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.threads = []
+        self.archived = []
+
+    def archived_threads(self, limit=100):
+        rows = self.archived[:limit]
+
+        async def gen():
+            for t in rows:
+                yield t
+        return gen()
+
+
+def test_list_threads_per_channel_includes_archived_on_request():
+    guild = _ThreadGuild(1, [], [])
+    parent = _ThreadParentChannel(10, _Perms(True, True), guild=guild)
+    parent.threads = [_FakeThread(id=111, parent_id=10)]
+    parent.archived = [_FakeThread(id=222, parent_id=10, archived=True)]
+    guild._channels = {10: parent}
+
+    active_only = asyncio.run(registry.call(
+        "list_threads", _search_ctx(guild), guild=guild, channel=parent))
+    assert [t["id"] for t in active_only.value["threads"]] == [111]
+
+    both = asyncio.run(registry.call(
+        "list_threads", _search_ctx(guild), guild=guild, channel=parent,
+        include_archived=True))
+    assert [t["id"] for t in both.value["threads"]] == [111, 222]
+    assert both.value["threads"][1]["archived"] is True
+
+
+def test_list_threads_refuses_archived_without_a_channel():
+    guild = _ThreadGuild(1, [], [])
+    res = asyncio.run(registry.call("list_threads", _search_ctx(guild),
+                                    guild=guild, include_archived=True))
+    assert res.ok is False
+    assert "channel_id" in res.error
+
+
+def test_list_thread_members_resolves_display_names():
+    import datetime as _dt
+    from core.ops import list_thread_members
+
+    class _MemberGuild:
+        @staticmethod
+        def get_member(uid):
+            if uid == 42:
+                return type("M", (), {"display_name": "Alice"})()
+            return None
+
+    thread = _FakeThread(guild=_MemberGuild())
+    thread._thread_members = [
+        type("TM", (), {"id": 42,
+                        "joined_at": _dt.datetime(2026, 8, 1, 9, 0, 0)})(),
+        type("TM", (), {"id": 43, "joined_at": None})(),
+    ]
+    payload = asyncio.run(list_thread_members(_NoActorCtx(), thread))
+    assert payload["count"] == 2
+    assert payload["members"][0] == {
+        "id": 42, "display_name": "Alice",
+        "joined_at": "2026-08-01T09:00:00"}
+    # Uncached member: id survives, display_name is None (never invented).
+    assert payload["members"][1] == {
+        "id": 43, "display_name": None, "joined_at": None}
+
+
+def test_list_thread_members_refuses_a_non_thread():
+    from core.ops import list_thread_members
+    with pytest.raises(ValueError, match="not a thread"):
+        asyncio.run(list_thread_members(_NoActorCtx(), _NotAThread()))
+
+
+def test_join_and_leave_thread_change_only_bot_membership():
+    from core.ops import join_thread, leave_thread
+    thread = _FakeThread()
+    assert asyncio.run(join_thread(_NoActorCtx(), thread)) is True
+    assert thread.joined
+    assert asyncio.run(leave_thread(_NoActorCtx(), thread)) is True
+    assert thread.left
+
+
+@pytest.mark.parametrize("opname", ["join_thread", "leave_thread"])
+def test_join_leave_thread_refuse_a_non_thread(opname):
+    import core.ops as ops_module
+    impl = getattr(ops_module, opname)
+    with pytest.raises(ValueError, match="not a thread"):
+        asyncio.run(impl(_NoActorCtx(), _NotAThread()))
+
+
+def test_edit_thread_applies_partial_edits_with_audit_reason():
+    from core.ops import edit_thread
+    thread = _FakeThread()
+    payload = asyncio.run(edit_thread(_AuthorCtx(), thread,
+                                      name="renamed", archived=True))
+    assert thread.edit_kwargs == {"name": "renamed", "archived": True}
+    assert "edit_thread op by tester (321)" == thread.edit_reason
+    assert payload["thread_id"] == 111
+    assert payload["name"] == "renamed"
+    assert payload["archived"] is True
+    assert payload["locked"] is False
+
+
+def test_edit_thread_requires_at_least_one_field():
+    from core.ops import edit_thread
+    thread = _FakeThread()
+    with pytest.raises(ValueError, match="Nothing to edit"):
+        asyncio.run(edit_thread(_AuthorCtx(), thread))
+    assert thread.edit_kwargs is None
+
+
+def test_edit_thread_rejects_an_invalid_auto_archive_duration():
+    from core.ops import edit_thread
+    thread = _FakeThread()
+    with pytest.raises(ValueError, match="auto_archive_duration"):
+        asyncio.run(edit_thread(_AuthorCtx(), thread,
+                                auto_archive_duration=120))
+    assert thread.edit_kwargs is None
+
+
+def test_edit_thread_refuses_a_non_thread():
+    from core.ops import edit_thread
+    with pytest.raises(ValueError, match="not a thread"):
+        asyncio.run(edit_thread(_AuthorCtx(), _NotAThread(), name="x"))
+
+
+class _EditableChannel:
+    def __init__(self, **attrs):
+        self.id = attrs.pop("id", 10)
+        self.name = attrs.pop("name", "general")
+        self.type = attrs.pop("type", "text")
+        self.edit_kwargs = None
+        self.edit_reason = None
+        for key, value in attrs.items():
+            setattr(self, key, value)
+
+    async def edit(self, *, reason=None, **kwargs):
+        self.edit_kwargs = dict(kwargs)
+        self.edit_reason = reason
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        return self
+
+
+def test_set_slowmode_edits_the_channel_with_audit_reason():
+    from core.ops import set_slowmode
+    chan = _EditableChannel(slowmode_delay=0)
+    payload = asyncio.run(set_slowmode(_AuthorCtx(), chan, 30))
+    assert chan.edit_kwargs == {"slowmode_delay": 30}
+    assert chan.edit_reason == "set_slowmode op by tester (321)"
+    assert payload == {"channel_id": 10, "slowmode_delay": 30}
+
+
+def test_set_slowmode_refuses_threads_and_slowmodeless_channels():
+    from core.ops import set_slowmode
+    with pytest.raises(ValueError, match="edit_thread"):
+        asyncio.run(set_slowmode(_AuthorCtx(), _FakeThread(), 30))
+
+    class _Category:
+        id = 9
+    with pytest.raises(ValueError, match="no.*slowmode|slowmode"):
+        asyncio.run(set_slowmode(_AuthorCtx(), _Category(), 30))
+
+
+def test_edit_channel_applies_partial_edits():
+    from core.ops import edit_channel
+    chan = _EditableChannel(topic="old", nsfw=False)
+    payload = asyncio.run(edit_channel(_AuthorCtx(), chan,
+                                       topic="new topic", nsfw=True))
+    assert chan.edit_kwargs == {"topic": "new topic", "nsfw": True}
+    assert chan.edit_reason == "edit_channel op by tester (321)"
+    assert payload == {"id": 10, "name": "general", "topic": "new topic",
+                       "nsfw": True, "type": "text"}
+
+
+def test_edit_channel_requires_at_least_one_field():
+    from core.ops import edit_channel
+    chan = _EditableChannel(topic="old")
+    with pytest.raises(ValueError, match="Nothing to edit"):
+        asyncio.run(edit_channel(_AuthorCtx(), chan))
+    assert chan.edit_kwargs is None
+
+
+def test_edit_channel_refuses_threads_and_topicless_topic_edits():
+    from core.ops import edit_channel
+    with pytest.raises(ValueError, match="edit_thread"):
+        asyncio.run(edit_channel(_AuthorCtx(), _FakeThread(), name="x"))
+    voice = _EditableChannel(type="voice")  # no topic attribute
+    with pytest.raises(ValueError, match="topic"):
+        asyncio.run(edit_channel(_AuthorCtx(), voice, topic="nope"))
+    assert voice.edit_kwargs is None
+
+
+def test_get_member_permissions_returns_granted_names_only():
+    from core.ops import get_member_permissions
+
+    class _Chan:
+        id = 10
+
+        def permissions_for(self, member):
+            return [("read_messages", True), ("send_messages", True),
+                    ("manage_guild", False)]
+
+    member = type("M", (), {"id": 42})()
+    payload = asyncio.run(get_member_permissions(
+        _NoActorCtx(), _Chan(), member))
+    assert payload == {"channel_id": 10, "user_id": 42,
+                       "permissions": ["read_messages", "send_messages"]}
+
+
+class _FakeForum(discord.ForumChannel):
+    """A real discord.ForumChannel (isinstance guard must pass) with none of
+    the gateway state — __init__ is deliberately not chained."""
+
+    def __init__(self, tags=()):  # noqa: D107 - test fake
+        self.id = 30
+        self.name = "help-forum"
+        self._tags = list(tags)
+        self.created_with = None
+
+    @property
+    def available_tags(self):
+        return self._tags
+
+    async def create_thread(self, **kwargs):
+        self.created_with = dict(kwargs)
+        thread = type("T", (), {"id": 77, "name": kwargs["name"]})()
+        message = type("M", (), {"id": 88})()
+        return type("TM", (), {"thread": thread, "message": message})()
+
+
+def _forum_tag(tid, name):
+    return type("Tag", (), {"id": tid, "name": name})()
+
+
+def test_create_forum_post_creates_thread_with_tags_and_no_pings():
+    from core.ops import create_forum_post
+    forum = _FakeForum(tags=[_forum_tag(1, "solved"), _forum_tag(2, "bug")])
+    result = asyncio.run(create_forum_post(
+        _NoActorCtx(), forum, "Help please", "It broke.", tag_ids=["2"]))
+    assert forum.created_with["name"] == "Help please"
+    assert forum.created_with["content"] == "It broke."
+    assert [t.id for t in forum.created_with["applied_tags"]] == [2]
+    # Same never-ping policy as every send-class op.
+    assert forum.created_with["allowed_mentions"].everyone is False
+    payload = registry.get("create_forum_post").serialize_result(result)
+    assert payload == {"thread_id": 77, "name": "Help please",
+                       "message_id": 88}
+
+
+def test_create_forum_post_rejects_an_unknown_tag_id():
+    from core.ops import create_forum_post
+    forum = _FakeForum(tags=[_forum_tag(1, "solved")])
+    with pytest.raises(ValueError, match="forum tag"):
+        asyncio.run(create_forum_post(_NoActorCtx(), forum, "T", "body",
+                                      tag_ids=["999"]))
+    assert forum.created_with is None
+
+
+def test_create_forum_post_refuses_non_forum_and_empty_content():
+    from core.ops import create_forum_post
+
+    class _Text:
+        id = 10
+    with pytest.raises(ValueError, match="not a.*forum"):
+        asyncio.run(create_forum_post(_NoActorCtx(), _Text(), "T", "body"))
+    forum = _FakeForum()
+    with pytest.raises(ValueError, match="non-empty content"):
+        asyncio.run(create_forum_post(_NoActorCtx(), forum, "T", "   "))
+    assert forum.created_with is None
+
+
+# --------------------------------------------------------------------------
+# Guild & members ops added in the 2026-08 guild-domain gap pass.
+# Wire shapes and permission tiers first (decisions worth locking), then
+# impl behavior with fakes (no Discord needed).
+# --------------------------------------------------------------------------
+
+def test_get_member_shape():
+    schema = registry.get("get_member").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id"}
+    # guild_id is ambient-optional, same as add_role.
+    assert schema["required"] == ["user_id"]
+
+
+def test_get_guild_info_shape():
+    schema = registry.get("get_guild_info").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id"}
+    assert schema["required"] == ["guild_id"]
+
+
+def test_search_members_shape():
+    schema = registry.get("search_members").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "query", "limit"}
+    assert set(schema["required"]) == {"guild_id", "query"}
+    assert schema["properties"]["limit"]["maximum"] == 100
+    assert schema["properties"]["limit"]["default"] == 10
+
+
+def test_set_nickname_shape():
+    schema = registry.get("set_nickname").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id", "nick",
+                                         "reason"}
+    # nick is optional ON PURPOSE: omitting it clears the nickname.
+    assert schema["required"] == ["user_id"]
+
+
+def test_timeout_member_shape_and_28_day_cap():
+    from core.ops import TIMEOUT_MAX_MINUTES
+    schema = registry.get("timeout_member").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id",
+                                         "duration_minutes", "reason"}
+    assert set(schema["required"]) == {"user_id", "duration_minutes"}
+    assert schema["properties"]["duration_minutes"]["maximum"] == 40320
+    assert TIMEOUT_MAX_MINUTES == 40320  # Discord's 28-day cap
+    assert schema["properties"]["duration_minutes"]["minimum"] == 1
+
+
+def test_remove_timeout_shape():
+    schema = registry.get("remove_timeout").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id", "reason"}
+    assert schema["required"] == ["user_id"]
+
+
+def test_list_bans_shape():
+    schema = registry.get("list_bans").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "limit", "after_user_id"}
+    assert schema["required"] == ["guild_id"]
+    assert schema["properties"]["limit"]["maximum"] == 1000
+    assert schema["properties"]["after_user_id"]["type"] == "string"
+
+
+def test_fetch_audit_logs_shape():
+    schema = registry.get("fetch_audit_logs").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "limit", "user_id",
+                                         "action", "before"}
+    assert schema["required"] == ["guild_id"]
+    assert schema["properties"]["limit"]["maximum"] == 100
+    # The entry-id cursor is a snowflake and must travel as a string even
+    # though its wire name doesn't end in _id.
+    assert schema["properties"]["before"]["type"] == "string"
+
+
+def test_estimate_prune_shape():
+    schema = registry.get("estimate_prune").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "days"}
+    assert schema["required"] == ["guild_id"]
+    assert schema["properties"]["days"]["maximum"] == 30
+
+
+@pytest.mark.parametrize("name", ["list_integrations", "list_invites"])
+def test_guild_enumeration_ops_take_only_a_guild_id(name):
+    schema = registry.get(name).to_json_schema()
+    assert set(schema["properties"]) == {"guild_id"}
+    assert schema["required"] == ["guild_id"]
+
+
+@pytest.mark.parametrize("name,level", [
+    # By-hand-without-a-dialog reads any member can see stay EVERYONE.
+    ("get_member", PermissionLevel.EVERYONE),
+    ("get_guild_info", PermissionLevel.EVERYONE),
+    ("search_members", PermissionLevel.EVERYONE),
+    # Admin-view reads and member-state writes carry the ADMIN gate.
+    ("set_nickname", PermissionLevel.ADMIN),
+    ("timeout_member", PermissionLevel.ADMIN),
+    ("remove_timeout", PermissionLevel.ADMIN),
+    ("list_bans", PermissionLevel.ADMIN),
+    ("fetch_audit_logs", PermissionLevel.ADMIN),
+    ("estimate_prune", PermissionLevel.ADMIN),
+    ("list_integrations", PermissionLevel.ADMIN),
+    ("list_invites", PermissionLevel.ADMIN),
+])
+def test_guild_domain_permission_tiers(name, level):
+    op_obj = registry.require(name)
+    assert op_obj.permission == level
+    assert op_obj.scope == OpScope.GUILD
+
+
+def test_get_member_serializer_ships_the_profile_fields():
+    import datetime as _dt
+
+    _default_role = type("R", (), {
+        "id": 1, "name": "@everyone", "is_default": lambda self: True})()
+    _mod_role = type("R", (), {
+        "id": 2, "name": "Mods", "is_default": lambda self: False})()
+    _avatar = type("Av", (), {
+        "__str__": lambda self: "https://cdn/avatars/42.png"})()
+
+    class _Member:
+        id = 42
+        name = "alice"
+        display_name = "Alice"
+        nick = "Alice"
+        bot = False
+        roles = [_default_role, _mod_role]
+        joined_at = _dt.datetime(2025, 1, 2, 3, 4, 5)
+        created_at = _dt.datetime(2020, 6, 7, 8, 9, 10)
+        premium_since = None
+        timed_out_until = _dt.datetime(2026, 8, 21, 0, 0, 0)
+        status = "idle"
+        display_avatar = _avatar
+        pending = False
+
+    payload = registry.get("get_member").serialize_result(_Member())
+    assert payload["id"] == 42
+    assert payload["name"] == "alice"
+    assert payload["nick"] == "Alice"
+    # @everyone is implicit membership, not information — excluded.
+    assert payload["roles"] == [{"id": 2, "name": "Mods"}]
+    assert payload["joined_at"] == "2025-01-02T03:04:05"
+    assert payload["created_at"] == "2020-06-07T08:09:10"
+    assert payload["premium_since"] is None
+    assert payload["timed_out_until"] == "2026-08-21T00:00:00"
+    assert payload["status"] == "idle"
+    assert payload["avatar_url"] == "https://cdn/avatars/42.png"
+    assert payload["pending"] is False
+
+
+def test_get_guild_info_reads_the_cache_facts():
+    import datetime as _dt
+    from core.ops import get_guild_info
+
+    _icon = type("Ic", (), {"__str__": lambda self: "https://cdn/icon.png"})()
+
+    class _Guild:
+        id = 1
+        name = "Testland"
+        description = "a place"
+        owner_id = 42
+        member_count = 250
+        created_at = _dt.datetime(2019, 5, 1, 0, 0, 0)
+        premium_tier = 2
+        premium_subscription_count = 14
+        features = ("COMMUNITY", "NEWS")
+        verification_level = "medium"
+        preferred_locale = "en-US"
+        vanity_url_code = None
+        icon = _icon
+        banner = None
+
+    payload = asyncio.run(get_guild_info(_NoActorCtx(), _Guild()))
+    assert payload["name"] == "Testland"
+    assert payload["owner_id"] == 42
+    assert payload["member_count"] == 250
+    assert payload["created_at"] == "2019-05-01T00:00:00"
+    assert payload["premium_tier"] == 2
+    assert payload["features"] == ["COMMUNITY", "NEWS"]
+    assert payload["verification_level"] == "medium"
+    assert payload["preferred_locale"] == "en-US"
+    assert payload["icon_url"] == "https://cdn/icon.png"
+    assert payload["banner_url"] is None
+
+
+def test_search_members_queries_the_gateway_and_serializes_rows():
+    from core.ops import search_members
+
+    class _QueryGuild:
+        def __init__(self):
+            self.seen = None
+
+        async def query_members(self, query=None, *, limit=5, cache=True):
+            self.seen = (query, limit, cache)
+            return [type("M", (), {"id": 42, "display_name": "Alice",
+                                   "name": "alice", "status": "online"})()]
+
+    guild = _QueryGuild()
+    rows = asyncio.run(search_members(_NoActorCtx(), guild, "ali", limit=25))
+    assert guild.seen == ("ali", 25, True)
+    assert rows == [{"id": 42, "display_name": "Alice", "name": "alice",
+                     "status": "online"}]
+    payload = registry.get("search_members").serialize_result(rows)
+    assert payload == {"members": rows, "count": 1}
+
+
+class _EditableMember:
+    def __init__(self, mid=42):
+        self.id = mid
+        self.edit_kwargs = None
+        self.edit_reason = None
+        self.timeout_until = "unset"
+        self.timeout_reason = None
+
+    async def edit(self, *, nick, reason=None):
+        self.edit_kwargs = {"nick": nick}
+        self.edit_reason = reason
+
+    async def timeout(self, until, *, reason=None):
+        self.timeout_until = until
+        self.timeout_reason = reason
+
+
+def test_set_nickname_sets_and_stamps_an_audit_reason():
+    from core.ops import set_nickname
+    member = _EditableMember()
+    payload = asyncio.run(set_nickname(_AuthorCtx(), member, nick="Cool"))
+    assert member.edit_kwargs == {"nick": "Cool"}
+    assert member.edit_reason == "set_nickname op by tester (321)"
+    assert payload == {"member_id": 42, "nick": "Cool"}
+
+
+@pytest.mark.parametrize("nick", [None, "", "   "])
+def test_set_nickname_omitted_or_empty_clears(nick):
+    from core.ops import set_nickname
+    member = _EditableMember()
+    payload = asyncio.run(set_nickname(_AuthorCtx(), member, nick=nick,
+                                       reason="cleanup"))
+    assert member.edit_kwargs == {"nick": None}
+    # A caller-supplied reason wins over the actor stamp.
+    assert member.edit_reason == "cleanup"
+    assert payload == {"member_id": 42, "nick": None}
+
+
+def test_timeout_member_times_out_until_now_plus_duration():
+    import datetime as _dt
+    from core.ops import timeout_member
+    member = _EditableMember()
+    start = discord.utils.utcnow()
+    payload = asyncio.run(timeout_member(_AuthorCtx(), member, 30,
+                                         reason="spam"))
+    until = member.timeout_until
+    assert isinstance(until, _dt.datetime)
+    delta = until - (start + _dt.timedelta(minutes=30))
+    assert abs(delta.total_seconds()) < 5
+    assert member.timeout_reason == "spam"
+    assert payload == {"member_id": 42,
+                       "timed_out_until": until.isoformat()}
+
+
+def test_remove_timeout_passes_none_with_the_actor_stamp():
+    from core.ops import remove_timeout
+    member = _EditableMember()
+    assert asyncio.run(remove_timeout(_AuthorCtx(), member)) is True
+    assert member.timeout_until is None
+    assert member.timeout_reason == "remove_timeout op by tester (321)"
+
+
+class _BanGuild:
+    def __init__(self, entries):
+        self._entries = entries
+        self.seen_kwargs = None
+
+    def bans(self, **kwargs):
+        self.seen_kwargs = kwargs
+        entries = self._entries
+
+        async def gen():
+            for e in entries:
+                yield e
+        return gen()
+
+
+def _ban_entry(uid, name, reason):
+    user = type("U", (), {"id": uid, "name": name})()
+    return type("BanEntry", (), {"user": user, "reason": reason})()
+
+
+def test_list_bans_serializes_entries():
+    from core.ops import list_bans
+    guild = _BanGuild([_ban_entry(1, "spammer", "spam"),
+                       _ban_entry(2, "raider", None)])
+    rows = asyncio.run(list_bans(_NoActorCtx(), guild))
+    assert rows == [{"user_id": 1, "name": "spammer", "reason": "spam"},
+                    {"user_id": 2, "name": "raider", "reason": None}]
+    assert guild.seen_kwargs == {"limit": 100}
+    payload = registry.get("list_bans").serialize_result(rows)
+    assert payload == {"bans": rows, "count": 2}
+
+
+def test_list_bans_pages_by_user_id_cursor():
+    from core.ops import list_bans
+    guild = _BanGuild([])
+    asyncio.run(list_bans(_NoActorCtx(), guild, limit=50, after_user_id=99))
+    assert guild.seen_kwargs["limit"] == 50
+    after = guild.seen_kwargs["after"]
+    assert isinstance(after, discord.Object) and after.id == 99
+
+
+class _AuditGuild:
+    def __init__(self, entries):
+        self._entries = entries
+        self.seen_kwargs = None
+
+    def audit_logs(self, **kwargs):
+        self.seen_kwargs = kwargs
+        entries = self._entries
+
+        async def gen():
+            for e in entries:
+                yield e
+        return gen()
+
+
+def _audit_entry():
+    import datetime as _dt
+
+    class _LiveRole:
+        def __str__(self):
+            return "<Role Mods>"
+
+    changes = type("Changes", (), {
+        # AuditLogDiff iterates as (attribute, value) pairs; "color" only
+        # exists on the after side (a create-style one-sided change), and
+        # its value is a live object that must be stringified.
+        "before": [("name", "old-name")],
+        "after": [("name", "new-name"), ("color", _LiveRole())],
+    })()
+    return type("Entry", (), {
+        "id": 777,
+        "action": discord.AuditLogAction.role_update,
+        "user": type("U", (), {"id": 42})(),
+        "target": type("Role", (), {"id": 9})(),
+        "reason": "tidy",
+        "created_at": _dt.datetime(2026, 8, 19, 12, 0, 0),
+        "changes": changes,
+    })()
+
+
+def test_fetch_audit_logs_serializes_entries_and_stringifies_live_objects():
+    from core.ops import fetch_audit_logs
+    guild = _AuditGuild([_audit_entry()])
+    entries = asyncio.run(fetch_audit_logs(_NoActorCtx(), guild))
+    assert guild.seen_kwargs == {"limit": 50}
+    assert len(entries) == 1
+    e = entries[0]
+    assert e["id"] == 777
+    assert e["action"] == "role_update"
+    assert e["user_id"] == 42
+    assert e["target_id"] == 9
+    assert e["target_type"] == "Role"
+    assert e["reason"] == "tidy"
+    assert e["created_at"] == "2026-08-19T12:00:00"
+    assert e["changes"] == [
+        {"attribute": "name", "before": "old-name", "after": "new-name"},
+        {"attribute": "color", "before": None, "after": "<Role Mods>"},
+    ]
+    payload = registry.get("fetch_audit_logs").serialize_result(entries)
+    assert payload == {"entries": entries, "count": 1}
+
+
+def test_fetch_audit_logs_resolves_action_names_and_passes_filters():
+    from core.ops import fetch_audit_logs
+    guild = _AuditGuild([])
+    user = type("U", (), {"id": 42})()
+    asyncio.run(fetch_audit_logs(_NoActorCtx(), guild, limit=10, user=user,
+                                 action="ban", before=555))
+    assert guild.seen_kwargs["limit"] == 10
+    assert guild.seen_kwargs["user"] is user
+    assert guild.seen_kwargs["action"] is discord.AuditLogAction.ban
+    before = guild.seen_kwargs["before"]
+    assert isinstance(before, discord.Object) and before.id == 555
+
+
+def test_fetch_audit_logs_rejects_an_unknown_action_name():
+    from core.ops import fetch_audit_logs
+    guild = _AuditGuild([])
+    with pytest.raises(ValueError, match="audit-log action"):
+        asyncio.run(fetch_audit_logs(_NoActorCtx(), guild,
+                                     action="explode_guild"))
+    assert guild.seen_kwargs is None
+
+
+def test_estimate_prune_is_a_dry_run_read():
+    from core.ops import estimate_prune
+
+    class _Guild:
+        seen_days = None
+
+        async def estimate_pruned_members(self, *, days):
+            self.seen_days = days
+            return 7
+
+    guild = _Guild()
+    payload = asyncio.run(estimate_prune(_NoActorCtx(), guild, days=14))
+    assert guild.seen_days == 14
+    assert payload == {"days": 14, "estimated_members": 7}
+
+
+def test_list_integrations_serializes_accounts_and_bot_apps():
+    from core.ops import list_integrations
+
+    _account = type("Acc", (), {"id": "twitch-1", "name": "streamer"})()
+    _plain = type("Integ", (), {
+        "id": 1, "name": "Twitch", "type": "twitch", "enabled": True,
+        "account": _account, "application": None})()
+    _bot_app = type("App", (), {"user": type("U", (), {"id": 555})()})()
+    _bot = type("Integ", (), {
+        "id": 2, "name": "SomeBot", "type": "discord", "enabled": True,
+        "account": None, "application": _bot_app})()
+
+    class _Guild:
+        async def integrations(self):
+            return [_plain, _bot]
+
+    rows = asyncio.run(list_integrations(_NoActorCtx(), _Guild()))
+    assert rows[0] == {"id": 1, "name": "Twitch", "type": "twitch",
+                       "enabled": True, "account_id": "twitch-1",
+                       "account_name": "streamer"}
+    # application_bot_user_id appears only on bot integrations.
+    assert "application_bot_user_id" not in rows[0]
+    assert rows[1]["application_bot_user_id"] == 555
+    payload = registry.get("list_integrations").serialize_result(rows)
+    assert payload == {"integrations": rows, "count": 2}
+
+
+def test_list_invites_serializes_invite_facts():
+    import datetime as _dt
+    from core.ops import list_invites
+
+    _invite = type("Inv", (), {
+        "code": "abc123",
+        "channel": type("C", (), {"id": 10})(),
+        "inviter": type("U", (), {"id": 42, "name": "alice"})(),
+        "uses": 3,
+        "max_uses": 0,
+        "max_age": 86400,
+        "created_at": _dt.datetime(2026, 8, 1, 0, 0, 0),
+        "expires_at": None,
+        "temporary": False,
+    })()
+
+    class _Guild:
+        vanity_url_code = "coolguild"
+
+        async def invites(self):
+            return [_invite]
+
+    payload = asyncio.run(list_invites(_NoActorCtx(), _Guild()))
+    assert payload["invites"] == [{
+        "code": "abc123", "channel_id": 10, "inviter_id": 42,
+        "inviter_name": "alice", "uses": 3, "max_uses": 0, "max_age": 86400,
+        "created_at": "2026-08-01T00:00:00", "expires_at": None,
+        "temporary": False}]
+    assert payload["vanity_code"] == "coolguild"
+    assert payload["count"] == 1
+    # Identity serializer: the payload dict IS the wire shape.
+    assert registry.get("list_invites").serialize_result(payload) is payload
+
+
+# --------------------------------------------------------------------------
+# Expressive-domain ops added in the 2026-08 gap pass: stickers, emoji
+# role restriction + download, poll voters, invite create/revoke, webhook
+# audit. Wire shapes and permission tiers first, then impl behavior with
+# fakes (no Discord needed).
+# --------------------------------------------------------------------------
+
+def test_sticker_op_shapes():
+    assert set(registry.get("list_stickers").to_json_schema()
+               ["properties"]) == {"guild_id"}
+
+    create = registry.get("create_sticker").to_json_schema()
+    assert set(create["properties"]) == {
+        "guild_id", "name", "description", "emoji", "file_path"}
+    # Discord requires all of these on upload — none is optional.
+    assert set(create["required"]) == {
+        "guild_id", "name", "description", "emoji", "file_path"}
+
+    edit = registry.get("edit_sticker").to_json_schema()
+    assert set(edit["properties"]) == {
+        "guild_id", "sticker_id", "name", "description", "emoji"}
+    assert set(edit["required"]) == {"guild_id", "sticker_id"}
+    assert edit["properties"]["sticker_id"]["type"] == "string"
+
+    delete = registry.get("delete_sticker").to_json_schema()
+    assert set(delete["properties"]) == {"guild_id", "sticker_id"}
+    assert set(delete["required"]) == {"guild_id", "sticker_id"}
+
+
+def test_download_emoji_shape():
+    schema = registry.get("download_emoji").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "emoji_id", "sticker"}
+    assert set(schema["required"]) == {"guild_id", "emoji_id"}
+    assert schema["properties"]["emoji_id"]["type"] == "string"
+    assert schema["properties"]["sticker"]["type"] == "boolean"
+
+
+def test_get_poll_voters_shape():
+    schema = registry.get("get_poll_voters").to_json_schema()
+    assert set(schema["properties"]) == {
+        "channel_id", "message_id", "answer_id", "limit"}
+    assert set(schema["required"]) == {
+        "channel_id", "message_id", "answer_id"}
+    # Poll answer ids are small ordinals, but every *_id wire param travels
+    # as a string by registry convention (the 2**53 rule is name-based).
+    assert schema["properties"]["answer_id"]["type"] == "string"
+    assert schema["properties"]["limit"]["maximum"] == 100
+
+
+def test_create_invite_shape_and_safe_defaults():
+    schema = registry.get("create_invite").to_json_schema()
+    assert set(schema["properties"]) == {
+        "channel_id", "max_age_seconds", "max_uses", "temporary"}
+    assert schema["required"] == ["channel_id"]
+    # The lazy path expires: 24h default, never-expiring only on request.
+    assert schema["properties"]["max_age_seconds"]["default"] == 86400
+    assert schema["properties"]["max_age_seconds"]["maximum"] == 604800
+    assert schema["properties"]["max_uses"]["default"] == 0
+    assert schema["properties"]["max_uses"]["maximum"] == 100
+
+
+def test_revoke_invite_shape():
+    schema = registry.get("revoke_invite").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "code"}
+    assert set(schema["required"]) == {"guild_id", "code"}
+
+
+def test_list_webhooks_shape():
+    schema = registry.get("list_webhooks").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "channel_id"}
+    assert schema["required"] == ["guild_id"]
+
+
+def test_edit_emoji_gains_optional_role_ids():
+    schema = registry.get("edit_emoji").to_json_schema()
+    assert set(schema["properties"]) == {
+        "guild_id", "emoji_id", "name", "role_ids"}
+    assert set(schema["required"]) == {"guild_id", "emoji_id", "name"}
+    assert schema["properties"]["role_ids"]["type"] == "array"
+
+
+@pytest.mark.parametrize("name,level", [
+    # Reads any member gets in the client stay EVERYONE.
+    ("list_stickers", PermissionLevel.EVERYONE),
+    ("get_poll_voters", PermissionLevel.EVERYONE),
+    # Asset writes mirror the emoji precedent; invite lifecycle and the
+    # webhook audit mirror the client's Manage-Server surface; download
+    # writes the server filesystem (attachment-gate class).
+    ("create_sticker", PermissionLevel.ADMIN),
+    ("edit_sticker", PermissionLevel.ADMIN),
+    ("delete_sticker", PermissionLevel.ADMIN),
+    ("download_emoji", PermissionLevel.ADMIN),
+    ("create_invite", PermissionLevel.ADMIN),
+    ("revoke_invite", PermissionLevel.ADMIN),
+    ("list_webhooks", PermissionLevel.ADMIN),
+])
+def test_expressive_domain_permission_tiers(name, level):
+    op_obj = registry.require(name)
+    assert op_obj.permission == level
+    assert op_obj.scope == OpScope.GUILD
+
+
+class _FakeSticker:
+    def __init__(self, sid=901, name="wave", description="a wave",
+                 emoji="👋", stype=None, fmt_name="png", fmt_ext="png"):
+        self.id = sid
+        self.name = name
+        self.description = description
+        self.emoji = emoji
+        self.type = stype if stype is not None else discord.StickerType.guild
+        self.format = type("Fmt", (), {
+            "name": fmt_name, "file_extension": fmt_ext})()
+        self.url = f"https://cdn/stickers/{sid}.{fmt_ext}"
+        self.edit_kwargs = None
+        self.edit_reason = None
+        self.deleted = False
+
+    async def edit(self, *, reason=None, **kwargs):
+        self.edit_kwargs = dict(kwargs)
+        self.edit_reason = reason
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        return self
+
+    async def delete(self, *, reason=None):
+        self.deleted = True
+
+    async def read(self):
+        return b"sticker-bytes"
+
+
+class _StickerGuild:
+    def __init__(self, stickers=(), emojis=()):
+        self.name = "Testland"
+        self.stickers = list(stickers)
+        self.emojis = list(emojis)
+        self.created_with = None
+
+    async def create_sticker(self, *, name, description, emoji, file,
+                             reason=None):
+        self.created_with = {"name": name, "description": description,
+                             "emoji": emoji, "file": file, "reason": reason}
+        return _FakeSticker(sid=999, name=name, description=description,
+                            emoji=emoji)
+
+
+class _AdminCtx:
+    """Ctx that passes core.utils.is_admin via the guild admins config list
+    — for direct impl calls that re-check admin internally (the attachment
+    gate on create_sticker)."""
+
+    def __init__(self):
+        self.author = type("A", (), {
+            "id": 321, "__str__": lambda self: "tester"})()
+        self.guild = type("G", (), {"id": 1, "owner": None})()
+        config = type("Cfg", (), {
+            "get": lambda s, ctx, key, default=None, **kw:
+                [321] if key == "admins" else default,
+            "get_global": lambda s, key, default=None: default,
+        })()
+        self.bot = type("B", (), {
+            "config": config,
+            "user": type("U", (), {"id": 555})(),
+        })()
+
+
+def test_list_stickers_serializes_the_sticker_facts():
+    from core.ops import list_stickers
+    guild = _StickerGuild(stickers=[_FakeSticker()])
+    rows = asyncio.run(list_stickers(_NoActorCtx(), guild))
+    assert rows == [{
+        "id": 901, "name": "wave", "description": "a wave", "emoji": "👋",
+        "format": "png", "url": "https://cdn/stickers/901.png"}]
+    payload = registry.get("list_stickers").serialize_result(rows)
+    assert payload == {"stickers": rows, "count": 1}
+
+
+def test_create_sticker_uploads_a_validated_file(tmp_path):
+    from core.ops import create_sticker
+    img = tmp_path / "wave.png"
+    img.write_bytes(b"PNG-fake")
+    guild = _StickerGuild()
+    result = asyncio.run(create_sticker(_AdminCtx(), guild, "wave",
+                                        "a wave", "👋", str(img)))
+    assert guild.created_with["name"] == "wave"
+    assert guild.created_with["description"] == "a wave"
+    assert guild.created_with["emoji"] == "👋"
+    assert guild.created_with["file"].filename == "wave.png"
+    assert "create_sticker op by tester (321)" == guild.created_with["reason"]
+    payload = registry.get("create_sticker").serialize_result(result)
+    assert payload == {"id": 999, "name": "wave",
+                       "url": "https://cdn/stickers/999.png"}
+
+
+def test_create_sticker_rejects_bad_names_and_files(tmp_path):
+    from core.ops import STICKER_MAX_BYTES, create_sticker, load_sticker_file
+    guild = _StickerGuild()
+    img = tmp_path / "ok.png"
+    img.write_bytes(b"PNG-fake")
+    with pytest.raises(ValueError, match="2-30"):
+        asyncio.run(create_sticker(_AdminCtx(), guild, "x", "d", "👋",
+                                   str(img)))
+    assert guild.created_with is None
+
+    with pytest.raises(ValueError, match="(?i)not found"):
+        load_sticker_file("/no/such/sticker.png")
+    bad_ext = tmp_path / "sticker.webp"  # valid for emoji, NOT for stickers
+    bad_ext.write_bytes(b"RIFF-fake")
+    with pytest.raises(ValueError, match="(?i)extension"):
+        load_sticker_file(str(bad_ext))
+    huge = tmp_path / "huge.png"
+    huge.write_bytes(b"x" * (STICKER_MAX_BYTES + 1))
+    with pytest.raises(ValueError, match="(?i)too large"):
+        load_sticker_file(str(huge))
+    # Lottie json is allowed — the sticker list differs from the emoji one.
+    lottie = tmp_path / "anim.json"
+    lottie.write_bytes(b"{}")
+    assert load_sticker_file(str(lottie)) == lottie.resolve()
+
+
+def test_edit_sticker_applies_partial_edits_with_guards():
+    from core.ops import edit_sticker
+    sticker = _FakeSticker()
+    guild = _StickerGuild(stickers=[sticker])
+    result = asyncio.run(edit_sticker(_AuthorCtx(), guild, 901,
+                                      name="waving", emoji="🌊"))
+    assert sticker.edit_kwargs == {"name": "waving", "emoji": "🌊"}
+    assert sticker.edit_reason == "edit_sticker op by tester (321)"
+    payload = registry.get("edit_sticker").serialize_result(result)
+    assert payload == {"id": 901, "name": "waving", "description": "a wave"}
+
+    with pytest.raises(ValueError, match="Nothing to edit"):
+        asyncio.run(edit_sticker(_AuthorCtx(), guild, 901))
+    with pytest.raises(ValueError, match="list_stickers"):
+        asyncio.run(edit_sticker(_AuthorCtx(), guild, 777, name="x"))
+
+
+def test_edit_sticker_refuses_a_non_guild_sticker():
+    from core.ops import edit_sticker
+    standard = _FakeSticker(stype=discord.StickerType.standard)
+    guild = _StickerGuild(stickers=[standard])
+    with pytest.raises(ValueError, match="not a guild sticker"):
+        asyncio.run(edit_sticker(_AuthorCtx(), guild, 901, name="x"))
+    assert standard.edit_kwargs is None
+
+
+def test_delete_sticker_deletes_and_reports():
+    from core.ops import delete_sticker
+    sticker = _FakeSticker()
+    guild = _StickerGuild(stickers=[sticker])
+    info = asyncio.run(delete_sticker(_AuthorCtx(), guild, 901))
+    assert sticker.deleted
+    assert info == {"deleted": True, "id": 901, "name": "wave"}
+    with pytest.raises(ValueError, match="list_stickers"):
+        asyncio.run(delete_sticker(_AuthorCtx(), guild, 901234))
+
+
+class _StickerSendChannel(_SendCaptureChannel):
+    def __init__(self, guild):
+        super().__init__()
+        self.guild = guild
+
+
+def test_send_message_attaches_a_guild_sticker():
+    from core.ops import send_message
+    sticker = _FakeSticker()
+    chan = _StickerSendChannel(_StickerGuild(stickers=[sticker]))
+    # Sticker-only send: empty content is allowed when a sticker rides along.
+    asyncio.run(send_message(_NoActorCtx(), chan, "", sticker_id=901))
+    assert chan.kwargs["stickers"] == [sticker]
+    assert chan.kwargs["allowed_mentions"].everyone is False
+
+
+def test_send_message_refuses_a_foreign_sticker_id():
+    from core.ops import send_message
+    chan = _StickerSendChannel(_StickerGuild(stickers=[_FakeSticker()]))
+    with pytest.raises(ValueError, match="list_stickers"):
+        asyncio.run(send_message(_NoActorCtx(), chan, "hi", sticker_id=777))
+    assert chan.kwargs is None
+
+
+def test_download_emoji_writes_the_asset_under_the_download_dir(
+        tmp_path, monkeypatch):
+    import core.ops as ops_module
+    from core.ops import download_emoji
+    monkeypatch.setattr(ops_module, "EMOJI_DOWNLOAD_DIR", tmp_path / "dl")
+
+    class _Emoji:
+        id = 42
+        name = "blob"
+        animated = False
+
+        async def read(self):
+            return b"emoji-bytes"
+
+    guild = _StickerGuild(emojis=[_Emoji()])
+    payload = asyncio.run(download_emoji(_NoActorCtx(), guild, 42))
+    dest = tmp_path / "dl" / "blob_42.png"
+    assert payload == {"file_path": str(dest), "bytes": 11, "name": "blob"}
+    assert dest.read_bytes() == b"emoji-bytes"
+
+
+def test_download_emoji_sticker_mode_uses_the_sticker_extension(
+        tmp_path, monkeypatch):
+    import core.ops as ops_module
+    from core.ops import download_emoji
+    monkeypatch.setattr(ops_module, "EMOJI_DOWNLOAD_DIR", tmp_path)
+    sticker = _FakeSticker(fmt_name="lottie", fmt_ext="json")
+    guild = _StickerGuild(stickers=[sticker])
+    payload = asyncio.run(download_emoji(_NoActorCtx(), guild, 901,
+                                         sticker=True))
+    assert payload["file_path"].endswith("wave_901.json")
+    assert payload["bytes"] == len(b"sticker-bytes")
+    # An emoji id must not resolve in sticker mode and vice versa.
+    with pytest.raises(ValueError, match="list_emojis"):
+        asyncio.run(download_emoji(_NoActorCtx(), guild, 901))
+
+
+class _VotersAnswer:
+    def __init__(self, aid, text, user_ids):
+        self.id = aid
+        self.text = text
+        self._user_ids = list(user_ids)
+        self.seen_limit = None
+
+    def voters(self, *, limit=None):
+        self.seen_limit = limit
+        ids = self._user_ids[:limit]
+
+        async def gen():
+            for uid in ids:
+                yield type("U", (), {"id": uid, "name": f"u{uid}",
+                                     "display_name": f"U{uid}"})()
+        return gen()
+
+
+def test_get_poll_voters_enumerates_one_answer():
+    from core.ops import get_poll_voters
+    answer = _VotersAnswer(2, "fruit", [11, 22])
+
+    class _Poll:
+        @staticmethod
+        def get_answer(aid):
+            return answer if aid == 2 else None
+
+    class _Msg:
+        poll = _Poll()
+
+    payload = asyncio.run(get_poll_voters(_NoActorCtx(), _Msg(), 2))
+    assert answer.seen_limit == 100
+    assert payload == {
+        "answer_id": 2, "text": "fruit",
+        "voters": [{"id": 11, "name": "u11", "display_name": "U11"},
+                   {"id": 22, "name": "u22", "display_name": "U22"}],
+        "count": 2}
+
+    with pytest.raises(ValueError, match="no answer"):
+        asyncio.run(get_poll_voters(_NoActorCtx(), _Msg(), 9))
+
+
+def test_get_poll_voters_refuses_a_poll_less_message():
+    from core.ops import get_poll_voters
+
+    class _Msg:
+        poll = None
+
+    with pytest.raises(ValueError, match="no poll"):
+        asyncio.run(get_poll_voters(_NoActorCtx(), _Msg(), 1))
+
+
+class _RestrictableEmoji:
+    def __init__(self):
+        self.id = 42
+        self.name = "blob"
+        self.animated = False
+        self.managed = False
+        self.url = "https://cdn/emojis/42.png"
+        self.roles = []
+        self.edit_kwargs = None
+
+    def __str__(self):
+        return "<:blob:42>"
+
+    async def edit(self, *, reason=None, **kwargs):
+        self.edit_kwargs = dict(kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+        return self
+
+
+def test_edit_emoji_applies_a_role_restriction_and_serializes_it():
+    from core.ops import edit_emoji
+    emoji = _RestrictableEmoji()
+    role = type("R", (), {"id": 7, "name": "Mods"})()
+    guild = _StickerGuild(emojis=[emoji])
+    guild.id = 1
+    guild.get_role = lambda rid: role if rid == 7 else None
+
+    result = asyncio.run(edit_emoji(_AuthorCtx(), guild, 42, "blob",
+                                    role_ids=["7"]))
+    assert emoji.edit_kwargs == {"name": "blob", "roles": [role]}
+    payload = registry.get("edit_emoji").serialize_result(result)
+    assert payload["roles"] == [7]
+
+    # Empty list clears the restriction (roles=[] on the API call).
+    asyncio.run(edit_emoji(_AuthorCtx(), guild, 42, "blob", role_ids=[]))
+    assert emoji.edit_kwargs == {"name": "blob", "roles": []}
+
+
+def test_edit_emoji_refuses_an_unresolvable_role_id():
+    from core.ops import ResolutionError, edit_emoji
+    emoji = _RestrictableEmoji()
+    guild = _StickerGuild(emojis=[emoji])
+    guild.id = 1
+    guild.get_role = lambda rid: None
+    with pytest.raises(ResolutionError):
+        asyncio.run(edit_emoji(_AuthorCtx(), guild, 42, "blob",
+                               role_ids=["999"]))
+    assert emoji.edit_kwargs is None
+
+
+class _InviteChannel:
+    def __init__(self, cid=10):
+        self.id = cid
+        self.seen_kwargs = None
+
+    async def create_invite(self, **kwargs):
+        import datetime as _dt
+        self.seen_kwargs = dict(kwargs)
+        return type("Inv", (), {
+            "code": "fresh1",
+            "url": "https://discord.gg/fresh1",
+            "created_at": _dt.datetime(2026, 8, 20, 12, 0, 0),
+            "expires_at": None,
+        })()
+
+
+def test_create_invite_defaults_to_expiring_and_computes_expiry():
+    from core.ops import create_invite
+    chan = _InviteChannel()
+    payload = asyncio.run(create_invite(_AuthorCtx(), chan))
+    assert chan.seen_kwargs["max_age"] == 86400
+    assert chan.seen_kwargs["max_uses"] == 0
+    assert chan.seen_kwargs["temporary"] is False
+    assert chan.seen_kwargs["unique"] is True
+    assert chan.seen_kwargs["reason"] == "create_invite op by tester (321)"
+    assert payload["code"] == "fresh1"
+    assert payload["url"] == "https://discord.gg/fresh1"
+    assert payload["channel_id"] == 10
+    assert payload["max_age"] == 86400
+    # Discord's create response carries no expires_at; it is derived from
+    # created_at + max_age rather than reported as null.
+    assert payload["expires_at"] == "2026-08-21T12:00:00"
+
+
+def test_create_invite_refuses_an_inviteless_channel():
+    from core.ops import create_invite
+
+    class _Category:
+        id = 9
+    with pytest.raises(ValueError, match="cannot carry invites"):
+        asyncio.run(create_invite(_AuthorCtx(), _Category()))
+
+
+class _RevocableInvite:
+    def __init__(self, code, uses=3):
+        self.code = code
+        self.uses = uses
+        self.deleted_reason = None
+
+    async def delete(self, *, reason=None):
+        self.deleted_reason = reason
+
+
+class _InviteGuild:
+    def __init__(self, invites):
+        self.name = "Testland"
+        self._invites = list(invites)
+
+    async def invites(self):
+        return list(self._invites)
+
+
+def test_revoke_invite_revokes_a_verified_code():
+    from core.ops import revoke_invite
+    invite = _RevocableInvite("abc123", uses=5)
+    guild = _InviteGuild([invite])
+    payload = asyncio.run(revoke_invite(_AuthorCtx(), guild, "abc123"))
+    assert invite.deleted_reason == "revoke_invite op by tester (321)"
+    assert payload == {"revoked": True, "code": "abc123",
+                       "uses_at_revoke": 5}
+
+
+def test_revoke_invite_accepts_a_pasted_url():
+    from core.ops import revoke_invite
+    invite = _RevocableInvite("abc123")
+    guild = _InviteGuild([invite])
+    payload = asyncio.run(revoke_invite(
+        _AuthorCtx(), guild, "https://discord.gg/abc123"))
+    assert payload["code"] == "abc123"
+    assert invite.deleted_reason is not None
+
+
+def test_revoke_invite_refuses_a_code_not_in_this_guild():
+    """The guard against blind Client.delete_invite: a code that isn't in
+    THIS guild's own invite list is never deleted."""
+    from core.ops import revoke_invite
+    foreign = _RevocableInvite("other99")
+    guild = _InviteGuild([foreign])
+    with pytest.raises(ValueError, match="No active invite"):
+        asyncio.run(revoke_invite(_AuthorCtx(), guild, "abc123"))
+    assert foreign.deleted_reason is None
+
+
+def _webhook(wid, name, channel_id, creator_id, creator_name):
+    return type("WH", (), {
+        "id": wid, "name": name, "channel_id": channel_id,
+        "type": type("WT", (), {"name": "incoming"})(),
+        "user": type("U", (), {"id": creator_id, "name": creator_name})(),
+        "url": "https://discord.com/api/webhooks/SECRET/TOKEN",
+        "token": "SECRET-TOKEN",
+    })()
+
+
+def test_list_webhooks_never_serializes_url_or_token():
+    from core.ops import list_webhooks
+
+    class _Guild:
+        async def webhooks(self):
+            return [_webhook(1, "gh-feed", 10, 42, "alice")]
+
+    payload = asyncio.run(list_webhooks(_NoActorCtx(), _Guild()))
+    assert payload == {"webhooks": [{
+        "id": 1, "name": "gh-feed", "channel_id": 10, "type": "incoming",
+        "creator_id": 42, "creator_name": "alice"}], "count": 1}
+    # The credential must not appear ANYWHERE in the wire payload.
+    import json
+    flat = json.dumps(payload)
+    assert "SECRET" not in flat and "TOKEN" not in flat
+
+
+def test_list_webhooks_narrows_to_one_channel():
+    from core.ops import list_webhooks
+
+    class _Chan:
+        id = 10
+
+        async def webhooks(self):
+            return [_webhook(2, "chan-hook", 10, 42, "alice")]
+
+    class _Guild:
+        async def webhooks(self):  # pragma: no cover - must not be called
+            raise AssertionError("guild-wide path taken despite channel")
+
+    payload = asyncio.run(list_webhooks(_NoActorCtx(), _Guild(), _Chan()))
+    assert [w["id"] for w in payload["webhooks"]] == [2]
+
+    class _Category:
+        id = 9
+    with pytest.raises(ValueError, match="cannot carry webhooks"):
+        asyncio.run(list_webhooks(_NoActorCtx(), _Guild(), _Category()))
+
+
+# --------------------------------------------------------------------------
+# Voice, scheduled-event, and automod ops (2026-08 voice-domain gap pass).
+# Wire shapes first (decisions worth locking), then impl behavior with
+# fakes. Vocal-channel fakes SUBCLASS the real discord.py types without
+# calling their __init__, because the ops' isinstance guards are part of
+# the behavior under test (same pattern as _FakeThread above).
+# --------------------------------------------------------------------------
+
+def test_get_voice_state_shape():
+    schema = registry.get("get_voice_state").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id"}
+    # guild_id is ambient-optional, same as add_role.
+    assert schema["required"] == ["user_id"]
+
+
+def test_list_voice_states_shape():
+    schema = registry.get("list_voice_states").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id"}
+    assert schema["required"] == []
+
+
+def test_move_member_shape():
+    schema = registry.get("move_member").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id", "channel_id"}
+    assert set(schema["required"]) == {"user_id", "channel_id"}
+
+
+def test_disconnect_member_shape():
+    schema = registry.get("disconnect_member").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id"}
+    assert schema["required"] == ["user_id"]
+
+
+@pytest.mark.parametrize("name,flag", [
+    ("set_voice_mute", "muted"),
+    ("set_voice_deafen", "deafened"),
+    ("set_stage_suppress", "suppressed"),
+])
+def test_voice_toggle_ops_take_a_required_boolean(name, flag):
+    """One op with a boolean beats an op pair — the flag is REQUIRED so a
+    caller always states the direction explicitly."""
+    schema = registry.get(name).to_json_schema()
+    assert set(schema["properties"]) == {"guild_id", "user_id", flag}
+    assert set(schema["required"]) == {"user_id", flag}
+    assert schema["properties"][flag]["type"] == "boolean"
+
+
+def test_get_stage_instance_shape():
+    schema = registry.get("get_stage_instance").to_json_schema()
+    assert set(schema["properties"]) == {"channel_id"}
+    assert schema["required"] == ["channel_id"]
+
+
+def test_scheduled_event_read_shapes():
+    listing = registry.get("list_scheduled_events").to_json_schema()
+    assert set(listing["properties"]) == {"guild_id"}
+    assert listing["required"] == []
+    single = registry.get("get_scheduled_event").to_json_schema()
+    assert set(single["properties"]) == {"guild_id", "event_id"}
+    assert single["required"] == ["event_id"]
+    assert single["properties"]["event_id"]["type"] == "string"
+    users = registry.get("list_scheduled_event_users").to_json_schema()
+    assert set(users["properties"]) == {"guild_id", "event_id", "limit"}
+    assert users["required"] == ["event_id"]
+    assert users["properties"]["limit"]["maximum"] == 1000
+
+
+def test_create_scheduled_event_shape():
+    schema = registry.get("create_scheduled_event").to_json_schema()
+    assert set(schema["properties"]) == {
+        "guild_id", "name", "start_time", "entity_type", "channel_id",
+        "location", "end_time", "description"}
+    assert set(schema["required"]) == {"name", "start_time", "entity_type"}
+
+
+def test_edit_scheduled_event_shape():
+    schema = registry.get("edit_scheduled_event").to_json_schema()
+    assert set(schema["properties"]) == {
+        "guild_id", "event_id", "name", "description", "channel_id",
+        "location", "start_time", "end_time", "status"}
+    assert schema["required"] == ["event_id"]
+
+
+def test_list_automod_rules_shape():
+    schema = registry.get("list_automod_rules").to_json_schema()
+    assert set(schema["properties"]) == {"guild_id"}
+    assert schema["required"] == []
+
+
+@pytest.mark.parametrize("name,level", [
+    # Reads any member gets in the client stay EVERYONE.
+    ("get_voice_state", PermissionLevel.EVERYONE),
+    ("list_voice_states", PermissionLevel.EVERYONE),
+    ("get_stage_instance", PermissionLevel.EVERYONE),
+    ("list_scheduled_events", PermissionLevel.EVERYONE),
+    ("get_scheduled_event", PermissionLevel.EVERYONE),
+    ("list_scheduled_event_users", PermissionLevel.EVERYONE),
+    # Reversible client-parity voice writes and event writes are ADMIN.
+    ("move_member", PermissionLevel.ADMIN),
+    ("disconnect_member", PermissionLevel.ADMIN),
+    ("set_voice_mute", PermissionLevel.ADMIN),
+    ("set_voice_deafen", PermissionLevel.ADMIN),
+    ("set_stage_suppress", PermissionLevel.ADMIN),
+    ("create_scheduled_event", PermissionLevel.ADMIN),
+    ("edit_scheduled_event", PermissionLevel.ADMIN),
+    # ADMIN read: keyword rules expose the guild's filtered-word lists.
+    ("list_automod_rules", PermissionLevel.ADMIN),
+])
+def test_voice_domain_permission_tiers(name, level):
+    op_obj = registry.require(name)
+    assert op_obj.permission == level
+    assert op_obj.scope == OpScope.GUILD
+
+
+def test_voice_and_event_groups_are_assigned():
+    for name in ("get_voice_state", "list_voice_states", "move_member",
+                 "disconnect_member", "set_voice_mute", "set_voice_deafen",
+                 "set_stage_suppress", "get_stage_instance"):
+        assert registry.require(name).group == "voice"
+    for name in ("list_scheduled_events", "get_scheduled_event",
+                 "list_scheduled_event_users", "create_scheduled_event",
+                 "edit_scheduled_event"):
+        assert registry.require(name).group == "events"
+    assert registry.require("list_automod_rules").group == "moderation"
+
+
+class _FakeVoiceState:
+    def __init__(self, channel=None, **flags):
+        self.channel = channel
+        self.mute = flags.get("mute", False)
+        self.deaf = flags.get("deaf", False)
+        self.self_mute = flags.get("self_mute", False)
+        self.self_deaf = flags.get("self_deaf", False)
+        self.self_stream = flags.get("self_stream", False)
+        self.self_video = flags.get("self_video", False)
+        self.suppress = flags.get("suppress", False)
+        self.requested_to_speak_at = None
+
+
+class _DuckVoiceChannel:
+    """Duck-typed vocal channel for the READ ops (no isinstance guards):
+    permissions_for drives the actor-visibility policy."""
+
+    def __init__(self, cid=30, name="General", perms=None, members=()):
+        self.id = cid
+        self.name = name
+        self._perms = perms or _Perms(True, True)
+        self.members = list(members)
+
+    def permissions_for(self, member):
+        return self._perms
+
+
+class _VoiceMember:
+    def __init__(self, mid=42, display_name="Alice", voice=None):
+        self.id = mid
+        self.display_name = display_name
+        self.voice = voice
+        self.moved_to = "unset"
+        self.move_reason = None
+        self.edit_kwargs = None
+        self.edit_reason = None
+
+    async def move_to(self, channel, *, reason=None):
+        self.moved_to = channel
+        self.move_reason = reason
+
+    async def edit(self, **kwargs):
+        self.edit_reason = kwargs.pop("reason", None)
+        self.edit_kwargs = kwargs
+
+
+def test_get_voice_state_reads_the_cached_state():
+    from core.ops import get_voice_state
+    chan = _DuckVoiceChannel(30, "General")
+    vs = _FakeVoiceState(channel=chan, self_mute=True, self_stream=True)
+    member = _VoiceMember(voice=vs)
+    payload = asyncio.run(get_voice_state(_NoActorCtx(), member))
+    assert payload["in_voice"] is True
+    assert payload["channel_id"] == 30
+    assert payload["channel_name"] == "General"
+    assert payload["self_mute"] is True
+    assert payload["streaming"] is True
+    assert payload["mute"] is False
+    assert payload["suppress"] is False
+
+
+def test_get_voice_state_reports_not_in_voice():
+    from core.ops import get_voice_state
+    payload = asyncio.run(get_voice_state(_NoActorCtx(),
+                                          _VoiceMember(voice=None)))
+    assert payload == {"in_voice": False}
+
+
+def test_get_voice_state_hides_a_channel_the_actor_cannot_see():
+    """A real Member who can't read the target's voice channel gets
+    in_voice=false — never a leak of WHERE the member is."""
+    from core.ops import get_voice_state
+    hidden = _DuckVoiceChannel(30, "staff-voice", perms=_Perms(False, False))
+    member = _VoiceMember(voice=_FakeVoiceState(channel=hidden))
+    ctx = OpContext(bot=None, author=_FakeMember(), guild=None)
+    payload = asyncio.run(get_voice_state(ctx, member))
+    assert payload == {"in_voice": False}
+
+
+def test_list_voice_states_walks_voice_and_stage_channels():
+    from core.ops import list_voice_states
+    talker = _VoiceMember(1, "Alice",
+                          _FakeVoiceState(self_mute=True))
+    lurker = _VoiceMember(2, "Bob", _FakeVoiceState(deaf=True))
+    voice = _DuckVoiceChannel(30, "General", members=[talker])
+    stage = _DuckVoiceChannel(40, "Town hall", members=[lurker])
+    empty = _DuckVoiceChannel(50, "AFK")
+
+    class _Guild:
+        voice_channels = [voice, empty]
+        stage_channels = [stage]
+
+    rows = asyncio.run(list_voice_states(_NoActorCtx(), guild=_Guild()))
+    assert [r["channel_id"] for r in rows] == [30, 50, 40]
+    assert [r["type"] for r in rows] == ["voice", "voice", "stage"]
+    assert rows[0]["members"][0] == {
+        "id": 1, "display_name": "Alice", "mute": False, "deaf": False,
+        "self_mute": True, "self_deaf": False, "streaming": False,
+        "video": False}
+    assert rows[1]["members"] == []  # empty channels included, like the sidebar
+    assert rows[2]["members"][0]["deaf"] is True
+    payload = registry.get("list_voice_states").serialize_result(rows)
+    assert payload == {"channels": rows, "count": 3}
+
+
+def test_list_voice_states_drops_channels_the_actor_cannot_see():
+    from core.ops import list_voice_states
+    visible = _DuckVoiceChannel(30, "General")
+    hidden = _DuckVoiceChannel(31, "staff-voice",
+                               perms=_Perms(False, False))
+
+    class _Guild:
+        voice_channels = [visible, hidden]
+        stage_channels = []
+
+    ctx = OpContext(bot=None, author=_FakeMember(), guild=None)
+    rows = asyncio.run(list_voice_states(ctx, guild=_Guild()))
+    assert [r["channel_id"] for r in rows] == [30]
+
+
+class _FakeVocalChannel(discord.VoiceChannel):
+    """A real discord.VoiceChannel (isinstance guards must pass) with none
+    of the gateway state — __init__ is deliberately not chained."""
+
+    def __init__(self, cid=30, name="General", guild=None):
+        self.id = cid
+        self.name = name
+        self.guild = guild
+
+
+class _FakeStageChannelReal(discord.StageChannel):
+    """Real discord.StageChannel for isinstance guards. The class attribute
+    shadows the parent's `instance` property so tests can assign it."""
+
+    instance = None
+
+    def __init__(self, cid=40, name="Stage", guild=None, instance=None):
+        self.id = cid
+        self.name = name
+        self.guild = guild
+        self.instance = instance
+        self.fetch_calls = 0
+
+    async def fetch_instance(self):
+        self.fetch_calls += 1
+        response = type("R", (), {"status": 404, "reason": "Not Found"})()
+        raise discord.NotFound(response, "no live stage")
+
+
+def test_move_member_moves_with_an_audit_stamp():
+    from core.ops import move_member
+    dest = _FakeVocalChannel(30)
+    member = _VoiceMember()
+    payload = asyncio.run(move_member(_AuthorCtx(), member, dest))
+    assert member.moved_to is dest
+    assert member.move_reason == "move_member op by tester (321)"
+    assert payload == {"moved": True, "channel_id": 30}
+
+
+def test_move_member_refuses_a_non_vocal_channel():
+    from core.ops import move_member
+
+    class _TextChan:
+        id = 10
+
+    member = _VoiceMember()
+    with pytest.raises(ValueError, match="not a voice or stage"):
+        asyncio.run(move_member(_AuthorCtx(), member, _TextChan()))
+    assert member.moved_to == "unset"
+
+
+def test_disconnect_member_moves_to_none():
+    from core.ops import disconnect_member
+    member = _VoiceMember()
+    assert asyncio.run(disconnect_member(_AuthorCtx(), member)) is True
+    assert member.moved_to is None
+    assert member.move_reason == "disconnect_member op by tester (321)"
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_set_voice_mute_toggles_both_ways(value):
+    from core.ops import set_voice_mute
+    member = _VoiceMember()
+    payload = asyncio.run(set_voice_mute(_AuthorCtx(), member, value))
+    assert member.edit_kwargs == {"mute": value}
+    assert member.edit_reason == "set_voice_mute op by tester (321)"
+    assert payload == {"member_id": 42, "muted": value}
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_set_voice_deafen_toggles_both_ways(value):
+    from core.ops import set_voice_deafen
+    member = _VoiceMember()
+    payload = asyncio.run(set_voice_deafen(_AuthorCtx(), member, value))
+    assert member.edit_kwargs == {"deafen": value}
+    assert payload == {"member_id": 42, "deafened": value}
+
+
+def test_set_stage_suppress_edits_a_stage_member():
+    from core.ops import set_stage_suppress
+    stage = _FakeStageChannelReal()
+    member = _VoiceMember(voice=_FakeVoiceState(channel=stage))
+    payload = asyncio.run(set_stage_suppress(_AuthorCtx(), member, True))
+    assert member.edit_kwargs == {"suppress": True}
+    assert payload == {"member_id": 42, "suppressed": True}
+
+
+def test_set_stage_suppress_refuses_outside_a_stage_channel():
+    """Suppress only exists on stages: a member in a plain voice channel
+    (or not in voice at all) is refused locally, before any API call."""
+    from core.ops import set_stage_suppress
+    in_voice = _VoiceMember(
+        voice=_FakeVoiceState(channel=_FakeVocalChannel()))
+    with pytest.raises(ValueError, match="stage"):
+        asyncio.run(set_stage_suppress(_AuthorCtx(), in_voice, True))
+    assert in_voice.edit_kwargs is None
+    not_connected = _VoiceMember(voice=None)
+    with pytest.raises(ValueError, match="stage"):
+        asyncio.run(set_stage_suppress(_AuthorCtx(), not_connected, False))
+
+
+def test_get_stage_instance_reads_a_live_stage():
+    from core.ops import get_stage_instance
+    inst = type("I", (), {
+        "topic": "AMA", "privacy_level": discord.PrivacyLevel.guild_only,
+        "scheduled_event_id": 77})()
+    stage = _FakeStageChannelReal(instance=inst)
+    payload = asyncio.run(get_stage_instance(_NoActorCtx(), stage))
+    assert payload == {"live": True, "topic": "AMA",
+                       "privacy_level": "guild_only",
+                       "scheduled_event_id": 77}
+    assert stage.fetch_calls == 0  # cache hit, no REST call
+
+
+def test_get_stage_instance_reports_no_live_stage():
+    from core.ops import get_stage_instance
+    stage = _FakeStageChannelReal(instance=None)
+    payload = asyncio.run(get_stage_instance(_NoActorCtx(), stage))
+    assert payload == {"live": False}
+    assert stage.fetch_calls == 1  # cache miss fell through to fetch
+
+
+def test_get_stage_instance_refuses_a_non_stage_channel():
+    from core.ops import get_stage_instance
+    with pytest.raises(ValueError, match="not a stage channel"):
+        asyncio.run(get_stage_instance(_NoActorCtx(), _FakeVocalChannel()))
+
+
+# -- scheduled events ------------------------------------------------------
+
+class _FakeScheduledEvent:
+    def __init__(self, eid=7, users=()):
+        import datetime as _dt
+        self.id = eid
+        self.name = "Movie night"
+        self.description = "bring popcorn"
+        self.status = discord.EventStatus.scheduled
+        self.entity_type = discord.EntityType.voice
+        self.start_time = _dt.datetime(2026, 9, 1, 20, 0,
+                                       tzinfo=_dt.timezone.utc)
+        self.end_time = None
+        self.channel_id = 30
+        self.location = None
+        self.creator_id = 42
+        self.user_count = 5
+        self.url = f"https://discord.com/events/1/{eid}"
+        self.cover_image = None
+        self._users = list(users)
+        self.edit_kwargs = None
+        self.edit_reason = None
+
+    def users(self, *, limit=None):
+        rows = self._users[:limit]
+
+        async def gen():
+            for u in rows:
+                yield u
+        return gen()
+
+    async def edit(self, *, reason=None, **kwargs):
+        self.edit_kwargs = dict(kwargs)
+        self.edit_reason = reason
+        return self
+
+
+class _EventGuild:
+    def __init__(self, events=()):
+        self._events = {e.id: e for e in events}
+        self.fetch_seen = None
+        self.create_kwargs = None
+
+    async def fetch_scheduled_events(self, *, with_counts=True):
+        self.fetch_seen = with_counts
+        return list(self._events.values())
+
+    async def fetch_scheduled_event(self, event_id, *, with_counts=True):
+        self.fetch_seen = (event_id, with_counts)
+        return self._events[event_id]
+
+    async def create_scheduled_event(self, **kwargs):
+        self.create_kwargs = kwargs
+        return _FakeScheduledEvent()
+
+
+def test_list_scheduled_events_serializes_rows_with_counts():
+    from core.ops import list_scheduled_events
+    guild = _EventGuild([_FakeScheduledEvent()])
+    rows = asyncio.run(list_scheduled_events(_NoActorCtx(), guild=guild))
+    assert guild.fetch_seen is True  # with_counts requested
+    assert rows == [{
+        "id": 7, "name": "Movie night", "description": "bring popcorn",
+        "status": "scheduled", "entity_type": "voice",
+        "start_time": "2026-09-01T20:00:00+00:00", "end_time": None,
+        "channel_id": 30, "location": None, "creator_id": 42,
+        "user_count": 5}]
+    payload = registry.get("list_scheduled_events").serialize_result(rows)
+    assert payload == {"events": rows, "count": 1}
+
+
+def test_get_scheduled_event_adds_url_and_image():
+    from core.ops import get_scheduled_event
+    guild = _EventGuild([_FakeScheduledEvent()])
+    event = asyncio.run(get_scheduled_event(_NoActorCtx(), 7, guild=guild))
+    assert guild.fetch_seen == (7, True)
+    payload = registry.get("get_scheduled_event").serialize_result(event)
+    assert payload["url"] == "https://discord.com/events/1/7"
+    assert payload["image_url"] is None
+    assert payload["name"] == "Movie night"
+
+
+def test_list_scheduled_event_users_enumerates_rsvps():
+    from core.ops import list_scheduled_event_users
+    users = [type("U", (), {"id": 1, "display_name": "Alice"})(),
+             type("U", (), {"id": 2, "display_name": "Bob"})()]
+    guild = _EventGuild([_FakeScheduledEvent(users=users)])
+    rows = asyncio.run(list_scheduled_event_users(
+        _NoActorCtx(), 7, limit=1, guild=guild))
+    assert rows == [{"id": 1, "display_name": "Alice"}]
+    payload = registry.get(
+        "list_scheduled_event_users").serialize_result(rows)
+    assert payload == {"users": rows, "count": 1}
+
+
+def test_create_scheduled_event_builds_a_voice_event():
+    from core.ops import create_scheduled_event
+    guild = _EventGuild()
+    chan = _FakeVocalChannel(30)
+    asyncio.run(create_scheduled_event(
+        _AuthorCtx(), "Movie night", "2100-01-01T20:00:00+00:00", "voice",
+        channel=chan, description="bring popcorn", guild=guild))
+    kw = guild.create_kwargs
+    assert kw["name"] == "Movie night"
+    assert kw["entity_type"] is discord.EntityType.voice
+    assert kw["privacy_level"] is discord.PrivacyLevel.guild_only
+    assert kw["channel"] is chan
+    assert kw["description"] == "bring popcorn"
+    assert kw["start_time"].tzinfo is not None
+    assert kw["reason"] == "create_scheduled_event op by tester (321)"
+    assert "location" not in kw
+
+
+def test_create_scheduled_event_naive_time_is_taken_as_utc():
+    import datetime as _dt
+    from core.ops import create_scheduled_event
+    guild = _EventGuild()
+    asyncio.run(create_scheduled_event(
+        _AuthorCtx(), "X", "2100-01-01T20:00:00", "external",
+        location="the park", end_time="2100-01-01T22:00:00", guild=guild))
+    kw = guild.create_kwargs
+    assert kw["start_time"].tzinfo == _dt.timezone.utc
+    assert kw["end_time"].tzinfo == _dt.timezone.utc
+    assert kw["location"] == "the park"
+    assert "channel" not in kw
+
+
+@pytest.mark.parametrize("kwargs,match", [
+    # Unknown entity type.
+    (dict(entity_type="concert"), "entity_type"),
+    # Past start time.
+    (dict(start_time="2001-01-01T00:00:00+00:00"), "future"),
+    # Garbage timestamp.
+    (dict(start_time="tomorrowish"), "ISO-8601"),
+    # voice event without a channel.
+    (dict(channel=None), "require a voice/stage channel"),
+    # external event without a location / end_time.
+    (dict(entity_type="external", end_time="2100-01-02T00:00:00"),
+     "location"),
+    (dict(entity_type="external", location="the park"), "end_time"),
+])
+def test_create_scheduled_event_refusals(kwargs, match):
+    from core.ops import create_scheduled_event
+    guild = _EventGuild()
+    base = dict(name="X", start_time="2100-01-01T20:00:00+00:00",
+                entity_type="voice", channel=_FakeVocalChannel(), guild=guild)
+    base.update(kwargs)
+    with pytest.raises(ValueError, match=match):
+        asyncio.run(create_scheduled_event(_AuthorCtx(), **base))
+    assert guild.create_kwargs is None
+
+
+def test_edit_scheduled_event_applies_sparse_edits_with_status():
+    from core.ops import edit_scheduled_event
+    event = _FakeScheduledEvent()
+    guild = _EventGuild([event])
+    asyncio.run(edit_scheduled_event(
+        _AuthorCtx(), 7, name="Movie afternoon", status="active",
+        guild=guild))
+    assert event.edit_kwargs == {"name": "Movie afternoon",
+                                 "status": discord.EventStatus.active}
+    assert event.edit_reason == "edit_scheduled_event op by tester (321)"
+
+
+def test_edit_scheduled_event_refuses_cancellation_and_empty_edits():
+    """'canceled' would destroy the RSVP list — the delete gap is an owner
+    decision, so the status vocabulary is forward-only on purpose."""
+    from core.ops import edit_scheduled_event
+    event = _FakeScheduledEvent()
+    guild = _EventGuild([event])
+    with pytest.raises(ValueError, match="active.*completed"):
+        asyncio.run(edit_scheduled_event(_AuthorCtx(), 7, status="canceled",
+                                         guild=guild))
+    with pytest.raises(ValueError, match="Nothing to edit"):
+        asyncio.run(edit_scheduled_event(_AuthorCtx(), 7, guild=guild))
+    assert event.edit_kwargs is None
+
+
+# -- automod ---------------------------------------------------------------
+
+def test_list_automod_rules_serializes_defensively():
+    import datetime as _dt
+    from core.ops import list_automod_rules
+
+    _keyword_trigger = type("T", (), {
+        "type": discord.AutoModRuleTriggerType.keyword,
+        "keyword_filter": ["badword"], "regex_patterns": ["b[a4]d"],
+        "allow_list": ["badminton"], "mention_limit": None,
+        "presets": None})()
+    _action = type("A", (), {
+        "type": discord.AutoModRuleActionType.timeout,
+        "channel_id": None,
+        "duration": _dt.timedelta(minutes=1)})()
+    _keyword_rule = type("R", (), {
+        "id": 1, "name": "no swears", "enabled": True,
+        "event_type": discord.AutoModRuleEventType.message_send,
+        "trigger": _keyword_trigger, "actions": [_action],
+        "exempt_role_ids": [2], "exempt_channel_ids": [], "creator_id": 42})()
+    # A presets rule exercises the flags path and absent keyword facets.
+    _presets_trigger = type("T", (), {
+        "type": discord.AutoModRuleTriggerType.keyword_preset,
+        "keyword_filter": None, "regex_patterns": None, "allow_list": None,
+        "mention_limit": None,
+        "presets": discord.AutoModPresets(profanity=True)})()
+    _presets_rule = type("R", (), {
+        "id": 2, "name": "presets", "enabled": False,
+        "event_type": discord.AutoModRuleEventType.message_send,
+        "trigger": _presets_trigger, "actions": [],
+        "exempt_role_ids": [], "exempt_channel_ids": [9], "creator_id": 42})()
+
+    class _Guild:
+        async def fetch_automod_rules(self):
+            return [_keyword_rule, _presets_rule]
+
+    rows = asyncio.run(list_automod_rules(_NoActorCtx(), guild=_Guild()))
+    assert rows[0] == {
+        "id": 1, "name": "no swears", "enabled": True,
+        "event_type": "message_send", "trigger_type": "keyword",
+        "keyword_filter": ["badword"], "regex_patterns": ["b[a4]d"],
+        "allow_list": ["badminton"], "mention_limit": None, "presets": [],
+        "actions": [{"type": "timeout", "channel_id": None,
+                     "duration_s": 60.0}],
+        "exempt_role_ids": [2], "exempt_channel_ids": [], "creator_id": 42}
+    assert rows[1]["trigger_type"] == "keyword_preset"
+    assert rows[1]["presets"] == ["profanity"]
+    assert rows[1]["keyword_filter"] == []
+    payload = registry.get("list_automod_rules").serialize_result(rows)
+    assert payload == {"rules": rows, "count": 2}

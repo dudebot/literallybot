@@ -36,9 +36,10 @@ Guardrails (per the Codex review of the original spike, issue #58):
   control belongs upstream in the caller. The only guild confinement in
   the system is the in-bot !gpt agent loop's own {ctx.guild.id} policy.
   DM channels are still refused on id-based calls — DMs flow only through
-  the user-keyed DM ops (send_dm/read_dms/fetch_dms/delete_dm), one-to-one
-  with the DM API (keyed by user_id, never a channel id; Discord itself
-  refuses bot DMs to users sharing no guild).
+  the user-keyed DM ops (send_dm/read_dms/fetch_dms/delete_dm/edit_dm/
+  add_dm_reaction/remove_dm_reaction/list_dm_pins/list_dm_conversations),
+  one-to-one with the DM API (keyed by user_id, never a channel id; Discord
+  itself refuses bot DMs to users sharing no guild).
 - send_message always sends with allowed_mentions=none — no pings, ever.
 - search_history clamps `limit` to core.ops.HISTORY_LIMIT_MAX (200),
   declared on the op itself.

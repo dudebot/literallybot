@@ -49,7 +49,7 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 
 ## ✨ Key Features
 
-- **🧭 One Ops Layer, Many Frontends** — 27 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
+- **🧭 One Ops Layer, Many Frontends** — 89 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
 - **🧩 Modular Cog System** — features are self-contained cogs; disable them globally without deleting them (binds at restart); cogs can register their own ops
 - **🤖 AI Integration** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory, personality, and an optional agentic mode that performs real Discord actions
 - **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
@@ -79,7 +79,7 @@ differs, and the panel shows them as separate sections.
 ```mermaid
 flowchart TB
     subgraph SRC["Where ops come from"]
-        CORE["core/ops.py<br/><i>27 API primitives</i><br/>@registry.op(...) · origin=core"]
+        CORE["core/ops.py<br/><i>89 API primitives</i><br/>@registry.op(...) · origin=core"]
         COG["Any cog — behavioral primitives<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
     end
 
@@ -322,8 +322,10 @@ than fixed.)
   `search_history` clamps `limit` to 200.
 - **Full guild reach by design** — tools act as raw primitives: every guild
   the bot account is in is addressable. DMs flow through the dedicated
-  `send_dm`/`read_dms`/`fetch_dms`/`delete_dm` ops, never through id-based
-  channel calls.
+  user-keyed DM ops (`send_dm`, `read_dms`, `fetch_dms`, `delete_dm`,
+  `edit_dm`, `list_dm_conversations`, `add_dm_reaction`,
+  `remove_dm_reaction`, `list_dm_pins`), never through id-based channel
+  calls.
   Access control belongs upstream in the MCP caller; the only guild-confined
   surface is the in-bot agent loop (pinned to its invoking guild).
 - **Accepted risk:** `actor_id` is caller-supplied and not bound to the
@@ -365,17 +367,24 @@ port if you set `mcp_ops_port`):
 ```
 
 **Exposed tools:** by default the full ops registry, queried live when the
-server starts — so ops a cog registered are included too. The 27 API
+server starts — so ops a cog registered are included too. The 89 API
 primitives, by group:
 
 | Group | Ops |
 |-------|-----|
-| **Messaging** | `send_message`, `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`, `search_history`, `pin_message`, `create_thread` |
+| **Messaging** | `send_message`, `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`, `search_history`, `get_message`, `read_history`, `pin_message`, `unpin_message`, `list_pins`, `create_thread`, `list_reactions`, `trigger_typing`, `forward_message`, `suppress_embeds`, `send_embed`, `send_poll`, `get_poll_results`, `end_poll`, `get_poll_voters` |
+| **Threads** | `list_threads`, `list_thread_members`, `join_thread`, `leave_thread`, `edit_thread`, `create_forum_post` |
 | **Roles** | `add_role`, `remove_role`, `list_roles`, `list_role_members`, `create_role`, `edit_role`, `delete_role` |
-| **Emojis** | `list_emojis`, `create_emoji`, `edit_emoji`, `delete_emoji` |
-| **Guild info** | `list_channels`, `list_members`, `list_channel_overwrites` |
-| **Direct messages** | `send_dm`, `read_dms`, `fetch_dms`, `delete_dm` |
-| **Guild** | `list_guilds` |
+| **Emojis & stickers** | `list_emojis`, `create_emoji`, `edit_emoji`, `delete_emoji`, `list_stickers`, `create_sticker`, `edit_sticker`, `delete_sticker`, `download_emoji` |
+| **Guild info** | `list_channels`, `list_members`, `list_channel_overwrites`, `get_channel_info`, `set_slowmode`, `edit_channel`, `get_member_permissions`, `get_member`, `get_guild_info`, `search_members`, `fetch_audit_logs`, `estimate_prune`, `list_integrations` |
+| **Members** | `set_nickname`, `timeout_member`, `remove_timeout` |
+| **Moderation** | `list_bans`, `list_automod_rules` |
+| **Voice** | `get_voice_state`, `list_voice_states`, `move_member`, `disconnect_member`, `set_voice_mute`, `set_voice_deafen`, `set_stage_suppress`, `get_stage_instance` |
+| **Scheduled events** | `list_scheduled_events`, `get_scheduled_event`, `list_scheduled_event_users`, `create_scheduled_event`, `edit_scheduled_event` |
+| **Invites** | `list_invites`, `create_invite`, `revoke_invite` |
+| **Direct messages** | `send_dm`, `read_dms`, `fetch_dms`, `delete_dm`, `edit_dm`, `list_dm_conversations`, `add_dm_reaction`, `remove_dm_reaction`, `list_dm_pins` |
+| **Guild** | `list_guilds`, `get_user` |
+| **Integrations** | `list_webhooks` |
 
 Loaded cogs add their own behavioral primitives on top (e.g.
 `add_emoji_role_toggle` and `sync_emoji_role_toggles` from `setrole`,

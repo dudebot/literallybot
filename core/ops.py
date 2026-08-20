@@ -66,13 +66,14 @@ import asyncio
 import inspect
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import discord
 
-from core.dm_log import load_dms, log_dm, row_from_message
+from core.dm_log import list_dm_users, load_dms, log_dm, row_from_message
 from core.utils import is_admin, is_superadmin
 
 # Shared history-scan cap: search_history never scans more than this many
@@ -117,9 +118,39 @@ class OpScope(str, Enum):
 # per group, so each group must stay under Discord's 25-option select cap.
 OP_GROUPS: Dict[str, str] = {
     "messaging": "Messaging",
+    # Thread-family ops live in their own group, NOT "messaging": messaging
+    # already carries 20 ops and each group must fit one 25-option Discord
+    # select (see test_each_group_fits_in_one_select) — the thread ops would
+    # have pushed it over the cap.
+    "threads": "Threads",
     "roles": "Roles",
-    "emojis": "Emojis",
+    # Stickers joined this group in the 2026-08 expressive-domain pass —
+    # relabeled rather than minting a new group id (labels are presentation
+    # only; the id is what code and stored config speak).
+    "emojis": "Emojis & stickers",
     "guild-info": "Guild info",
+    # Member-state writes (nickname, timeout) live apart from "roles" and
+    # "guild-info": the reads stay browsable in guild-info, while this group
+    # collects the ADMIN member-moderation write surface.
+    "members": "Members",
+    # Moderation reads (ban list, automod rules; the ban/kick/prune WRITES
+    # are deliberately not ops — owner-tier decisions, see the guild gap
+    # sheet).
+    "moderation": "Moderation",
+    # Voice-state reads and the reversible client-parity voice writes
+    # (move/disconnect/server-mute/deafen/stage suppress) from the 2026-08
+    # voice-domain pass. Bot voice PRESENCE (connect/play audio) is out of
+    # scope — a stateful gateway session, not an atomic op.
+    "voice": "Voice",
+    # Guild scheduled events (2026-08 voice-domain pass): reads for everyone,
+    # create/edit for admins. Delete/cancel is deliberately NOT an op — it
+    # destroys the accrued RSVP list irreversibly and the client confirms it.
+    "events": "Scheduled events",
+    # Invite lifecycle (2026-08 expressive-domain pass): admin list/create/
+    # revoke. Webhook create/edit/delete/execute are deliberately NOT ops —
+    # a webhook URL is a persistent unauthenticated posting credential, so
+    # exposing those is an owner decision, not a gap-fill.
+    "invites": "Invites",
     "dm": "Direct messages",
     "guild": "Guild",
     # Cog-provided groups. Declared here (not invented ad hoc by the cog) so
@@ -1111,13 +1142,15 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
     "send_message",
     "Send a text message to a channel, optionally as a reply to an existing "
     "message in that channel. Optional local file attachment(s) via "
-    "file_paths (server filesystem paths the bot can read; admin-only).",
+    "file_paths (server filesystem paths the bot can read; admin-only), and "
+    "an optional custom sticker from this guild via sticker_id.",
     PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to send into."),
         OpParam("content", ParamKind.STRING,
-                "Message text to send (may be empty if attaching a file).",
+                "Message text to send (may be empty if attaching a file "
+                "or a sticker).",
                 required=False, default=""),
         OpParam("reference_message_id", ParamKind.SNOWFLAKE,
                 "Optional message id in the same channel to reply to.",
@@ -1125,6 +1158,10 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
         OpParam("file_paths", ParamKind.STRING_LIST,
                 "Optional attachments: absolute server-side file paths "
                 "(gif/png/jpg/webp/mp4/…), max 10. Requires admin.",
+                required=False),
+        OpParam("sticker_id", ParamKind.SNOWFLAKE,
+                "Optional custom sticker id to attach — must belong to "
+                "THIS guild (see list_stickers); foreign ids are refused.",
                 required=False),
         OpParam("allowed_mentions", ParamKind.INTERNAL),
     ],
@@ -1140,6 +1177,7 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
 async def send_message(ctx: OpContext, channel, content: str = "",
                        reference_message_id: Optional[int] = None,
                        file_paths: Optional[List[str]] = None,
+                       sticker_id: Optional[int] = None,
                        allowed_mentions=None):
     # Never-ping by default: model/tool-originated sends must not be able
     # to ping anyone. An object-based caller that WANTS pings must pass an
@@ -1147,8 +1185,20 @@ async def send_message(ctx: OpContext, channel, content: str = "",
     # and MCP frontends so no frontend can forget it.)
     _require_admin_for_attachments(ctx, file_paths)
     text = content if content is not None else ""
-    if not str(text).strip() and not file_paths:
-        raise ValueError("send_message requires non-empty content and/or a file attachment")
+    if not str(text).strip() and not file_paths and sticker_id is None:
+        raise ValueError("send_message requires non-empty content, a file "
+                         "attachment, and/or a sticker")
+    stickers = None
+    if sticker_id is not None:
+        # Stickers resolve against the DESTINATION channel's own guild —
+        # bots can only send a guild's stickers inside that guild, and the
+        # in-guild lookup doubles as the guild-confinement refusal for
+        # foreign sticker ids.
+        guild = getattr(channel, "guild", None)
+        if guild is None:
+            raise ValueError("sticker_id requires a guild channel.")
+        stickers = [_require_guild_sticker(
+            guild, _as_int(sticker_id, "sticker_id"))]
     files = load_discord_attachments(file_paths)
     kwargs: Dict[str, Any] = {
         "allowed_mentions": allowed_mentions
@@ -1156,6 +1206,8 @@ async def send_message(ctx: OpContext, channel, content: str = "",
     }
     if files:
         kwargs["files"] = files
+    if stickers:
+        kwargs["stickers"] = stickers
     try:
         if reference_message_id is not None:
             # Reply to a message in the same channel. mention_author is governed
@@ -1335,6 +1387,25 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
     return visible
 
 
+def _require_actor_history_perm(ctx: OpContext, channel: Any) -> None:
+    """History-class reads (chronological scans, pin listings) need Read
+    Message History, which the generic visibility gate deliberately does NOT
+    check (it stays read_messages-only because it also guards non-history
+    ops like send_message). Same policy as search_history's fallback branch
+    (#71): real Members are enforced; bare id-holder actors are the MCP
+    frontend's documented accepted risk and pass through. Raises ValueError,
+    which Op.__call__ surfaces as OpResult(ok=False)."""
+    actor = getattr(ctx, "author", None)
+    if actor is None or not hasattr(actor, "guild_permissions"):
+        return
+    try:
+        allowed = bool(channel.permissions_for(actor).read_message_history)
+    except Exception:  # noqa: BLE001 - odd channel types err to hidden
+        allowed = False
+    if not allowed:
+        raise ValueError("actor lacks Read Message History in this channel")
+
+
 @registry.op(
     "search_history",
     "Search FULL message history via Discord's search index (keyword "
@@ -1464,6 +1535,95 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
         return {"messages": results, "count": len(results), "note": note}
 
 
+def _serialize_full_message(message: Any) -> Dict[str, Any]:
+    """serialize_message plus the inspection fields get_message promises:
+    attachments (filename+url), embed count, pinned flag, jump_url."""
+    payload = serialize_message(message)
+    payload["attachments"] = [
+        {"filename": a.filename, "url": a.url}
+        for a in (message.attachments or [])
+    ]
+    payload["embeds"] = len(message.embeds or [])
+    payload["pinned"] = bool(getattr(message, "pinned", False))
+    payload["jump_url"] = getattr(message, "jump_url", None)
+    return payload
+
+
+@registry.op(
+    "get_message",
+    "Read a single message by id: content, author, attachments (filename "
+    "and url), embed count, pinned flag, and jump_url. Pure read.",
+    PermissionLevel.EVERYONE,
+    params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to read.")],
+    serialize=_serialize_full_message,
+    agent_guidance=(
+        "get_message reads one specific message (e.g. a linked or referenced "
+        "one) — use it instead of search_history when you already have the "
+        "message id."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def get_message(ctx: OpContext, message):
+    # The MESSAGE resolver already fetched the message and the generic
+    # channel-visibility gate already ran; this impl is a bare pass-through
+    # to the serializer.
+    return message
+
+
+@registry.op(
+    "read_history",
+    "Read a channel's message history chronologically (no keyword filter), "
+    "oldest first. Defaults to the most recent messages; page backwards "
+    "with before_message_id, or forwards from a known point with "
+    "after_message_id. For keyword or author-filtered search use "
+    "search_history instead.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Channel to read."),
+        OpParam("limit", ParamKind.INTEGER,
+                f"Max messages to return (default 50, clamped to "
+                f"{HISTORY_LIMIT_MAX}).",
+                required=False, default=50, minimum=1, maximum=HISTORY_LIMIT_MAX),
+        OpParam("before_message_id", ParamKind.SNOWFLAKE,
+                "Optional pagination cursor: only messages older than this "
+                "id. Pass the previous page's oldest message id to walk "
+                "further back.",
+                required=False),
+        OpParam("after_message_id", ParamKind.SNOWFLAKE,
+                "Optional cursor: only messages newer than this id.",
+                required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "read_history returns messages oldest-first within the page. To page "
+        "backwards through history, call again with before_message_id set to "
+        "the first row's id until a page comes back empty. It reads only — "
+        "for keyword questions use search_history."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def read_history(ctx: OpContext, channel, limit: int = 50,
+                       before_message_id: Optional[int] = None,
+                       after_message_id: Optional[int] = None):
+    # The generic gate checks read_messages only; a chronological scan is a
+    # HISTORY read and must also enforce the actor's Read Message History
+    # (same #71 policy as search_history's fallback branch).
+    _require_actor_history_perm(ctx, channel)
+    before = (discord.Object(id=before_message_id)
+              if before_message_id is not None else None)
+    after = (discord.Object(id=after_message_id)
+             if after_message_id is not None else None)
+    rows = []
+    async for message in channel.history(limit=limit, before=before,
+                                         after=after):
+        rows.append(serialize_message(message))
+    # history() iteration order depends on the cursors (newest-first by
+    # default, oldest-first when `after` is set); snowflakes are monotonic,
+    # so sorting by id presents oldest-first regardless.
+    rows.sort(key=lambda r: r["id"])
+    return {"messages": rows, "count": len(rows)}
+
+
 @registry.op(
     "add_role",
     "Add a role to a member. Requires admin — self-service role assignment "
@@ -1524,6 +1684,51 @@ async def pin_message(ctx: OpContext, message):
 
 
 @registry.op(
+    "unpin_message",
+    "Unpin a message in its channel. Requires admin (mirror of pin_message; "
+    "also the only way to manage Discord's 50-pin-per-channel cap).",
+    PermissionLevel.ADMIN,
+    params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to unpin.")],
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def unpin_message(ctx: OpContext, message):
+    await message.unpin()
+    return True
+
+
+@registry.op(
+    "list_pins",
+    "List a channel's pinned messages (newest pin first), each with its "
+    "pinned_at timestamp. Read-only — use it before pin_message/"
+    "unpin_message to manage the 50-pin cap.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Channel whose pins to list."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max pinned messages to return (default 50, clamped to 50 — "
+                "Discord's per-channel pin cap).",
+                required=False, default=50, minimum=1, maximum=50),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def list_pins(ctx: OpContext, channel, limit: int = 50):
+    # Discord gates the pins endpoint itself on Read Message History, so the
+    # actor must hold it too (#71 policy; the generic gate checks only
+    # read_messages).
+    _require_actor_history_perm(ctx, channel)
+    rows = []
+    async for message in channel.pins(limit=limit):
+        row = serialize_message(message)
+        pinned_at = getattr(message, "pinned_at", None)
+        row["pinned_at"] = pinned_at.isoformat() if pinned_at else None
+        rows.append(row)
+    return {"messages": rows, "count": len(rows)}
+
+
+@registry.op(
     "create_thread",
     "Create a thread, either attached to an existing message or standalone "
     "on a channel.",
@@ -1544,6 +1749,354 @@ async def create_thread(ctx: OpContext, channel, name: str, message=None):
     if message is not None:
         return await message.create_thread(name=name)
     return await channel.create_thread(name=name)
+
+
+def _reaction_matches(reaction: Any, emoji: str) -> bool:
+    """Match a wire emoji string against a live Reaction: the literal form
+    (unicode char or '<:name:id>') or the name:id reaction_form add_reaction
+    accepts — both, so callers can echo back whatever form they hold."""
+    if str(reaction.emoji) == emoji:
+        return True
+    em = reaction.emoji
+    name = getattr(em, "name", None)
+    eid = getattr(em, "id", None)
+    return name is not None and eid is not None and f"{name}:{eid}" == emoji
+
+
+@registry.op(
+    "list_reactions",
+    "List the reactions on a message (emoji, count, whether the bot "
+    "reacted). Pass emoji to also get the user ids who reacted with that "
+    "emoji. Read-only.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Message whose reactions to list."),
+        OpParam("emoji", ParamKind.STRING,
+                "Optional: only this emoji, including its reactor user ids "
+                "(unicode emoji or `name:id` custom emoji).",
+                required=False),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max reactor user ids to return when emoji is given "
+                "(default 100, clamped to 100).",
+                required=False, default=100, minimum=1, maximum=100),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "list_reactions answers 'who voted / who reacted': call it without "
+        "emoji to see the tallies, then again with emoji to enumerate the "
+        "reactors of one option. Emoji take the same literal form as "
+        "add_reaction (unicode char or name:id)."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def list_reactions(ctx: OpContext, message, emoji: Optional[str] = None,
+                         limit: int = 100):
+    reactions = [
+        {"emoji": str(r.emoji), "count": r.count, "me": bool(r.me)}
+        for r in (message.reactions or [])
+    ]
+    payload: Dict[str, Any] = {"reactions": reactions}
+    if emoji is not None:
+        target = next((r for r in (message.reactions or [])
+                       if _reaction_matches(r, emoji)), None)
+        users: List[int] = []
+        if target is not None:
+            async for u in target.users(limit=limit):
+                users.append(u.id)
+        payload["users"] = users
+    return payload
+
+
+@registry.op(
+    "trigger_typing",
+    "Show the bot's typing indicator in a channel for ~10 seconds (it "
+    "self-expires; sending a message also clears it). Cosmetic only.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Channel to show the typing indicator in."),
+    ],
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def trigger_typing(ctx: OpContext, channel):
+    # Awaiting the Typing object fires the one-shot ~10s indicator (2.6).
+    await channel.typing()
+    return True
+
+
+@registry.op(
+    "forward_message",
+    "Forward a message to another channel in the SAME guild (Discord's "
+    "forward feature; the forward arrives as a new bot-owned message, "
+    "deletable via delete_message). Cross-guild destinations are refused.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("message", ParamKind.MESSAGE, "Message to forward."),
+        # A SNOWFLAKE scalar on purpose, NOT a second ParamKind.CHANNEL: the
+        # MESSAGE param already claims the channel_id wire name for the
+        # SOURCE channel, so the destination must travel under its own name
+        # (same dodge delete_dm documents for its message_id).
+        OpParam("destination_channel_id", ParamKind.SNOWFLAKE,
+                "Channel id to forward into (must be in the same guild)."),
+    ],
+    serialize=lambda m: {"message_id": m.id, "channel_id": m.channel.id},
+    agent_guidance=(
+        "forward_message posts a forward-embed of the source message into "
+        "the destination channel and returns the new message's id — use "
+        "delete_message on that id to undo. The destination must be in the "
+        "same guild as the source."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def forward_message(ctx: OpContext, message, destination_channel_id: int):
+    # The destination arrives as a bare snowflake, so the shared resolver's
+    # guild confinement must be applied here in-impl: confine it to the
+    # SOURCE message's guild, which both keeps the op honestly GUILD-scoped
+    # and blocks cross-guild exfiltration regardless of frontend policy.
+    source_guild = getattr(message, "guild", None) or getattr(
+        getattr(message, "channel", None), "guild", None)
+    if source_guild is None:
+        raise ValueError("forward_message requires a guild message as its source.")
+    destination = await resolve_channel(
+        ctx.bot, _as_int(destination_channel_id, "destination_channel_id"),
+        frozenset({source_guild.id}))
+    # The generic gate already covered the SOURCE channel (via the resolved
+    # message); the destination resolved after gating, so check it here.
+    vis_ok, vis_reason = _check_channel_visibility(
+        ctx, {"destination": destination})
+    if not vis_ok:
+        raise ValueError(vis_reason)
+    return await message.forward(destination)
+
+
+@registry.op(
+    "suppress_embeds",
+    "Hide (or restore) the embeds on a message — the link-preview boxes. "
+    "Requires admin: unlike edit_message it works on ANY message, not just "
+    "the bot's own. Fully reversible with suppress=false.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Message whose embeds to hide/show."),
+        OpParam("suppress", ParamKind.BOOLEAN,
+                "True hides embeds, False restores them.",
+                required=False, default=True),
+    ],
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def suppress_embeds(ctx: OpContext, message, suppress: bool = True):
+    await message.edit(suppress=suppress)
+    return True
+
+
+@registry.op(
+    "send_embed",
+    "Send a rich embed to a channel: title, description, link url, color, "
+    "image, footer — all optional, but at least one of title/description/"
+    "image_url is required. Never pings. Reversible via delete_message.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Channel to send into."),
+        OpParam("title", ParamKind.STRING,
+                "Embed title (max 256 chars).", required=False),
+        OpParam("description", ParamKind.STRING,
+                "Embed body text (max 4096 chars).", required=False),
+        OpParam("url", ParamKind.STRING,
+                "Link the title points at.", required=False),
+        OpParam("color", ParamKind.STRING,
+                "Accent color, hex like '#5865F2'.", required=False),
+        OpParam("image_url", ParamKind.STRING,
+                "Image to display in the embed body.", required=False),
+        OpParam("footer", ParamKind.STRING,
+                "Footer text.", required=False),
+        OpParam("allowed_mentions", ParamKind.INTERNAL),
+    ],
+    serialize=_serialize_sent_message,
+    agent_guidance=(
+        "send_embed is send_message with rich formatting — use it for "
+        "announcement-style output, not for ordinary replies. It returns the "
+        "new message's message_id; reuse it for edits or reactions."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def send_embed(ctx: OpContext, channel, title: Optional[str] = None,
+                     description: Optional[str] = None,
+                     url: Optional[str] = None, color: Optional[str] = None,
+                     image_url: Optional[str] = None,
+                     footer: Optional[str] = None, allowed_mentions=None):
+    if not any((title, description, image_url)):
+        raise ValueError(
+            "send_embed requires at least one of title/description/image_url")
+    embed = discord.Embed(title=title, description=description, url=url)
+    if color is not None:
+        embed.colour = _parse_color(color)
+    if image_url is not None:
+        embed.set_image(url=image_url)
+    if footer is not None:
+        embed.set_footer(text=footer)
+    # Same never-ping default as send_message (embed text can't ping, but
+    # the policy travels with every send-class op so no caller can forget).
+    return await channel.send(
+        embed=embed,
+        allowed_mentions=allowed_mentions
+        if allowed_mentions is not None else discord.AllowedMentions.none())
+
+
+@registry.op(
+    "send_poll",
+    "Post a native Discord poll to a channel: a question and 2-10 answer "
+    "options, open for duration_hours. The poll rides an ordinary message, "
+    "so delete_message removes it.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Channel to post the poll in."),
+        OpParam("question", ParamKind.STRING,
+                "Poll question (max 300 chars)."),
+        OpParam("answers", ParamKind.STRING_LIST,
+                "Answer options, 2-10 entries."),
+        OpParam("duration_hours", ParamKind.INTEGER,
+                "How long the poll stays open, in hours (default 24, max "
+                "168 = one week).",
+                required=False, default=24, minimum=1, maximum=168),
+        OpParam("multiselect", ParamKind.BOOLEAN,
+                "Allow voters to pick multiple answers (default false).",
+                required=False, default=False),
+    ],
+    serialize=_serialize_sent_message,
+    agent_guidance=(
+        "send_poll returns the poll message's message_id — reuse it with "
+        "get_poll_results to read the tallies, and end_poll to close it "
+        "early. Votes are NOT reactions; list_reactions won't see them."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def send_poll(ctx: OpContext, channel, question: str, answers: List[str],
+                    duration_hours: int = 24, multiselect: bool = False):
+    if len(str(question)) > 300:
+        raise ValueError("Poll questions are capped at 300 characters.")
+    options = [str(a) for a in (answers or []) if str(a).strip()]
+    if not 2 <= len(options) <= 10:
+        raise ValueError(
+            f"Polls need 2-10 answer options, got {len(options)}.")
+    poll = discord.Poll(question=question,
+                        duration=timedelta(hours=duration_hours),
+                        multiple=multiselect)
+    for text in options:
+        poll.add_answer(text=text)
+    return await channel.send(poll=poll,
+                              allowed_mentions=discord.AllowedMentions.none())
+
+
+def _require_message_poll(message: Any):
+    poll = getattr(message, "poll", None)
+    if poll is None:
+        raise ValueError("That message has no poll.")
+    return poll
+
+
+@registry.op(
+    "get_poll_results",
+    "Read a poll's current tallies from its message: question, per-answer "
+    "vote counts, expiry time, and whether it has finalized. Read-only.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Message carrying the poll to read."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "get_poll_results reads the live tallies at call time; finalized: "
+        "false means voting is still open and the counts can still move."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def get_poll_results(ctx: OpContext, message):
+    poll = _require_message_poll(message)
+    expires_at = poll.expires_at
+    return {
+        "question": poll.question,
+        "answers": [{"text": a.text, "count": a.vote_count}
+                    for a in poll.answers],
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "finalized": bool(poll.is_finalized()),
+    }
+
+
+@registry.op(
+    "end_poll",
+    "End one of the BOT's own polls immediately, finalizing the results. "
+    "Refuses polls on messages the bot did not author — mirroring "
+    "edit_message's own-message discipline.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Bot-authored message carrying the poll to end."),
+    ],
+    serialize=lambda m: {"message_id": m.id},
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def end_poll(ctx: OpContext, message):
+    _require_message_poll(message)
+    if message.author.id != ctx.bot.user.id:
+        raise ValueError(
+            "end_poll can only end polls on the bot's own messages.")
+    return await message.end_poll()
+
+
+@registry.op(
+    "get_poll_voters",
+    "List who voted for one poll answer (Discord polls are non-anonymous — "
+    "the client shows this list to every channel member on click). Get the "
+    "answer_id from get_poll_results. Read-only.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Message carrying the poll."),
+        # Poll answer ids are small per-poll ordinals, not snowflakes, but
+        # every *_id wire param travels as a string by registry convention
+        # (see _SNOWFLAKE_JSON_TYPE) — SNOWFLAKE kind gives the string wire
+        # type and central int coercion.
+        OpParam("answer_id", ParamKind.SNOWFLAKE,
+                "Answer id to enumerate voters for (from "
+                "get_poll_results)."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max voters to return (default 100, clamped to 100).",
+                required=False, default=100, minimum=1, maximum=100),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "get_poll_voters answers 'who voted for X': get_poll_results first "
+        "for the answer ids and tallies, then this per answer. Poll votes "
+        "are NOT reactions — list_reactions cannot see them."),
+    scope=OpScope.GUILD,
+    group="messaging",
+)
+async def get_poll_voters(ctx: OpContext, message, answer_id: int,
+                          limit: int = 100):
+    poll = _require_message_poll(message)
+    answer = poll.get_answer(_as_int(answer_id, "answer_id"))
+    if answer is None:
+        raise ValueError(
+            f"Poll has no answer with id {answer_id} — see "
+            f"get_poll_results for valid answer ids.")
+    voters = []
+    async for u in answer.voters(limit=limit):
+        voters.append({
+            "id": u.id,
+            "name": getattr(u, "name", None),
+            "display_name": getattr(u, "display_name", None),
+        })
+    return {
+        "answer_id": answer.id,
+        "text": getattr(answer, "text", None),
+        "voters": voters,
+        "count": len(voters),
+    }
 
 
 @registry.op(
@@ -1828,6 +2381,244 @@ async def delete_dm(ctx: OpContext, user, message_id: int):
     return True
 
 
+@registry.op(
+    "edit_dm",
+    "Edit a DM message the bot itself sent to a user — the fix-the-typo "
+    "sibling of delete_dm. Refuses messages the bot did not author: "
+    "Discord allows no way to edit the other participant's side of a DM.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("user", ParamKind.USER,
+                "Discord user id whose DM conversation holds the message."),
+        # Same SNOWFLAKE-not-MESSAGE dodge as delete_dm: MESSAGE implies a
+        # required channel_id and the guild-refusing channel resolver.
+        OpParam("message_id", ParamKind.SNOWFLAKE,
+                "Discord message id of the bot-authored DM to edit."),
+        OpParam("content", ParamKind.STRING, "Replacement text."),
+    ],
+    serialize=lambda m: {"message_id": m.id},
+    agent_guidance=(
+        "edit_dm rewrites one of the BOT's own DM messages in place; it can "
+        "never touch anything the user wrote. The stored transcript keeps "
+        "the original row and gains an edited:true row, so read_dms shows "
+        "both what was first sent and the correction."),
+    scope=OpScope.DM,
+    group="dm",
+)
+async def edit_dm(ctx: OpContext, user, message_id: int, content: str):
+    if not str(content).strip():
+        raise ValueError("edit_dm requires non-empty replacement content")
+    channel = user.dm_channel or await user.create_dm()
+    message = await channel.fetch_message(message_id)
+    if message.author.id != ctx.bot.user.id:
+        raise ValueError(
+            "edit_dm can only edit the bot's own messages — Discord does "
+            "not allow editing the other participant's DMs.")
+    edited = await message.edit(content=content)
+    # Append an update note to the transcript (the original row is kept as
+    # the audit record of what was first sent), same failure policy as
+    # send_dm: a storage failure must not undo a successful edit.
+    try:
+        row = row_from_message(edited, user.id)
+        row["edited"] = True
+        log_dm(user.id, row)
+    except Exception:  # noqa: BLE001
+        logger = getattr(ctx.bot, "logger", None)
+        if logger:
+            logger.warning("edit_dm: failed to persist DM edit note",
+                           exc_info=True)
+    return edited
+
+
+def _dm_conversation_rows(limit: int) -> List[Dict[str, Any]]:
+    """Blocking half of list_dm_conversations (runs via asyncio.to_thread,
+    same as read_dms' file I/O): enumerate stored transcripts and read each
+    one's newest row for a last_message_at timestamp."""
+    rows = []
+    for uid in list_dm_users()[:limit]:
+        tail = load_dms(uid, limit=1)
+        rows.append({
+            "user_id": uid,
+            "last_message_at": tail[-1]["timestamp"] if tail else None,
+        })
+    return rows
+
+
+@registry.op(
+    "list_dm_conversations",
+    "List the users who have a stored DM transcript (the entry point for "
+    "read_dms when the user id is not already known): user_id, cached "
+    "user_name (null when the user is not in the bot's cache), and the "
+    "timestamp of the newest stored row. Reads local transcript storage "
+    "only — same privacy class as read_dms.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("limit", ParamKind.INTEGER,
+                "Max conversations to return (default 100, clamped to 1000).",
+                required=False, default=100, minimum=1, maximum=1000),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "list_dm_conversations covers only conversations recorded since "
+        "transcript storage was enabled — a user missing here may still "
+        "have real DM history (fetch_dms reads it once you have their id). "
+        "user_name is a cache convenience and comes back null for users "
+        "the bot cannot currently see."),
+    scope=OpScope.DM,
+    group="dm",
+)
+async def list_dm_conversations(ctx: OpContext, limit: int = 100):
+    # File I/O off the event loop, same as read_dms.
+    rows = await asyncio.to_thread(_dm_conversation_rows, limit)
+    for row in rows:
+        cached = ctx.bot.get_user(row["user_id"])
+        row["user_name"] = cached.name if cached else None
+    return {"conversations": rows, "count": len(rows)}
+
+
+@registry.op(
+    "add_dm_reaction",
+    "Add the bot's emoji reaction to a message in a DM conversation — a "
+    "lightweight acknowledgement of a user's DM without sending text. The "
+    "DM mirror of add_reaction (whose MESSAGE param structurally cannot "
+    "reach DM channels). Fully reversible via remove_dm_reaction.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("user", ParamKind.USER,
+                "Discord user id whose DM conversation holds the message."),
+        # Same SNOWFLAKE-not-MESSAGE dodge as delete_dm: MESSAGE implies a
+        # required channel_id and the guild-refusing channel resolver.
+        OpParam("message_id", ParamKind.SNOWFLAKE,
+                "DM message id to react to."),
+        OpParam("emoji", ParamKind.STRING,
+                "Emoji to react with (unicode emoji or `name:id` custom "
+                "emoji)."),
+    ],
+    agent_guidance=(
+        "add_dm_reaction takes the same literal-emoji form as add_reaction "
+        "(a unicode character or name:id — never a word or description) and "
+        "reacts inside a private DM, not in any channel."),
+    scope=OpScope.DM,
+    group="dm",
+)
+async def add_dm_reaction(ctx: OpContext, user, message_id: int, emoji: str):
+    channel = user.dm_channel or await user.create_dm()
+    message = await channel.fetch_message(message_id)
+    await message.add_reaction(emoji)
+    return True
+
+
+@registry.op(
+    "remove_dm_reaction",
+    "Remove the bot's own emoji reaction from a message in a DM "
+    "conversation. Only reactions the bot itself added can be removed — "
+    "the other participant's reactions are untouchable by design, "
+    "mirroring the guild remove_reaction guarantee.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("user", ParamKind.USER,
+                "Discord user id whose DM conversation holds the message."),
+        OpParam("message_id", ParamKind.SNOWFLAKE,
+                "DM message id to remove the bot's reaction from."),
+        OpParam("emoji", ParamKind.STRING,
+                "Emoji to remove (unicode emoji or `name:id` custom emoji)."),
+    ],
+    agent_guidance=(
+        "remove_dm_reaction only removes reactions the bot itself added, "
+        "and takes the same literal-emoji form as add_dm_reaction."),
+    scope=OpScope.DM,
+    group="dm",
+)
+async def remove_dm_reaction(ctx: OpContext, user, message_id: int,
+                             emoji: str):
+    channel = user.dm_channel or await user.create_dm()
+    message = await channel.fetch_message(message_id)
+    # Passing the bot's own user makes this structurally self-scoped: the
+    # API call can only ever remove the bot's reaction.
+    await message.remove_reaction(emoji, ctx.bot.user)
+    return True
+
+
+@registry.op(
+    "list_dm_pins",
+    "List the pinned messages in a DM conversation, same row shape as "
+    "read_dms/fetch_dms (direction in/out, attachments with filename+url). "
+    "Read-only.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("user", ParamKind.USER,
+                "Discord user id whose DM conversation to read pins from."),
+    ],
+    serialize=lambda rows: {"messages": rows, "count": len(rows)},
+    scope=OpScope.DM,
+    group="dm",
+)
+async def list_dm_pins(ctx: OpContext, user):
+    channel = user.dm_channel or await user.create_dm()
+    rows = []
+    async for message in channel.pins():
+        rows.append(row_from_message(message, user.id))
+    return rows
+
+
+def _serialize_user_profile(u: Any) -> Dict[str, Any]:
+    flags = getattr(u, "public_flags", None)
+    accent = getattr(u, "accent_colour", None)
+    avatar = getattr(u, "display_avatar", None)
+    banner = getattr(u, "banner", None)
+    return {
+        "id": u.id,
+        "name": u.name,
+        "global_name": getattr(u, "global_name", None),
+        "display_name": getattr(u, "display_name", None),
+        "bot": bool(getattr(u, "bot", False)),
+        "system": bool(getattr(u, "system", False)),
+        "created_at": _iso(getattr(u, "created_at", None)),
+        "avatar_url": str(avatar) if avatar else None,
+        "banner_url": str(banner) if banner else None,
+        "accent_color": (f"#{accent.value:06X}"
+                         if accent is not None else None),
+        "public_flags": ([f.name for f in flags.all()]
+                         if flags is not None else []),
+        "mutual_guilds": [
+            {"id": g.id, "name": g.name}
+            for g in (getattr(u, "mutual_guilds", None) or [])
+        ],
+    }
+
+
+@registry.op(
+    "get_user",
+    "Look up any Discord user globally by id: name, global name, account "
+    "creation date, bot/system flags, public profile badges, avatar/banner "
+    "urls, and which guilds they share with the bot. Read-only public data "
+    "— exactly what any Discord client renders for any user id. Guild-"
+    "independent: works for DM correspondents who share no channel with "
+    "the caller (use get_member for guild-specific facts like roles).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("user", ParamKind.USER, "Discord user id to look up."),
+    ],
+    serialize=_serialize_user_profile,
+    agent_guidance=(
+        "get_user reads a user's global public profile; mutual_guilds lists "
+        "the guilds the user shares with the BOT, not with the caller. For "
+        "roles/nick/presence inside a guild, use get_member instead."),
+    scope=OpScope.GLOBAL,
+    group="guild",
+)
+async def get_user(ctx: OpContext, user):
+    # The cache-then-fetch resolver may hand back a gateway-cached User,
+    # which never carries banner/accent_colour (Discord only serves those
+    # on GET /users/{id}); re-fetch for the full profile and fall back to
+    # the resolved user if the fetch fails (the public-cache facts still
+    # answer most of the question).
+    try:
+        return await ctx.bot.fetch_user(user.id)
+    except Exception:  # noqa: BLE001
+        return user
+
+
 def _parse_color(color: str):
     value = color.lstrip("#")
     try:
@@ -2049,6 +2840,8 @@ def serialize_emoji(emoji: Any) -> Dict[str, Any]:
         # hands back the exact string rather than making callers build it.
         "mention": str(emoji),
         "reaction_form": f"{emoji.name}:{emoji.id}",
+        # Role restriction: empty means everyone may use the emoji.
+        "roles": [r.id for r in (getattr(emoji, "roles", None) or [])],
     }
 
 
@@ -2161,30 +2954,43 @@ async def create_emoji(ctx: OpContext, guild, name: str, file_path: str):
 
 @registry.op(
     "edit_emoji",
-    "Rename an existing custom emoji. Requires admin. Managed "
-    "(integration-owned) emoji are refused.",
+    "Rename an existing custom emoji, and/or restrict it to specific roles "
+    "(role_ids; an empty list clears the restriction). Requires admin. "
+    "Managed (integration-owned) emoji are refused.",
     PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id the emoji belongs to."),
         OpParam("emoji_id", ParamKind.SNOWFLAKE,
                 "Custom emoji id to edit (from list_emojis)."),
         OpParam("name", ParamKind.STRING, "New emoji name."),
+        OpParam("role_ids", ParamKind.STRING_LIST,
+                "Optional role restriction: only these role ids may use the "
+                "emoji. Pass an empty list to clear the restriction (back "
+                "to everyone). Omit to leave roles unchanged.",
+                required=False),
     ],
     serialize=serialize_emoji,
     agent_guidance=(
         "Renaming an emoji changes the :name: users type but keeps its id, so "
-        "existing reactions and messages keep working."),
+        "existing reactions and messages keep working. role_ids must come "
+        "from list_roles — never guess one."),
     scope=OpScope.GUILD,
     group="emojis",
 )
-async def edit_emoji(ctx: OpContext, guild, emoji_id: int, name: str):
+async def edit_emoji(ctx: OpContext, guild, emoji_id: int, name: str,
+                     role_ids: Optional[List[str]] = None):
     emoji = _require_guild_emoji(guild, _as_int(emoji_id, "emoji_id"))
     _guard_emoji_editable(emoji)
-    await emoji.edit(
-        name=name,
-        reason=f"edit_emoji op by {ctx.author} ({ctx.author.id})",
+    kwargs: Dict[str, Any] = {"name": name}
+    if role_ids is not None:
+        # Same in-guild refusal as ROLE params: an id from another guild
+        # must not restrict (or unlock) an emoji through this op.
+        kwargs["roles"] = [resolve_role(guild, _as_int(rid, "role_ids"))
+                           for rid in role_ids]
+    edited = await emoji.edit(
+        reason=f"edit_emoji op by {ctx.author} ({ctx.author.id})", **kwargs,
     )
-    return emoji
+    return edited if edited is not None else emoji
 
 
 @registry.op(
@@ -2212,6 +3018,281 @@ async def delete_emoji(ctx: OpContext, guild, emoji_id: int):
         reason=f"delete_emoji op by {ctx.author} ({ctx.author.id})",
     )
     return info
+
+
+# ---------------------------------------------------------------------------
+# Stickers (2026-08 expressive-domain gap pass) — the exact sibling surface
+# of the emoji ops above, sharing the "emojis" group (relabeled "Emojis &
+# stickers"). Discord's sticker upload limit differs from the emoji one:
+# 512KB, and lottie (.json) is a valid format alongside png/apng/gif.
+# ---------------------------------------------------------------------------
+
+STICKER_MAX_BYTES = 512 * 1024
+STICKER_EXTENSIONS = frozenset({".png", ".apng", ".gif", ".json"})
+
+# Where download_emoji drops fetched images: <repo>/media/tmp. A module
+# constant (not inlined) so tests can point it at a tmp dir.
+EMOJI_DOWNLOAD_DIR = Path(__file__).resolve().parent.parent / "media" / "tmp"
+
+
+def serialize_sticker(sticker: Any) -> Dict[str, Any]:
+    fmt = getattr(sticker, "format", None)
+    return {
+        "id": sticker.id,
+        "name": sticker.name,
+        "description": getattr(sticker, "description", None),
+        # The related unicode emoji Discord requires on every sticker.
+        "emoji": getattr(sticker, "emoji", None),
+        "format": getattr(fmt, "name", str(fmt) if fmt is not None else None),
+        "url": str(sticker.url),
+    }
+
+
+def _require_guild_sticker(guild, sticker_id: int):
+    """Resolve a sticker id against THIS guild — same in-impl guild
+    confinement as _require_guild_emoji (stickers have no ParamKind, so the
+    shared resolver never sees them)."""
+    for s in getattr(guild, "stickers", ()) or ():
+        if s.id == sticker_id:
+            return s
+    raise ValueError(
+        f"No custom sticker with id {sticker_id} in guild '{guild.name}'. "
+        f"Call list_stickers to see valid ids."
+    )
+
+
+def _guard_sticker_editable(sticker: Any):
+    """Only guild-owned stickers are editable/deletable; a standard
+    (Discord-pack) sticker id must be refused, mirroring the managed-emoji
+    guard."""
+    stype = getattr(sticker, "type", None)
+    if stype is not None and stype != discord.StickerType.guild:
+        raise ValueError(
+            f"Sticker '{sticker.name}' is not a guild sticker "
+            f"(type {getattr(stype, 'name', stype)}) and cannot be modified."
+        )
+
+
+def load_sticker_file(file_path: str) -> Path:
+    """Validate a local sticker file BEFORE any upload: existence,
+    regular-file, extension allowlist, and Discord's 512KB sticker cap.
+    Returns the resolved path (create_sticker hands discord.File the path,
+    unlike the emoji API's raw bytes)."""
+    path = Path(str(file_path).strip()).expanduser()
+    try:
+        path = path.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise ValueError(f"sticker file not found: {file_path}") from exc
+    if not path.is_file():
+        raise ValueError(f"sticker file is not a file: {path}")
+    ext = path.suffix.lower()
+    if ext not in STICKER_EXTENSIONS:
+        raise ValueError(
+            f"sticker file extension not allowed: {ext or '(none)'} "
+            f"(allowed: {', '.join(sorted(STICKER_EXTENSIONS))})"
+        )
+    size = path.stat().st_size
+    if size <= 0:
+        raise ValueError(f"sticker file is empty: {path}")
+    if size > STICKER_MAX_BYTES:
+        raise ValueError(
+            f"sticker file too large ({size} bytes > {STICKER_MAX_BYTES}). "
+            f"Discord's sticker limit is 512KB — resize or re-encode it."
+        )
+    return path
+
+
+@registry.op(
+    "list_stickers",
+    "List a guild's custom stickers (id, name, description, related emoji, "
+    "format, image url). Use the id with send_message's sticker_id to send "
+    "one.",
+    PermissionLevel.EVERYONE,
+    params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
+    serialize=lambda ss: {"stickers": ss, "count": len(ss)},
+    agent_guidance=(
+        "Use list_stickers to get a sticker's exact id before sending "
+        "(send_message sticker_id) or edit/delete — never guess an id. "
+        "Stickers are not emoji: they cannot be used in reactions."),
+    scope=OpScope.GUILD,
+    group="emojis",
+)
+async def list_stickers(ctx: OpContext, guild):
+    return [serialize_sticker(s) for s in guild.stickers]
+
+
+@registry.op(
+    "create_sticker",
+    "Upload a new custom sticker to a guild from a local file. Requires "
+    "admin. File must be png/apng/gif/json(lottie) and under 512KB; Discord "
+    "also requires a description and a related unicode emoji.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to add the sticker to."),
+        OpParam("name", ParamKind.STRING,
+                "Sticker name (2-30 characters)."),
+        OpParam("description", ParamKind.STRING,
+                "Sticker description shown in the picker."),
+        OpParam("emoji", ParamKind.STRING,
+                "The related unicode emoji Discord requires (a literal "
+                "emoji character, e.g. 😀)."),
+        OpParam("file_path", ParamKind.STRING,
+                "Absolute server-side path to the image "
+                "(png/apng/gif/json, max 512KB)."),
+    ],
+    serialize=lambda s: {"id": s.id, "name": s.name, "url": str(s.url)},
+    agent_guidance=(
+        "create_sticker returns the new sticker's id — reuse it directly "
+        "with send_message's sticker_id instead of calling list_stickers "
+        "again. Guilds have a boost-tier sticker slot limit; if creation "
+        "fails for a full guild, say so rather than retrying."),
+    scope=OpScope.GUILD,
+    group="emojis",
+)
+async def create_sticker(ctx: OpContext, guild, name: str, description: str,
+                         emoji: str, file_path: str):
+    # Reads the HOST filesystem — same explicit admin gate as create_emoji,
+    # kept even though the op is already ADMIN so the rule survives a
+    # future tier change.
+    _require_admin_for_attachments(ctx, [file_path])
+    if not 2 <= len(str(name)) <= 30:
+        raise ValueError(
+            f"Sticker names must be 2-30 characters, got {len(str(name))}.")
+    path = load_sticker_file(file_path)
+    file = discord.File(path, filename=path.name)
+    try:
+        return await guild.create_sticker(
+            name=name, description=description, emoji=emoji, file=file,
+            reason=f"create_sticker op by {ctx.author} ({ctx.author.id})",
+        )
+    finally:
+        # discord.py closes files it was handed once the request runs;
+        # File.close() is safe to repeat and covers pre-request failures.
+        file.close()
+
+
+@registry.op(
+    "edit_sticker",
+    "Edit a custom sticker's name, description, or related emoji. Requires "
+    "admin. Reversible metadata edit; standard (Discord-pack) stickers are "
+    "refused.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the sticker belongs to."),
+        OpParam("sticker_id", ParamKind.SNOWFLAKE,
+                "Custom sticker id to edit (from list_stickers)."),
+        OpParam("name", ParamKind.STRING,
+                "New sticker name (2-30 characters).", required=False),
+        OpParam("description", ParamKind.STRING,
+                "New description.", required=False),
+        OpParam("emoji", ParamKind.STRING,
+                "New related unicode emoji.", required=False),
+    ],
+    serialize=lambda s: {"id": s.id, "name": s.name,
+                         "description": getattr(s, "description", None)},
+    scope=OpScope.GUILD,
+    group="emojis",
+)
+async def edit_sticker(ctx: OpContext, guild, sticker_id: int,
+                       name: Optional[str] = None,
+                       description: Optional[str] = None,
+                       emoji: Optional[str] = None):
+    sticker = _require_guild_sticker(guild, _as_int(sticker_id, "sticker_id"))
+    _guard_sticker_editable(sticker)
+    kwargs: Dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if description is not None:
+        kwargs["description"] = description
+    if emoji is not None:
+        kwargs["emoji"] = emoji
+    if not kwargs:
+        raise ValueError(
+            "Nothing to edit: pass at least one of name/description/emoji.")
+    edited = await sticker.edit(
+        reason=f"edit_sticker op by {ctx.author} ({ctx.author.id})", **kwargs,
+    )
+    return edited if edited is not None else sticker
+
+
+@registry.op(
+    "delete_sticker",
+    "Delete a custom sticker from a guild. Requires admin. Standard "
+    "(Discord-pack) stickers are refused.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the sticker belongs to."),
+        OpParam("sticker_id", ParamKind.SNOWFLAKE,
+                "Custom sticker id to delete (from list_stickers)."),
+    ],
+    serialize=lambda info: info,
+    agent_guidance=(
+        "delete_sticker is irreversible — confirm intent before calling it. "
+        "Messages already sent with the sticker keep rendering it."),
+    scope=OpScope.GUILD,
+    group="emojis",
+)
+async def delete_sticker(ctx: OpContext, guild, sticker_id: int):
+    sticker = _require_guild_sticker(guild, _as_int(sticker_id, "sticker_id"))
+    _guard_sticker_editable(sticker)
+    info = {"deleted": True, "id": sticker.id, "name": sticker.name}
+    await sticker.delete(
+        reason=f"delete_sticker op by {ctx.author} ({ctx.author.id})",
+    )
+    return info
+
+
+@registry.op(
+    "download_emoji",
+    "Download a custom emoji's (or, with sticker=true, a custom sticker's) "
+    "image from Discord's CDN to a server-side file under media/tmp — the "
+    "read half of cloning an asset between guilds (pair with "
+    "create_emoji/create_sticker's file_path). Requires admin: it writes "
+    "to the server filesystem, mirroring the attachment gate.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the asset belongs to."),
+        OpParam("emoji_id", ParamKind.SNOWFLAKE,
+                "Custom emoji id (or sticker id when sticker=true) to "
+                "download."),
+        OpParam("sticker", ParamKind.BOOLEAN,
+                "Treat the id as a sticker id instead of an emoji id "
+                "(default false).",
+                required=False, default=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "download_emoji returns the saved file_path — pass it straight to "
+        "create_emoji (or create_sticker) on the destination guild to clone "
+        "the asset."),
+    scope=OpScope.GUILD,
+    group="emojis",
+)
+async def download_emoji(ctx: OpContext, guild, emoji_id: int,
+                         sticker: bool = False):
+    asset_id = _as_int(emoji_id, "emoji_id")
+    if sticker:
+        asset = _require_guild_sticker(guild, asset_id)
+        fmt = getattr(asset, "format", None)
+        ext = "." + (getattr(fmt, "file_extension", None) or "png")
+    else:
+        asset = _require_guild_emoji(guild, asset_id)
+        ext = ".gif" if getattr(asset, "animated", False) else ".png"
+    data = await asset.read()
+    # Asset names are Discord-validated (word characters), but sanitize
+    # anyway — the name lands in a server-side filename.
+    safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", str(asset.name)) or "asset"
+    dest = Path(EMOJI_DOWNLOAD_DIR) / f"{safe_name}_{asset.id}{ext}"
+    # File I/O off the event loop, same policy as read_dms.
+    def _write() -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    await asyncio.to_thread(_write)
+    return {"file_path": str(dest), "bytes": len(data), "name": asset.name}
 
 
 @registry.op(
@@ -2258,6 +3339,1872 @@ async def list_channel_overwrites(ctx: OpContext, guild, channel=None, role=None
             })
     return out
 
+
+
+# ---------------------------------------------------------------------------
+# Channels & threads (2026-08 channels-domain gap pass).
+#
+# Threads travel through the ordinary CHANNEL param kind — a thread IS a
+# channel to the resolver and to the channel-visibility gate — with an
+# in-impl isinstance guard where an op only makes sense for one or the
+# other (edit_thread owns thread edits; edit_channel/set_slowmode refuse
+# threads so there is exactly one op per edit surface).
+#
+# Deliberately NOT here (owner-tier decisions, see the channels gap sheet):
+# channel create/delete/clone/move, overwrite writes, invites, webhooks,
+# archived PRIVATE thread enumeration, and thread add_user/remove_user
+# (an unsuppressable ping — conflicts with the never-ping invariant).
+# ---------------------------------------------------------------------------
+
+# Discord accepts exactly these auto-archive durations (minutes).
+THREAD_AUTO_ARCHIVE_DURATIONS = (60, 1440, 4320, 10080)
+# Discord's slowmode cap: 6 hours.
+SLOWMODE_MAX_SECONDS = 21600
+
+
+def _require_thread(channel: Any) -> Any:
+    """Thread-only ops accept any CHANNEL on the wire; refuse non-threads
+    with a clear error instead of an AttributeError mid-call."""
+    if not isinstance(channel, discord.Thread):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} is not a thread "
+            f"(got {type(channel).__name__})."
+        )
+    return channel
+
+
+def serialize_thread(t: Any) -> Dict[str, Any]:
+    created_at = getattr(t, "created_at", None)
+    return {
+        "id": t.id,
+        "name": t.name,
+        "parent_id": getattr(t, "parent_id", None),
+        "owner_id": getattr(t, "owner_id", None),
+        "archived": bool(getattr(t, "archived", False)),
+        "locked": bool(getattr(t, "locked", False)),
+        "member_count": getattr(t, "member_count", None),
+        "message_count": getattr(t, "message_count", None),
+        "slowmode_delay": getattr(t, "slowmode_delay", None),
+        "auto_archive_duration": getattr(t, "auto_archive_duration", None),
+        "created_at": created_at.isoformat() if created_at else None,
+    }
+
+
+@registry.op(
+    "get_channel_info",
+    "Read one channel's full details: topic, nsfw flag, slowmode, category, "
+    "position, created_at — plus voice specifics (bitrate/user_limit), forum "
+    "tags (available_tags), and the parent id for threads, where they apply. "
+    "Pure read; same detail every member sees in the client's channel "
+    "settings.",
+    PermissionLevel.EVERYONE,
+    params=[OpParam("channel", ParamKind.CHANNEL,
+                    "Discord channel id to inspect.")],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "get_channel_info is the detail view to list_channels' index — use "
+        "it when topic/nsfw/slowmode/category matters, and to read a forum's "
+        "available_tags before create_forum_post."),
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def get_channel_info(ctx: OpContext, channel):
+    category = getattr(channel, "category", None)
+    created_at = getattr(channel, "created_at", None)
+    payload: Dict[str, Any] = {
+        "id": channel.id,
+        "name": channel.name,
+        "type": str(channel.type),
+        "topic": getattr(channel, "topic", None),
+        "nsfw": bool(getattr(channel, "nsfw", False)),
+        "category_id": getattr(channel, "category_id", None),
+        "category_name": getattr(category, "name", None),
+        "position": getattr(channel, "position", None),
+        "created_at": created_at.isoformat() if created_at else None,
+        "slowmode_delay": getattr(channel, "slowmode_delay", None),
+        "default_auto_archive_duration": getattr(
+            channel, "default_auto_archive_duration", None),
+    }
+    # Type-specific facets appear only where the channel type carries them,
+    # so a text channel's payload doesn't grow null voice fields.
+    if hasattr(channel, "bitrate"):
+        payload["bitrate"] = channel.bitrate
+        payload["user_limit"] = getattr(channel, "user_limit", None)
+    tags = getattr(channel, "available_tags", None)
+    if tags is not None:
+        payload["available_tags"] = [{"id": t.id, "name": t.name}
+                                     for t in tags]
+    if isinstance(channel, discord.Thread):
+        payload["thread_parent_id"] = channel.parent_id
+    return payload
+
+
+def _drop_threads_actor_cannot_see(ctx: OpContext, guild, threads):
+    """Guild-wide thread enumeration can surface threads whose PARENT channel
+    the invoking user cannot read — same actor-visibility policy as
+    _drop_hits_actor_cannot_see (real Members filtered; bare id-holder
+    actors are the MCP frontend's documented accepted risk and pass
+    through). Threads whose parent no longer resolves are dropped as
+    unverifiable."""
+    actor = getattr(ctx, "author", None)
+    if actor is None or not hasattr(actor, "guild_permissions"):
+        return threads
+    visible = []
+    for t in threads:
+        parent = (guild.get_channel(getattr(t, "parent_id", None))
+                  if guild else None)
+        if parent is None or not hasattr(parent, "permissions_for"):
+            continue
+        try:
+            if parent.permissions_for(actor).read_messages:
+                visible.append(t)
+        except Exception:  # noqa: BLE001 - odd channel types err to hidden
+            continue
+    return visible
+
+
+@registry.op(
+    "list_threads",
+    "List threads: active guild-wide by default, or one parent channel's "
+    "threads (optionally including its archived PUBLIC threads). Read-only. "
+    "Archived private threads are never listed.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to enumerate (active threads guild-wide)."),
+        OpParam("channel", ParamKind.CHANNEL,
+                "Optional channel id to restrict to one parent channel.",
+                required=False),
+        OpParam("include_archived", ParamKind.BOOLEAN,
+                "Also list archived public threads (requires channel_id; "
+                "default false).",
+                required=False, default=False),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max threads to return (default 100).",
+                required=False, default=100, minimum=1, maximum=500),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "list_threads answers 'what threads exist' — guild-wide for active "
+        "ones, or per channel (add include_archived for that channel's "
+        "archived public threads). Thread ids are channel ids: pass them as "
+        "channel_id to read_history, join_thread, edit_thread, etc."),
+    scope=OpScope.GUILD,
+    group="threads",
+)
+async def list_threads(ctx: OpContext, guild, channel=None,
+                       include_archived: bool = False, limit: int = 100):
+    if include_archived and channel is None:
+        raise ValueError(
+            "include_archived requires a channel_id — Discord has no "
+            "guild-wide archived-thread listing.")
+    if channel is not None:
+        if not hasattr(channel, "threads"):
+            raise ValueError(
+                f"Channel {channel.id} ({type(channel).__name__}) cannot "
+                f"parent threads.")
+        threads = list(channel.threads)
+        if include_archived:
+            # Public archived threads only. archived_threads(private=True)
+            # needs manage_threads and enumerates invite-only conversations
+            # — deliberately out of scope (thread MEMBERSHIP, not channel
+            # readability, is the real boundary there).
+            async for t in channel.archived_threads(limit=limit):
+                threads.append(t)
+    else:
+        threads = list(await guild.active_threads())
+    threads = _drop_threads_actor_cannot_see(ctx, guild, threads)
+    rows = [serialize_thread(t) for t in threads[:limit]]
+    return {"threads": rows, "count": len(rows)}
+
+
+@registry.op(
+    "list_thread_members",
+    "List a thread's members (threads have explicit membership, unlike "
+    "channels). Read-only; same list the client shows in the thread header.",
+    PermissionLevel.EVERYONE,
+    params=[OpParam("channel", ParamKind.CHANNEL,
+                    "Discord thread id whose members to list (threads are "
+                    "channels; a non-thread channel id is refused).")],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "list_thread_members answers 'who is in this thread' — explicit "
+        "joins only, not everyone who could read the parent channel "
+        "(list_members answers that)."),
+    scope=OpScope.GUILD,
+    group="threads",
+)
+async def list_thread_members(ctx: OpContext, channel):
+    thread = _require_thread(channel)
+    guild = getattr(thread, "guild", None)
+    rows = []
+    for tm in await thread.fetch_members():
+        member = guild.get_member(tm.id) if guild else None
+        joined_at = getattr(tm, "joined_at", None)
+        rows.append({
+            "id": tm.id,
+            # Resolved via the guild member cache; None when the member is
+            # not cached — the id is always present.
+            "display_name": getattr(member, "display_name", None),
+            "joined_at": joined_at.isoformat() if joined_at else None,
+        })
+    return {"members": rows, "count": len(rows)}
+
+
+@registry.op(
+    "join_thread",
+    "Join the BOT to a thread, so it follows the conversation there. "
+    "Requires admin. Only changes the bot's own membership; reversible via "
+    "leave_thread.",
+    PermissionLevel.ADMIN,
+    params=[OpParam("channel", ParamKind.CHANNEL,
+                    "Discord thread id to join.")],
+    scope=OpScope.GUILD,
+    group="threads",
+)
+async def join_thread(ctx: OpContext, channel):
+    thread = _require_thread(channel)
+    await thread.join()
+    return True
+
+
+@registry.op(
+    "leave_thread",
+    "Remove the BOT from a thread. Requires admin. Inverse of join_thread; "
+    "only changes the bot's own membership.",
+    PermissionLevel.ADMIN,
+    params=[OpParam("channel", ParamKind.CHANNEL,
+                    "Discord thread id to leave.")],
+    scope=OpScope.GUILD,
+    group="threads",
+)
+async def leave_thread(ctx: OpContext, channel):
+    thread = _require_thread(channel)
+    await thread.leave()
+    return True
+
+
+@registry.op(
+    "edit_thread",
+    "Edit a thread: rename, archive/unarchive, lock/unlock, slowmode, or "
+    "auto-archive duration. Requires admin. Every flag is reversible "
+    "(unarchive/unlock/rename back).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Discord thread id to edit."),
+        OpParam("name", ParamKind.STRING, "New thread name.", required=False),
+        OpParam("archived", ParamKind.BOOLEAN,
+                "Archive (true) or unarchive (false).", required=False),
+        OpParam("locked", ParamKind.BOOLEAN,
+                "Lock so only moderators can unarchive/reply.",
+                required=False),
+        OpParam("slowmode_delay", ParamKind.INTEGER,
+                "Seconds between messages per user, 0 disables (max 21600).",
+                required=False, minimum=0, maximum=SLOWMODE_MAX_SECONDS),
+        OpParam("auto_archive_duration", ParamKind.INTEGER,
+                "Minutes of inactivity before auto-archive: 60, 1440, 4320, "
+                "or 10080.",
+                required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "edit_thread with archived=true is the reversible alternative to "
+        "deleting a thread — the conversation is preserved and any member "
+        "can reopen it (locked=true additionally restricts reopening to "
+        "moderators)."),
+    scope=OpScope.GUILD,
+    group="threads",
+)
+async def edit_thread(ctx: OpContext, channel, name: Optional[str] = None,
+                      archived: Optional[bool] = None,
+                      locked: Optional[bool] = None,
+                      slowmode_delay: Optional[int] = None,
+                      auto_archive_duration: Optional[int] = None):
+    thread = _require_thread(channel)
+    kwargs: Dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if archived is not None:
+        kwargs["archived"] = archived
+    if locked is not None:
+        kwargs["locked"] = locked
+    if slowmode_delay is not None:
+        kwargs["slowmode_delay"] = slowmode_delay
+    if auto_archive_duration is not None:
+        if auto_archive_duration not in THREAD_AUTO_ARCHIVE_DURATIONS:
+            raise ValueError(
+                f"auto_archive_duration must be one of "
+                f"{', '.join(str(d) for d in THREAD_AUTO_ARCHIVE_DURATIONS)} "
+                f"(minutes), got {auto_archive_duration}.")
+        kwargs["auto_archive_duration"] = auto_archive_duration
+    if not kwargs:
+        raise ValueError(
+            "Nothing to edit: pass at least one of name/archived/locked/"
+            "slowmode_delay/auto_archive_duration.")
+    edited = await thread.edit(
+        reason=f"edit_thread op by {ctx.author} ({ctx.author.id})", **kwargs)
+    target = edited if edited is not None else thread
+    return {
+        "thread_id": target.id,
+        "name": target.name,
+        "archived": bool(getattr(target, "archived", False)),
+        "locked": bool(getattr(target, "locked", False)),
+        "slowmode_delay": getattr(target, "slowmode_delay", None),
+        "auto_archive_duration": getattr(target, "auto_archive_duration",
+                                         None),
+    }
+
+
+@registry.op(
+    "set_slowmode",
+    "Set a channel's slowmode (seconds between messages per user; 0 "
+    "disables). Requires admin. Reversible; a deliberately atomic op — "
+    "channel name/topic edits are edit_channel's job, thread slowmode is "
+    "edit_thread's.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id to set slowmode on."),
+        OpParam("seconds", ParamKind.INTEGER,
+                "Seconds between messages per user; 0 disables. Max 21600 "
+                "(6h).",
+                minimum=0, maximum=SLOWMODE_MAX_SECONDS),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def set_slowmode(ctx: OpContext, channel, seconds: int):
+    if isinstance(channel, discord.Thread):
+        raise ValueError(
+            "set_slowmode does not accept threads — use edit_thread's "
+            "slowmode_delay.")
+    if not hasattr(channel, "slowmode_delay"):
+        raise ValueError(
+            f"Channel {channel.id} ({type(channel).__name__}) has no "
+            f"slowmode.")
+    await channel.edit(
+        slowmode_delay=seconds,
+        reason=f"set_slowmode op by {ctx.author} ({ctx.author.id})")
+    return {"channel_id": channel.id, "slowmode_delay": seconds}
+
+
+@registry.op(
+    "edit_channel",
+    "Edit a channel's name, topic, or nsfw flag. Requires admin. Reversible "
+    "in-place edits only — position/category moves and permission "
+    "overwrites are deliberately NOT ops. Threads are refused (edit_thread "
+    "owns those).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Discord channel id to edit."),
+        OpParam("name", ParamKind.STRING, "New channel name.",
+                required=False),
+        OpParam("topic", ParamKind.STRING,
+                "New channel topic (text/forum channels).", required=False),
+        OpParam("nsfw", ParamKind.BOOLEAN, "Age-restrict the channel.",
+                required=False),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def edit_channel(ctx: OpContext, channel, name: Optional[str] = None,
+                       topic: Optional[str] = None,
+                       nsfw: Optional[bool] = None):
+    if isinstance(channel, discord.Thread):
+        raise ValueError(
+            "edit_channel does not accept threads — use edit_thread.")
+    kwargs: Dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if topic is not None:
+        if not hasattr(channel, "topic"):
+            raise ValueError(
+                f"Channel {channel.id} ({type(channel).__name__}) has no "
+                f"topic.")
+        kwargs["topic"] = topic
+    if nsfw is not None:
+        kwargs["nsfw"] = nsfw
+    if not kwargs:
+        raise ValueError(
+            "Nothing to edit: pass at least one of name/topic/nsfw.")
+    edited = await channel.edit(
+        reason=f"edit_channel op by {ctx.author} ({ctx.author.id})", **kwargs)
+    # channel.edit returns the updated channel, or None for edits discord.py
+    # treats as purely positional — fall back to the original object.
+    target = edited if edited is not None else channel
+    return {
+        "id": target.id,
+        "name": target.name,
+        "topic": getattr(target, "topic", None),
+        "nsfw": bool(getattr(target, "nsfw", False)),
+        "type": str(target.type),
+    }
+
+
+@registry.op(
+    "get_member_permissions",
+    "Compute one member's EFFECTIVE permissions in one channel — guild "
+    "roles plus channel overwrites, fully resolved. Requires admin, same "
+    "gate as list_channel_overwrites (this resolves ACLs of channels "
+    "hidden from ordinary members).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id to evaluate in."),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id whose effective permissions to compute."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "get_member_permissions answers 'why can/can't X do Y here' with the "
+        "fully-resolved result; list_channel_overwrites shows the raw ACL "
+        "entries it was computed from."),
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def get_member_permissions(ctx: OpContext, channel, member):
+    perms = channel.permissions_for(member)
+    return {
+        "channel_id": channel.id,
+        "user_id": member.id,
+        "permissions": [name for name, value in perms if value],
+    }
+
+
+@registry.op(
+    "create_forum_post",
+    "Create a forum post: a thread with its required starter message in a "
+    "forum channel (create_thread cannot serve forums — they refuse "
+    "threads without content). Never pings. Optional forum tags.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord forum channel id to post in."),
+        OpParam("name", ParamKind.STRING, "Post title."),
+        OpParam("content", ParamKind.STRING,
+                "Starter message body (forums require one)."),
+        OpParam("tag_ids", ParamKind.STRING_LIST,
+                "Optional forum tag ids to apply (from get_channel_info's "
+                "available_tags).",
+                required=False),
+    ],
+    serialize=lambda tm: {"thread_id": tm.thread.id, "name": tm.thread.name,
+                          "message_id": tm.message.id},
+    agent_guidance=(
+        "create_forum_post is for forum channels only — text channels take "
+        "create_thread. Tag ids must come from get_channel_info's "
+        "available_tags, never guessed."),
+    scope=OpScope.GUILD,
+    group="threads",
+)
+async def create_forum_post(ctx: OpContext, channel, name: str, content: str,
+                            tag_ids: Optional[List[str]] = None):
+    if not isinstance(channel, discord.ForumChannel):
+        raise ValueError(
+            f"Channel {channel.id} ({type(channel).__name__}) is not a "
+            f"forum channel — use create_thread for text channels.")
+    if not str(content).strip():
+        raise ValueError(
+            "create_forum_post requires non-empty content — forums require "
+            "a starter message.")
+    applied = []
+    if tag_ids:
+        available = {t.id: t for t in channel.available_tags}
+        for raw_id in tag_ids:
+            tid = _as_int(raw_id, "tag_ids")
+            if tid not in available:
+                raise ValueError(
+                    f"No forum tag with id {tid} in channel {channel.id} — "
+                    f"see get_channel_info's available_tags.")
+            applied.append(available[tid])
+    kwargs: Dict[str, Any] = {
+        "name": name,
+        "content": content,
+        # Same never-ping policy as every send-class op.
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if applied:
+        kwargs["applied_tags"] = applied
+    return await channel.create_thread(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Guild & members (2026-08 guild-domain gap pass).
+#
+# SAFE_NOW bar for this section: an admin could already do it by hand in the
+# Discord client without a confirmation dialog. That is why timeout_member is
+# here (duration picker, no confirm, reversible any moment via remove_timeout)
+# while kick/ban/prune/unban are deliberately NOT ops — the client confirms
+# those, they eject people irreversibly, and exposing them is an owner
+# decision, not a gap-fill.
+#
+# Datetimes serialize as ISO strings; ids stay ints in results like every
+# serializer above (the string-snowflake rule is a WIRE-INPUT rule).
+# ---------------------------------------------------------------------------
+
+# Discord's timeout cap: 28 days.
+TIMEOUT_MAX_MINUTES = 40320
+
+
+def _iso(dt: Any) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+def _op_audit_reason(ctx: OpContext, op_name: str,
+                     reason: Optional[str]) -> str:
+    """Audit-log reason: the caller's own text when given, else the same
+    actor stamp edit_thread/edit_channel write."""
+    if reason is not None and str(reason).strip():
+        return str(reason)
+    return f"{op_name} op by {ctx.author} ({ctx.author.id})"
+
+
+def _serialize_activity(a: Any) -> Dict[str, Any]:
+    """One presence activity: type (playing/listening/custom/...), name,
+    and details when the activity carries them."""
+    a_type = getattr(a, "type", None)
+    row: Dict[str, Any] = {
+        "type": getattr(a_type, "name", None) or (str(a_type) if a_type is not None else None),
+        "name": getattr(a, "name", None),
+    }
+    details = getattr(a, "details", None)
+    if details:
+        row["details"] = details
+    return row
+
+
+def serialize_member_profile(m: Any) -> Dict[str, Any]:
+    avatar = getattr(m, "display_avatar", None)
+    guild_avatar = getattr(m, "guild_avatar", None)
+    top_role = getattr(m, "top_role", None)
+    return {
+        "id": m.id,
+        "name": m.name,
+        "global_name": getattr(m, "global_name", None),
+        "display_name": m.display_name,
+        "nick": getattr(m, "nick", None),
+        "bot": bool(getattr(m, "bot", False)),
+        # @everyone is implicit membership, not information — excluded.
+        "roles": [
+            {"id": r.id, "name": r.name}
+            for r in getattr(m, "roles", [])
+            if not (hasattr(r, "is_default") and r.is_default())
+        ],
+        "top_role": ({"id": top_role.id, "name": top_role.name}
+                     if top_role is not None else None),
+        "joined_at": _iso(getattr(m, "joined_at", None)),
+        "created_at": _iso(getattr(m, "created_at", None)),
+        "premium_since": _iso(getattr(m, "premium_since", None)),
+        "timed_out_until": _iso(getattr(m, "timed_out_until", None)),
+        "status": str(getattr(m, "status", "offline")),
+        # Per-platform presence, same enum-to-string treatment as status.
+        "client_status": {
+            "desktop": str(getattr(m, "desktop_status", "offline")),
+            "mobile": str(getattr(m, "mobile_status", "offline")),
+            "web": str(getattr(m, "web_status", "offline")),
+        },
+        "activities": [_serialize_activity(a)
+                       for a in (getattr(m, "activities", None) or [])],
+        # Asset.__str__ is the CDN url; display_avatar always resolves
+        # (custom avatar or default) on a real Member.
+        "avatar_url": str(avatar) if avatar else None,
+        # The per-guild avatar override, when the member set one.
+        "guild_avatar_url": str(guild_avatar) if guild_avatar else None,
+        "pending": bool(getattr(m, "pending", False)),
+    }
+
+
+@registry.op(
+    "get_member",
+    "Read one member's full profile: nick, roles, join/creation dates, "
+    "timeout state, booster status, presence, avatar url. Pure read — the "
+    "detail view to list_members' index.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER, "Discord user id to read."),
+    ],
+    serialize=serialize_member_profile,
+    agent_guidance=(
+        "get_member answers 'what roles does X have', 'when did X join', "
+        "'is X timed out' in one call — use it instead of scanning every "
+        "role with list_role_members. Get the user id from search_members "
+        "or the visible context, never by guessing."),
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def get_member(ctx: OpContext, member, guild=None):
+    # The MEMBER resolver already fetched the member; bare pass-through to
+    # the serializer, same as get_message.
+    return member
+
+
+@registry.op(
+    "get_guild_info",
+    "Read a guild's metadata: name, description, owner, member count, boost "
+    "tier, features, verification level, locale, vanity code, icon/banner "
+    "urls. Pure cache read — the same facts any member sees on the server "
+    "banner.",
+    PermissionLevel.EVERYONE,
+    params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to read.")],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "get_guild_info is the detail view to list_guilds' index — use it "
+        "for member_count, boost tier, features, or the owner's user id."),
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def get_guild_info(ctx: OpContext, guild):
+    icon = getattr(guild, "icon", None)
+    banner = getattr(guild, "banner", None)
+    verification = getattr(guild, "verification_level", None)
+    locale = getattr(guild, "preferred_locale", None)
+    return {
+        "id": guild.id,
+        "name": guild.name,
+        "description": getattr(guild, "description", None),
+        "owner_id": getattr(guild, "owner_id", None),
+        "member_count": getattr(guild, "member_count", None),
+        "created_at": _iso(getattr(guild, "created_at", None)),
+        "premium_tier": getattr(guild, "premium_tier", None),
+        "premium_subscription_count": getattr(
+            guild, "premium_subscription_count", None),
+        "features": list(getattr(guild, "features", None) or []),
+        "verification_level": (str(verification)
+                               if verification is not None else None),
+        "preferred_locale": str(locale) if locale is not None else None,
+        "vanity_url_code": getattr(guild, "vanity_url_code", None),
+        "icon_url": str(icon) if icon else None,
+        "banner_url": str(banner) if banner else None,
+    }
+
+
+@registry.op(
+    "search_members",
+    "Search a guild's members by name/nick prefix (gateway member search). "
+    "Read-only — the path from a name to a user_id without dumping the "
+    "whole member list.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to search."),
+        OpParam("query", ParamKind.STRING,
+                "Name/nick prefix to match (Discord matches username and "
+                "nickname prefixes, case-insensitively)."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max matches to return (default 10, clamped to 100).",
+                required=False, default=10, minimum=1, maximum=100),
+    ],
+    serialize=lambda ms: {"members": ms, "count": len(ms)},
+    agent_guidance=(
+        "search_members resolves a name to a user_id ('what roles does "
+        "Alice have' -> search_members, then get_member). It matches "
+        "PREFIXES only — search the shortest distinctive prefix, and never "
+        "guess an id when zero rows come back."),
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def search_members(ctx: OpContext, guild, query: str, limit: int = 10):
+    members = await guild.query_members(query=query, limit=limit, cache=True)
+    return [
+        {
+            "id": m.id,
+            "display_name": m.display_name,
+            "name": m.name,
+            "status": str(getattr(m, "status", "offline")),
+        }
+        for m in members
+    ]
+
+
+@registry.op(
+    "set_nickname",
+    "Set or clear a member's nickname. Requires admin (Manage Nicknames "
+    "class action). Omit nick, or pass an empty string, to clear the "
+    "nickname back to the username. Fully reversible.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id whose nickname to set."),
+        OpParam("nick", ParamKind.STRING,
+                "New nickname (max 32 chars). Omit or pass empty to clear.",
+                required=False),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="members",
+)
+async def set_nickname(ctx: OpContext, member, nick: Optional[str] = None,
+                       reason: Optional[str] = None, guild=None):
+    # Empty/whitespace clears, same as omitting: there is no meaningful
+    # all-whitespace nickname, and 'empty clears' matches the client.
+    cleaned = nick if nick is not None and str(nick).strip() else None
+    await member.edit(nick=cleaned,
+                      reason=_op_audit_reason(ctx, "set_nickname", reason))
+    return {"member_id": member.id, "nick": cleaned}
+
+
+@registry.op(
+    "timeout_member",
+    "Timeout a member (Discord's native mute-everything) for a duration in "
+    "minutes, max 28 days. Requires admin. Auto-expires and reversible at "
+    "any moment via remove_timeout. Refuses members the bot cannot "
+    "moderate (role hierarchy) with a Forbidden error.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id to timeout."),
+        OpParam("duration_minutes", ParamKind.INTEGER,
+                "Timeout length in minutes (max 40320 = Discord's 28-day "
+                "cap).",
+                minimum=1, maximum=TIMEOUT_MAX_MINUTES),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "timeout_member is reversible moderation: it auto-expires at "
+        "timed_out_until and remove_timeout undoes it early. It is NOT "
+        "kick or ban — the bot has no ejection ops at all; if asked to "
+        "kick or ban, say that is not available."),
+    scope=OpScope.GUILD,
+    group="members",
+)
+async def timeout_member(ctx: OpContext, member, duration_minutes: int,
+                         reason: Optional[str] = None, guild=None):
+    until = discord.utils.utcnow() + timedelta(minutes=duration_minutes)
+    await member.timeout(until,
+                         reason=_op_audit_reason(ctx, "timeout_member",
+                                                 reason))
+    return {"member_id": member.id, "timed_out_until": until.isoformat()}
+
+
+@registry.op(
+    "remove_timeout",
+    "Remove a member's timeout early. Requires admin. The reversal half of "
+    "timeout_member; strictly permission-restoring.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id whose timeout to remove."),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+    ],
+    scope=OpScope.GUILD,
+    group="members",
+)
+async def remove_timeout(ctx: OpContext, member,
+                         reason: Optional[str] = None, guild=None):
+    await member.timeout(None,
+                         reason=_op_audit_reason(ctx, "remove_timeout",
+                                                 reason))
+    return True
+
+
+@registry.op(
+    "list_bans",
+    "Read the guild ban list (user id, name, reason) — the same list "
+    "Server Settings → Bans shows an admin. Read-only; there is no "
+    "ban/unban op. Pages by user id via after_user_id.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to read."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max ban entries to return (default 100, clamped to 1000).",
+                required=False, default=100, minimum=1, maximum=1000),
+        OpParam("after_user_id", ParamKind.SNOWFLAKE,
+                "Optional pagination cursor: only bans of user ids greater "
+                "than this (Discord pages bans by user id). Pass the "
+                "previous page's last user_id to walk forward.",
+                required=False),
+    ],
+    serialize=lambda bs: {"bans": bs, "count": len(bs)},
+    agent_guidance=(
+        "list_bans answers 'why can't X rejoin' — it reads only; the bot "
+        "has no ban or unban ops. Page forward with after_user_id set to "
+        "the last row's user_id until a page comes back short."),
+    scope=OpScope.GUILD,
+    group="moderation",
+)
+async def list_bans(ctx: OpContext, guild, limit: int = 100,
+                    after_user_id: Optional[int] = None):
+    kwargs: Dict[str, Any] = {"limit": limit}
+    if after_user_id is not None:
+        kwargs["after"] = discord.Object(id=after_user_id)
+    rows = []
+    async for entry in guild.bans(**kwargs):
+        rows.append({
+            "user_id": entry.user.id,
+            "name": entry.user.name,
+            "reason": entry.reason,
+        })
+    return rows
+
+
+def _audit_change_value(value: Any) -> Any:
+    """AuditLogDiff values include live objects (roles, overwrites, colours);
+    keep JSON scalars as-is and stringify everything else defensively."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    return str(value)
+
+
+@registry.op(
+    "fetch_audit_logs",
+    "Read the guild audit log ('who did that?'): action, actor, target, "
+    "reason, and per-attribute before/after changes. Read-only; the same "
+    "view Server Settings → Audit Log shows an admin. Requires the bot to "
+    "hold View Audit Log.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to read."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max entries to return, newest first (default 50, clamped "
+                "to 100).",
+                required=False, default=50, minimum=1, maximum=100),
+        OpParam("user", ParamKind.USER,
+                "Optional filter — only actions performed by this user id.",
+                required=False),
+        OpParam("action", ParamKind.STRING,
+                "Optional filter — an AuditLogAction name like 'ban', "
+                "'kick', 'member_update', 'role_create'.",
+                required=False),
+        OpParam("before", ParamKind.SNOWFLAKE,
+                "Optional pagination cursor: only entries older than this "
+                "entry id. Pass the previous page's last entry id to walk "
+                "further back.",
+                required=False),
+    ],
+    serialize=lambda es: {"entries": es, "count": len(es)},
+    agent_guidance=(
+        "fetch_audit_logs answers 'who did that?' — filter by user_id for "
+        "one actor's actions or by action name (e.g. 'ban', 'role_create') "
+        "for one kind. Summarize the entries in plain text; never paste "
+        "them raw."),
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def fetch_audit_logs(ctx: OpContext, guild, limit: int = 50,
+                           user=None, action: Optional[str] = None,
+                           before: Optional[int] = None):
+    kwargs: Dict[str, Any] = {"limit": limit}
+    if user is not None:
+        kwargs["user"] = user
+    if action is not None:
+        resolved = getattr(discord.AuditLogAction, str(action), None)
+        if not isinstance(resolved, discord.AuditLogAction):
+            raise ValueError(
+                f"Unknown audit-log action {action!r} — use a "
+                f"discord.AuditLogAction name like 'ban', 'kick', "
+                f"'member_update', 'role_create'.")
+        kwargs["action"] = resolved
+    if before is not None:
+        kwargs["before"] = discord.Object(id=before)
+    entries = []
+    async for e in guild.audit_logs(**kwargs):
+        # AuditLogDiff iterates as (attribute, value) pairs; union the
+        # before/after keys so one-sided changes (e.g. a create) still show.
+        before_diff = dict(e.changes.before)
+        after_diff = dict(e.changes.after)
+        changes = [
+            {
+                "attribute": key,
+                "before": _audit_change_value(before_diff.get(key)),
+                "after": _audit_change_value(after_diff.get(key)),
+            }
+            for key in dict.fromkeys(list(before_diff) + list(after_diff))
+        ]
+        target = getattr(e, "target", None)
+        entries.append({
+            "id": e.id,
+            "action": getattr(e.action, "name", str(e.action)),
+            "user_id": getattr(getattr(e, "user", None), "id", None),
+            "target_id": getattr(target, "id", None),
+            "target_type": (type(target).__name__
+                            if target is not None else None),
+            "reason": getattr(e, "reason", None),
+            "created_at": _iso(getattr(e, "created_at", None)),
+            "changes": changes,
+        })
+    return entries
+
+
+@registry.op(
+    "estimate_prune",
+    "Estimate how many members a prune would remove (dry-run) — the number "
+    "the client shows before a prune. Pure read; there is no prune op.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to estimate in."),
+        OpParam("days", ParamKind.INTEGER,
+                "Inactivity window in days (default 30, clamped to 1-30).",
+                required=False, default=30, minimum=1, maximum=30),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def estimate_prune(ctx: OpContext, guild, days: int = 30):
+    estimated = await guild.estimate_pruned_members(days=days)
+    return {"days": days, "estimated_members": estimated}
+
+
+@registry.op(
+    "list_integrations",
+    "List a guild's integrations (connected bots, Twitch/YouTube subs) — "
+    "the same list Server Settings → Integrations shows an admin. "
+    "Read-only; there is no integration delete op.",
+    PermissionLevel.ADMIN,
+    params=[OpParam("guild", ParamKind.GUILD,
+                    "Discord guild id to enumerate.")],
+    serialize=lambda rows: {"integrations": rows, "count": len(rows)},
+    scope=OpScope.GUILD,
+    group="guild-info",
+)
+async def list_integrations(ctx: OpContext, guild):
+    rows = []
+    for integration in await guild.integrations():
+        account = getattr(integration, "account", None)
+        row: Dict[str, Any] = {
+            "id": integration.id,
+            "name": integration.name,
+            "type": getattr(integration, "type", None),
+            "enabled": bool(getattr(integration, "enabled", False)),
+            "account_id": getattr(account, "id", None),
+            "account_name": getattr(account, "name", None),
+        }
+        # Bot integrations only: the connected application's bot user id.
+        bot_user = getattr(getattr(integration, "application", None),
+                           "user", None)
+        if bot_user is not None:
+            row["application_bot_user_id"] = bot_user.id
+        rows.append(row)
+    return rows
+
+
+@registry.op(
+    "list_invites",
+    "List a guild's active invites (code, channel, inviter, uses, expiry, "
+    "plus the vanity code when the guild has one) — the same list Server "
+    "Settings → Invites shows an admin. Read-only; the entry point for "
+    "revoke_invite. The bot needs Manage Guild or the call fails.",
+    PermissionLevel.ADMIN,
+    params=[OpParam("guild", ParamKind.GUILD,
+                    "Discord guild id to enumerate.")],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="invites",
+)
+async def list_invites(ctx: OpContext, guild):
+    rows = []
+    for invite in await guild.invites():
+        inviter = getattr(invite, "inviter", None)
+        rows.append({
+            "code": invite.code,
+            "channel_id": getattr(getattr(invite, "channel", None),
+                                  "id", None),
+            "inviter_id": getattr(inviter, "id", None),
+            "inviter_name": getattr(inviter, "name", None),
+            "uses": getattr(invite, "uses", None),
+            "max_uses": getattr(invite, "max_uses", None),
+            "max_age": getattr(invite, "max_age", None),
+            "created_at": _iso(getattr(invite, "created_at", None)),
+            "expires_at": _iso(getattr(invite, "expires_at", None)),
+            "temporary": bool(getattr(invite, "temporary", False)),
+        })
+    return {
+        "invites": rows,
+        # Cache read; None when the guild has no vanity URL set.
+        "vanity_code": getattr(guild, "vanity_url_code", None),
+        "count": len(rows),
+    }
+
+
+# Discord's invite caps: max_age tops out at 7 days, max_uses at 100.
+INVITE_MAX_AGE_SECONDS = 604800
+INVITE_MAX_USES = 100
+
+
+@registry.op(
+    "create_invite",
+    "Create an invite link for a channel. Requires admin. Defaults to a "
+    "24-hour expiry and unlimited uses (pass max_age_seconds=0 for a "
+    "never-expiring link — deliberate, never the default). Fully "
+    "reversible via revoke_invite.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id the invite lands in."),
+        OpParam("max_age_seconds", ParamKind.INTEGER,
+                "Seconds until the link expires (default 86400 = 24h; 0 = "
+                "never; max 604800 = 7 days).",
+                required=False, default=86400, minimum=0,
+                maximum=INVITE_MAX_AGE_SECONDS),
+        OpParam("max_uses", ParamKind.INTEGER,
+                "How many joins the link allows (default 0 = unlimited; "
+                "max 100).",
+                required=False, default=0, minimum=0, maximum=INVITE_MAX_USES),
+        OpParam("temporary", ParamKind.BOOLEAN,
+                "Grant temporary membership (kicked on disconnect unless "
+                "given a role). Default false.",
+                required=False, default=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "create_invite returns the full url — hand THAT to the user. The "
+        "default link expires in 24h; only pass max_age_seconds=0 when a "
+        "permanent link was explicitly asked for, and mention that "
+        "revoke_invite undoes it."),
+    scope=OpScope.GUILD,
+    group="invites",
+)
+async def create_invite(ctx: OpContext, channel, max_age_seconds: int = 86400,
+                        max_uses: int = 0, temporary: bool = False):
+    if not hasattr(channel, "create_invite"):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) cannot carry invites.")
+    invite = await channel.create_invite(
+        max_age=max_age_seconds, max_uses=max_uses, temporary=temporary,
+        unique=True,
+        reason=f"create_invite op by {ctx.author} ({ctx.author.id})",
+    )
+    expires_at = getattr(invite, "expires_at", None)
+    if expires_at is None and max_age_seconds:
+        created_at = getattr(invite, "created_at", None)
+        if created_at is not None:
+            expires_at = created_at + timedelta(seconds=max_age_seconds)
+    return {
+        "code": invite.code,
+        "url": getattr(invite, "url", None),
+        "channel_id": getattr(channel, "id", None),
+        "max_age": max_age_seconds,
+        "max_uses": max_uses,
+        "expires_at": _iso(expires_at),
+    }
+
+
+@registry.op(
+    "revoke_invite",
+    "Revoke one of THIS guild's active invites by code. Requires admin. "
+    "Codes not found in the guild's own invite list are refused — a foreign "
+    "or expired code is never deleted blind. Low-stakes destructive: "
+    "create_invite mints a replacement in one call.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the invite belongs to."),
+        OpParam("code", ParamKind.STRING,
+                "Invite code to revoke (from list_invites; a full "
+                "discord.gg URL is also accepted)."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "revoke_invite kills the link for everyone holding it — get the "
+        "code from list_invites, never from memory. uses_at_revoke in the "
+        "result says how many joins it had served."),
+    scope=OpScope.GUILD,
+    group="invites",
+)
+async def revoke_invite(ctx: OpContext, guild, code: str):
+    # Accept a bare code or a pasted invite URL; the last path segment is
+    # the code either way.
+    wanted = str(code).strip().rstrip("/").rsplit("/", 1)[-1]
+    if not wanted:
+        raise ValueError("revoke_invite requires a non-empty invite code.")
+    # Match against the guild's OWN invite list — never Client.delete_invite
+    # on an unverified code, which would reach invites of foreign guilds.
+    target = next((inv for inv in await guild.invites()
+                   if inv.code == wanted), None)
+    if target is None:
+        raise ValueError(
+            f"No active invite with code '{wanted}' in guild "
+            f"'{guild.name}' — see list_invites.")
+    uses = getattr(target, "uses", None)
+    await target.delete(
+        reason=f"revoke_invite op by {ctx.author} ({ctx.author.id})")
+    return {"revoked": True, "code": wanted, "uses_at_revoke": uses}
+
+
+@registry.op(
+    "list_webhooks",
+    "List a guild's webhooks (or one channel's): id, name, channel, type, "
+    "creator — the same integration audit Server Settings → Integrations → "
+    "Webhooks shows an admin. Read-only, and the webhook URL/token (a "
+    "bearer credential that posts without any auth) is NEVER included. The "
+    "bot needs Manage Webhooks or the call fails.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to enumerate."),
+        OpParam("channel", ParamKind.CHANNEL,
+                "Optional channel id to narrow the audit to one channel.",
+                required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "list_webhooks is an audit read: there are deliberately NO ops to "
+        "create, edit, execute, or delete webhooks, and the webhook URL is "
+        "never available — if asked for one, say the surface doesn't "
+        "exist."),
+    scope=OpScope.GUILD,
+    group="integrations",
+)
+async def list_webhooks(ctx: OpContext, guild, channel=None):
+    if channel is not None:
+        if not hasattr(channel, "webhooks"):
+            raise ValueError(
+                f"Channel {getattr(channel, 'id', '?')} "
+                f"({type(channel).__name__}) cannot carry webhooks.")
+        hooks = await channel.webhooks()
+    else:
+        hooks = await guild.webhooks()
+    rows = []
+    for w in hooks:
+        creator = getattr(w, "user", None)
+        wtype = getattr(w, "type", None)
+        # Deliberately NO url and NO token — either one is a persistent
+        # unauthenticated posting credential.
+        rows.append({
+            "id": w.id,
+            "name": w.name,
+            "channel_id": getattr(w, "channel_id", None),
+            "type": getattr(wtype, "name",
+                            str(wtype) if wtype is not None else None),
+            "creator_id": getattr(creator, "id", None),
+            "creator_name": getattr(creator, "name", None),
+        })
+    return {"webhooks": rows, "count": len(rows)}
+
+
+# ---------------------------------------------------------------------------
+# Voice, scheduled-event, and automod ops (2026-08 voice-domain gap pass).
+#
+# Same SAFE_NOW bar as the guild-domain section above: everything here is
+# either a read any member gets in the client (the voice sidebar, the events
+# tab) or a no-confirmation reversible client action (dragging a member
+# between voice channels, the server-mute checkbox). Kick/ban/prune, event
+# delete/cancel, automod CRUD, and stage go-live are deliberately NOT ops —
+# destructive or guild-notifying, owner decisions rather than gap-fills.
+# Bot voice PRESENCE (connect/play) is structurally out of scope: a stateful
+# gateway session, not an atomic request/response op.
+#
+# All voice writes ride Member.move_to / Member.edit, which 400 when the
+# target is not connected to voice — Op.__call__ surfaces that HTTPException
+# as the op's uniform error string.
+# ---------------------------------------------------------------------------
+
+
+def _actor_can_see_channel(ctx: OpContext, channel: Any) -> bool:
+    """The channel-visibility policy of _check_channel_visibility, reusable
+    for targets the generic gate can't reach (a member's voice channel, the
+    guild-wide voice walk). Real Members are checked; bare id-holder actors
+    (the MCP frontend's documented accepted risk) always pass."""
+    actor = getattr(ctx, "author", None)
+    if actor is None or not hasattr(actor, "guild_permissions"):
+        return True
+    if channel is None or not hasattr(channel, "permissions_for"):
+        return True
+    try:
+        return bool(channel.permissions_for(actor).read_messages)
+    except Exception:  # noqa: BLE001 - odd channel types err to hidden
+        return False
+
+
+def _voice_flags(vs: Any) -> Dict[str, Any]:
+    """The per-member voice flags every voice read returns — one shape, so
+    get_voice_state and list_voice_states can't drift apart."""
+    return {
+        "mute": bool(getattr(vs, "mute", False)),
+        "deaf": bool(getattr(vs, "deaf", False)),
+        "self_mute": bool(getattr(vs, "self_mute", False)),
+        "self_deaf": bool(getattr(vs, "self_deaf", False)),
+        "streaming": bool(getattr(vs, "self_stream", False)),
+        "video": bool(getattr(vs, "self_video", False)),
+    }
+
+
+@registry.op(
+    "get_voice_state",
+    "Read one member's live voice state: which voice/stage channel they are "
+    "in and their mute/deafen/streaming/video flags — the same info any "
+    "member sees in the channel sidebar. Returns in_voice=false when the "
+    "member is not connected (or their channel is not visible to you).",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id whose voice state to read."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def get_voice_state(ctx: OpContext, member, guild=None):
+    vs = getattr(member, "voice", None)
+    channel = getattr(vs, "channel", None) if vs is not None else None
+    if channel is None:
+        return {"in_voice": False}
+    # Same policy as list_members: an actor who cannot see the channel gets
+    # in_voice=false rather than a leak of WHERE the member is.
+    if not _actor_can_see_channel(ctx, channel):
+        return {"in_voice": False}
+    return {
+        "in_voice": True,
+        "channel_id": channel.id,
+        "channel_name": getattr(channel, "name", None),
+        **_voice_flags(vs),
+        "suppress": bool(getattr(vs, "suppress", False)),
+        "requested_to_speak_at": _iso(
+            getattr(vs, "requested_to_speak_at", None)),
+    }
+
+
+@registry.op(
+    "list_voice_states",
+    "Guild-wide 'who is in voice': every voice/stage channel the invoking "
+    "user can see, with connected members and their mute/deafen/streaming/"
+    "video flags — exactly the voice sidebar. Read-only cache walk.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to enumerate. Optional when the invoking "
+                "context already carries a guild (in-guild commands); "
+                "required over guild-less frontends like MCP.",
+                required=False),
+    ],
+    serialize=lambda cs: {"channels": cs, "count": len(cs)},
+    agent_guidance=(
+        "list_voice_states answers 'who is in voice right now' in one call "
+        "— never iterate get_voice_state over the member list. Empty "
+        "channels are included, like the sidebar."),
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def list_voice_states(ctx: OpContext, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("list_voice_states needs a guild context.")
+    channels = []
+    tagged = [(c, "voice") for c in getattr(guild, "voice_channels", [])]
+    tagged += [(c, "stage") for c in getattr(guild, "stage_channels", [])]
+    for channel, ctype in tagged:
+        # Same visibility policy as search_history's per-hit drop: channels
+        # the invoking user can't see are omitted entirely.
+        if not _actor_can_see_channel(ctx, channel):
+            continue
+        members = []
+        for m in getattr(channel, "members", []):
+            vs = getattr(m, "voice", None)
+            members.append({
+                "id": m.id,
+                "display_name": m.display_name,
+                **_voice_flags(vs),
+            })
+        channels.append({
+            "channel_id": channel.id,
+            "name": getattr(channel, "name", None),
+            "type": ctype,
+            "members": members,
+        })
+    return channels
+
+
+def _require_vocal_channel(channel: Any) -> None:
+    """Voice writes only make sense against voice/stage channels; refuse
+    anything else locally rather than relaying a raw Discord 400."""
+    if not isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) is not a voice or stage channel.")
+
+
+@registry.op(
+    "move_member",
+    "Move a member to another voice/stage channel (they must already be "
+    "connected to voice). Requires admin. Client-parity drag action — "
+    "instantly reversible by moving them back.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id to move (must be connected to voice)."),
+        OpParam("channel", ParamKind.CHANNEL,
+                "Voice or stage channel id to move the member into."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def move_member(ctx: OpContext, member, channel, guild=None):
+    _require_vocal_channel(channel)
+    await member.move_to(channel,
+                         reason=_op_audit_reason(ctx, "move_member", None))
+    return {"moved": True, "channel_id": channel.id}
+
+
+@registry.op(
+    "disconnect_member",
+    "Disconnect a member from voice. Requires admin. Client-parity "
+    "right-click action with no confirmation; the member can rejoin "
+    "immediately. Deliberately a separate op from move_member — explicit "
+    "intent beats a magic null channel.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id to disconnect from voice."),
+    ],
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def disconnect_member(ctx: OpContext, member, guild=None):
+    await member.move_to(
+        None, reason=_op_audit_reason(ctx, "disconnect_member", None))
+    return True
+
+
+@registry.op(
+    "set_voice_mute",
+    "Server-mute or unmute a member in voice (one op, boolean — the client "
+    "checkbox). Requires admin. Symmetric and instantly reversible; errors "
+    "if the member is not connected to voice.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id to server-mute/unmute."),
+        OpParam("muted", ParamKind.BOOLEAN,
+                "true to server-mute, false to unmute."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def set_voice_mute(ctx: OpContext, member, muted: bool, guild=None):
+    await member.edit(mute=muted,
+                      reason=_op_audit_reason(ctx, "set_voice_mute", None))
+    return {"member_id": member.id, "muted": muted}
+
+
+@registry.op(
+    "set_voice_deafen",
+    "Server-deafen or undeafen a member in voice (one op, boolean — the "
+    "client checkbox). Requires admin. Symmetric and instantly reversible; "
+    "errors if the member is not connected to voice.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id to server-deafen/undeafen."),
+        OpParam("deafened", ParamKind.BOOLEAN,
+                "true to server-deafen, false to undeafen."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def set_voice_deafen(ctx: OpContext, member, deafened: bool,
+                           guild=None):
+    await member.edit(deafen=deafened,
+                      reason=_op_audit_reason(ctx, "set_voice_deafen", None))
+    return {"member_id": member.id, "deafened": deafened}
+
+
+@registry.op(
+    "set_stage_suppress",
+    "Move a stage speaker to the audience (suppressed=true) or approve them "
+    "as a speaker (suppressed=false). Requires admin. Stage-moderator "
+    "client action, fully reversible; only valid while the member is in a "
+    "stage channel.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id whose stage suppression to set."),
+        OpParam("suppressed", ParamKind.BOOLEAN,
+                "true = move to audience, false = make speaker."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def set_stage_suppress(ctx: OpContext, member, suppressed: bool,
+                             guild=None):
+    vs = getattr(member, "voice", None)
+    channel = getattr(vs, "channel", None) if vs is not None else None
+    if not isinstance(channel, discord.StageChannel):
+        raise ValueError(
+            "set_stage_suppress requires the member to be in a stage "
+            "channel.")
+    await member.edit(suppress=suppressed)
+    return {"member_id": member.id, "suppressed": suppressed}
+
+
+@registry.op(
+    "get_stage_instance",
+    "Read the live stage instance of a stage channel (topic, privacy "
+    "level), or live=false when nothing is live — the same view any member "
+    "who can see the stage channel gets.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Stage channel id to read."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="voice",
+)
+async def get_stage_instance(ctx: OpContext, channel):
+    if not isinstance(channel, discord.StageChannel):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) is not a stage channel.")
+    instance = channel.instance
+    if instance is None:
+        try:
+            instance = await channel.fetch_instance()
+        except discord.NotFound:
+            instance = None
+    if instance is None:
+        return {"live": False}
+    privacy = getattr(instance, "privacy_level", None)
+    return {
+        "live": True,
+        "topic": getattr(instance, "topic", None),
+        "privacy_level": getattr(privacy, "name",
+                                 str(privacy) if privacy is not None
+                                 else None),
+        "scheduled_event_id": getattr(instance, "scheduled_event_id", None),
+    }
+
+
+# -- scheduled events -------------------------------------------------------
+
+def _parse_event_time(value: Any, param: str) -> datetime:
+    """ISO-8601 → aware datetime, defaulting naive input to UTC (same
+    lenience as read_dms' 'since'). 'Z' suffix accepted."""
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(
+            f"'{param}' must be an ISO-8601 timestamp "
+            f"(e.g. '2026-09-01T20:00:00+00:00'), got {value!r}.") from exc
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def serialize_scheduled_event(e: Any) -> Dict[str, Any]:
+    status = getattr(e, "status", None)
+    entity_type = getattr(e, "entity_type", None)
+    return {
+        "id": e.id,
+        "name": e.name,
+        "description": getattr(e, "description", None),
+        "status": getattr(status, "name",
+                          str(status) if status is not None else None),
+        "entity_type": getattr(entity_type, "name",
+                               str(entity_type) if entity_type is not None
+                               else None),
+        "start_time": _iso(getattr(e, "start_time", None)),
+        "end_time": _iso(getattr(e, "end_time", None)),
+        "channel_id": getattr(e, "channel_id", None),
+        "location": getattr(e, "location", None),
+        "creator_id": getattr(e, "creator_id", None),
+        "user_count": getattr(e, "user_count", None),
+    }
+
+
+def serialize_scheduled_event_full(e: Any) -> Dict[str, Any]:
+    """The single-event shape: the list row plus url and cover image."""
+    cover = getattr(e, "cover_image", None)
+    return {
+        **serialize_scheduled_event(e),
+        "url": getattr(e, "url", None),
+        "image_url": str(cover) if cover else None,
+    }
+
+
+@registry.op(
+    "list_scheduled_events",
+    "List a guild's scheduled events with interest counts — the same events "
+    "tab every member sees. Read-only.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to enumerate. Optional when the invoking "
+                "context already carries a guild (in-guild commands); "
+                "required over guild-less frontends like MCP.",
+                required=False),
+    ],
+    serialize=lambda es: {"events": es, "count": len(es)},
+    scope=OpScope.GUILD,
+    group="events",
+)
+async def list_scheduled_events(ctx: OpContext, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("list_scheduled_events needs a guild context.")
+    events = await guild.fetch_scheduled_events(with_counts=True)
+    return [serialize_scheduled_event(e) for e in events]
+
+
+@registry.op(
+    "get_scheduled_event",
+    "Get one scheduled event by id, with its interest count, url, and cover "
+    "image. Read-only.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the event belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("event_id", ParamKind.SNOWFLAKE,
+                "Scheduled event id (from list_scheduled_events)."),
+    ],
+    serialize=serialize_scheduled_event_full,
+    scope=OpScope.GUILD,
+    group="events",
+)
+async def get_scheduled_event(ctx: OpContext, event_id: int, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("get_scheduled_event needs a guild context.")
+    return await guild.fetch_scheduled_event(event_id, with_counts=True)
+
+
+@registry.op(
+    "list_scheduled_event_users",
+    "List the users interested in a scheduled event (RSVPs) — the same "
+    "interest list any member sees on the event card. Read-only.",
+    PermissionLevel.EVERYONE,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the event belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("event_id", ParamKind.SNOWFLAKE,
+                "Scheduled event id (from list_scheduled_events)."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max users to return (default 100, clamped to 1000).",
+                required=False, default=100, minimum=1, maximum=1000),
+    ],
+    serialize=lambda us: {"users": us, "count": len(us)},
+    scope=OpScope.GUILD,
+    group="events",
+)
+async def list_scheduled_event_users(ctx: OpContext, event_id: int,
+                                     limit: int = 100, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("list_scheduled_event_users needs a guild context.")
+    event = await guild.fetch_scheduled_event(event_id)
+    rows = []
+    async for user in event.users(limit=limit):
+        rows.append({
+            "id": user.id,
+            "display_name": getattr(user, "display_name",
+                                    getattr(user, "name", None)),
+        })
+    return rows
+
+
+_EVENT_ENTITY_TYPES = ("voice", "stage_instance", "external")
+
+
+@registry.op(
+    "create_scheduled_event",
+    "Create a guild scheduled event (voice, stage_instance, or external). "
+    "Requires admin. voice/stage_instance events need a channel id; "
+    "external events need a location and an end_time. No notification "
+    "blast on create; reversible by deleting the event in the client "
+    "before it accrues RSVPs (there is deliberately no delete op).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to create the event in. Optional when "
+                "the invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("name", ParamKind.STRING, "Event name."),
+        OpParam("start_time", ParamKind.STRING,
+                "ISO-8601 start time (must be in the future; naive input "
+                "is taken as UTC)."),
+        OpParam("entity_type", ParamKind.STRING,
+                "Where the event happens: 'voice', 'stage_instance', or "
+                "'external'."),
+        OpParam("channel", ParamKind.CHANNEL,
+                "Voice/stage channel id — required for voice and "
+                "stage_instance events.",
+                required=False),
+        OpParam("location", ParamKind.STRING,
+                "Freeform location — required for external events.",
+                required=False),
+        OpParam("end_time", ParamKind.STRING,
+                "ISO-8601 end time — required for external events.",
+                required=False),
+        OpParam("description", ParamKind.STRING,
+                "Optional event description.", required=False),
+    ],
+    serialize=serialize_scheduled_event_full,
+    agent_guidance=(
+        "create_scheduled_event returns the event's url — hand THAT to the "
+        "user. Times are ISO-8601 and must be in the future; there is no "
+        "delete/cancel op, so double-check details before creating."),
+    scope=OpScope.GUILD,
+    group="events",
+)
+async def create_scheduled_event(ctx: OpContext, name: str, start_time: str,
+                                 entity_type: str, channel=None,
+                                 location: Optional[str] = None,
+                                 end_time: Optional[str] = None,
+                                 description: Optional[str] = None,
+                                 guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("create_scheduled_event needs a guild context.")
+    if entity_type not in _EVENT_ENTITY_TYPES:
+        raise ValueError(
+            f"entity_type must be one of {', '.join(_EVENT_ENTITY_TYPES)}; "
+            f"got {entity_type!r}.")
+    start = _parse_event_time(start_time, "start_time")
+    if start <= datetime.now(timezone.utc):
+        raise ValueError("start_time must be in the future.")
+    kwargs: Dict[str, Any] = {
+        "name": name,
+        "start_time": start,
+        "entity_type": getattr(discord.EntityType, entity_type),
+        # The API requires a privacy level and guild_only is the only
+        # valid value; discord.py omits it from the payload when unset.
+        "privacy_level": discord.PrivacyLevel.guild_only,
+        "reason": _op_audit_reason(ctx, "create_scheduled_event", None),
+    }
+    if entity_type == "external":
+        if not (location and str(location).strip()):
+            raise ValueError("external events require a location.")
+        if end_time is None:
+            raise ValueError("external events require an end_time.")
+        kwargs["location"] = location
+    else:
+        if channel is None:
+            raise ValueError(
+                f"{entity_type} events require a voice/stage channel id.")
+        _require_vocal_channel(channel)
+        kwargs["channel"] = channel
+    if end_time is not None:
+        kwargs["end_time"] = _parse_event_time(end_time, "end_time")
+    if description is not None and str(description).strip():
+        kwargs["description"] = description
+    return await guild.create_scheduled_event(**kwargs)
+
+
+@registry.op(
+    "edit_scheduled_event",
+    "Edit a scheduled event: rename, retime, move, describe, or transition "
+    "its status ('active' to start it, 'completed' to end an active one — "
+    "forward-only per the API). Requires admin. All fields optional and "
+    "sparse; cancel/delete is deliberately NOT available.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the event belongs to. Optional when the "
+                "invoking context already carries a guild (in-guild "
+                "commands); required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("event_id", ParamKind.SNOWFLAKE,
+                "Scheduled event id to edit (from list_scheduled_events)."),
+        OpParam("name", ParamKind.STRING, "New event name.", required=False),
+        OpParam("description", ParamKind.STRING,
+                "New event description.", required=False),
+        OpParam("channel", ParamKind.CHANNEL,
+                "New voice/stage channel id.", required=False),
+        OpParam("location", ParamKind.STRING,
+                "New freeform location (external events).", required=False),
+        OpParam("start_time", ParamKind.STRING,
+                "New ISO-8601 start time.", required=False),
+        OpParam("end_time", ParamKind.STRING,
+                "New ISO-8601 end time.", required=False),
+        OpParam("status", ParamKind.STRING,
+                "Status transition: 'active' (start) or 'completed' (end). "
+                "Forward-only; cancellation is not available.",
+                required=False),
+    ],
+    serialize=serialize_scheduled_event_full,
+    scope=OpScope.GUILD,
+    group="events",
+)
+async def edit_scheduled_event(ctx: OpContext, event_id: int,
+                               name: Optional[str] = None,
+                               description: Optional[str] = None,
+                               channel=None,
+                               location: Optional[str] = None,
+                               start_time: Optional[str] = None,
+                               end_time: Optional[str] = None,
+                               status: Optional[str] = None,
+                               guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("edit_scheduled_event needs a guild context.")
+    event = await guild.fetch_scheduled_event(event_id)
+    kwargs: Dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if description is not None:
+        kwargs["description"] = description
+    if channel is not None:
+        _require_vocal_channel(channel)
+        kwargs["channel"] = channel
+    if location is not None:
+        kwargs["location"] = location
+    if start_time is not None:
+        kwargs["start_time"] = _parse_event_time(start_time, "start_time")
+    if end_time is not None:
+        kwargs["end_time"] = _parse_event_time(end_time, "end_time")
+    if status is not None:
+        if status not in ("active", "completed"):
+            raise ValueError(
+                "status must be 'active' or 'completed' — cancellation is "
+                "deliberately not available through this op.")
+        kwargs["status"] = getattr(discord.EventStatus, status)
+    if not kwargs:
+        raise ValueError(
+            "Nothing to edit: pass at least one of name/description/"
+            "channel/location/start_time/end_time/status.")
+    return await event.edit(
+        reason=_op_audit_reason(ctx, "edit_scheduled_event", None), **kwargs)
+
+
+# -- automod ----------------------------------------------------------------
+
+def _serialize_automod_rule(rule: Any) -> Dict[str, Any]:
+    """Defensive per-field serialization: trigger fields vary by
+    trigger_type, and absent facets serialize as empty/None rather than
+    raising."""
+    trigger = getattr(rule, "trigger", None)
+    trigger_type = getattr(trigger, "type", None)
+    event_type = getattr(rule, "event_type", None)
+    presets = getattr(trigger, "presets", None)
+    try:
+        preset_names = ([name for name, value in presets if value]
+                        if presets is not None else [])
+    except TypeError:
+        preset_names = []
+    actions = []
+    for action in (getattr(rule, "actions", None) or []):
+        action_type = getattr(action, "type", None)
+        duration = getattr(action, "duration", None)
+        actions.append({
+            "type": getattr(action_type, "name",
+                            str(action_type) if action_type is not None
+                            else None),
+            "channel_id": getattr(action, "channel_id", None),
+            "duration_s": (duration.total_seconds()
+                           if duration is not None else None),
+        })
+    return {
+        "id": rule.id,
+        "name": rule.name,
+        "enabled": bool(getattr(rule, "enabled", False)),
+        "event_type": getattr(event_type, "name",
+                              str(event_type) if event_type is not None
+                              else None),
+        "trigger_type": getattr(trigger_type, "name",
+                                str(trigger_type) if trigger_type is not None
+                                else None),
+        "keyword_filter": list(getattr(trigger, "keyword_filter", None)
+                               or []),
+        "regex_patterns": list(getattr(trigger, "regex_patterns", None)
+                               or []),
+        "allow_list": list(getattr(trigger, "allow_list", None) or []),
+        "mention_limit": getattr(trigger, "mention_limit", None),
+        "presets": preset_names,
+        "actions": actions,
+        "exempt_role_ids": list(getattr(rule, "exempt_role_ids", None)
+                                or []),
+        "exempt_channel_ids": list(getattr(rule, "exempt_channel_ids", None)
+                                   or []),
+        "creator_id": getattr(rule, "creator_id", None),
+    }
+
+
+@registry.op(
+    "list_automod_rules",
+    "Read a guild's automod rules (triggers, keyword lists, actions, "
+    "exemptions) — the same view Server Settings → AutoMod shows an admin. "
+    "Requires admin, NOT everyone: keyword rules expose the guild's "
+    "filtered-word lists. Read-only; automod create/edit/delete are "
+    "deliberately not ops.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to read. Optional when the invoking "
+                "context already carries a guild (in-guild commands); "
+                "required over guild-less frontends like MCP.",
+                required=False),
+    ],
+    serialize=lambda rs: {"rules": rs, "count": len(rs)},
+    agent_guidance=(
+        "list_automod_rules is an admin-only read of moderation policy — "
+        "summarize what the rules do; never paste a guild's full "
+        "filtered-word list into a public channel."),
+    scope=OpScope.GUILD,
+    group="moderation",
+)
+async def list_automod_rules(ctx: OpContext, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("list_automod_rules needs a guild context.")
+    rules = await guild.fetch_automod_rules()
+    return [_serialize_automod_rule(rule) for rule in rules]
 
 
 # ---------------------------------------------------------------------------

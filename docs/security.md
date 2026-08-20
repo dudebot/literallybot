@@ -71,10 +71,60 @@ Security properties enforced centrally, so no frontend can skip them:
 - **Scope is a structural boundary.** Every op declares an `OpScope`, and the
   in-guild agent's tool universe is *derived* as exactly the `GUILD`-scoped ops
   (`registry.guild_agent_names()`), queried live. DM-scoped ops (`send_dm`,
-  `read_dms`, `fetch_dms`, `delete_dm`) and global ops (`list_guilds`) are
+  `read_dms`, `fetch_dms`, `delete_dm`, `edit_dm`, `list_dm_conversations`,
+  `add_dm_reaction`, `remove_dm_reaction`, `list_dm_pins`) and global ops
+  (`list_guilds`, `get_user`) are
   therefore never offerable to a guild's agent surface at all — not by config, not by mistake.
   There is no hand-maintained "agent tools" list to drift (the former
   `agent=True` flag was removed in the 2026-08 refactor).
+- **Member moderation is reversible-only.** The 2026-08 guild-domain pass
+  added ADMIN-gated member-state writes (`set_nickname`, `timeout_member`,
+  `remove_timeout` — every one undoable, and timeouts auto-expire at
+  Discord's 28-day cap) and ADMIN-gated moderation/admin-view reads
+  (`list_bans`, `fetch_audit_logs`, `estimate_prune`, `list_integrations`,
+  `list_invites`). Irreversible ejection (kick / ban / unban / prune) and
+  guild-settings writes are deliberately NOT ops — exposing those is an
+  owner decision, not a gap-fill. Profile reads any member can see in the
+  client (`get_member`, `get_guild_info`, `search_members`) are EVERYONE,
+  like the other guild-info reads.
+- **Expressive assets follow the emoji precedent; webhooks are read-only.**
+  The 2026-08 expressive-domain pass added the sticker siblings of the
+  emoji ops (`list_stickers` EVERYONE; `create_sticker`/`edit_sticker`/
+  `delete_sticker` ADMIN, with the same managed/standard-asset refusals),
+  `download_emoji` (ADMIN — it writes the server filesystem, the same
+  class as the attachment gate), poll reads any channel member gets in the
+  client (`get_poll_voters` EVERYONE — Discord polls are non-anonymous),
+  and the ADMIN invite lifecycle (`create_invite` defaults to a 24h
+  expiry; `revoke_invite` only deletes codes verified against the guild's
+  own invite list). `list_webhooks` (ADMIN) deliberately NEVER serializes
+  a webhook's url or token — either is a persistent unauthenticated
+  posting credential — and webhook create/edit/execute/delete are NOT ops:
+  minting or driving an impersonation-capable credential is an owner
+  decision, not a gap-fill. `send_message`'s optional `sticker_id` and
+  `edit_emoji`'s `role_ids` resolve strictly in-guild, preserving guild
+  confinement.
+- **Voice moderation is client-parity and reversible; events are
+  create/edit only.** The 2026-08 voice-domain pass added voice-state reads
+  (`get_voice_state`, `list_voice_states` — EVERYONE, filtered by the
+  invoking user's channel visibility exactly like the voice sidebar: a
+  member you can't see reads as not-in-voice, a channel you can't see is
+  omitted), reversible ADMIN voice writes (`move_member`,
+  `disconnect_member`, `set_voice_mute`, `set_voice_deafen`,
+  `set_stage_suppress` — each a no-confirmation client action, instantly
+  undoable, and a 400 when the target isn't in voice surfaces as the op
+  error), stage/event reads (`get_stage_instance`, `list_scheduled_events`,
+  `get_scheduled_event`, `list_scheduled_event_users` — EVERYONE, same
+  visibility any member has), and ADMIN event writes
+  (`create_scheduled_event`, `edit_scheduled_event` — event delete/cancel
+  is deliberately NOT an op and `edit_scheduled_event` refuses
+  status='canceled': cancellation irreversibly destroys the accrued RSVP
+  list, an owner decision). `list_automod_rules` is an ADMIN read on
+  purpose — keyword rules expose the guild's filtered-word lists, which
+  must not leak to members through a guild agent — and automod
+  create/edit/delete are NOT ops (guild-wide enforcement-policy CRUD).
+  Bot voice PRESENCE (connect / play audio / its own request-to-speak) is
+  structurally out of scope: a stateful gateway session, not an atomic
+  request/response op.
 - **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
   allowlist (default empty, meaning `!gpt` is plain chat with no tools), managed
   from the `!aisettings` panel. The MCP server consumes its own global
@@ -125,7 +175,8 @@ permission change on the next panel save.
 `registry.call_ids` checks the permission gate **before** resolving any ids to
 live Discord objects, so a caller who fails the gate learns nothing about
 whether a guessed id exists — no id-probing oracle. That is what makes
-ADMIN-tier ops (e.g. `delete_message`) safely exposable on both frontends: a
+ADMIN-tier ops (e.g. `delete_message`, `timeout_member`, `list_bans`) safely
+exposable on both frontends: a
 non-admin gets the same permission error regardless of target validity.
 `Op.__call__`'s own permission check is belt-and-suspenders for object-based
 callers that bypass `call_ids` and resolved nothing through the registry.
@@ -158,7 +209,12 @@ gates are fail-closed and independently required:
   control belongs upstream in the MCP caller. DM channels are still refused
   on id-based calls — DMs flow only through the user-keyed DM ops (keyed by
   user_id, never a channel id, matching the DM API; Discord refuses bot DMs
-  to strangers; `delete_dm` retracts only bot-authored messages). The one
+  to strangers; `delete_dm` retracts and `edit_dm` edits only bot-authored
+  messages, and `remove_dm_reaction` can only remove the bot's own
+  reactions). The whole DM family — including the `list_dm_conversations`/
+  `list_dm_pins`/`fetch_dms` reads — is ADMIN-gated, as is `get_user`
+  (global public-profile read: keeps arbitrary-id lookups off the EVERYONE
+  surface). The one
   guild-confined surface in the system is the in-bot `!gpt` agent loop,
   which passes exactly `{ctx.guild.id}` to the registry.
 
