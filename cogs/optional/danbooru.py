@@ -20,6 +20,10 @@ from discord.ext import commands
 
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 
+# Danbooru's Cloudflare rejects the default python-requests User-Agent (and
+# spoofed browser UAs) with an HTML challenge page; an honest bot UA passes.
+REQUEST_HEADERS = {"User-Agent": "literallybot/1.0 (Discord bot)"}
+
 
 def _channel_is_nsfw(channel) -> bool:
     """DMs and other channels with no NSFW concept count as NOT NSFW, so the
@@ -85,7 +89,8 @@ class Danbooru(commands.Cog):
             url += f"&login={login}&api_key={api_key}"
         try:
             # requests is blocking; run it off the event loop
-            response = await asyncio.to_thread(requests.get, url)
+            response = await asyncio.to_thread(requests.get, url,
+                                               headers=REQUEST_HEADERS)
             data = response.json()
         except Exception:
             self.logger.exception("Danbooru posts.json request failed")
@@ -109,7 +114,8 @@ class Danbooru(commands.Cog):
         autocomplete_url = (f"{self.danbooru_base}/autocomplete?"
                             f"search[query]={first_tag}&search[type]=tag_query")
         try:
-            auto_resp = await asyncio.to_thread(requests.get, autocomplete_url)
+            auto_resp = await asyncio.to_thread(requests.get, autocomplete_url,
+                                                headers=REQUEST_HEADERS)
             soup = bs4.BeautifulSoup(auto_resp.text, "html.parser")
             li_tags = soup.find_all("li", class_="ui-menu-item")
             return [li.get("data-autocomplete-value") for li in li_tags][:5]
