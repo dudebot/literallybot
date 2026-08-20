@@ -49,7 +49,7 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 
 ## ✨ Key Features
 
-- **🧭 One Ops Layer, Many Frontends** — 89 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
+- **🧭 One Ops Layer, Many Frontends** — 125 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
 - **🧩 Modular Cog System** — features are self-contained cogs; disable them globally without deleting them (binds at restart); cogs can register their own ops
 - **🤖 AI Integration** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory, personality, and an optional agentic mode that performs real Discord actions
 - **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
@@ -79,7 +79,7 @@ differs, and the panel shows them as separate sections.
 ```mermaid
 flowchart TB
     subgraph SRC["Where ops come from"]
-        CORE["core/ops.py<br/><i>89 API primitives</i><br/>@registry.op(...) · origin=core"]
+        CORE["core/ops.py<br/><i>125 API primitives</i><br/>@registry.op(...) · origin=core"]
         COG["Any cog — behavioral primitives<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
     end
 
@@ -370,24 +370,30 @@ port if you set `mcp_ops_port`):
 ```
 
 **Exposed tools:** by default the full ops registry, queried live when the
-server starts — so ops a cog registered are included too. The 89 API
+server starts — so ops a cog registered are included too. The 125 API
 primitives, by group:
 
 | Group | Ops |
 |-------|-----|
 | **Messaging** | `send_message`, `edit_message`, `delete_message`, `add_reaction`, `remove_reaction`, `search_history`, `get_message`, `read_history`, `pin_message`, `unpin_message`, `list_pins`, `create_thread`, `list_reactions`, `trigger_typing`, `forward_message`, `suppress_embeds`, `send_embed`, `send_poll`, `get_poll_results`, `end_poll`, `get_poll_voters` |
-| **Threads** | `list_threads`, `list_thread_members`, `join_thread`, `leave_thread`, `edit_thread`, `create_forum_post` |
+| **Message moderation** | `bulk_delete_messages`, `purge_messages`¹, `publish_message`, `send_tts`, `send_sticker`, `remove_reaction_other`, `clear_reactions` |
+| **Threads** | `list_threads`, `list_thread_members`, `join_thread`, `leave_thread`, `edit_thread`, `create_forum_post`, `delete_thread`, `add_thread_member`, `remove_thread_member`, `list_private_archived_threads` |
+| **Channels** | `create_channel`, `delete_channel`, `clone_channel`, `move_channel`, `set_channel_overwrite`, `delete_channel_overwrite` |
 | **Roles** | `add_role`, `remove_role`, `list_roles`, `list_role_members`, `create_role`, `edit_role`, `delete_role` |
 | **Emojis & stickers** | `list_emojis`, `create_emoji`, `edit_emoji`, `delete_emoji`, `list_stickers`, `create_sticker`, `edit_sticker`, `delete_sticker`, `download_emoji` |
-| **Guild info** | `list_channels`, `list_members`, `list_channel_overwrites`, `get_channel_info`, `set_slowmode`, `edit_channel`, `get_member_permissions`, `get_member`, `get_guild_info`, `search_members`, `fetch_audit_logs`, `estimate_prune`, `list_integrations` |
-| **Members** | `set_nickname`, `timeout_member`, `remove_timeout` |
+| **Guild info** | `list_channels`, `list_members`, `list_channel_overwrites`, `get_channel_info`, `set_slowmode`, `edit_channel`, `get_member_permissions`, `get_member`, `get_guild_info`, `search_members`, `fetch_audit_logs`, `estimate_prune`, `list_integrations`, `edit_guild_settings`¹ |
+| **Members** | `set_nickname`, `timeout_member`, `remove_timeout`, `kick_member`, `ban_member`, `unban_member`, `bulk_ban`¹, `prune_members`, `edit_member_roles` |
 | **Moderation** | `list_bans`, `list_automod_rules` |
-| **Voice** | `get_voice_state`, `list_voice_states`, `move_member`, `disconnect_member`, `set_voice_mute`, `set_voice_deafen`, `set_stage_suppress`, `get_stage_instance` |
-| **Scheduled events** | `list_scheduled_events`, `get_scheduled_event`, `list_scheduled_event_users`, `create_scheduled_event`, `edit_scheduled_event` |
-| **Invites** | `list_invites`, `create_invite`, `revoke_invite` |
+| **AutoMod** | `create_automod_rule`, `edit_automod_rule`, `delete_automod_rule` |
+| **Voice** | `get_voice_state`, `list_voice_states`, `move_member`, `disconnect_member`, `set_voice_mute`, `set_voice_deafen`, `set_stage_suppress`, `get_stage_instance`, `create_stage`, `edit_stage`, `end_stage` |
+| **Scheduled events** | `list_scheduled_events`, `get_scheduled_event`, `list_scheduled_event_users`, `create_scheduled_event`, `edit_scheduled_event`, `delete_scheduled_event` |
+| **Invites** | `list_invites`, `create_invite`, `revoke_invite`, `delete_invite` |
+| **Webhooks** | `create_webhook`, `edit_webhook`, `delete_webhook`, `execute_webhook` |
 | **Direct messages** | `send_dm`, `read_dms`, `fetch_dms`, `delete_dm`, `edit_dm`, `list_dm_conversations`, `add_dm_reaction`, `remove_dm_reaction`, `list_dm_pins` |
 | **Guild** | `list_guilds`, `get_user` |
 | **Integrations** | `list_webhooks` |
+
+¹ SUPERADMIN-gated (server-wide blast radius); every other op above `bulk_delete_messages`/`create_channel`/etc. in the NEEDS_OWNER destructive tier is ADMIN. The 2026-08 owner-tier pass added 36 destructive/privileged primitives (channel & webhook & automod CRUD, member ejection, mass delete, publish/TTS/sticker sends, stage lifecycle) — each admin-defaulted in the per-guild agent gate, never `everyone`.
 
 Loaded cogs add their own behavioral primitives on top (e.g.
 `add_emoji_role_toggle` and `sync_emoji_role_toggles` from `setrole`,

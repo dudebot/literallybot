@@ -125,6 +125,31 @@ Security properties enforced centrally, so no frontend can skip them:
   Bot voice PRESENCE (connect / play audio / its own request-to-speak) is
   structurally out of scope: a stateful gateway session, not an atomic
   request/response op.
+- **The NEEDS_OWNER destructive/privileged tier is admin-defaulted, three
+  ops superadmin.** The 2026-08 owner-tier pass added the 36 destructive or
+  privileged primitives that every domain above deliberately withheld:
+  channel CRUD + overwrite writes (`create_channel`, `delete_channel`,
+  `clone_channel`, `move_channel`, `set_channel_overwrite`,
+  `delete_channel_overwrite`); thread destruction & membership
+  (`delete_thread`, `add_thread_member`, `remove_thread_member`,
+  `list_private_archived_threads`); member ejection & role batch edits
+  (`kick_member`, `ban_member`, `unban_member`, `prune_members`,
+  `edit_member_roles`); message moderation (`bulk_delete_messages`,
+  `publish_message`, `send_tts`, `send_sticker`, `remove_reaction_other`,
+  `clear_reactions`); webhook CRUD + execute (`create_webhook`,
+  `edit_webhook`, `delete_webhook`, `execute_webhook` — the URL/token is
+  still never serialized); AutoMod CRUD (`create_automod_rule`,
+  `edit_automod_rule`, `delete_automod_rule`); the scheduled-event delete
+  (`delete_scheduled_event`) and stage lifecycle (`create_stage`,
+  `edit_stage`, `end_stage`); and the invite delete (`delete_invite`). Every
+  one is at least `PermissionLevel.ADMIN` and seeds the per-guild agent gate
+  at `agent_default="admin"` — none is ever `everyone`. Three carry
+  server-wide blast radius and are `PermissionLevel.SUPERADMIN`:
+  `edit_guild_settings` (guild identity/verification posture), `bulk_ban`
+  (up to 200 members in one call), and `purge_messages` (unbounded mass
+  delete). Webhooks resolve against the guild's own webhook list and
+  overwrite/ban/bulk targets are guild-confined, so a destructive op can
+  never reach an entity outside the confined guild.
 - **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
   allowlist (default empty, meaning `!gpt` is plain chat with no tools), managed
   from the `!aisettings` panel. The MCP server consumes its own global

@@ -12,6 +12,15 @@ from core.utils import InvokerOnlyView, app_is_admin, is_admin, is_superadmin, r
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
 from core.agent_loop import agent_ops, resolve_bot_tools
+from core.agent_gate import (
+    GATE_ADMIN,
+    GATE_EVERYONE,
+    GATE_OFF,
+    GATE_KEY,
+    WHITELIST_KEY,
+    guild_gate,
+    is_whitelisted,
+)
 from core.mcp_server import ENABLE_CONFIG_KEY, exposed_ops, resolve_mcp_tools
 
 PANEL_TIMEOUT = 180
@@ -222,7 +231,11 @@ class Gpt(commands.Cog):
         if not getattr(ctx, "guild", None):
             return []
         from core.agent_loop import resolve_bot_tools
-        return resolve_bot_tools(self.bot.config.get(ctx, "bot_tools_enabled"))
+        from core.utils import is_admin, is_superadmin
+        wl = self.bot.config.get_global("agent_ops_whitelist")
+        gate = self.bot.config.get(ctx, "agent_ops_gate")
+        return resolve_bot_tools(wl, gate,
+                                 is_superadmin_actor=is_superadmin(ctx))
 
     def cooldown_config(self):
         """(tier_bases, windows) — operator overrides merged over defaults.
@@ -662,7 +675,28 @@ class Gpt(commands.Cog):
         # themselves — see core/agent_loop.py. The pydantic-ai limit below is
         # set to 2x as a runaway backstop only; in the normal exhaustion path
         # the model authors its own final reply and no exception fires.
-        tools = build_agent_tools(ctx, self.logger, tool_names)
+        from core.utils import is_admin, is_superadmin
+        from core.agent_gate import call_requires_admin
+        from core.ops import registry as _registry
+
+        def _live_gate_check(op_name):
+            # Re-read policy at each dispatch (codex review 2026-08-20): an
+            # admin tightening an op to "admin only" mid-run binds on the next
+            # call. Admins/superadmins are never gated; for everyone else the
+            # gate is resolved live from the current whitelist + guild config.
+            if is_admin(ctx) or is_superadmin(ctx):
+                return False
+            op = _registry.get(op_name)
+            if op is None:
+                return True  # unknown op → fail closed
+            wl = self.bot.config.get_global("agent_ops_whitelist")
+            gate = self.bot.config.get(ctx, "agent_ops_gate")
+            return call_requires_admin(op, wl, gate)
+
+        tools = build_agent_tools(
+            ctx, self.logger, tool_names,
+            gate_check=_live_gate_check,
+        )
         self.logger.info(
             f"agentic gpt run: guild={ctx.guild.id} channel={ctx.channel.id} "
             f"actor={ctx.author.id} provider={provider_config.provider} "
@@ -1421,6 +1455,49 @@ class _ToolSelect(discord.ui.Select):
                             self._chunk + self._elsewhere)
 
 
+# The three agent-gate states a server admin can pick per whitelisted op, in
+# escalation order, with the SelectOption label/emoji each renders as.
+_GATE_CHOICES = (
+    (GATE_OFF, "Off", "🚫"),
+    (GATE_ADMIN, "Admin only", "🛡"),
+    (GATE_EVERYONE, "Everyone", "👥"),
+)
+
+
+class _OpGateSelect(discord.ui.Select):
+    """One per-op tri-state control for the Server tab: Off / Admin only /
+    Everyone. Rendered one select PER OP (not per group) because Discord
+    multi-selects express set membership, not per-row state — three states
+    per op can only be a single-choice select over three options. The server
+    tab renders only WHITELISTED guild-scoped ops, so this stays a small,
+    bounded set in practice (a super-admin curates the whitelist).
+
+    Value is encoded `op_name::state`; the callback decodes it and hands the
+    saver (op_name, state). The op's default_gate() is pre-selected when the
+    guild has no stored override."""
+
+    def __init__(self, op_name: str, current_state: str, on_save):
+        self._op_name = op_name
+        self._on_save = on_save
+        options = [
+            discord.SelectOption(
+                label=f"{op_name} — {label}",
+                value=f"{op_name}::{state}",
+                emoji=emoji,
+                default=(state == current_state),
+            )
+            for state, label, emoji in _GATE_CHOICES
+        ]
+        super().__init__(
+            placeholder=f"{op_name}: agent access"[:150],
+            min_values=1, max_values=1, options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        _op_name, _, state = self.values[0].partition("::")
+        await self._on_save(interaction, self._op_name, state)
+
+
 class _ProviderSelect(discord.ui.Select):
     def __init__(self, view: "AiSettingsView"):
         self._panel = view
@@ -1760,7 +1837,6 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         self.gpt = gpt_cog
         self.bot = gpt_cog.bot
         self.invoker_id = user.id
-        self.is_super = is_superadmin(self.bot.config, user.id)
         self.guild = guild
         self.page = "server"
         self.message = None
@@ -1805,11 +1881,34 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
     def _ai_enabled(self):
         return bool(self.bot.config.get(self._cfg_ctx(), "ai_enabled", True))
 
+    def _whitelist(self):
+        # GLOBAL super-admin ceiling: {op_name: bool}. Absent/false => the op
+        # is disabled everywhere and never renders in any guild's Server tab.
+        return self.bot.config.get_global(WHITELIST_KEY) or {}
+
+    def _gate_cfg(self):
+        # Per-GUILD server-admin overrides: {op_name: "off"|"admin"|"everyone"}.
+        return self.bot.config.get(self._cfg_ctx(), GATE_KEY) or {}
+
     def _bot_tools(self):
-        # Same resolver the agent loop uses — the panel must show exactly
-        # the effective set, never a private re-derivation of it.
-        return resolve_bot_tools(
-            self.bot.config.get(self._cfg_ctx(), "bot_tools_enabled"))
+        # Same resolver the agent loop uses — the panel's summary line must
+        # show exactly the effective set (whitelist + per-guild gate), never
+        # a private re-derivation of it.
+        return resolve_bot_tools(self._whitelist(), self._gate_cfg())
+
+    def _server_gate_ops(self):
+        """The (group_label, [Op, ...]) sections the Server tab renders: only
+        WHITELISTED guild-scoped ops, grouped in OP_GROUPS order. A
+        non-whitelisted op is disabled globally, so it must NOT appear here
+        (both a context/clarity win and a correctness one — a guild admin
+        cannot enable what the super-admin has withheld)."""
+        wl = self._whitelist()
+        sections = []
+        for gid, label, ops in registry.grouped(scope=OpScope.GUILD):
+            live = [o for o in ops if is_whitelisted(o.name, wl)]
+            if live:
+                sections.append((label, live))
+        return sections
 
     def _mcp_tools(self):
         # Same resolver the MCP server build uses (incl. unset => full
@@ -1844,6 +1943,53 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             else:
                 self.add_item(self._row(payload))
 
+    # Components V2 caps a message at 40 total components; each per-op gate
+    # select is its own ActionRow, and the tab also spends rows on the tab
+    # bar, text, provider/model selects and the button row. Cap the gate
+    # selects well under the ceiling and tell the admin to have the
+    # super-admin narrow the whitelist if it overflows.
+    _MAX_GATE_SELECTS = 22
+
+    def _add_gate_sections(self):
+        """Render the Server tab's per-op Off/Admin only/Everyone controls,
+        one select per whitelisted guild-scoped op, grouped by OP_GROUPS with
+        a heading per group. The current state is the guild override if set,
+        else the op's default_gate()."""
+        gate_cfg = self._gate_cfg()
+        sections = self._server_gate_ops()
+        if not sections:
+            self.add_item(discord.ui.TextDisplay(
+                "*No agent ops are enabled for this bot. A bot super-admin "
+                "must whitelist ops on the 🛠 Agent Ops tab before this "
+                "server can grant agent access.*"))
+            return
+        shown = 0
+        overflow = False
+        for label, ops in sections:
+            if shown >= self._MAX_GATE_SELECTS:
+                overflow = True
+                break
+            self.add_item(discord.ui.TextDisplay(f"**{label}**"))
+            for op in ops:
+                if shown >= self._MAX_GATE_SELECTS:
+                    overflow = True
+                    break
+                state = guild_gate(op, gate_cfg)
+                self.add_item(self._row(
+                    _OpGateSelect(op.name, state, self._save_op_gate)))
+                shown += 1
+        if overflow:
+            self.add_item(discord.ui.TextDisplay(
+                "*More whitelisted ops exist than fit on one panel. Ask a bot "
+                "super-admin to trim the 🛠 Agent Ops whitelist so every op "
+                "you want to configure fits here.*"))
+
+    def _whitelist_names(self):
+        """Op names the super-admin whitelist currently has set true — the
+        'current' allowlist the Agent Ops tab's selects render as enabled."""
+        wl = self._whitelist()
+        return [name for name, on in wl.items() if on]
+
     def _tab_button(self, label, page):
         style = (discord.ButtonStyle.primary if self.page == page
                  else discord.ButtonStyle.secondary)
@@ -1856,15 +2002,24 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         btn.callback = cb
         return btn
 
+    @property
+    def is_super(self):
+        # LIVE, not snapshotted at view creation (codex review 2026-08-20): a
+        # superadmin demoted while their panel is open must lose the global
+        # tabs on the next rerender, not keep them until the view times out.
+        # (Saves already recheck live and refuse; this closes the view side.)
+        return is_superadmin(self.bot.config, self.invoker_id)
+
     def _build(self):
         self.clear_items()
-        if self.page in ("providers", "mcp") and not self.is_super:
+        if self.page in ("providers", "mcp", "agentops") and not self.is_super:
             self.page = "server"
         tabs = [self._tab_button("⚙ Server config", "server")]
         if self.is_super:
             # Global-scope pages: invisible to non-superadmins, not merely
             # disabled — a guild admin shouldn't even see the catalog knobs.
             tabs.append(self._tab_button("🧩 Models & Providers", "providers"))
+            tabs.append(self._tab_button("🛠 Agent Ops", "agentops"))
             tabs.append(self._tab_button("🌐 MCP", "mcp"))
         self.add_item(self._row(*tabs))
         self.add_item(discord.ui.TextDisplay(self._text()))
@@ -1872,14 +2027,23 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         if self.page == "server":
             self.add_item(self._row(_ProviderSelect(self)))
             self.add_item(self._row(_ModelSelect(self)))
-            # The server tab's universe is the LIVE guild-scoped set — the
-            # same ceiling agent_ops() gives the loop, rendered per group.
-            self._add_tool_sections(
-                self._sections(scope=OpScope.GUILD),
-                self._bot_tools(), self._save_bot_tools)
+            # The server tab's universe is the WHITELISTED guild-scoped set:
+            # for each, a per-op Off/Admin only/Everyone control writing this
+            # guild's agent_ops_gate. Non-whitelisted ops are disabled
+            # globally and are not rendered at all (see _server_gate_ops).
+            self._add_gate_sections()
             self.add_item(self._row(self._ai_toggle_button(),
                                     self._personality_button(),
                                     self._nickname_button()))
+        elif self.page == "agentops":
+            # Super-admin whitelist editor: the global on/off ceiling per op
+            # across ALL scopes. Reuses the plain allowlist _ToolSelect path.
+            self._add_tool_sections(
+                self._sections(), self._whitelist_names(),
+                self._save_whitelist)
+            self.add_item(self._row(
+                self._preset_button("Clear all", self._clear_whitelist, []),
+            ))
         elif self.page == "providers":
             self.add_item(self._row(_MgmtProviderSelect(self)))
             self.add_item(self._row(_MgmtModelSelect(self)))
@@ -1920,6 +2084,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             body = self._providers_text()
         elif self.page == "mcp":
             body = self._mcp_text()
+        elif self.page == "agentops":
+            body = self._agentops_text()
         else:
             body = self._server_text()
         if self._flash:
@@ -1938,8 +2104,27 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             f"## AI settings — {self.guild.name}\n"
             f"**AI replies:** {'ON — mention or reply to the bot' if self._ai_enabled() else 'OFF'}\n"
             f"**Provider / model:** {self.provider} / **{self.model}** ({tier}: {rate})\n"
-            f"**Bot tools here:** "
+            "Set each agent op below to **Off**, **Admin only**, or "
+            "**Everyone**. Only ops a bot super-admin has enabled appear here.\n"
+            f"**Agent tools here:** "
             + (", ".join(bot_tools) if bot_tools else "*none — plain chat*")
+        )
+
+    def _agentops_text(self):
+        wl = self._whitelist_names()
+        live = [n for n in wl if registry.get(n) is not None]
+        offline = sorted(n for n in wl if registry.get(n) is None)
+        note = (f"\n*{len(offline)} whitelisted name(s) belong to unloaded "
+                f"cogs and stay enabled: {', '.join(offline)}*") if offline else ""
+        return (
+            "## AI settings — Agent Ops whitelist\n"
+            "Global ceiling — the ops the in-chat agent may EVER use, across "
+            "every server and DM. An op left off here is disabled everywhere "
+            "and never appears on any server's ⚙ tab. Each server admin then "
+            "sets Off/Admin/Everyone per op for their own guild.\n"
+            f"**Enabled ops:** {len(live)} live"
+            + (f" (+{len(offline)} offline)" if offline else "")
+            + note
         )
 
     def _providers_text(self):
@@ -2159,24 +2344,77 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 merged.append(name)
         return merged
 
-    async def _save_bot_tools(self, interaction: discord.Interaction, selected,
-                              universe=None):
-        # Guild admins configure their OWN guild's agent surface. This is not
-        # an escalation path: the universe rendered here is guild-scoped ops
-        # only, each of which still enforces its own PermissionLevel against
-        # the invoking user at call time.
+    async def _save_op_gate(self, interaction: discord.Interaction,
+                            op_name: str, state: str):
+        """Server tab: set one whitelisted op's per-guild agent gate to
+        off/admin/everyone. Guild admins configure their OWN guild's agent
+        surface — this is not an escalation path: the op still enforces its
+        own PermissionLevel against the invoking user at call time, and the
+        super-admin whitelist is the ceiling this cannot exceed.
+
+        Storage is sparse: a choice EQUAL to the op's default is stored as an
+        explicit override anyway (so the admin's intent survives a later
+        default change), while an unknown op_name is refused rather than
+        written."""
         if not is_admin(interaction):
             await interaction.response.send_message(
                 "Requires admin.", ephemeral=True)
             return
-        stored = self.bot.config.get(self._cfg_ctx(), "bot_tools_enabled")
-        # `universe` is the select's render-time capture (see
-        # _ToolSelect.callback); fall back to live only when no capture
-        # exists. Merging against live would drop names whose cog loaded
-        # after this panel rendered.
-        merged = self._merge_stored(stored, selected,
-                                    agent_ops() if universe is None else universe)
-        self.bot.config.set(self._cfg_ctx(), "bot_tools_enabled", merged)
+        op = registry.get(op_name)
+        if op is None or not is_whitelisted(op_name, self._whitelist()):
+            # Whitelist changed out from under this stale panel, or a bogus
+            # value — never write a gate for an op the guild can't see.
+            self.flash(f"'{op_name}' is not an enabled agent op here.")
+            await self.rerender(interaction)
+            return
+        if state not in (GATE_OFF, GATE_ADMIN, GATE_EVERYONE):
+            self.flash(f"Unknown gate state '{state}'.")
+            await self.rerender(interaction)
+            return
+        gate_cfg = dict(self._gate_cfg())
+        gate_cfg[op_name] = state
+        self.bot.config.set(self._cfg_ctx(), GATE_KEY, gate_cfg)
+        await self.rerender(interaction)
+
+    async def _save_whitelist(self, interaction: discord.Interaction, selected,
+                              universe=None):
+        """Super-admin Agent Ops tab: the GLOBAL {op_name: bool} whitelist —
+        the ceiling for every guild. A plain allowlist over the whole
+        registry (all scopes). Reuses the offline-preserving merge so an op
+        whose cog is unloaded stays whitelisted across a save (the property
+        that used to live on bot_tools_enabled)."""
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Requires superadmin (this edits global bot config).",
+                ephemeral=True)
+            return
+        stored = self._whitelist_names()
+        merged = self._merge_stored(
+            stored, selected,
+            registry.names() if universe is None else universe)
+        # Store as an explicit {name: True} map: absent/false both read as
+        # disabled, so an off op simply drops out of the map.
+        self.bot.config.set_global(WHITELIST_KEY, {n: True for n in merged})
+        await self.rerender(interaction)
+
+    async def _clear_whitelist(self, interaction: discord.Interaction, _selected):
+        """"Clear all" on the Agent Ops tab disables every op globally,
+        including names whose cog is currently unloaded — same reasoning as
+        the MCP "Clear all": the super-admin locking the agent surface down is
+        speaking for everything, so a carried-through offline name would sit
+        silently armed. Names the tab could not render are named in the flash
+        so nothing disappears invisibly."""
+        if not is_superadmin(interaction):
+            await interaction.response.send_message(
+                "Requires superadmin.", ephemeral=True)
+            return
+        stored = self._whitelist_names()
+        self.bot.config.set_global(WHITELIST_KEY, {})
+        offline = [n for n in stored if registry.get(n) is None]
+        note = (f" ({len(offline)} name(s) for currently-unloaded cogs also "
+                f"cleared: {', '.join(sorted(offline))})") if offline else ""
+        self.flash(f"Cleared the agent-ops whitelist — every op is now "
+                   f"disabled for the agent everywhere.{note}")
         await self.rerender(interaction)
 
     async def _save_mcp_tools(self, interaction: discord.Interaction, selected,

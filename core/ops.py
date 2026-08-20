@@ -151,6 +151,14 @@ OP_GROUPS: Dict[str, str] = {
     # a webhook URL is a persistent unauthenticated posting credential, so
     # exposing those is an owner decision, not a gap-fill.
     "invites": "Invites",
+    # NEEDS_OWNER-tier destructive/privileged surfaces (2026-08 owner-tier
+    # pass). Each fills the deliberately-omitted destructive half of a domain
+    # above, kept in its own group so a server admin sees the blast radius
+    # grouped rather than mixed into the reversible reads/writes.
+    "channels": "Channels",             # channel create/delete/clone/move + overwrite writes
+    "message-mod": "Message moderation",  # bulk delete/purge/publish/tts/sticker/reaction moderation
+    "webhooks": "Webhooks",             # webhook CRUD + execute (impersonation surface)
+    "automod": "AutoMod",               # automod rule create/edit/delete
     "dm": "Direct messages",
     "guild": "Guild",
     # Cog-provided groups. Declared here (not invented ad hoc by the cog) so
@@ -447,6 +455,21 @@ class Op:
     # and can't drift out of sync with the enabled-tool set. Distinct from
     # `description`, which rides inside the function schema itself.
     agent_guidance: Optional[str] = None
+    # DEFAULT per-guild agent gate for this op: "everyone" | "admin". Seeds
+    # the three-state Off/Admin/Everyone control a server admin sees, before
+    # they override it. The question it answers: "would a regular server
+    # member reasonably ask the bot to do this?" — reads/harmless → everyone,
+    # state-changing/abusable → admin. This governs the AGENT path only; the
+    # `permission` field above stays the hard floor for MCP/direct calls and
+    # is also the call-time floor an "everyone" gate cannot lower. Falls back
+    # to permission (EVERYONE→"everyone", else "admin") when unset.
+    agent_default: Optional[str] = None
+
+    def default_gate(self) -> str:
+        """The Off/Admin/Everyone default for this op's agent exposure."""
+        if self.agent_default in ("everyone", "admin"):
+            return self.agent_default
+        return "everyone" if self.permission == PermissionLevel.EVERYONE else "admin"
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
         allowed, reason = _check_permission(ctx, self.permission)
@@ -781,6 +804,7 @@ class OpSpec:
     agent_guidance: Optional[str] = None
     scope: OpScope = OpScope.GUILD
     group: str = "messaging"
+    agent_default: Optional[str] = None
 
 
 # Attribute an OpSpec rides on. Mirrors how discord.py's CogMeta finds
@@ -794,7 +818,8 @@ def op(name: str, description: str, permission: PermissionLevel,
        serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
        agent_guidance: Optional[str] = None,
        scope: OpScope = OpScope.GUILD,
-       group: str = "messaging"):
+       group: str = "messaging",
+       agent_default: Optional[str] = None):
     """Declare a cog method as an op, WITHOUT registering it.
 
         class MyCog(commands.Cog):
@@ -816,6 +841,7 @@ def op(name: str, description: str, permission: PermissionLevel,
             name=name, description=description, permission=permission,
             params=tuple(params or []), serialize=serialize,
             agent_guidance=agent_guidance, scope=scope, group=group,
+            agent_default=agent_default,
         ))
         return func
     return decorator
@@ -825,7 +851,7 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
               impl: Callable[..., Any], params: Optional[List[OpParam]],
               serialize: Optional[Callable[[Any], Dict[str, Any]]],
               agent_guidance: Optional[str], scope: OpScope, group: str,
-              origin: str, owner: Any) -> Op:
+              origin: str, owner: Any, agent_default: Optional[str] = None) -> Op:
     """Validate and construct an Op. Shared by both registration paths so a
     cog op and a core op are held to exactly the same rules."""
     if not inspect.iscoroutinefunction(impl):
@@ -834,11 +860,13 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
         raise TypeError(f"Op '{name}' scope must be an OpScope, got {scope!r}.")
     if not group or not isinstance(group, str):
         raise ValueError(f"Op '{name}' must declare a non-empty group id.")
+    if agent_default not in (None, "everyone", "admin"):
+        raise ValueError(f"Op '{name}' agent_default must be 'everyone', 'admin', or None.")
     return Op(
         name=name, description=description, permission=permission,
         impl=impl, params=list(params or []), serialize=serialize,
         agent_guidance=agent_guidance, scope=scope, group=group,
-        origin=origin, owner=owner,
+        origin=origin, owner=owner, agent_default=agent_default,
     )
 
 
@@ -855,7 +883,8 @@ class OpsRegistry:
            serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
            agent_guidance: Optional[str] = None,
            scope: OpScope = OpScope.GUILD,
-           group: str = "messaging"):
+           group: str = "messaging",
+           agent_default: Optional[str] = None):
         """Decorator: `@registry.op("name", "...", PermissionLevel.ADMIN)`
         registers an `async def impl(ctx, **kwargs)` under `name`.
 
@@ -869,7 +898,7 @@ class OpsRegistry:
                 name=name, description=description, permission=permission,
                 impl=func, params=params, serialize=serialize,
                 agent_guidance=agent_guidance, scope=scope, group=group,
-                origin=ORIGIN_CORE, owner=None,
+                origin=ORIGIN_CORE, owner=None, agent_default=agent_default,
             ))
             return func
         return decorator
@@ -1001,6 +1030,7 @@ class OpsRegistry:
                 params=list(spec.params), serialize=spec.serialize,
                 agent_guidance=spec.agent_guidance, scope=spec.scope,
                 group=spec.group, origin=ORIGIN_COG, owner=cog,
+                agent_default=spec.agent_default,
             ))
         # Preflight passed — commit.
         for built in batch:
@@ -5205,6 +5235,1509 @@ async def list_automod_rules(ctx: OpContext, guild=None):
         raise ValueError("list_automod_rules needs a guild context.")
     rules = await guild.fetch_automod_rules()
     return [_serialize_automod_rule(rule) for rule in rules]
+
+
+# ===========================================================================
+# NEEDS_OWNER-tier destructive / privileged ops (2026-08 owner-tier pass).
+#
+# Everything below fills the deliberately-omitted DESTRUCTIVE or PRIVILEGED
+# half of a domain above — the actions the client itself fronts with a
+# confirmation dialog, or that mint credentials / expand the permission
+# model / broadcast irreversibly. They exist as ops because an owner opted
+# in, and they are gated accordingly:
+#
+#   - every one is at least PermissionLevel.ADMIN;
+#   - edit_guild_settings, bulk_ban and purge_messages are SUPERADMIN —
+#     server-wide blast radius (guild identity, 200-member ban, unbounded
+#     mass delete);
+#   - every one passes agent_default="admin" so the per-guild agent gate
+#     never defaults a destructive op to "everyone".
+#
+# Snowflake-input rule as everywhere: ids on the wire are strings, results
+# keep ids as ints. Bulk operations cap their batch (bulk_ban <=200 per the
+# API, purge/bulk_delete <=100). Webhooks are resolved against the guild's
+# own webhook list so a foreign id is never edited/deleted/executed blind.
+# ===========================================================================
+
+
+# -- channels ---------------------------------------------------------------
+
+_CHANNEL_KIND_CREATORS = {
+    "text": "create_text_channel",
+    "voice": "create_voice_channel",
+    "forum": "create_forum",
+    "stage": "create_stage_channel",
+    "category": "create_category",
+}
+
+
+def _serialize_channel_ref(ch: Any) -> Dict[str, Any]:
+    """The small {id,name,type} ref every channel-CRUD op returns."""
+    return {
+        "id": getattr(ch, "id", None),
+        "name": getattr(ch, "name", None),
+        "type": str(getattr(ch, "type", None)),
+        "parent_id": getattr(getattr(ch, "category", None), "id", None),
+    }
+
+
+@registry.op(
+    "create_channel",
+    "Create a channel in a guild (text, voice, forum, stage, or category). "
+    "Requires admin. Server-structure-expanding — pair of delete_channel.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to create the channel in."),
+        OpParam("name", ParamKind.STRING, "New channel name."),
+        OpParam("kind", ParamKind.STRING,
+                "Channel kind: 'text', 'voice', 'forum', 'stage', or "
+                "'category'.",
+                required=False, default="text"),
+        OpParam("category", ParamKind.CHANNEL,
+                "Optional category channel id to nest the new channel under "
+                "(ignored when kind is 'category').",
+                required=False),
+        OpParam("topic", ParamKind.STRING,
+                "Optional topic (text/forum channels).", required=False),
+    ],
+    serialize=_serialize_channel_ref,
+    agent_guidance=(
+        "create_channel expands the server's structure — confirm the kind and "
+        "name with the user before creating, and reuse the returned id rather "
+        "than calling list_channels again."),
+    scope=OpScope.GUILD,
+    group="channels",
+    agent_default="admin",
+)
+async def create_channel(ctx: OpContext, guild, name: str,
+                         kind: str = "text", category=None,
+                         topic: Optional[str] = None):
+    creator_name = _CHANNEL_KIND_CREATORS.get(str(kind).lower())
+    if creator_name is None:
+        raise ValueError(
+            f"kind must be one of {', '.join(_CHANNEL_KIND_CREATORS)}; got "
+            f"{kind!r}.")
+    kwargs: Dict[str, Any] = {
+        "name": name,
+        "reason": _op_audit_reason(ctx, "create_channel", None),
+    }
+    if kind != "category":
+        if category is not None:
+            if not isinstance(category, discord.CategoryChannel):
+                raise ValueError(
+                    f"category must be a category channel id, got "
+                    f"{type(category).__name__}.")
+            kwargs["category"] = category
+        # topic is only valid on text/forum channels.
+        if topic is not None and kind in ("text", "forum"):
+            kwargs["topic"] = topic
+    creator = getattr(guild, creator_name)
+    return await creator(**kwargs)
+
+
+@registry.op(
+    "delete_channel",
+    "Delete a channel and its entire history. Requires admin. The canonical "
+    "destructive channel action — irreversible.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Discord channel id to delete."),
+    ],
+    serialize=lambda info: info,
+    agent_guidance=(
+        "delete_channel is irreversible and destroys the channel with all of "
+        "its messages — confirm intent with the user before calling it, and "
+        "never on a busy channel without explicit confirmation."),
+    scope=OpScope.GUILD,
+    group="channels",
+    agent_default="admin",
+)
+async def delete_channel(ctx: OpContext, channel):
+    info = {"deleted_channel_id": channel.id,
+            "name": getattr(channel, "name", None)}
+    await channel.delete(
+        reason=_op_audit_reason(ctx, "delete_channel", None))
+    return info
+
+
+@registry.op(
+    "clone_channel",
+    "Clone a channel, copying its settings AND its permission overwrites into "
+    "a new channel. Requires admin. This is create_channel plus an "
+    "overwrite-write in one call.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Discord channel id to clone."),
+        OpParam("name", ParamKind.STRING,
+                "Optional name for the clone (defaults to the source name).",
+                required=False),
+    ],
+    serialize=_serialize_channel_ref,
+    scope=OpScope.GUILD,
+    group="channels",
+    agent_default="admin",
+)
+async def clone_channel(ctx: OpContext, channel, name: Optional[str] = None):
+    if isinstance(channel, discord.Thread):
+        raise ValueError("clone_channel does not accept threads.")
+    kwargs: Dict[str, Any] = {
+        "reason": _op_audit_reason(ctx, "clone_channel", None)}
+    if name is not None:
+        kwargs["name"] = name
+    return await channel.clone(**kwargs)
+
+
+@registry.op(
+    "move_channel",
+    "Move/reorder a channel: set its position and/or its category. Requires "
+    "admin. Positions shift globally around the moved channel (like role "
+    "positions, but more visible).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Discord channel id to move."),
+        OpParam("position", ParamKind.INTEGER,
+                "New absolute position within its category/top level "
+                "(0 = first).",
+                required=False, minimum=0),
+        OpParam("category_id", ParamKind.SNOWFLAKE,
+                "Optional category channel id to move the channel into — a "
+                "SNOWFLAKE (not a CHANNEL param) so it does not collide with "
+                "the moved channel's own channel_id wire slot; resolved and "
+                "guild-confined in-impl.",
+                required=False),
+    ],
+    serialize=_serialize_channel_ref,
+    agent_guidance=(
+        "move_channel shifts the whole layout around the moved channel — "
+        "after a batch of moves, call list_channels once to see the settled "
+        "order rather than assuming each landed exactly where requested."),
+    scope=OpScope.GUILD,
+    group="channels",
+    agent_default="admin",
+)
+async def move_channel(ctx: OpContext, channel, position: Optional[int] = None,
+                       category_id: Optional[int] = None):
+    if isinstance(channel, discord.Thread):
+        raise ValueError("move_channel does not accept threads.")
+    if position is None and category_id is None:
+        raise ValueError(
+            "Nothing to move: pass a position and/or a category_id.")
+    category = None
+    if category_id is not None:
+        guild = getattr(channel, "guild", None)
+        category = (guild.get_channel(int(category_id))
+                    if guild is not None else None)
+        if not isinstance(category, discord.CategoryChannel):
+            raise ValueError(
+                f"category_id {category_id} is not a category channel in "
+                f"this guild.")
+    reason = _op_audit_reason(ctx, "move_channel", None)
+    if category is not None:
+        kwargs: Dict[str, Any] = {"category": category, "reason": reason}
+        if position is not None:
+            kwargs["beginning"] = False
+            kwargs["offset"] = position
+        else:
+            kwargs["end"] = True
+        await channel.move(**kwargs)
+    else:
+        # Position-only move: the absolute-position form via edit.
+        await channel.edit(position=position, reason=reason)
+    return _serialize_channel_ref(channel)
+
+
+def _overwrite_target(guild, target_type: str, target_id: int):
+    """Resolve an overwrite target (a role or a member) IN THIS GUILD, so an
+    overwrite write can never reach an entity outside the confined guild."""
+    if target_type == "role":
+        target = guild.get_role(target_id)
+        if target is None:
+            raise ValueError(
+                f"No role with id {target_id} in guild {guild.id}.")
+        return target
+    if target_type == "member":
+        target = guild.get_member(target_id)
+        if target is None:
+            raise ValueError(
+                f"No member with id {target_id} in guild {guild.id}.")
+        return target
+    raise ValueError(
+        f"target_type must be 'role' or 'member', got {target_type!r}.")
+
+
+@registry.op(
+    "set_channel_overwrite",
+    "Write a permission overwrite (channel ACL) for a role or member on a "
+    "channel. Requires admin — this rewrites who may do what in the channel. "
+    "allow/deny are lists of permission names (e.g. 'read_messages', "
+    "'send_messages'); a permission in neither list is left at inherit.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id to set the overwrite on."),
+        OpParam("target_type", ParamKind.STRING,
+                "'role' or 'member' — what target_id refers to."),
+        OpParam("target_id", ParamKind.SNOWFLAKE,
+                "Role or member id (in this guild) the overwrite applies to."),
+        OpParam("allow", ParamKind.STRING_LIST,
+                "Permission names to explicitly ALLOW.", required=False),
+        OpParam("deny", ParamKind.STRING_LIST,
+                "Permission names to explicitly DENY.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "set_channel_overwrite rewrites a channel ACL — use "
+        "list_channel_overwrites first to see the current entries, and "
+        "delete_channel_overwrite to remove one entirely (an empty allow+deny "
+        "here writes an all-inherit overwrite, not a removal)."),
+    scope=OpScope.GUILD,
+    group="channels",
+    agent_default="admin",
+)
+async def set_channel_overwrite(ctx: OpContext, channel, target_type: str,
+                                target_id: int,
+                                allow: Optional[List[str]] = None,
+                                deny: Optional[List[str]] = None):
+    if isinstance(channel, discord.Thread):
+        raise ValueError(
+            "set_channel_overwrite does not accept threads — overwrites live "
+            "on the parent channel.")
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        raise ValueError("set_channel_overwrite requires a guild channel.")
+    target = _overwrite_target(guild, str(target_type),
+                               _as_int(target_id, "target_id"))
+    valid = {name for name, _ in discord.Permissions()}
+    overwrite = discord.PermissionOverwrite()
+    for name in (allow or []):
+        if name not in valid:
+            raise ValueError(f"Unknown permission name {name!r}.")
+        setattr(overwrite, name, True)
+    for name in (deny or []):
+        if name not in valid:
+            raise ValueError(f"Unknown permission name {name!r}.")
+        setattr(overwrite, name, False)
+    await channel.set_permissions(
+        target, overwrite=overwrite,
+        reason=_op_audit_reason(ctx, "set_channel_overwrite", None))
+    return {
+        "channel_id": channel.id,
+        "target_type": str(target_type),
+        "target_id": target.id,
+        "allow": list(allow or []),
+        "deny": list(deny or []),
+    }
+
+
+@registry.op(
+    "delete_channel_overwrite",
+    "Remove a role's or member's permission overwrite from a channel "
+    "entirely (back to inherit). Requires admin.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id to remove the overwrite from."),
+        OpParam("target_type", ParamKind.STRING,
+                "'role' or 'member' — what target_id refers to."),
+        OpParam("target_id", ParamKind.SNOWFLAKE,
+                "Role or member id (in this guild) whose overwrite to remove."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="channels",
+    agent_default="admin",
+)
+async def delete_channel_overwrite(ctx: OpContext, channel, target_type: str,
+                                   target_id: int):
+    if isinstance(channel, discord.Thread):
+        raise ValueError(
+            "delete_channel_overwrite does not accept threads.")
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        raise ValueError("delete_channel_overwrite requires a guild channel.")
+    target = _overwrite_target(guild, str(target_type),
+                               _as_int(target_id, "target_id"))
+    await channel.set_permissions(
+        target, overwrite=None,
+        reason=_op_audit_reason(ctx, "delete_channel_overwrite", None))
+    return {
+        "channel_id": channel.id,
+        "target_type": str(target_type),
+        "target_id": target.id,
+        "removed": True,
+    }
+
+
+# -- threads (destructive / membership) -------------------------------------
+
+@registry.op(
+    "delete_thread",
+    "Delete a thread and all its messages. Requires admin. Destructive — "
+    "edit_thread with archived=true is the reversible alternative.",
+    PermissionLevel.ADMIN,
+    params=[OpParam("channel", ParamKind.CHANNEL,
+                    "Discord thread id to delete.")],
+    serialize=lambda info: info,
+    agent_guidance=(
+        "delete_thread is irreversible — prefer edit_thread with "
+        "archived=true, which preserves the conversation and can be reopened."),
+    scope=OpScope.GUILD,
+    group="threads",
+    agent_default="admin",
+)
+async def delete_thread(ctx: OpContext, channel):
+    thread = _require_thread(channel)
+    info = {"deleted_thread_id": thread.id, "name": thread.name}
+    await thread.delete()
+    return info
+
+
+@registry.op(
+    "add_thread_member",
+    "Add a user to a thread. Requires admin. Note this fires a notification "
+    "to the added user (it is the one add-class op that pings).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord thread id to add the user to."),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id to add to the thread."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="threads",
+    agent_default="admin",
+)
+async def add_thread_member(ctx: OpContext, channel, member):
+    thread = _require_thread(channel)
+    await thread.add_user(member)
+    return {"thread_id": thread.id, "user_id": member.id, "added": True}
+
+
+@registry.op(
+    "remove_thread_member",
+    "Remove a user from a thread (ejects them from the conversation). "
+    "Requires admin. Reversible via add_thread_member.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord thread id to remove the user from."),
+        OpParam("member", ParamKind.MEMBER,
+                "Discord user id to remove from the thread."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="threads",
+    agent_default="admin",
+)
+async def remove_thread_member(ctx: OpContext, channel, member):
+    thread = _require_thread(channel)
+    await thread.remove_user(member)
+    return {"thread_id": thread.id, "user_id": member.id, "removed": True}
+
+
+@registry.op(
+    "list_private_archived_threads",
+    "List a channel's archived PRIVATE threads — invite-only conversations "
+    "the actor may never have been in. Requires admin (privacy-sensitive "
+    "beyond the channel-visibility gate: thread membership, not channel "
+    "readability, is the real boundary).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Parent channel id whose archived private threads to list."),
+        OpParam("limit", ParamKind.INTEGER,
+                "Max threads to return (default 100).",
+                required=False, default=100, minimum=1, maximum=500),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="threads",
+    agent_default="admin",
+)
+async def list_private_archived_threads(ctx: OpContext, channel,
+                                        limit: int = 100):
+    if not hasattr(channel, "archived_threads"):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) cannot parent threads.")
+    rows = []
+    async for t in channel.archived_threads(private=True, limit=limit):
+        rows.append(serialize_thread(t))
+    return {"threads": rows, "count": len(rows)}
+
+
+# -- member moderation (kick / ban / prune / role edit) ---------------------
+
+# Discord's bulk-ban and delete_message caps.
+BULK_BAN_MAX = 200
+BAN_DELETE_MESSAGE_SECONDS_MAX = 604800  # 7 days
+
+
+@registry.op(
+    "kick_member",
+    "Kick a member from the guild. Requires admin. Irreversible by the bot — "
+    "the member must be re-invited to return.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional in-guild; "
+                "required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER, "Discord user id to kick."),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "kick_member ejects a member (they can rejoin only via a new invite) "
+        "— confirm intent with the user before calling it. For a reversible "
+        "silencing, timeout_member is the softer tool."),
+    scope=OpScope.GUILD,
+    group="members",
+    agent_default="admin",
+)
+async def kick_member(ctx: OpContext, member, reason: Optional[str] = None,
+                      guild=None):
+    guild = guild or getattr(member, "guild", None) or ctx.guild
+    if guild is None:
+        raise ValueError("kick_member needs a guild context.")
+    await guild.kick(member,
+                     reason=_op_audit_reason(ctx, "kick_member", reason))
+    return {"member_id": member.id, "kicked": True}
+
+
+@registry.op(
+    "ban_member",
+    "Ban a member (or any user id) from the guild, optionally deleting their "
+    "recent messages. Requires admin. Blocks rejoin until unbanned; can "
+    "bulk-delete up to 7 days of the target's messages.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to ban from. Optional in-guild; required "
+                "over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER, "Discord user id to ban."),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+        OpParam("delete_message_seconds", ParamKind.INTEGER,
+                "Seconds of the target's recent messages to delete (0 = "
+                "none; max 604800 = 7 days).",
+                required=False, default=0, minimum=0,
+                maximum=BAN_DELETE_MESSAGE_SECONDS_MAX),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "ban_member blocks the user from rejoining and can erase up to 7 days "
+        "of their messages (delete_message_seconds) — confirm both the ban "
+        "and any message deletion with the user first. unban_member reverses "
+        "the ban, but deleted messages are gone."),
+    scope=OpScope.GUILD,
+    group="members",
+    agent_default="admin",
+)
+async def ban_member(ctx: OpContext, member, reason: Optional[str] = None,
+                     delete_message_seconds: int = 0, guild=None):
+    guild = guild or getattr(member, "guild", None) or ctx.guild
+    if guild is None:
+        raise ValueError("ban_member needs a guild context.")
+    await guild.ban(
+        member, reason=_op_audit_reason(ctx, "ban_member", reason),
+        delete_message_seconds=delete_message_seconds)
+    return {"member_id": member.id, "banned": True,
+            "deleted_message_seconds": delete_message_seconds}
+
+
+@registry.op(
+    "unban_member",
+    "Unban a user from the guild by id. Requires admin. The reversal half of "
+    "ban_member; strictly access-restoring.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to unban from. Optional in-guild; required "
+                "over guild-less frontends like MCP.",
+                required=False),
+        OpParam("user", ParamKind.USER, "Discord user id to unban."),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="members",
+    agent_default="admin",
+)
+async def unban_member(ctx: OpContext, user, reason: Optional[str] = None,
+                       guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("unban_member needs a guild context.")
+    await guild.unban(user,
+                      reason=_op_audit_reason(ctx, "unban_member", reason))
+    return {"user_id": user.id, "unbanned": True}
+
+
+@registry.op(
+    "bulk_ban",
+    "Ban up to 200 users at once by id, optionally deleting a day of their "
+    "messages. Requires SUPERADMIN — a mass-destructive raid tool; one bad "
+    "id list nukes 200 members.",
+    PermissionLevel.SUPERADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to ban from. Optional in-guild; required "
+                "over guild-less frontends like MCP.",
+                required=False),
+        OpParam("user_ids", ParamKind.STRING_LIST,
+                "User ids to ban (max 200)."),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+        OpParam("delete_message_seconds", ParamKind.INTEGER,
+                "Seconds of recent messages to delete per user (default "
+                "86400 = 1 day; max 604800 = 7 days).",
+                required=False, default=86400, minimum=0,
+                maximum=BAN_DELETE_MESSAGE_SECONDS_MAX),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "bulk_ban is a superadmin-only mass action — never call it without "
+        "explicit, specific confirmation of the exact id list; a wrong list "
+        "bans up to 200 people irreversibly."),
+    scope=OpScope.GUILD,
+    group="members",
+    agent_default="admin",
+)
+async def bulk_ban(ctx: OpContext, user_ids: List[str],
+                   reason: Optional[str] = None,
+                   delete_message_seconds: int = 86400, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("bulk_ban needs a guild context.")
+    ids = [_as_int(uid, "user_ids") for uid in (user_ids or [])]
+    if not ids:
+        raise ValueError("bulk_ban requires at least one user id.")
+    if len(ids) > BULK_BAN_MAX:
+        raise ValueError(
+            f"bulk_ban accepts at most {BULK_BAN_MAX} users, got {len(ids)}.")
+    targets = [discord.Object(id=i) for i in ids]
+    result = await guild.bulk_ban(
+        targets, reason=_op_audit_reason(ctx, "bulk_ban", reason),
+        delete_message_seconds=delete_message_seconds)
+    banned = [getattr(o, "id", None) for o in getattr(result, "banned", [])]
+    failed = [getattr(o, "id", None) for o in getattr(result, "failed", [])]
+    return {"banned_user_ids": banned, "failed_user_ids": failed,
+            "banned_count": len(banned)}
+
+
+@registry.op(
+    "prune_members",
+    "Prune inactive members (no role, no activity in the given number of "
+    "days). Requires admin. A mass kick with no undo — the client fronts it "
+    "with an explicit confirmation flow (estimate_prune is the safe read "
+    "half).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id to prune. Optional in-guild; required over "
+                "guild-less frontends like MCP.",
+                required=False),
+        OpParam("days", ParamKind.INTEGER,
+                "Inactivity threshold in days (1-30).",
+                minimum=1, maximum=30),
+        OpParam("reason", ParamKind.STRING,
+                "Optional audit-log reason.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "prune_members mass-kicks inactive members with no undo — always run "
+        "estimate_prune for the same days first and confirm the number with "
+        "the user before pruning."),
+    scope=OpScope.GUILD,
+    group="members",
+    agent_default="admin",
+)
+async def prune_members(ctx: OpContext, days: int,
+                        reason: Optional[str] = None, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("prune_members needs a guild context.")
+    pruned = await guild.prune_members(
+        days=days, reason=_op_audit_reason(ctx, "prune_members", reason))
+    return {"days": days, "pruned_members": pruned}
+
+
+@registry.op(
+    "edit_member_roles",
+    "Add and/or remove multiple roles on a member in one call. Requires "
+    "admin. Managed roles and @everyone are refused. Reversible by swapping "
+    "the add/remove lists.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the member belongs to. Optional in-guild; "
+                "required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("member", ParamKind.MEMBER, "Discord user id to edit."),
+        OpParam("add_role_ids", ParamKind.STRING_LIST,
+                "Role ids to grant.", required=False),
+        OpParam("remove_role_ids", ParamKind.STRING_LIST,
+                "Role ids to remove.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "edit_member_roles is the batch form of add_role/remove_role — role "
+        "ids must come from list_roles, never guessed; managed and @everyone "
+        "roles are refused."),
+    scope=OpScope.GUILD,
+    group="members",
+    agent_default="admin",
+)
+async def edit_member_roles(ctx: OpContext, member,
+                            add_role_ids: Optional[List[str]] = None,
+                            remove_role_ids: Optional[List[str]] = None,
+                            guild=None):
+    guild = guild or getattr(member, "guild", None) or ctx.guild
+    if guild is None:
+        raise ValueError("edit_member_roles needs a guild context.")
+    if not add_role_ids and not remove_role_ids:
+        raise ValueError(
+            "Nothing to do: pass add_role_ids and/or remove_role_ids.")
+
+    def _resolve(ids):
+        out = []
+        for rid in (ids or []):
+            role = guild.get_role(_as_int(rid, "role_ids"))
+            if role is None:
+                raise ValueError(
+                    f"No role with id {rid} in guild {guild.id}.")
+            _guard_editable(role)
+            out.append(role)
+        return out
+
+    to_add = _resolve(add_role_ids)
+    to_remove = _resolve(remove_role_ids)
+    reason = _op_audit_reason(ctx, "edit_member_roles", None)
+    if to_add:
+        await member.add_roles(*to_add, reason=reason)
+    if to_remove:
+        await member.remove_roles(*to_remove, reason=reason)
+    return {
+        "member_id": member.id,
+        "added_role_ids": [r.id for r in to_add],
+        "removed_role_ids": [r.id for r in to_remove],
+    }
+
+
+# -- message moderation -----------------------------------------------------
+
+# Discord's bulk-delete cap (a single delete_messages / purge batch).
+BULK_DELETE_MAX = 100
+
+
+@registry.op(
+    "bulk_delete_messages",
+    "Bulk-delete specific messages by id in one channel (max 100, and none "
+    "older than 14 days — Discord's bulk-delete limits). Requires admin. "
+    "Destructive and irreversible.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id the messages are in."),
+        OpParam("message_ids", ParamKind.STRING_LIST,
+                "Message ids to delete (max 100, all under 14 days old)."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "bulk_delete_messages erases the listed messages permanently — "
+        "confirm the id list with the user; Discord refuses messages older "
+        "than 14 days and batches over 100."),
+    scope=OpScope.GUILD,
+    group="message-mod",
+    agent_default="admin",
+)
+async def bulk_delete_messages(ctx: OpContext, channel,
+                               message_ids: List[str]):
+    if not hasattr(channel, "delete_messages"):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) does not support bulk delete.")
+    ids = [_as_int(mid, "message_ids") for mid in (message_ids or [])]
+    if not ids:
+        raise ValueError("bulk_delete_messages requires at least one id.")
+    if len(ids) > BULK_DELETE_MAX:
+        raise ValueError(
+            f"bulk_delete_messages accepts at most {BULK_DELETE_MAX} ids, "
+            f"got {len(ids)}.")
+    targets = [discord.Object(id=i) for i in ids]
+    await channel.delete_messages(
+        targets, reason=_op_audit_reason(ctx, "bulk_delete_messages", None))
+    return {"channel_id": channel.id, "deleted_count": len(ids)}
+
+
+@registry.op(
+    "purge_messages",
+    "Purge the most recent messages in a channel (up to a limit, optionally "
+    "only a given author's). Requires SUPERADMIN — unbounded mass delete, "
+    "the server-wide-blast-radius sibling of the !cleanup command.",
+    PermissionLevel.SUPERADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id to purge."),
+        OpParam("limit", ParamKind.INTEGER,
+                "How many recent messages to scan/delete (max 100).",
+                minimum=1, maximum=BULK_DELETE_MAX),
+        OpParam("author", ParamKind.MEMBER,
+                "Optional: only delete messages by this member.",
+                required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "purge_messages is superadmin-only and deletes in bulk — confirm the "
+        "channel, the count, and any author filter explicitly before calling."),
+    scope=OpScope.GUILD,
+    group="message-mod",
+    agent_default="admin",
+)
+async def purge_messages(ctx: OpContext, channel, limit: int, author=None):
+    if not hasattr(channel, "purge"):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) does not support purge.")
+    kwargs: Dict[str, Any] = {
+        "limit": limit,
+        "reason": _op_audit_reason(ctx, "purge_messages", None),
+    }
+    if author is not None:
+        kwargs["check"] = lambda m: m.author.id == author.id
+    deleted = await channel.purge(**kwargs)
+    return {"channel_id": channel.id, "deleted_count": len(deleted)}
+
+
+@registry.op(
+    "publish_message",
+    "Publish (crosspost) a message in an announcement channel to every "
+    "following server. Requires admin. Irreversible broadcast — there is no "
+    "un-publish — under a tight 10/hour rate limit.",
+    PermissionLevel.ADMIN,
+    params=[OpParam("message", ParamKind.MESSAGE,
+                    "Announcement-channel message id to publish.")],
+    serialize=lambda m: {"message_id": m.id, "published": True},
+    agent_guidance=(
+        "publish_message broadcasts irreversibly to every server following "
+        "the announcement channel — confirm with the user before publishing, "
+        "and note the 10/hour rate limit."),
+    scope=OpScope.GUILD,
+    group="message-mod",
+    agent_default="admin",
+)
+async def publish_message(ctx: OpContext, message):
+    await message.publish()
+    return message
+
+
+@registry.op(
+    "send_tts",
+    "Send a text-to-speech message to a channel — Discord reads it ALOUD to "
+    "everyone currently focused on the channel. Requires admin (audible "
+    "interruption of everyone in the channel).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Channel to send into."),
+        OpParam("content", ParamKind.STRING, "Text to speak (non-empty)."),
+    ],
+    serialize=_serialize_sent_message,
+    agent_guidance=(
+        "send_tts is audible to everyone in the channel — use it only when "
+        "the user explicitly asks for a spoken/TTS message, never for an "
+        "ordinary reply (that is send_message)."),
+    scope=OpScope.GUILD,
+    group="message-mod",
+    agent_default="admin",
+)
+async def send_tts(ctx: OpContext, channel, content: str):
+    if not str(content).strip():
+        raise ValueError("send_tts requires non-empty content.")
+    return await channel.send(
+        content, tts=True,
+        allowed_mentions=discord.AllowedMentions.none())
+
+
+@registry.op(
+    "send_sticker",
+    "Send a message consisting of a guild sticker. Requires admin. The "
+    "sticker must belong to THIS guild (foreign ids are refused, preserving "
+    "guild confinement).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Channel to send into."),
+        OpParam("sticker_id", ParamKind.SNOWFLAKE,
+                "Guild sticker id to send (see list_stickers)."),
+    ],
+    serialize=_serialize_sent_message,
+    scope=OpScope.GUILD,
+    group="message-mod",
+    agent_default="admin",
+)
+async def send_sticker(ctx: OpContext, channel, sticker_id: int):
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        raise ValueError("send_sticker requires a guild channel.")
+    sticker = _require_guild_sticker(guild, _as_int(sticker_id, "sticker_id"))
+    return await channel.send(
+        stickers=[sticker],
+        allowed_mentions=discord.AllowedMentions.none())
+
+
+@registry.op(
+    "remove_reaction_other",
+    "Remove ANOTHER user's specific emoji reaction from a message. Requires "
+    "admin. This deliberately overrides the 'other users' reactions are "
+    "untouchable' rule of remove_reaction — a moderation action (it can also "
+    "strip reaction-role toggles, so use it carefully).",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Message to remove the reaction from."),
+        OpParam("member", ParamKind.MEMBER,
+                "Whose reaction to remove."),
+        OpParam("emoji", ParamKind.STRING,
+                "Emoji to remove (unicode emoji or `name:id` custom emoji)."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "remove_reaction_other strips another member's reaction — it can "
+        "remove a reaction-role toggle by mistake; confirm the target and "
+        "emoji with the user first."),
+    scope=OpScope.GUILD,
+    group="message-mod",
+    agent_default="admin",
+)
+async def remove_reaction_other(ctx: OpContext, message, member, emoji: str):
+    await message.remove_reaction(emoji, member)
+    return {"message_id": message.id, "user_id": member.id, "removed": True}
+
+
+@registry.op(
+    "clear_reactions",
+    "Clear reactions from a message: one emoji, or ALL reactions. Requires "
+    "admin. Destructive (also strips reaction-role toggles); no undo.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("message", ParamKind.MESSAGE,
+                "Message whose reactions to clear."),
+        OpParam("emoji", ParamKind.STRING,
+                "Optional: clear only this emoji. Omit to clear ALL "
+                "reactions.",
+                required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "clear_reactions with no emoji wipes EVERY reaction (including "
+        "reaction-role toggles) — confirm intent; pass an emoji to clear just "
+        "that one."),
+    scope=OpScope.GUILD,
+    group="message-mod",
+    agent_default="admin",
+)
+async def clear_reactions(ctx: OpContext, message, emoji: Optional[str] = None):
+    if emoji is not None and str(emoji).strip():
+        await message.clear_reaction(emoji)
+        return {"message_id": message.id, "cleared_emoji": emoji}
+    await message.clear_reactions()
+    return {"message_id": message.id, "cleared_all": True}
+
+
+# -- webhooks ---------------------------------------------------------------
+
+async def _resolve_guild_webhook(guild, webhook_id: int):
+    """Resolve a webhook by id against THIS guild's own webhook list, so an
+    edit/delete/execute can never reach a webhook outside the confined guild.
+    Returns a full Webhook (carrying the token needed to execute/edit)."""
+    for w in await guild.webhooks():
+        if w.id == webhook_id:
+            return w
+    raise ValueError(
+        f"No webhook with id {webhook_id} in guild {guild.id} — see "
+        f"list_webhooks.")
+
+
+def _serialize_webhook_ref(w: Any) -> Dict[str, Any]:
+    """Webhook ref WITHOUT url/token — a bearer credential is never serialized
+    (same rule list_webhooks follows)."""
+    return {
+        "id": getattr(w, "id", None),
+        "name": getattr(w, "name", None),
+        "channel_id": getattr(w, "channel_id", None),
+    }
+
+
+@registry.op(
+    "create_webhook",
+    "Create a webhook on a channel. Requires admin. Mints a persistent "
+    "unauthenticated posting credential — anyone holding the URL can post as "
+    "it, outside every permission gate. The URL/token is NEVER returned by "
+    "this op.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL,
+                "Discord channel id to create the webhook on."),
+        OpParam("name", ParamKind.STRING, "Webhook name."),
+    ],
+    serialize=_serialize_webhook_ref,
+    agent_guidance=(
+        "create_webhook mints a posting credential; this op deliberately "
+        "never returns the webhook URL/token, so tell the user to copy it "
+        "from Server Settings — never try to surface it."),
+    scope=OpScope.GUILD,
+    group="webhooks",
+    agent_default="admin",
+)
+async def create_webhook(ctx: OpContext, channel, name: str):
+    if not hasattr(channel, "create_webhook"):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) cannot carry webhooks.")
+    webhook = await channel.create_webhook(
+        name=name, reason=_op_audit_reason(ctx, "create_webhook", None))
+    return webhook
+
+
+@registry.op(
+    "edit_webhook",
+    "Rename a webhook and/or move it to another channel. Requires admin. Can "
+    "silently redirect/rebrand webhooks owned by third-party integrations.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the webhook belongs to."),
+        OpParam("webhook_id", ParamKind.SNOWFLAKE,
+                "Webhook id to edit (from list_webhooks)."),
+        OpParam("name", ParamKind.STRING, "New webhook name.", required=False),
+        OpParam("channel", ParamKind.CHANNEL,
+                "New channel id to move the webhook to.", required=False),
+    ],
+    serialize=_serialize_webhook_ref,
+    scope=OpScope.GUILD,
+    group="webhooks",
+    agent_default="admin",
+)
+async def edit_webhook(ctx: OpContext, guild, webhook_id: int,
+                       name: Optional[str] = None, channel=None):
+    webhook = await _resolve_guild_webhook(
+        guild, _as_int(webhook_id, "webhook_id"))
+    kwargs: Dict[str, Any] = {
+        "reason": _op_audit_reason(ctx, "edit_webhook", None)}
+    if name is not None:
+        kwargs["name"] = name
+    if channel is not None:
+        # Confine the destination to this guild.
+        if getattr(channel, "guild", None) is None or channel.guild.id != guild.id:
+            raise ValueError(
+                "edit_webhook destination channel must be in the same guild.")
+        kwargs["channel"] = channel
+    if "name" not in kwargs and "channel" not in kwargs:
+        raise ValueError("Nothing to edit: pass a name and/or a channel.")
+    edited = await webhook.edit(**kwargs)
+    return edited if edited is not None else webhook
+
+
+@registry.op(
+    "delete_webhook",
+    "Delete a webhook. Requires admin. Destructive — irreversibly kills any "
+    "third-party integration depending on it; the same URL can never be "
+    "recreated.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the webhook belongs to."),
+        OpParam("webhook_id", ParamKind.SNOWFLAKE,
+                "Webhook id to delete (from list_webhooks)."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "delete_webhook is irreversible and can break a GitHub/RSS-style "
+        "integration silently — confirm with the user which webhook (by id "
+        "from list_webhooks) before deleting."),
+    scope=OpScope.GUILD,
+    group="webhooks",
+    agent_default="admin",
+)
+async def delete_webhook(ctx: OpContext, guild, webhook_id: int):
+    webhook = await _resolve_guild_webhook(
+        guild, _as_int(webhook_id, "webhook_id"))
+    info = {"deleted_webhook_id": webhook.id, "name": webhook.name}
+    await webhook.delete(reason=_op_audit_reason(ctx, "delete_webhook", None))
+    return info
+
+
+@registry.op(
+    "execute_webhook",
+    "Post a message through a webhook, optionally under a custom display name "
+    "and avatar. Requires admin. Impersonation surface — it sends under an "
+    "arbitrary name/face, sidestepping the bot's own identity; never pings.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the webhook belongs to."),
+        OpParam("webhook_id", ParamKind.SNOWFLAKE,
+                "Webhook id to post through (from list_webhooks)."),
+        OpParam("content", ParamKind.STRING, "Message text to post."),
+        OpParam("username", ParamKind.STRING,
+                "Optional display name to post under.", required=False),
+        OpParam("avatar_url", ParamKind.STRING,
+                "Optional avatar image URL to post with.", required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "execute_webhook posts under an arbitrary name/avatar — that is "
+        "impersonation; use it only when the user explicitly wants a "
+        "webhook-authored message, and it never pings anyone."),
+    scope=OpScope.GUILD,
+    group="webhooks",
+    agent_default="admin",
+)
+async def execute_webhook(ctx: OpContext, guild, webhook_id: int,
+                          content: str, username: Optional[str] = None,
+                          avatar_url: Optional[str] = None):
+    if not str(content).strip():
+        raise ValueError("execute_webhook requires non-empty content.")
+    webhook = await _resolve_guild_webhook(
+        guild, _as_int(webhook_id, "webhook_id"))
+    kwargs: Dict[str, Any] = {
+        "wait": True,
+        "allowed_mentions": discord.AllowedMentions.none(),
+    }
+    if username is not None:
+        kwargs["username"] = username
+    if avatar_url is not None:
+        kwargs["avatar_url"] = avatar_url
+    sent = await webhook.send(content, **kwargs)
+    return {"webhook_id": webhook.id,
+            "message_id": getattr(sent, "id", None)}
+
+
+# -- guild settings ---------------------------------------------------------
+
+@registry.op(
+    "edit_guild_settings",
+    "Edit guild-identity settings: name, description, and verification "
+    "level. Requires SUPERADMIN — guild-identity and safety-posture changes "
+    "have server-wide blast radius. Deliberately narrow: dangerous sub-fields "
+    "(owner transfer, MFA level, icon) are not exposed.",
+    PermissionLevel.SUPERADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to edit."),
+        OpParam("name", ParamKind.STRING, "New guild name.", required=False),
+        OpParam("description", ParamKind.STRING,
+                "New guild description.", required=False),
+        OpParam("verification_level", ParamKind.STRING,
+                "New verification level: 'none', 'low', 'medium', 'high', or "
+                "'highest'.",
+                required=False),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "edit_guild_settings is superadmin-only and changes the server's "
+        "public identity — confirm every field with the user before "
+        "applying; raising verification_level can lock out new members."),
+    scope=OpScope.GUILD,
+    group="guild-info",
+    agent_default="admin",
+)
+async def edit_guild_settings(ctx: OpContext, guild,
+                              name: Optional[str] = None,
+                              description: Optional[str] = None,
+                              verification_level: Optional[str] = None):
+    kwargs: Dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if description is not None:
+        kwargs["description"] = description
+    if verification_level is not None:
+        level = getattr(discord.VerificationLevel,
+                        str(verification_level), None)
+        if not isinstance(level, discord.VerificationLevel):
+            raise ValueError(
+                f"Unknown verification_level {verification_level!r} — use "
+                f"none/low/medium/high/highest.")
+        kwargs["verification_level"] = level
+    if not kwargs:
+        raise ValueError(
+            "Nothing to edit: pass at least one of name/description/"
+            "verification_level.")
+    await guild.edit(reason=_op_audit_reason(ctx, "edit_guild_settings", None),
+                     **kwargs)
+    return {
+        "id": guild.id,
+        "name": guild.name,
+        "description": getattr(guild, "description", None),
+        "verification_level": str(getattr(guild, "verification_level", None)),
+    }
+
+
+# -- automod CRUD -----------------------------------------------------------
+
+_AUTOMOD_TRIGGER_TYPES = {
+    "keyword": "keyword",
+    "spam": "spam",
+    "keyword_preset": "keyword_preset",
+    "mention_spam": "mention_spam",
+}
+
+
+def _build_automod_trigger(trigger_type: str,
+                           keyword_filter: Optional[List[str]],
+                           regex_patterns: Optional[List[str]],
+                           mention_limit: Optional[int]):
+    ttype = getattr(discord.AutoModRuleTriggerType, trigger_type, None)
+    if not isinstance(ttype, discord.AutoModRuleTriggerType):
+        raise ValueError(
+            f"trigger_type must be one of "
+            f"{', '.join(_AUTOMOD_TRIGGER_TYPES)}; got {trigger_type!r}.")
+    kwargs: Dict[str, Any] = {"type": ttype}
+    if trigger_type == "keyword":
+        if not keyword_filter and not regex_patterns:
+            raise ValueError(
+                "keyword triggers need a keyword_filter and/or "
+                "regex_patterns.")
+        if keyword_filter:
+            kwargs["keyword_filter"] = list(keyword_filter)
+        if regex_patterns:
+            kwargs["regex_patterns"] = list(regex_patterns)
+    elif trigger_type == "mention_spam":
+        if mention_limit is None:
+            raise ValueError("mention_spam triggers need a mention_limit.")
+        kwargs["mention_limit"] = mention_limit
+    return discord.AutoModTrigger(**kwargs)
+
+
+def _serialize_automod_ref(rule: Any) -> Dict[str, Any]:
+    return {"id": rule.id, "name": rule.name,
+            "enabled": bool(getattr(rule, "enabled", False))}
+
+
+@registry.op(
+    "create_automod_rule",
+    "Create an AutoMod rule (guild-wide enforcement policy that blocks "
+    "matching messages). Requires admin. v0 supports the common 'keyword' "
+    "trigger (keyword_filter/regex_patterns) and 'mention_spam' "
+    "(mention_limit); the block action is applied automatically.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD, "Discord guild id to create in."),
+        OpParam("name", ParamKind.STRING, "Rule name."),
+        OpParam("trigger_type", ParamKind.STRING,
+                "'keyword' or 'mention_spam'."),
+        OpParam("keyword_filter", ParamKind.STRING_LIST,
+                "Substrings to block (keyword trigger).", required=False),
+        OpParam("regex_patterns", ParamKind.STRING_LIST,
+                "Regex patterns to block (keyword trigger).", required=False),
+        OpParam("mention_limit", ParamKind.INTEGER,
+                "Max mentions allowed before the rule fires (mention_spam "
+                "trigger).",
+                required=False, minimum=1, maximum=50),
+        OpParam("enabled", ParamKind.BOOLEAN,
+                "Enable the rule immediately (default true).",
+                required=False, default=True),
+    ],
+    serialize=_serialize_automod_ref,
+    agent_guidance=(
+        "create_automod_rule installs a guild-wide filter the whole server "
+        "feels — confirm the trigger and keywords with the user, and use "
+        "list_automod_rules to review existing rules first."),
+    scope=OpScope.GUILD,
+    group="automod",
+    agent_default="admin",
+)
+async def create_automod_rule(ctx: OpContext, guild, name: str,
+                              trigger_type: str,
+                              keyword_filter: Optional[List[str]] = None,
+                              regex_patterns: Optional[List[str]] = None,
+                              mention_limit: Optional[int] = None,
+                              enabled: bool = True):
+    trigger = _build_automod_trigger(str(trigger_type), keyword_filter,
+                                     regex_patterns, mention_limit)
+    action = discord.AutoModRuleAction(
+        type=discord.AutoModRuleActionType.block_message)
+    return await guild.create_automod_rule(
+        name=name,
+        event_type=discord.AutoModRuleEventType.message_send,
+        trigger=trigger,
+        actions=[action],
+        enabled=bool(enabled),
+        reason=_op_audit_reason(ctx, "create_automod_rule", None),
+    )
+
+
+@registry.op(
+    "edit_automod_rule",
+    "Edit an AutoMod rule: rename, enable/disable, or replace its keyword/"
+    "regex filters. Requires admin. Disabling a rule silently drops the "
+    "protection it provided.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the rule belongs to."),
+        OpParam("rule_id", ParamKind.SNOWFLAKE,
+                "AutoMod rule id to edit (from list_automod_rules)."),
+        OpParam("name", ParamKind.STRING, "New rule name.", required=False),
+        OpParam("enabled", ParamKind.BOOLEAN,
+                "Enable (true) or disable (false) the rule.", required=False),
+        OpParam("keyword_filter", ParamKind.STRING_LIST,
+                "Replacement keyword list (keyword rules).", required=False),
+        OpParam("regex_patterns", ParamKind.STRING_LIST,
+                "Replacement regex list (keyword rules).", required=False),
+    ],
+    serialize=_serialize_automod_ref,
+    scope=OpScope.GUILD,
+    group="automod",
+    agent_default="admin",
+)
+async def edit_automod_rule(ctx: OpContext, guild, rule_id: int,
+                            name: Optional[str] = None,
+                            enabled: Optional[bool] = None,
+                            keyword_filter: Optional[List[str]] = None,
+                            regex_patterns: Optional[List[str]] = None):
+    rule = await guild.fetch_automod_rule(_as_int(rule_id, "rule_id"))
+    kwargs: Dict[str, Any] = {}
+    if name is not None:
+        kwargs["name"] = name
+    if enabled is not None:
+        kwargs["enabled"] = enabled
+    if keyword_filter is not None or regex_patterns is not None:
+        existing = getattr(rule, "trigger", None)
+        ttype = getattr(existing, "type", None)
+        if ttype != discord.AutoModRuleTriggerType.keyword:
+            raise ValueError(
+                "keyword_filter/regex_patterns can only be edited on a "
+                "keyword-trigger rule.")
+        trigger = discord.AutoModTrigger(
+            type=discord.AutoModRuleTriggerType.keyword,
+            keyword_filter=list(keyword_filter)
+            if keyword_filter is not None
+            else list(getattr(existing, "keyword_filter", None) or []),
+            regex_patterns=list(regex_patterns)
+            if regex_patterns is not None
+            else list(getattr(existing, "regex_patterns", None) or []),
+        )
+        kwargs["trigger"] = trigger
+    if not kwargs:
+        raise ValueError(
+            "Nothing to edit: pass name/enabled/keyword_filter/"
+            "regex_patterns.")
+    edited = await rule.edit(
+        reason=_op_audit_reason(ctx, "edit_automod_rule", None), **kwargs)
+    return edited if edited is not None else rule
+
+
+@registry.op(
+    "delete_automod_rule",
+    "Delete an AutoMod rule. Requires admin. Destructive — removes the "
+    "protection with no undo.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the rule belongs to."),
+        OpParam("rule_id", ParamKind.SNOWFLAKE,
+                "AutoMod rule id to delete (from list_automod_rules)."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "delete_automod_rule removes a guild protection with no undo — "
+        "confirm which rule (by id from list_automod_rules) with the user "
+        "first."),
+    scope=OpScope.GUILD,
+    group="automod",
+    agent_default="admin",
+)
+async def delete_automod_rule(ctx: OpContext, guild, rule_id: int):
+    rule = await guild.fetch_automod_rule(_as_int(rule_id, "rule_id"))
+    info = {"deleted_rule_id": rule.id, "name": rule.name}
+    await rule.delete(reason=_op_audit_reason(ctx, "delete_automod_rule", None))
+    return info
+
+
+# -- scheduled-event delete + stage lifecycle -------------------------------
+
+@registry.op(
+    "delete_scheduled_event",
+    "Delete/cancel a scheduled event. Requires admin. Destructive — destroys "
+    "the event and its accumulated RSVP/interest list irreversibly.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the event belongs to. Optional in-guild; "
+                "required over guild-less frontends like MCP.",
+                required=False),
+        OpParam("event_id", ParamKind.SNOWFLAKE,
+                "Scheduled event id to delete (from list_scheduled_events)."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "delete_scheduled_event destroys the event AND its RSVP list with no "
+        "undo — confirm with the user before calling; to merely end an active "
+        "event, edit_scheduled_event with status='completed' preserves it."),
+    scope=OpScope.GUILD,
+    group="events",
+    agent_default="admin",
+)
+async def delete_scheduled_event(ctx: OpContext, event_id: int, guild=None):
+    guild = guild or ctx.guild
+    if guild is None:
+        raise ValueError("delete_scheduled_event needs a guild context.")
+    event = await guild.fetch_scheduled_event(
+        _as_int(event_id, "event_id"))
+    info = {"deleted_event_id": event.id, "name": event.name}
+    await event.delete()
+    return info
+
+
+def _require_stage_channel(channel: Any):
+    if not isinstance(channel, discord.StageChannel):
+        raise ValueError(
+            f"Channel {getattr(channel, 'id', '?')} "
+            f"({type(channel).__name__}) is not a stage channel.")
+    return channel
+
+
+def _serialize_stage_instance(inst: Any) -> Dict[str, Any]:
+    privacy = getattr(inst, "privacy_level", None)
+    return {
+        "channel_id": getattr(inst, "channel_id", None),
+        "topic": getattr(inst, "topic", None),
+        "privacy_level": getattr(privacy, "name",
+                                 str(privacy) if privacy is not None
+                                 else None),
+    }
+
+
+@registry.op(
+    "create_stage",
+    "Go live on a stage channel: create its stage instance with a topic. "
+    "Requires admin. Can push a start notification to the whole guild.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Stage channel id to go live on."),
+        OpParam("topic", ParamKind.STRING, "Stage topic (1-120 chars)."),
+        OpParam("send_notification", ParamKind.BOOLEAN,
+                "Notify the guild that the stage went live (default false).",
+                required=False, default=False),
+    ],
+    serialize=_serialize_stage_instance,
+    agent_guidance=(
+        "create_stage goes live and can notify the whole guild — only call it "
+        "when the user is actually running a stage event, and confirm before "
+        "send_notification=true."),
+    scope=OpScope.GUILD,
+    group="voice",
+    agent_default="admin",
+)
+async def create_stage(ctx: OpContext, channel, topic: str,
+                       send_notification: bool = False):
+    stage = _require_stage_channel(channel)
+    instance = await stage.create_instance(
+        topic=topic, send_start_notification=bool(send_notification),
+        reason=_op_audit_reason(ctx, "create_stage", None))
+    return instance
+
+
+@registry.op(
+    "edit_stage",
+    "Edit the live stage instance's topic on a stage channel. Requires admin. "
+    "Reversible.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Stage channel id to edit."),
+        OpParam("topic", ParamKind.STRING, "New stage topic."),
+    ],
+    serialize=_serialize_stage_instance,
+    scope=OpScope.GUILD,
+    group="voice",
+    agent_default="admin",
+)
+async def edit_stage(ctx: OpContext, channel, topic: str):
+    stage = _require_stage_channel(channel)
+    instance = stage.instance
+    if instance is None:
+        try:
+            instance = await stage.fetch_instance()
+        except discord.NotFound:
+            instance = None
+    if instance is None:
+        raise ValueError(
+            f"Stage channel {stage.id} has no live stage instance to edit.")
+    await instance.edit(topic=topic,
+                        reason=_op_audit_reason(ctx, "edit_stage", None))
+    return instance
+
+
+@registry.op(
+    "end_stage",
+    "End the live stage instance on a stage channel (closes it, disconnecting "
+    "the audience). Requires admin. Destructive to the live session.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("channel", ParamKind.CHANNEL, "Stage channel id to close."),
+    ],
+    serialize=lambda payload: payload,
+    agent_guidance=(
+        "end_stage closes the live stage and disconnects everyone in the "
+        "audience — confirm with the user before ending an active stage."),
+    scope=OpScope.GUILD,
+    group="voice",
+    agent_default="admin",
+)
+async def end_stage(ctx: OpContext, channel):
+    stage = _require_stage_channel(channel)
+    instance = stage.instance
+    if instance is None:
+        try:
+            instance = await stage.fetch_instance()
+        except discord.NotFound:
+            instance = None
+    if instance is None:
+        raise ValueError(
+            f"Stage channel {stage.id} has no live stage instance to end.")
+    await instance.delete(reason=_op_audit_reason(ctx, "end_stage", None))
+    return {"channel_id": stage.id, "ended": True}
+
+
+# -- invite delete ----------------------------------------------------------
+
+@registry.op(
+    "delete_invite",
+    "Delete/revoke one of THIS guild's invites by code. Requires admin. "
+    "Codes not found in the guild's own invite list are refused — a foreign "
+    "code is never deleted blind. (Functionally the same as revoke_invite; "
+    "the delete_* name completes the destructive-op family.)",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("guild", ParamKind.GUILD,
+                "Discord guild id the invite belongs to."),
+        OpParam("code", ParamKind.STRING,
+                "Invite code to delete (from list_invites; a full "
+                "discord.gg URL is also accepted)."),
+    ],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD,
+    group="invites",
+    agent_default="admin",
+)
+async def delete_invite(ctx: OpContext, guild, code: str):
+    wanted = str(code).strip().rstrip("/").rsplit("/", 1)[-1]
+    if not wanted:
+        raise ValueError("delete_invite requires a non-empty invite code.")
+    target = next((inv for inv in await guild.invites()
+                   if inv.code == wanted), None)
+    if target is None:
+        raise ValueError(
+            f"No active invite with code '{wanted}' in guild "
+            f"'{guild.name}' — see list_invites.")
+    await target.delete(
+        reason=_op_audit_reason(ctx, "delete_invite", None))
+    return {"deleted": True, "code": wanted}
 
 
 # ---------------------------------------------------------------------------

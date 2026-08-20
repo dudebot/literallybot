@@ -718,22 +718,52 @@ def test_grouped_sections_render_whole_universe_once():
         assert len(rendered) == len(set(rendered))
 
 
-def test_server_tab_universe_is_exactly_guild_scope():
-    """The server tab is the in-guild agent surface: guild-scoped ops only.
-    A DM or GLOBAL op leaking in would let a guild admin enable an op that
-    reaches outside their guild."""
-    from cogs.optional.gpt import _grouped_tool_sections
+def _server_gate_view(whitelist):
+    """A bare AiSettingsView wired just enough to call _server_gate_ops:
+    the whitelist ceiling and an empty per-guild gate override map."""
+    from cogs.optional.gpt import AiSettingsView
 
-    rendered = {
-        o.value
-        for kind, payload in _grouped_tool_sections(
-            _panel_sections(OpScope.GUILD), [], None)
-        if kind == "select"
-        for o in payload.options
-    }
-    assert rendered == set(agent_ops())
+    view = AiSettingsView.__new__(AiSettingsView)
+    view._whitelist = lambda: dict(whitelist)
+    view._gate_cfg = lambda: {}
+    return view
+
+
+def test_server_tab_universe_is_exactly_guild_scope():
+    """The server tab is the in-guild agent surface: WHITELISTED guild-scoped
+    ops only. A DM or GLOBAL op leaking in would let a guild admin enable an
+    op that reaches outside their guild; a NON-whitelisted op leaking in would
+    let a guild admin grant access the super-admin withheld."""
+    guild_ops = set(registry.op_names(scope=OpScope.GUILD))
+    # Whitelist EVERYTHING (all scopes) so the only thing narrowing the server
+    # tab is the guild-scope + whitelist filter, not a sparse whitelist.
+    whitelist = {name: True for name in registry.names()}
+    view = _server_gate_view(whitelist)
+
+    rendered = {op.name for _label, ops in view._server_gate_ops() for op in ops}
+    assert rendered == guild_ops
     assert not rendered & set(registry.op_names(scope=OpScope.DM))
     assert not rendered & set(registry.op_names(scope=OpScope.GLOBAL))
+
+
+def test_server_tab_renders_only_whitelisted_ops():
+    """A guild-scoped op that the super-admin whitelist does not enable must
+    not render on the Server tab at all — it is disabled everywhere, and
+    rendering it would both bloat the panel and imply a guild admin could
+    turn it on."""
+    guild_ops = registry.op_names(scope=OpScope.GUILD)
+    assert len(guild_ops) >= 2, "need >=2 guild ops to test the filter"
+    chosen = guild_ops[0]
+    view = _server_gate_view({chosen: True})
+
+    rendered = {op.name for _label, ops in view._server_gate_ops() for op in ops}
+    assert rendered == {chosen}
+    # Everything else the registry offers is withheld.
+    assert not rendered & (set(guild_ops) - {chosen})
+
+    # Empty whitelist => nothing renders (the safe default).
+    empty = _server_gate_view({})
+    assert empty._server_gate_ops() == []
 
 
 def test_cross_select_merge_keeps_other_groups_enabled():
@@ -757,13 +787,17 @@ def test_cross_select_merge_keeps_other_groups_enabled():
 
 
 def test_save_preserves_names_whose_op_is_unregistered():
-    """A name stored while its cog was loaded must survive a panel save made
-    while that cog is unloaded — the select cannot render it, so a naive
-    filter would silently and permanently destroy the guild's choice."""
+    """A name whitelisted while its cog was loaded must survive a whitelist
+    save made while that cog is unloaded — the select cannot render it, so a
+    naive filter would silently and permanently destroy the super-admin's
+    choice. The whitelist universe is the WHOLE registry (all scopes), since
+    the Agent Ops tab is a plain global allowlist. (This property used to live
+    on the per-guild bot_tools_enabled list, which no longer exists.)"""
     from cogs.optional.gpt import AiSettingsView
 
+    universe = registry.names()
     merged = AiSettingsView._merge_stored(
-        ["ghost_op", "search_history"], ["list_channels"], agent_ops())
+        ["ghost_op", "search_history"], ["list_channels"], universe)
     assert "ghost_op" in merged
     assert merged.count("ghost_op") == 1
     assert set(merged) == {"ghost_op", "list_channels"}
@@ -771,11 +805,11 @@ def test_save_preserves_names_whose_op_is_unregistered():
     # An explicit "clear all" still persists as empty (not "unset") — but only
     # for names the universe can render. An OFFLINE name survives a merge of
     # [], which is exactly why the panel's "Clear all" button must not route
-    # through _merge_stored (see the test below).
+    # through _merge_stored (see test_clear_all_clears_names_whose_cog_is_unloaded).
     assert AiSettingsView._merge_stored(
-        ["search_history"], [], agent_ops()) == []
+        ["search_history"], [], universe) == []
     assert AiSettingsView._merge_stored(
-        ["ghost_op"], [], agent_ops()) == ["ghost_op"]
+        ["ghost_op"], [], universe) == ["ghost_op"]
 
 
 def test_clear_all_clears_names_whose_cog_is_unloaded():
@@ -3705,3 +3739,1022 @@ def test_list_automod_rules_serializes_defensively():
     assert rows[1]["keyword_filter"] == []
     payload = registry.get("list_automod_rules").serialize_result(rows)
     assert payload == {"rules": rows, "count": 2}
+
+
+# ==========================================================================
+# NEEDS_OWNER-tier destructive / privileged ops (2026-08 owner-tier pass).
+#
+# 36 ops filling the deliberately-omitted destructive half of each domain.
+# These freeze the inventory (the exact 36 names), the permission FLOOR
+# (ADMIN, with three SUPERADMIN), the agent_default="admin" seed, the new
+# group ids, and one impl behavior per op.
+# ==========================================================================
+
+OWNER_TIER_OPS = {
+    # channels
+    "create_channel", "delete_channel", "clone_channel", "move_channel",
+    "set_channel_overwrite", "delete_channel_overwrite",
+    # threads (destructive/membership)
+    "delete_thread", "add_thread_member", "remove_thread_member",
+    "list_private_archived_threads",
+    # member moderation
+    "kick_member", "ban_member", "unban_member", "bulk_ban", "prune_members",
+    "edit_member_roles",
+    # message moderation
+    "bulk_delete_messages", "purge_messages", "publish_message", "send_tts",
+    "send_sticker", "remove_reaction_other", "clear_reactions",
+    # webhooks
+    "create_webhook", "edit_webhook", "delete_webhook", "execute_webhook",
+    # guild settings
+    "edit_guild_settings",
+    # automod CRUD
+    "create_automod_rule", "edit_automod_rule", "delete_automod_rule",
+    # events / stage
+    "delete_scheduled_event", "create_stage", "edit_stage", "end_stage",
+    # invites
+    "delete_invite",
+}
+
+# The three with server-wide blast radius are SUPERADMIN; the rest ADMIN.
+OWNER_TIER_SUPERADMIN = {"edit_guild_settings", "bulk_ban", "purge_messages"}
+
+OWNER_TIER_GROUPS = {
+    "create_channel": "channels", "delete_channel": "channels",
+    "clone_channel": "channels", "move_channel": "channels",
+    "set_channel_overwrite": "channels",
+    "delete_channel_overwrite": "channels",
+    "delete_thread": "threads", "add_thread_member": "threads",
+    "remove_thread_member": "threads",
+    "list_private_archived_threads": "threads",
+    "kick_member": "members", "ban_member": "members",
+    "unban_member": "members", "bulk_ban": "members",
+    "prune_members": "members", "edit_member_roles": "members",
+    "bulk_delete_messages": "message-mod", "purge_messages": "message-mod",
+    "publish_message": "message-mod", "send_tts": "message-mod",
+    "send_sticker": "message-mod", "remove_reaction_other": "message-mod",
+    "clear_reactions": "message-mod",
+    "create_webhook": "webhooks", "edit_webhook": "webhooks",
+    "delete_webhook": "webhooks", "execute_webhook": "webhooks",
+    "edit_guild_settings": "guild-info",
+    "create_automod_rule": "automod", "edit_automod_rule": "automod",
+    "delete_automod_rule": "automod",
+    "delete_scheduled_event": "events",
+    "create_stage": "voice", "edit_stage": "voice", "end_stage": "voice",
+    "delete_invite": "invites",
+}
+
+
+def test_owner_tier_ops_all_registered():
+    """The full 36-op inventory is present — a missing one silently drops the
+    owner-approved destructive capability from every frontend."""
+    for name in OWNER_TIER_OPS:
+        assert registry.get(name) is not None, f"{name} not registered"
+
+
+@pytest.mark.parametrize("name", sorted(OWNER_TIER_OPS))
+def test_owner_tier_permission_floor_and_agent_default(name):
+    """Every owner-tier op is at least ADMIN (three are SUPERADMIN), guild
+    scope, and seeds the per-guild agent gate at 'admin' — none is ever
+    'everyone'."""
+    o = registry.require(name)
+    expected = (PermissionLevel.SUPERADMIN if name in OWNER_TIER_SUPERADMIN
+                else PermissionLevel.ADMIN)
+    assert o.permission == expected, f"{name} floor {o.permission}"
+    assert o.scope == OpScope.GUILD
+    assert o.agent_default == "admin", f"{name} agent_default {o.agent_default}"
+    assert o.default_gate() == "admin"
+
+
+@pytest.mark.parametrize("name,group", sorted(OWNER_TIER_GROUPS.items()))
+def test_owner_tier_group_assignments(name, group):
+    assert registry.require(name).group == group
+
+
+def test_owner_tier_new_groups_exist_and_stay_under_cap():
+    from cogs.optional.gpt import SELECT_MAX_OPTIONS
+    for gid in ("channels", "message-mod", "webhooks", "automod"):
+        assert gid in OP_GROUPS, f"new group {gid} missing from OP_GROUPS"
+    # No group anywhere exceeds Discord's select cap after the additions.
+    for _gid, _label, ops in registry.grouped():
+        assert len(ops) <= SELECT_MAX_OPTIONS
+
+
+# -- wire-shape freeze (required sets) --------------------------------------
+
+@pytest.mark.parametrize("name,props,required", [
+    # create_channel's `category` is a CHANNEL param → wire name channel_id.
+    ("create_channel",
+     {"guild_id", "name", "kind", "channel_id", "topic"},
+     {"guild_id", "name"}),
+    ("delete_channel", {"channel_id"}, {"channel_id"}),
+    ("clone_channel", {"channel_id", "name"}, {"channel_id"}),
+    # move_channel's category_id is a SNOWFLAKE (resolved in-impl) so it does
+    # not collide with the moved channel's own channel_id wire slot.
+    ("move_channel", {"channel_id", "position", "category_id"},
+     {"channel_id"}),
+    ("set_channel_overwrite",
+     {"channel_id", "target_type", "target_id", "allow", "deny"},
+     {"channel_id", "target_type", "target_id"}),
+    ("delete_channel_overwrite",
+     {"channel_id", "target_type", "target_id"},
+     {"channel_id", "target_type", "target_id"}),
+    ("delete_thread", {"channel_id"}, {"channel_id"}),
+    ("add_thread_member", {"channel_id", "user_id"},
+     {"channel_id", "user_id"}),
+    ("remove_thread_member", {"channel_id", "user_id"},
+     {"channel_id", "user_id"}),
+    ("list_private_archived_threads", {"channel_id", "limit"},
+     {"channel_id"}),
+    ("kick_member", {"guild_id", "user_id", "reason"}, {"user_id"}),
+    ("ban_member",
+     {"guild_id", "user_id", "reason", "delete_message_seconds"},
+     {"user_id"}),
+    ("unban_member", {"guild_id", "user_id", "reason"}, {"user_id"}),
+    ("bulk_ban",
+     {"guild_id", "user_ids", "reason", "delete_message_seconds"},
+     {"user_ids"}),
+    ("prune_members", {"guild_id", "days", "reason"}, {"days"}),
+    ("edit_member_roles",
+     {"guild_id", "user_id", "add_role_ids", "remove_role_ids"},
+     {"user_id"}),
+    ("bulk_delete_messages", {"channel_id", "message_ids"},
+     {"channel_id", "message_ids"}),
+    ("purge_messages", {"channel_id", "limit", "user_id"},
+     {"channel_id", "limit"}),
+    ("publish_message", {"channel_id", "message_id"},
+     {"channel_id", "message_id"}),
+    ("send_tts", {"channel_id", "content"}, {"channel_id", "content"}),
+    ("send_sticker", {"channel_id", "sticker_id"},
+     {"channel_id", "sticker_id"}),
+    ("remove_reaction_other",
+     {"channel_id", "message_id", "user_id", "emoji"},
+     {"channel_id", "message_id", "user_id", "emoji"}),
+    ("clear_reactions", {"channel_id", "message_id", "emoji"},
+     {"channel_id", "message_id"}),
+    ("create_webhook", {"channel_id", "name"}, {"channel_id", "name"}),
+    ("edit_webhook", {"guild_id", "webhook_id", "name", "channel_id"},
+     {"guild_id", "webhook_id"}),
+    ("delete_webhook", {"guild_id", "webhook_id"},
+     {"guild_id", "webhook_id"}),
+    ("execute_webhook",
+     {"guild_id", "webhook_id", "content", "username", "avatar_url"},
+     {"guild_id", "webhook_id", "content"}),
+    ("edit_guild_settings",
+     {"guild_id", "name", "description", "verification_level"},
+     {"guild_id"}),
+    ("create_automod_rule",
+     {"guild_id", "name", "trigger_type", "keyword_filter",
+      "regex_patterns", "mention_limit", "enabled"},
+     {"guild_id", "name", "trigger_type"}),
+    ("edit_automod_rule",
+     {"guild_id", "rule_id", "name", "enabled", "keyword_filter",
+      "regex_patterns"},
+     {"guild_id", "rule_id"}),
+    ("delete_automod_rule", {"guild_id", "rule_id"},
+     {"guild_id", "rule_id"}),
+    ("delete_scheduled_event", {"guild_id", "event_id"}, {"event_id"}),
+    ("create_stage", {"channel_id", "topic", "send_notification"},
+     {"channel_id", "topic"}),
+    ("edit_stage", {"channel_id", "topic"}, {"channel_id", "topic"}),
+    ("end_stage", {"channel_id"}, {"channel_id"}),
+    ("delete_invite", {"guild_id", "code"}, {"guild_id", "code"}),
+])
+def test_owner_tier_wire_shapes(name, props, required):
+    schema = registry.get(name).to_json_schema()
+    assert set(schema["properties"]) == props, name
+    assert set(schema["required"]) == required, name
+
+
+# -- channel-op impls -------------------------------------------------------
+
+class _CrudGuild:
+    """Guild fake covering the channel-CRUD / member-mod / invite creators."""
+
+    def __init__(self, gid=1, name="Guild", roles=None, members=None):
+        self.id = gid
+        self.name = name
+        self._roles = {r.id: r for r in (roles or [])}
+        self._members = {m.id: m for m in (members or [])}
+        self.create_kwargs = None
+        self.kicked = []
+        self.banned = []
+        self.unbanned = []
+        self.pruned_kwargs = None
+        self.edit_kwargs = None
+        self.description = None
+        self.verification_level = None
+
+    def get_role(self, rid):
+        return self._roles.get(rid)
+
+    def get_member(self, uid):
+        return self._members.get(uid)
+
+    async def create_text_channel(self, **kw):
+        self.create_kwargs = ("text", kw)
+        return type("C", (), {"id": 90, "name": kw["name"],
+                              "type": "text", "category": None})()
+
+    async def create_voice_channel(self, **kw):
+        self.create_kwargs = ("voice", kw)
+        return type("C", (), {"id": 91, "name": kw["name"],
+                              "type": "voice", "category": None})()
+
+    async def create_category(self, **kw):
+        self.create_kwargs = ("category", kw)
+        return type("C", (), {"id": 92, "name": kw["name"],
+                              "type": "category", "category": None})()
+
+    async def kick(self, user, *, reason=None):
+        self.kicked.append((user, reason))
+
+    async def ban(self, user, *, reason=None, delete_message_seconds=0):
+        self.banned.append((user, reason, delete_message_seconds))
+
+    async def unban(self, user, *, reason=None):
+        self.unbanned.append((user, reason))
+
+    async def bulk_ban(self, users, *, reason=None,
+                       delete_message_seconds=86400):
+        ids = [u.id for u in users]
+        return type("R", (), {
+            "banned": [type("O", (), {"id": i})() for i in ids[:-1]],
+            "failed": [type("O", (), {"id": i})() for i in ids[-1:]]})()
+
+    async def prune_members(self, *, days, reason=None):
+        self.pruned_kwargs = {"days": days, "reason": reason}
+        return 7
+
+    async def edit(self, *, reason=None, **kw):
+        self.edit_kwargs = dict(kw)
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def test_create_channel_builds_a_text_channel():
+    from core.ops import create_channel
+    guild = _CrudGuild()
+    ch = asyncio.run(create_channel(_AuthorCtx(), guild, "new-chan",
+                                    topic="hi"))
+    kind, kw = guild.create_kwargs
+    assert kind == "text"
+    assert kw["name"] == "new-chan"
+    assert kw["topic"] == "hi"
+    assert kw["reason"] == "create_channel op by tester (321)"
+    payload = registry.get("create_channel").serialize_result(ch)
+    assert payload["id"] == 90
+
+
+def test_create_channel_refuses_unknown_kind():
+    from core.ops import create_channel
+    with pytest.raises(ValueError, match="kind must be"):
+        asyncio.run(create_channel(_AuthorCtx(), _CrudGuild(), "x",
+                                   kind="wormhole"))
+
+
+class _CrudChannel:
+    def __init__(self, cid=10, name="general", guild=None):
+        self.id = cid
+        self.name = name
+        self.guild = guild
+        self.type = "text"
+        self.category = None
+        self.deleted_reason = None
+        self.clone_kwargs = None
+        self.edit_kwargs = None
+        self.set_perms = []
+
+    async def delete(self, *, reason=None):
+        self.deleted_reason = reason
+
+    async def clone(self, **kw):
+        self.clone_kwargs = kw
+        return _CrudChannel(cid=99, name=kw.get("name", self.name))
+
+    async def edit(self, *, reason=None, **kw):
+        self.edit_kwargs = dict(kw)
+
+    async def move(self, **kw):
+        self.edit_kwargs = dict(kw)
+
+    async def set_permissions(self, target, *, overwrite=None, reason=None):
+        self.set_perms.append((target, overwrite, reason))
+
+
+def test_delete_channel_deletes_with_audit_reason():
+    from core.ops import delete_channel
+    chan = _CrudChannel()
+    payload = asyncio.run(delete_channel(_AuthorCtx(), chan))
+    assert chan.deleted_reason == "delete_channel op by tester (321)"
+    assert payload == {"deleted_channel_id": 10, "name": "general"}
+
+
+def test_clone_channel_copies_with_optional_name():
+    from core.ops import clone_channel
+    chan = _CrudChannel()
+    cloned = asyncio.run(clone_channel(_AuthorCtx(), chan, name="copy"))
+    assert chan.clone_kwargs["name"] == "copy"
+    payload = registry.get("clone_channel").serialize_result(cloned)
+    assert payload["id"] == 99
+
+
+def test_move_channel_edits_position_only():
+    from core.ops import move_channel
+    chan = _CrudChannel()
+    asyncio.run(move_channel(_AuthorCtx(), chan, position=2))
+    assert chan.edit_kwargs["position"] == 2
+
+
+def test_move_channel_requires_a_target():
+    from core.ops import move_channel
+    with pytest.raises(ValueError, match="Nothing to move"):
+        asyncio.run(move_channel(_AuthorCtx(), _CrudChannel()))
+
+
+def test_set_channel_overwrite_writes_allow_and_deny():
+    from core.ops import set_channel_overwrite
+    role = type("R", (), {"id": 7, "name": "Mods"})()
+    guild = _CrudGuild(roles=[role])
+    chan = _CrudChannel(guild=guild)
+    payload = asyncio.run(set_channel_overwrite(
+        _AuthorCtx(), chan, "role", 7,
+        allow=["read_messages"], deny=["send_messages"]))
+    target, overwrite, reason = chan.set_perms[0]
+    assert target is role
+    assert overwrite.read_messages is True
+    assert overwrite.send_messages is False
+    assert payload["target_id"] == 7
+
+
+def test_set_channel_overwrite_rejects_unknown_permission():
+    from core.ops import set_channel_overwrite
+    role = type("R", (), {"id": 7, "name": "Mods"})()
+    guild = _CrudGuild(roles=[role])
+    with pytest.raises(ValueError, match="Unknown permission"):
+        asyncio.run(set_channel_overwrite(
+            _AuthorCtx(), _CrudChannel(guild=guild), "role", 7,
+            allow=["fly"]))
+
+
+def test_delete_channel_overwrite_clears_the_entry():
+    from core.ops import delete_channel_overwrite
+    member = type("M", (), {"id": 42})()
+    guild = _CrudGuild(members=[member])
+    chan = _CrudChannel(guild=guild)
+    payload = asyncio.run(delete_channel_overwrite(
+        _AuthorCtx(), chan, "member", 42))
+    target, overwrite, _reason = chan.set_perms[0]
+    assert target is member
+    assert overwrite is None
+    assert payload["removed"] is True
+
+
+# -- thread destructive/membership impls ------------------------------------
+
+class _ModThread(_FakeThread):
+    def __init__(self, **attrs):
+        super().__init__(**attrs)
+        self.deleted = False
+        self.added = []
+        self.removed = []
+        self._archived_private = []
+
+    async def delete(self):
+        self.deleted = True
+
+    async def add_user(self, user):
+        self.added.append(user)
+
+    async def remove_user(self, user):
+        self.removed.append(user)
+
+    def archived_threads(self, *, private=False, limit=100):
+        rows = self._archived_private if private else []
+
+        async def gen():
+            for t in rows[:limit]:
+                yield t
+        return gen()
+
+
+def test_delete_thread_deletes():
+    from core.ops import delete_thread
+    thread = _ModThread()
+    payload = asyncio.run(delete_thread(_NoActorCtx(), thread))
+    assert thread.deleted
+    assert payload == {"deleted_thread_id": 111, "name": "topic-drift"}
+
+
+def test_add_and_remove_thread_member():
+    from core.ops import add_thread_member, remove_thread_member
+    member = type("M", (), {"id": 42})()
+    thread = _ModThread()
+    add = asyncio.run(add_thread_member(_NoActorCtx(), thread, member))
+    assert thread.added == [member]
+    assert add == {"thread_id": 111, "user_id": 42, "added": True}
+    rem = asyncio.run(remove_thread_member(_NoActorCtx(), thread, member))
+    assert thread.removed == [member]
+    assert rem["removed"] is True
+
+
+def test_list_private_archived_threads_enumerates_private_only():
+    from core.ops import list_private_archived_threads
+    hidden = _FakeThread(id=222, name="secret")
+    parent = type("P", (), {})()
+    holder = _ModThread()
+    holder._archived_private = [hidden]
+    # A channel that parents threads: reuse the _ModThread's iterator by
+    # attaching it to a plain object.
+    parent.archived_threads = holder.archived_threads
+    payload = asyncio.run(
+        list_private_archived_threads(_NoActorCtx(), parent))
+    assert payload["count"] == 1
+    assert payload["threads"][0]["id"] == 222
+
+
+# -- member moderation impls ------------------------------------------------
+
+def test_kick_member_kicks_with_reason():
+    from core.ops import kick_member
+    guild = _CrudGuild()
+    member = type("M", (), {"id": 42, "guild": guild})()
+    payload = asyncio.run(kick_member(_AuthorCtx(), member, reason="spam"))
+    assert guild.kicked == [(member, "spam")]
+    assert payload == {"member_id": 42, "kicked": True}
+
+
+def test_ban_member_passes_delete_seconds():
+    from core.ops import ban_member
+    guild = _CrudGuild()
+    member = type("M", (), {"id": 42, "guild": guild})()
+    payload = asyncio.run(ban_member(_AuthorCtx(), member,
+                                     delete_message_seconds=3600))
+    user, _reason, secs = guild.banned[0]
+    assert user is member
+    assert secs == 3600
+    assert payload["deleted_message_seconds"] == 3600
+
+
+def test_unban_member_unbans():
+    from core.ops import unban_member
+    guild = _CrudGuild()
+    user = type("U", (), {"id": 42})()
+    ctx = _AuthorCtx()
+    ctx.guild = guild
+    payload = asyncio.run(unban_member(ctx, user))
+    assert guild.unbanned[0][0] is user
+    assert payload == {"user_id": 42, "unbanned": True}
+
+
+def test_bulk_ban_caps_and_reports_results():
+    from core.ops import bulk_ban
+    guild = _CrudGuild()
+    ctx = _AuthorCtx()
+    ctx.guild = guild
+    payload = asyncio.run(bulk_ban(ctx, ["1", "2", "3"]))
+    # The _CrudGuild fake bans all but the last, fails the last.
+    assert payload["banned_user_ids"] == [1, 2]
+    assert payload["failed_user_ids"] == [3]
+    assert payload["banned_count"] == 2
+
+
+def test_bulk_ban_refuses_over_200():
+    from core.ops import bulk_ban
+    ctx = _AuthorCtx()
+    ctx.guild = _CrudGuild()
+    with pytest.raises(ValueError, match="at most 200"):
+        asyncio.run(bulk_ban(ctx, [str(i) for i in range(201)]))
+
+
+def test_prune_members_prunes():
+    from core.ops import prune_members
+    guild = _CrudGuild()
+    ctx = _AuthorCtx()
+    ctx.guild = guild
+    payload = asyncio.run(prune_members(ctx, 14))
+    assert guild.pruned_kwargs["days"] == 14
+    assert payload == {"days": 14, "pruned_members": 7}
+
+
+def test_edit_member_roles_adds_and_removes():
+    from core.ops import edit_member_roles
+
+    class _Role:
+        def __init__(self, rid):
+            self.id = rid
+            self.managed = False
+
+        def is_default(self):
+            return False
+
+    r_add, r_rem = _Role(10), _Role(20)
+    guild = _CrudGuild(roles=[r_add, r_rem])
+
+    class _Member:
+        id = 42
+        guild = None
+
+        def __init__(self):
+            self.added = None
+            self.removed = None
+
+        async def add_roles(self, *roles, reason=None):
+            self.added = list(roles)
+
+        async def remove_roles(self, *roles, reason=None):
+            self.removed = list(roles)
+
+    member = _Member()
+    member.guild = guild
+    payload = asyncio.run(edit_member_roles(
+        _AuthorCtx(), member, add_role_ids=["10"], remove_role_ids=["20"]))
+    assert member.added == [r_add]
+    assert member.removed == [r_rem]
+    assert payload == {"member_id": 42, "added_role_ids": [10],
+                       "removed_role_ids": [20]}
+
+
+def test_edit_member_roles_refuses_a_managed_role():
+    from core.ops import edit_member_roles
+
+    class _Managed:
+        id = 10
+        name = "Integration"
+        managed = True
+
+        def is_default(self):
+            return False
+
+    guild = _CrudGuild(roles=[_Managed()])
+    member = type("M", (), {"id": 42, "guild": guild})()
+    with pytest.raises(ValueError, match="managed"):
+        asyncio.run(edit_member_roles(_AuthorCtx(), member,
+                                      add_role_ids=["10"]))
+
+
+# -- message moderation impls -----------------------------------------------
+
+class _ModChannel:
+    def __init__(self, cid=10):
+        self.id = cid
+        self.deleted = None
+        self.purge_kwargs = None
+        self.sent = None
+
+    async def delete_messages(self, messages, *, reason=None):
+        self.deleted = [m.id for m in messages]
+
+    async def purge(self, **kw):
+        self.purge_kwargs = kw
+        return [object(), object(), object()]
+
+    async def send(self, content=None, *, tts=False, stickers=None,
+                   allowed_mentions=None):
+        self.sent = {"content": content, "tts": tts, "stickers": stickers}
+        return type("M", (), {"id": 555, "attachments": []})()
+
+
+def test_bulk_delete_messages_deletes_by_id():
+    from core.ops import bulk_delete_messages
+    chan = _ModChannel()
+    payload = asyncio.run(bulk_delete_messages(
+        _AuthorCtx(), chan, ["1", "2", "3"]))
+    assert chan.deleted == [1, 2, 3]
+    assert payload == {"channel_id": 10, "deleted_count": 3}
+
+
+def test_bulk_delete_messages_caps_at_100():
+    from core.ops import bulk_delete_messages
+    with pytest.raises(ValueError, match="at most 100"):
+        asyncio.run(bulk_delete_messages(
+            _AuthorCtx(), _ModChannel(), [str(i) for i in range(101)]))
+
+
+def test_purge_messages_filters_by_author():
+    from core.ops import purge_messages
+    chan = _ModChannel()
+    author = type("M", (), {"id": 42})()
+    payload = asyncio.run(purge_messages(_AuthorCtx(), chan, 50,
+                                         author=author))
+    assert chan.purge_kwargs["limit"] == 50
+    check = chan.purge_kwargs["check"]
+    assert check(type("Msg", (), {"author": author})())
+    assert not check(type("Msg", (), {
+        "author": type("A", (), {"id": 99})()})())
+    assert payload == {"channel_id": 10, "deleted_count": 3}
+
+
+def test_publish_message_publishes():
+    from core.ops import publish_message
+
+    class _Msg:
+        id = 5
+
+        def __init__(self):
+            self.published = False
+
+        async def publish(self):
+            self.published = True
+
+    msg = _Msg()
+    result = asyncio.run(publish_message(_NoActorCtx(), msg))
+    assert msg.published
+    payload = registry.get("publish_message").serialize_result(result)
+    assert payload == {"message_id": 5, "published": True}
+
+
+def test_send_tts_sends_with_tts_flag():
+    from core.ops import send_tts
+    chan = _ModChannel()
+    asyncio.run(send_tts(_NoActorCtx(), chan, "hello aloud"))
+    assert chan.sent["tts"] is True
+    assert chan.sent["content"] == "hello aloud"
+
+
+def test_send_tts_refuses_empty():
+    from core.ops import send_tts
+    with pytest.raises(ValueError, match="non-empty"):
+        asyncio.run(send_tts(_NoActorCtx(), _ModChannel(), "   "))
+
+
+def test_send_sticker_requires_a_guild_sticker(monkeypatch):
+    import core.ops as ops_module
+    from core.ops import send_sticker
+    sticker = object()
+    monkeypatch.setattr(ops_module, "_require_guild_sticker",
+                        lambda guild, sid: sticker)
+    chan = _ModChannel()
+    chan.guild = type("G", (), {"id": 1})()
+    asyncio.run(send_sticker(_NoActorCtx(), chan, 77))
+    assert chan.sent["stickers"] == [sticker]
+
+
+class _ModMessage:
+    def __init__(self, mid=5):
+        self.id = mid
+        self.removed = []
+        self.cleared_emoji = []
+        self.cleared_all = False
+
+    async def remove_reaction(self, emoji, member):
+        self.removed.append((emoji, member))
+
+    async def clear_reaction(self, emoji):
+        self.cleared_emoji.append(emoji)
+
+    async def clear_reactions(self):
+        self.cleared_all = True
+
+
+def test_remove_reaction_other_targets_the_named_member():
+    from core.ops import remove_reaction_other
+    member = type("M", (), {"id": 42})()
+    msg = _ModMessage()
+    payload = asyncio.run(remove_reaction_other(
+        _NoActorCtx(), msg, member, "👍"))
+    assert msg.removed == [("👍", member)]
+    assert payload == {"message_id": 5, "user_id": 42, "removed": True}
+
+
+def test_clear_reactions_one_emoji_vs_all():
+    from core.ops import clear_reactions
+    msg = _ModMessage()
+    one = asyncio.run(clear_reactions(_NoActorCtx(), msg, emoji="👍"))
+    assert msg.cleared_emoji == ["👍"]
+    assert one == {"message_id": 5, "cleared_emoji": "👍"}
+    msg2 = _ModMessage()
+    allp = asyncio.run(clear_reactions(_NoActorCtx(), msg2))
+    assert msg2.cleared_all
+    assert allp == {"message_id": 5, "cleared_all": True}
+
+
+# -- webhook impls ----------------------------------------------------------
+
+class _FakeWebhook:
+    def __init__(self, wid=7, name="hook", channel_id=10):
+        self.id = wid
+        self.name = name
+        self.channel_id = channel_id
+        self.edit_kwargs = None
+        self.deleted_reason = None
+        self.sent = None
+
+    async def edit(self, *, reason=None, **kw):
+        self.edit_kwargs = dict(kw)
+        for k, v in kw.items():
+            if k == "name":
+                self.name = v
+        return self
+
+    async def delete(self, *, reason=None):
+        self.deleted_reason = reason
+
+    async def send(self, content, *, wait=False, username=None,
+                   avatar_url=None, allowed_mentions=None):
+        self.sent = {"content": content, "username": username,
+                     "avatar_url": avatar_url}
+        return type("M", (), {"id": 900})()
+
+
+class _WebhookChannel:
+    def __init__(self, cid=10, guild=None):
+        self.id = cid
+        self.guild = guild
+        self.created = None
+
+    async def create_webhook(self, *, name, reason=None):
+        self.created = name
+        return _FakeWebhook(name=name, channel_id=self.id)
+
+
+class _WebhookGuild:
+    def __init__(self, gid=1, webhooks=()):
+        self.id = gid
+        self._webhooks = list(webhooks)
+
+    async def webhooks(self):
+        return list(self._webhooks)
+
+
+def test_create_webhook_never_serializes_url_or_token():
+    from core.ops import create_webhook
+    chan = _WebhookChannel()
+    hook = asyncio.run(create_webhook(_AuthorCtx(), chan, "poster"))
+    assert chan.created == "poster"
+    payload = registry.get("create_webhook").serialize_result(hook)
+    assert set(payload) == {"id", "name", "channel_id"}
+    assert "url" not in payload and "token" not in payload
+
+
+def test_edit_webhook_resolves_in_guild_and_renames():
+    from core.ops import edit_webhook
+    hook = _FakeWebhook(wid=7, name="old")
+    guild = _WebhookGuild(webhooks=[hook])
+    asyncio.run(edit_webhook(_AuthorCtx(), guild, 7, name="new"))
+    assert hook.edit_kwargs["name"] == "new"
+
+
+def test_edit_webhook_refuses_unknown_id():
+    from core.ops import edit_webhook
+    guild = _WebhookGuild(webhooks=[])
+    with pytest.raises(ValueError, match="No webhook"):
+        asyncio.run(edit_webhook(_AuthorCtx(), guild, 999, name="x"))
+
+
+def test_delete_webhook_deletes_in_guild():
+    from core.ops import delete_webhook
+    hook = _FakeWebhook(wid=7, name="doomed")
+    guild = _WebhookGuild(webhooks=[hook])
+    payload = asyncio.run(delete_webhook(_AuthorCtx(), guild, 7))
+    assert hook.deleted_reason == "delete_webhook op by tester (321)"
+    assert payload == {"deleted_webhook_id": 7, "name": "doomed"}
+
+
+def test_execute_webhook_posts_under_custom_identity():
+    from core.ops import execute_webhook
+    hook = _FakeWebhook(wid=7)
+    guild = _WebhookGuild(webhooks=[hook])
+    payload = asyncio.run(execute_webhook(
+        _AuthorCtx(), guild, 7, "hi", username="Ghost",
+        avatar_url="https://cdn/a.png"))
+    assert hook.sent == {"content": "hi", "username": "Ghost",
+                         "avatar_url": "https://cdn/a.png"}
+    assert payload == {"webhook_id": 7, "message_id": 900}
+
+
+# -- guild settings impl ----------------------------------------------------
+
+def test_edit_guild_settings_edits_name_and_verification():
+    from core.ops import edit_guild_settings
+    guild = _CrudGuild(name="Old")
+    payload = asyncio.run(edit_guild_settings(
+        _AuthorCtx(), guild, name="New", verification_level="high"))
+    assert guild.edit_kwargs["name"] == "New"
+    assert (guild.edit_kwargs["verification_level"]
+            is discord.VerificationLevel.high)
+    assert payload["name"] == "New"
+
+
+def test_edit_guild_settings_rejects_bad_verification():
+    from core.ops import edit_guild_settings
+    with pytest.raises(ValueError, match="verification_level"):
+        asyncio.run(edit_guild_settings(_AuthorCtx(), _CrudGuild(),
+                                        verification_level="ultra"))
+
+
+def test_edit_guild_settings_requires_a_field():
+    from core.ops import edit_guild_settings
+    with pytest.raises(ValueError, match="Nothing to edit"):
+        asyncio.run(edit_guild_settings(_AuthorCtx(), _CrudGuild()))
+
+
+# -- automod CRUD impls -----------------------------------------------------
+
+class _AutomodGuild:
+    def __init__(self, rules=None):
+        self._rules = {r.id: r for r in (rules or [])}
+        self.create_kwargs = None
+
+    async def create_automod_rule(self, **kw):
+        self.create_kwargs = kw
+        return type("R", (), {"id": 5, "name": kw["name"], "enabled": True})()
+
+    async def fetch_automod_rule(self, rid):
+        return self._rules[rid]
+
+
+class _FakeAutomodRule:
+    def __init__(self, rid=5, name="rule", trigger=None):
+        self.id = rid
+        self.name = name
+        self.trigger = trigger
+        self.edit_kwargs = None
+        self.deleted_reason = None
+
+    async def edit(self, *, reason=None, **kw):
+        self.edit_kwargs = dict(kw)
+        return self
+
+    async def delete(self, *, reason=None):
+        self.deleted_reason = reason
+
+
+def test_create_automod_rule_builds_a_keyword_rule():
+    from core.ops import create_automod_rule
+    guild = _AutomodGuild()
+    asyncio.run(create_automod_rule(
+        _AuthorCtx(), guild, "no swears", "keyword",
+        keyword_filter=["badword"]))
+    kw = guild.create_kwargs
+    assert kw["name"] == "no swears"
+    assert kw["trigger"].keyword_filter == ["badword"]
+    assert kw["event_type"] is discord.AutoModRuleEventType.message_send
+    assert kw["actions"][0].type is discord.AutoModRuleActionType.block_message
+
+
+def test_create_automod_rule_keyword_needs_a_filter():
+    from core.ops import create_automod_rule
+    with pytest.raises(ValueError, match="keyword_filter"):
+        asyncio.run(create_automod_rule(
+            _AuthorCtx(), _AutomodGuild(), "x", "keyword"))
+
+
+def test_create_automod_rule_rejects_unknown_trigger():
+    from core.ops import create_automod_rule
+    with pytest.raises(ValueError, match="trigger_type"):
+        asyncio.run(create_automod_rule(
+            _AuthorCtx(), _AutomodGuild(), "x", "telepathy"))
+
+
+def test_edit_automod_rule_replaces_keyword_filter():
+    from core.ops import edit_automod_rule
+    trigger = type("T", (), {
+        "type": discord.AutoModRuleTriggerType.keyword,
+        "keyword_filter": ["old"], "regex_patterns": []})()
+    rule = _FakeAutomodRule(trigger=trigger)
+    guild = _AutomodGuild(rules=[rule])
+    asyncio.run(edit_automod_rule(_AuthorCtx(), guild, 5,
+                                  keyword_filter=["new"]))
+    assert rule.edit_kwargs["trigger"].keyword_filter == ["new"]
+
+
+def test_edit_automod_rule_requires_a_field():
+    from core.ops import edit_automod_rule
+    rule = _FakeAutomodRule()
+    guild = _AutomodGuild(rules=[rule])
+    with pytest.raises(ValueError, match="Nothing to edit"):
+        asyncio.run(edit_automod_rule(_AuthorCtx(), guild, 5))
+
+
+def test_delete_automod_rule_deletes():
+    from core.ops import delete_automod_rule
+    rule = _FakeAutomodRule(name="doomed")
+    guild = _AutomodGuild(rules=[rule])
+    payload = asyncio.run(delete_automod_rule(_AuthorCtx(), guild, 5))
+    assert rule.deleted_reason == "delete_automod_rule op by tester (321)"
+    assert payload == {"deleted_rule_id": 5, "name": "doomed"}
+
+
+# -- scheduled-event delete + stage lifecycle impls -------------------------
+
+def test_delete_scheduled_event_deletes():
+    from core.ops import delete_scheduled_event
+
+    class _Event:
+        id = 7
+        name = "Movie night"
+
+        def __init__(self):
+            self.deleted = False
+
+        async def delete(self):
+            self.deleted = True
+
+    event = _Event()
+
+    class _Guild:
+        async def fetch_scheduled_event(self, eid):
+            assert eid == 7
+            return event
+
+    payload = asyncio.run(delete_scheduled_event(
+        _NoActorCtx(), 7, guild=_Guild()))
+    assert event.deleted
+    assert payload == {"deleted_event_id": 7, "name": "Movie night"}
+
+
+class _StageInstance:
+    def __init__(self):
+        self.channel_id = 40
+        self.topic = "AMA"
+        self.privacy_level = discord.PrivacyLevel.guild_only
+        self.edit_topic = None
+        self.deleted_reason = None
+
+    async def edit(self, *, topic=None, reason=None):
+        self.edit_topic = topic
+
+    async def delete(self, *, reason=None):
+        self.deleted_reason = reason
+
+
+class _LiveStageChannel(_FakeStageChannelReal):
+    async def create_instance(self, *, topic, send_start_notification=False,
+                              reason=None):
+        inst = _StageInstance()
+        inst.topic = topic
+        self.created = (topic, send_start_notification)
+        return inst
+
+
+def test_create_stage_goes_live():
+    from core.ops import create_stage
+    stage = _LiveStageChannel()
+    inst = asyncio.run(create_stage(_AuthorCtx(), stage, "Town hall"))
+    assert stage.created == ("Town hall", False)
+    payload = registry.get("create_stage").serialize_result(inst)
+    assert payload["topic"] == "Town hall"
+
+
+def test_edit_stage_edits_the_live_instance():
+    from core.ops import edit_stage
+    inst = _StageInstance()
+    stage = _FakeStageChannelReal(instance=inst)
+    asyncio.run(edit_stage(_AuthorCtx(), stage, "New topic"))
+    assert inst.edit_topic == "New topic"
+
+
+def test_edit_stage_refuses_when_no_live_instance():
+    from core.ops import edit_stage
+    stage = _FakeStageChannelReal(instance=None)
+    with pytest.raises(ValueError, match="no live stage"):
+        asyncio.run(edit_stage(_AuthorCtx(), stage, "x"))
+
+
+def test_end_stage_deletes_the_live_instance():
+    from core.ops import end_stage
+    inst = _StageInstance()
+    stage = _FakeStageChannelReal(instance=inst)
+    payload = asyncio.run(end_stage(_AuthorCtx(), stage))
+    assert inst.deleted_reason == "end_stage op by tester (321)"
+    assert payload == {"channel_id": 40, "ended": True}
+
+
+# -- invite delete impl -----------------------------------------------------
+
+def test_delete_invite_deletes_a_guild_owned_code():
+    from core.ops import delete_invite
+
+    class _Invite:
+        code = "abc123"
+
+        def __init__(self):
+            self.deleted_reason = None
+
+        async def delete(self, *, reason=None):
+            self.deleted_reason = reason
+
+    invite = _Invite()
+
+    class _Guild:
+        name = "Guild"
+
+        async def invites(self):
+            return [invite]
+
+    payload = asyncio.run(delete_invite(_AuthorCtx(), _Guild(), "abc123"))
+    assert invite.deleted_reason == "delete_invite op by tester (321)"
+    assert payload == {"deleted": True, "code": "abc123"}
+
+
+def test_delete_invite_refuses_a_foreign_code():
+    from core.ops import delete_invite
+
+    class _Guild:
+        name = "Guild"
+
+        async def invites(self):
+            return []
+
+    with pytest.raises(ValueError, match="No active invite"):
+        asyncio.run(delete_invite(_AuthorCtx(), _Guild(), "nope"))
