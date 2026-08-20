@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from pathlib import Path
@@ -1305,10 +1306,13 @@ async def _index_search(bot, guild_id, channel_ids, limit, author_id, contains):
 
 def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
     """Guild-wide search can surface channels the invoking user can't read;
-    apply the same actor-visibility policy as _check_channel_visibility
-    (real Members are filtered, bare id-holder actors are the MCP frontend's
-    documented accepted risk and pass through). Hits in channels the bot no
-    longer resolves are dropped as unverifiable."""
+    apply the actor-visibility policy of _check_channel_visibility plus the
+    history-specific Read Message History requirement — this is a HISTORY
+    read, so read_messages alone is not enough (the generic gate stays
+    read_messages-only because it also guards non-history ops like
+    send_message). Real Members are filtered; bare id-holder actors are the
+    MCP frontend's documented accepted risk and pass through. Hits in
+    channels the bot no longer resolves are dropped as unverifiable."""
     actor = getattr(ctx, "author", None)
     if actor is None or not hasattr(actor, "guild_permissions"):
         return hits
@@ -1318,7 +1322,13 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
         if channel is None or not hasattr(channel, "permissions_for"):
             continue
         try:
-            if channel.permissions_for(actor).read_messages:
+            p = channel.permissions_for(actor)
+            # History reads need BOTH: View Channel and Read Message History.
+            # Discord treats them as distinct permissions (announcements and
+            # ticket channels commonly grant the first and deny the second),
+            # and search_history runs on the BOT's perms, so the actor's own
+            # history permission must be enforced here.
+            if p.read_messages and p.read_message_history:
                 visible.append(hit)
         except Exception:  # noqa: BLE001 - odd channel types err to hidden
             continue
@@ -1353,7 +1363,9 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
         OpParam("contains", ParamKind.STRING,
                 "Optional filter — keyword(s) to match in message content "
                 "(whole-word matching, like Discord's search bar; also "
-                "matches text inside embeds/links).",
+                "matches text inside embeds/links). The recent-window "
+                "fallback approximates this with a whole-word match on "
+                "message text only.",
                 required=False),
     ],
     serialize=lambda payload: payload,
@@ -1364,9 +1376,12 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
         "this server'); channel_ids: [id] for one channel; channel_ids: "
         "[id1, id2] for a subset. Filter with `contains` (keyword) and/or "
         "`author_id`. Results come back to YOU as data, newest first, each "
-        "hit tagged with its channel_id; `total_matches` is how many exist "
-        "in all — report that number honestly when it exceeds what was "
-        "returned. Read the results and answer in plain text — never paste "
+        "hit tagged with its channel_id; when present, `total_matches` is "
+        "how many exist in all — report that number honestly when it "
+        "exceeds what was returned. When `total_matches` is absent, some "
+        "matches were hidden from the invoking user (see the `note`) — do "
+        "NOT state or estimate a server-wide total. Read the results and "
+        "answer in plain text — never paste "
         "them raw. If the result carries a `note` about a fallback scan, "
         "only the most recent messages were checked — say so instead of "
         "claiming 'never'."),
@@ -1388,8 +1403,19 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
         hits, total = await _index_search(
             ctx.bot, guild.id, [c.id for c in scoped],
             limit, author_id, contains)
+        pre = len(hits)
         hits = _drop_hits_actor_cannot_see(ctx, guild, hits)
-        return {"messages": hits, "count": len(hits), "total_matches": total}
+        payload = {"messages": hits, "count": len(hits)}
+        if len(hits) < pre:
+            # Some matches sit in channels the invoking user cannot read.
+            # The index's total counts THOSE too, so returning it would
+            # disclose activity in hidden channels — omit it and say why.
+            payload["note"] = ("some matches were in channels the invoking "
+                               "user cannot read and were dropped; "
+                               "total_matches omitted")
+        else:
+            payload["total_matches"] = total
+        return payload
     except Exception as exc:
         # Index cold, endpoint withdrawn, or intent missing — degrade rather
         # than failing the tool outright, and SAY so in the payload so the
@@ -1405,16 +1431,37 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
                              "multi-channel search require it — retry with "
                              "channel_ids: [one channel id] to scan that "
                              "channel's recent messages")}
+        # The fallback bypasses _drop_hits_actor_cannot_see (it reads with
+        # the BOT's perms), so enforce the actor's Read Message History
+        # here; same real-Member-only policy as the generic gate.
+        actor = getattr(ctx, "author", None)
+        if actor is not None and hasattr(actor, "guild_permissions"):
+            try:
+                if not scoped[0].permissions_for(actor).read_message_history:
+                    return {"messages": [], "count": 0,
+                            "note": ("actor lacks Read Message History in "
+                                     "this channel")}
+            except Exception:  # noqa: BLE001 - odd channel types err to hidden
+                return {"messages": [], "count": 0,
+                        "note": ("could not verify actor's history "
+                                 "permission in this channel")}
         results = []
+        # Whole-word regex approximates the index path's whole-word
+        # semantics — a bare substring test would silently CHANGE what
+        # counts as a match between the two paths.
+        word = (re.compile(rf"\b{re.escape(contains)}\b", re.IGNORECASE)
+                if contains is not None else None)
         async for message in scoped[0].history(limit=limit):
             if author_id is not None and message.author.id != author_id:
                 continue
-            if contains is not None and contains.lower() not in message.content.lower():
+            if word is not None and not word.search(message.content):
                 continue
             results.append(serialize_message(message))
-        return {"messages": results, "count": len(results),
-                "note": (f"search index unavailable; scanned only the "
-                         f"{limit} most recent messages")}
+        note = (f"search index unavailable; scanned only the "
+                f"{limit} most recent messages")
+        if contains is not None:
+            note += "; `contains` matched via whole-word approximation"
+        return {"messages": results, "count": len(results), "note": note}
 
 
 @registry.op(
@@ -1742,6 +1789,43 @@ async def fetch_dms(ctx: OpContext, user, limit: int = 50,
         rows.append(row_from_message(msg, user.id))
     rows.reverse()  # history() yields newest-first; present oldest-first
     return rows
+
+
+@registry.op(
+    "delete_dm",
+    "Delete a DM message the bot itself sent to a user — the retract "
+    "button for a mistaken send_dm. Refuses messages the bot did not "
+    "author: Discord allows no way to delete the other participant's "
+    "side of a DM.",
+    PermissionLevel.ADMIN,
+    params=[
+        OpParam("user", ParamKind.USER,
+                "Discord user id whose DM conversation holds the message."),
+        # A SNOWFLAKE scalar on purpose, NOT ParamKind.MESSAGE: MESSAGE
+        # implies a required channel_id and resolves through the
+        # guild-refusing channel resolver — exactly what DM ops must avoid
+        # (see the section comment above).
+        OpParam("message_id", ParamKind.SNOWFLAKE,
+                "Discord message id of the bot-authored DM to delete."),
+    ],
+    agent_guidance=(
+        "delete_dm retracts one of the BOT's own DM messages; it can never "
+        "delete anything the user wrote. The stored transcript row is kept, "
+        "so read_dms still shows what was sent and later retracted."),
+    scope=OpScope.DM,
+    group="dm",
+)
+async def delete_dm(ctx: OpContext, user, message_id: int):
+    channel = user.dm_channel or await user.create_dm()
+    message = await channel.fetch_message(message_id)
+    if message.author.id != ctx.bot.user.id:
+        raise ValueError(
+            "delete_dm can only retract the bot's own messages — Discord "
+            "does not allow deleting the other participant's DMs.")
+    await message.delete()
+    # The logs/dms/ transcript row is deliberately untouched: it is the
+    # audit record that the DM existed and was retracted.
+    return True
 
 
 def _parse_color(color: str):

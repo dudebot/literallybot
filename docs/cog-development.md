@@ -257,6 +257,30 @@ Three rules for a service function:
    vs `"exists"` vs `"unchanged"`). The registry turns a raise into
    `OpResult(ok=False, error=...)` for every frontend identically.
 
+### Composing cogs
+
+Cogs never consume each other. No cog imports another cog's module, and no cog
+calls `bot.get_cog("Other")` to reach another cog's methods — the cog-to-cog
+dependency graph is empty by construction, and keeping it empty is what makes
+disabling any cog safe: `disabled_cogs` can drop any optional cog without
+stranding a caller.
+
+When two cogs need the same capability, the capability belongs to neither cog:
+it lives in a headless module (`core/` today; a `utils/` package if a
+deployment grows one), and each cog is a thin Discord surface over it — the
+service-function pattern above, one level up.
+
+The one legitimate `get_cog()` call inside a cog is fetching **its own**
+instance from a detached `View` callback, where discord.py hands the callback
+no cog reference. Fetching a *different* cog is the line not to cross.
+
+There is deliberately **no dependency system** behind the `!cogs` panel — no
+"cog X requires cog Y" metadata, no load ordering. With zero edges in the
+graph there is nothing for it to enforce, and the cog set is fixed at boot
+(#86), so there is no runtime unload to protect against either. Don't build
+one until a real cog-to-cog edge exists — and before creating that edge,
+prefer moving the shared capability into a headless module instead.
+
 ### Declaring the op
 
 Import the module-level `op` decorator from `core.ops` and decorate an **async**

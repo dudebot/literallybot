@@ -134,7 +134,8 @@ loop precisely when it acts on a guild — that is what `scope` means. WHICH of
 those a guild enables is per-guild config, not a constant in `core/ops.py`.
 
 Assignments: `send_dm`/`read_dms`/`fetch_dms` = DM; `list_guilds` = GLOBAL; the
-other 22 core ops = GUILD.
+other 22 core ops = GUILD. (2026-08: `delete_dm` — user-keyed retract of
+bot-authored DMs, #90 — later joined the DM set.)
 
 **Live queries are mandatory, not stylistic.** Cog ops appear and disappear with
 cog load/unload, so any import-time tuple is stale after the first `!reload`.

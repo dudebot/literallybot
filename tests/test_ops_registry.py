@@ -131,13 +131,14 @@ def test_guild_agent_universe_is_exactly_the_guild_scoped_ops():
     assert universe == {o.name for o in registry.ops() if o.scope == OpScope.GUILD}
     # DM and global ops are guild-confinement-incompatible and must not leak
     # into a guild-confined, user-actored loop.
-    for name in ("send_dm", "read_dms", "fetch_dms", "list_guilds"):
+    for name in ("send_dm", "read_dms", "fetch_dms", "delete_dm",
+                 "list_guilds"):
         assert name not in universe
 
 
 def test_scope_assignments():
     assert {o.name for o in registry.ops(scope=OpScope.DM)} == {
-        "send_dm", "read_dms", "fetch_dms"}
+        "send_dm", "read_dms", "fetch_dms", "delete_dm"}
     assert {o.name for o in registry.ops(scope=OpScope.GLOBAL)} == {"list_guilds"}
 
 
@@ -189,17 +190,24 @@ def test_role_ops_take_guild_from_wire_or_ambient_context():
     assert set(roles["required"]) == {"user_id", "role_id"}
 
 
-@pytest.mark.parametrize("name", ["send_dm", "read_dms", "fetch_dms"])
-def test_dm_ops_take_a_user_id_and_nothing_guild_shaped(name):
+@pytest.mark.parametrize("name,required", [
+    ("send_dm", {"user_id"}),
+    ("read_dms", {"user_id"}),
+    ("fetch_dms", {"user_id"}),
+    ("delete_dm", {"user_id", "message_id"}),
+])
+def test_dm_ops_take_a_user_id_and_nothing_guild_shaped(name, required):
     """DM ops resolve a guild-independent USER, one-to-one with the DM API.
     A raw DM channel id is never accepted, and the removed guild_id must not
-    creep back in (see the DM section comment in core/ops.py)."""
+    creep back in (see the DM section comment in core/ops.py). delete_dm's
+    message_id is a SNOWFLAKE scalar, not a MESSAGE param — MESSAGE would
+    drag in a required channel_id and the guild-refusing resolver."""
     schema = registry.get(name).to_json_schema()
     assert "user_id" in schema["properties"]
     assert schema["properties"]["user_id"]["type"] == "string"
     assert "channel_id" not in schema["properties"]
     assert "guild_id" not in schema["properties"]
-    assert set(schema["required"]) == {"user_id"}
+    assert set(schema["required"]) == required
 
 
 def test_emoji_ids_are_snowflake_strings():
@@ -275,6 +283,159 @@ def test_attachment_loads_a_valid_file(tmp_path):
     files = load_discord_attachments([str(good)])
     assert len(files) == 1
     files[0].close()
+
+
+# --------------------------------------------------------------------------
+# search_history actor-permission enforcement (#71). History is gated on
+# BOTH View Channel and Read Message History — Discord treats them as
+# distinct permissions, and search_history reads with the BOT's perms, so
+# the invoking member's own history permission must be enforced in the op.
+# --------------------------------------------------------------------------
+
+class _Perms:
+    def __init__(self, read_messages=True, read_message_history=True):
+        self.read_messages = read_messages
+        self.read_message_history = read_message_history
+
+
+class _FakeMember:
+    """hasattr(actor, 'guild_permissions') marks a real Member to the gates."""
+    guild_permissions = object()
+
+
+class _FakeGuild:
+    def __init__(self, gid, channels):
+        self.id = gid
+        self._channels = {c.id: c for c in channels}
+
+    def get_channel(self, cid):
+        return self._channels.get(cid)
+
+
+class _FakeChannel:
+    def __init__(self, cid, perms, messages=(), guild=None):
+        self.id = cid
+        self._perms = perms
+        self._messages = list(messages)
+        self.guild = guild
+        self.history_calls = 0
+
+    def permissions_for(self, member):
+        return self._perms
+
+    def history(self, limit=100):
+        self.history_calls += 1
+        messages = self._messages[:limit]
+
+        async def gen():
+            for m in messages:
+                yield m
+        return gen()
+
+
+class _FakeMessage:
+    def __init__(self, mid, channel, content):
+        self.id = mid
+        self.channel = channel
+        self.author = type("A", (), {"id": 999})()
+        self.content = content
+        self.created_at = None
+
+
+def _search_ctx(guild, member=None):
+    return OpContext(bot=None, author=member or _FakeMember(), guild=guild)
+
+
+def test_search_history_drops_hits_where_actor_lacks_history_perm(monkeypatch):
+    """Index path: a member with View Channel but NOT Read Message History
+    must not receive hits from that channel, and the unfiltered index total
+    must be omitted (it counts hidden-channel matches too)."""
+    import core.ops as ops_module
+    guild = _FakeGuild(1, [])
+    visible = _FakeChannel(10, _Perms(True, True), guild=guild)
+    denied = _FakeChannel(20, _Perms(True, False), guild=guild)  # the #71 combo
+    guild._channels = {10: visible, 20: denied}
+    hit_a = {"id": 1, "channel_id": 10, "content": "ok"}
+    hit_b = {"id": 2, "channel_id": 20, "content": "secret"}
+
+    async def fake_index(bot, gid, cids, limit, author_id, contains):
+        return [hit_a, hit_b], 42
+    monkeypatch.setattr(ops_module, "_index_search", fake_index)
+
+    res = asyncio.run(registry.call("search_history", _search_ctx(guild)))
+    assert res.ok
+    assert res.value["messages"] == [hit_a]
+    assert res.value["count"] == 1
+    assert "total_matches" not in res.value
+    assert "note" in res.value
+
+
+def test_search_history_allowed_actor_gets_hits_and_total(monkeypatch):
+    """A member with both permissions everywhere is unaffected: all hits
+    returned, total_matches present, no filtering note."""
+    import core.ops as ops_module
+    guild = _FakeGuild(1, [])
+    chan = _FakeChannel(10, _Perms(True, True), guild=guild)
+    guild._channels = {10: chan}
+    hits = [{"id": 1, "channel_id": 10, "content": "ok"}]
+
+    async def fake_index(bot, gid, cids, limit, author_id, contains):
+        return list(hits), 42
+    monkeypatch.setattr(ops_module, "_index_search", fake_index)
+
+    res = asyncio.run(registry.call("search_history", _search_ctx(guild)))
+    assert res.ok
+    assert res.value["messages"] == hits
+    assert res.value["total_matches"] == 42
+    assert "note" not in res.value
+
+
+def test_search_history_fallback_refuses_history_denied_actor(monkeypatch):
+    """Fallback path: the recent-window scan reads with the bot's perms and
+    bypasses per-hit filtering, so a history-denied member must be refused
+    outright — and the channel's history must never be iterated."""
+    import core.ops as ops_module
+
+    async def broken_index(*a, **k):
+        raise RuntimeError("index cold")
+    monkeypatch.setattr(ops_module, "_index_search", broken_index)
+
+    guild = _FakeGuild(1, [])
+    denied = _FakeChannel(20, _Perms(True, False), guild=guild)
+    guild._channels = {20: denied}
+
+    res = asyncio.run(registry.call(
+        "search_history", _search_ctx(guild), channels=[denied]))
+    assert res.ok
+    assert res.value["messages"] == []
+    assert res.value["count"] == 0
+    assert "Read Message History" in res.value["note"]
+    assert denied.history_calls == 0
+
+
+def test_search_history_fallback_matches_whole_words(monkeypatch):
+    """Fallback path: `contains` promises whole-word semantics (the index
+    path's behavior); a bare substring test would silently change match
+    semantics between the two paths."""
+    import core.ops as ops_module
+
+    async def broken_index(*a, **k):
+        raise RuntimeError("index cold")
+    monkeypatch.setattr(ops_module, "_index_search", broken_index)
+
+    guild = _FakeGuild(1, [])
+    chan = _FakeChannel(10, _Perms(True, True), guild=guild)
+    chan._messages = [
+        _FakeMessage(1, chan, "let us concatenate strings"),  # substring only
+        _FakeMessage(2, chan, "a CAT sat here"),              # whole word
+    ]
+    guild._channels = {10: chan}
+
+    res = asyncio.run(registry.call(
+        "search_history", _search_ctx(guild), channels=[chan], contains="cat"))
+    assert res.ok
+    assert [m["id"] for m in res.value["messages"]] == [2]
+    assert "whole-word" in res.value["note"]
 
 
 def test_attachment_rejects_missing_file():
@@ -621,3 +782,49 @@ def test_clear_all_clears_names_whose_cog_is_unloaded():
     # The surviving-name case is the one an operator could never see, so the
     # flash has to name it rather than reporting a bare success.
     assert "ghost_op" in (view._flash or "")
+
+
+# --------------------------------------------------------------------------
+# delete_dm implementation: bot-author-only retraction (no Discord needed).
+# --------------------------------------------------------------------------
+
+class _FakeDMChannel:
+    def __init__(self, message):
+        self._message = message
+
+    async def fetch_message(self, message_id):
+        return self._message
+
+
+class _FakeDMMessage:
+    def __init__(self, author_id):
+        self.author = type("A", (), {"id": author_id})()
+        self.deleted = False
+
+    async def delete(self):
+        self.deleted = True
+
+
+def _dm_ctx_and_user(message, bot_id=555):
+    bot = type("B", (), {"user": type("U", (), {"id": bot_id})()})()
+    user = type("Target", (), {"dm_channel": _FakeDMChannel(message)})()
+    return OpContext(bot=bot, author=None, guild=None), user
+
+
+def test_delete_dm_deletes_a_bot_authored_message():
+    from core.ops import delete_dm
+    msg = _FakeDMMessage(author_id=555)
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    assert asyncio.run(delete_dm(ctx, user, 123)) is True
+    assert msg.deleted
+
+
+def test_delete_dm_refuses_the_other_participants_message():
+    """The refusal is LOCAL (a pre-check before any delete call), not a
+    relayed Discord 403 — the op never even attempts the API delete."""
+    from core.ops import delete_dm
+    msg = _FakeDMMessage(author_id=999)
+    ctx, user = _dm_ctx_and_user(msg, bot_id=555)
+    with pytest.raises(ValueError, match="bot's own"):
+        asyncio.run(delete_dm(ctx, user, 123))
+    assert not msg.deleted

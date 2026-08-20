@@ -71,8 +71,8 @@ Security properties enforced centrally, so no frontend can skip them:
 - **Scope is a structural boundary.** Every op declares an `OpScope`, and the
   in-guild agent's tool universe is *derived* as exactly the `GUILD`-scoped ops
   (`registry.guild_agent_names()`), queried live. DM-scoped ops (`send_dm`,
-  `read_dms`, `fetch_dms`) and global ops (`list_guilds`) are therefore never
-  offerable to a guild's agent surface at all — not by config, not by mistake.
+  `read_dms`, `fetch_dms`, `delete_dm`) and global ops (`list_guilds`) are
+  therefore never offerable to a guild's agent surface at all — not by config, not by mistake.
   There is no hand-maintained "agent tools" list to drift (the former
   `agent=True` flag was removed in the 2026-08 refactor).
 - **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
@@ -156,8 +156,9 @@ gates are fail-closed and independently required:
   `MCP_OPS_GUILD_ALLOWLIST` gate was removed). MCP tools act as raw
   primitives: every guild the bot account is in is addressable, and access
   control belongs upstream in the MCP caller. DM channels are still refused
-  on id-based calls — DMs flow only through the user-keyed DM ops (user_id
-  only, matching the DM API; Discord refuses bot DMs to strangers). The one
+  on id-based calls — DMs flow only through the user-keyed DM ops (keyed by
+  user_id, never a channel id, matching the DM API; Discord refuses bot DMs
+  to strangers; `delete_dm` retracts only bot-authored messages). The one
   guild-confined surface in the system is the in-bot `!gpt` agent loop,
   which passes exactly `{ctx.guild.id}` to the registry.
 

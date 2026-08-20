@@ -49,7 +49,7 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 
 ## ✨ Key Features
 
-- **🧭 One Ops Layer, Many Frontends** — 26 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
+- **🧭 One Ops Layer, Many Frontends** — 27 permission-checked Discord primitives declared once, driving the in-chat agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
 - **🧩 Modular Cog System** — features are self-contained cogs; disable them globally without deleting them (binds at restart); cogs can register their own ops
 - **🤖 AI Integration** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory, personality, and an optional agentic mode that performs real Discord actions
 - **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
@@ -79,7 +79,7 @@ differs, and the panel shows them as separate sections.
 ```mermaid
 flowchart TB
     subgraph SRC["Where ops come from"]
-        CORE["core/ops.py<br/><i>26 API primitives</i><br/>@registry.op(...) · origin=core"]
+        CORE["core/ops.py<br/><i>27 API primitives</i><br/>@registry.op(...) · origin=core"]
         COG["Any cog — behavioral primitives<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
     end
 
@@ -322,7 +322,8 @@ than fixed.)
   `search_history` clamps `limit` to 200.
 - **Full guild reach by design** — tools act as raw primitives: every guild
   the bot account is in is addressable. DMs flow through the dedicated
-  `send_dm`/`read_dms`/`fetch_dms` ops, never through id-based channel calls.
+  `send_dm`/`read_dms`/`fetch_dms`/`delete_dm` ops, never through id-based
+  channel calls.
   Access control belongs upstream in the MCP caller; the only guild-confined
   surface is the in-bot agent loop (pinned to its invoking guild).
 - **Accepted risk:** `actor_id` is caller-supplied and not bound to the
@@ -364,7 +365,7 @@ port if you set `mcp_ops_port`):
 ```
 
 **Exposed tools:** by default the full ops registry, queried live when the
-server starts — so ops a cog registered are included too. The 26 API
+server starts — so ops a cog registered are included too. The 27 API
 primitives, by group:
 
 | Group | Ops |
@@ -373,7 +374,7 @@ primitives, by group:
 | **Roles** | `add_role`, `remove_role`, `list_roles`, `list_role_members`, `create_role`, `edit_role`, `delete_role` |
 | **Emojis** | `list_emojis`, `create_emoji`, `edit_emoji`, `delete_emoji` |
 | **Guild info** | `list_channels`, `list_members`, `list_channel_overwrites` |
-| **Direct messages** | `send_dm`, `read_dms`, `fetch_dms` |
+| **Direct messages** | `send_dm`, `read_dms`, `fetch_dms`, `delete_dm` |
 | **Guild** | `list_guilds` |
 
 Loaded cogs add their own behavioral primitives on top (e.g.

@@ -36,9 +36,9 @@ Guardrails (per the Codex review of the original spike, issue #58):
   control belongs upstream in the caller. The only guild confinement in
   the system is the in-bot !gpt agent loop's own {ctx.guild.id} policy.
   DM channels are still refused on id-based calls — DMs flow only through
-  the user-keyed DM ops (send_dm/read_dms/fetch_dms), one-to-one with the
-  DM API (user_id only; Discord itself refuses bot DMs to users sharing
-  no guild).
+  the user-keyed DM ops (send_dm/read_dms/fetch_dms/delete_dm), one-to-one
+  with the DM API (keyed by user_id, never a channel id; Discord itself
+  refuses bot DMs to users sharing no guild).
 - send_message always sends with allowed_mentions=none — no pings, ever.
 - search_history clamps `limit` to core.ops.HISTORY_LIMIT_MAX (200),
   declared on the op itself.
@@ -92,8 +92,10 @@ _LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
 # itself as ITS deployment, not as whichever bot it was written for.
 DEFAULT_SERVER_NAME = "discord-ops"
 
-# "array" is always a list of snowflake ids, carried as strings (ops.py
-# CHANNEL_LIST is the only array wire kind; see Op.to_json_schema).
+# "array" always carries STRING items: both array wire kinds (CHANNEL_LIST
+# snowflake ids, plain STRING_LIST) are string-itemed, so one mapping serves
+# (see Op.to_json_schema). An array kind with NON-string items must grow an
+# items-type facet on WireParam — and split this mapping with it.
 _JSON_TYPE_TO_PY = {"integer": int, "string": str, "boolean": bool,
                     "array": List[str]}
 
