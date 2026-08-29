@@ -173,12 +173,20 @@ def _all_on():
     return {n: True for n in registry.names()}
 
 
+def _all_in():
+    """Guild gate that puts every op in the agent universe (admin).
+    default_gate is off, so whitelist-alone is not enough — tests of
+    scope/whitelist use this to opt the universe in without testing the
+    default."""
+    return {n: "admin" for n in registry.names()}
+
+
 def test_guild_agent_universe_is_exactly_guild_scope_including_cog_ops(
         crowded_registry):
     """The live-query doctrine: guild-scoped ops registered by a COG join the
     agent universe automatically, with no code-level subset to update. With
     the whitelist fully open, the universe is exactly the guild-scoped set."""
-    universe = set(agent_universe(_all_on(), None))
+    universe = set(agent_universe(_all_on(), _all_in()))
     assert universe == set(registry.op_names(scope=OpScope.GUILD))
     assert {n for n in universe if n.startswith("crowd_op_")}, \
         "cog-registered guild ops must join the agent universe live"
@@ -191,7 +199,7 @@ def test_non_guild_scopes_never_reach_the_guild_agent_surface(scope):
     DM or global op is covered the day it is written."""
     off_limits = set(registry.op_names(scope=scope))
     assert off_limits, f"no {scope.value}-scoped ops — is the assignment gone?"
-    assert not off_limits & set(agent_universe(_all_on(), None))
+    assert not off_limits & set(agent_universe(_all_on(), _all_in()))
 
     server_tab = {o.value for sel in _rendered_selects(OpScope.GUILD)
                   for o in sel.options}
@@ -278,7 +286,8 @@ def test_unregistered_name_drops_from_effective_set_but_not_from_config():
     whitelist = {"search_history": True, "ghost_tool": True}
 
     # Cog unloaded: ghost_tool is not live, so it is not offered to the agent.
-    assert agent_universe(whitelist, None) == ["search_history"]
+    gates = {**_all_in(), "ghost_tool": "admin"}
+    assert agent_universe(whitelist, gates) == ["search_history"]
     assert whitelist == {"search_history": True, "ghost_tool": True}, \
         "resolution must not mutate the whitelist"
 
@@ -286,12 +295,12 @@ def test_unregistered_name_drops_from_effective_set_but_not_from_config():
     cog = _GhostCog()
     registry.register_cog_ops(cog)
     try:
-        assert set(agent_universe(whitelist, None)) == {"search_history", "ghost_tool"}
+        assert set(agent_universe(whitelist, gates)) == {"search_history", "ghost_tool"}
     finally:
         registry.unregister_owner(cog)
 
     # Unloaded again: back to the effective subset, whitelist still intact.
-    assert agent_universe(whitelist, None) == ["search_history"]
+    assert agent_universe(whitelist, gates) == ["search_history"]
     assert whitelist == {"search_history": True, "ghost_tool": True}
 
 
@@ -330,7 +339,8 @@ def test_a_panel_save_while_the_cog_is_unloaded_preserves_the_ghost():
     cog = _GhostCog()
     registry.register_cog_ops(cog)
     try:
-        assert "ghost_tool" in agent_universe(whitelist, None)
+        assert "ghost_tool" in agent_universe(
+            whitelist, {**_all_in(), "ghost_tool": "admin"})
     finally:
         registry.unregister_owner(cog)
 
@@ -531,7 +541,11 @@ def test_whitelist_tab_writes_global_config(monkeypatch):
     assert config.globals[WHITELIST_KEY] == {"search_history": True}
     assert ("agent_ops_whitelist", {"search_history": True}) in config.global_writes
     # The loop's resolver now offers it.
-    assert "search_history" in agent_universe(config.globals[WHITELIST_KEY], None)
+    assert "search_history" not in agent_universe(
+        config.globals[WHITELIST_KEY], None), \
+        "whitelist alone must not expose an op; default_gate is off"
+    assert "search_history" in agent_universe(
+        config.globals[WHITELIST_KEY], {"search_history": "admin"})
 
 
 def test_whitelist_save_preserves_offline_names(monkeypatch):

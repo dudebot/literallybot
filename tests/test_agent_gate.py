@@ -16,7 +16,7 @@ class _FakeOp:
         self.permission = permission
 
     def default_gate(self):
-        return "everyone" if self.permission == PermissionLevel.EVERYONE else "admin"
+        return "off"
 
 
 # ---- whitelist ceiling ----
@@ -36,9 +36,9 @@ def test_whitelist_false_disables_one_op():
 
 # ---- per-op default ----
 
-def test_default_gate_from_permission():
-    assert _FakeOp("x", permission=PermissionLevel.EVERYONE).default_gate() == "everyone"
-    assert _FakeOp("x", permission=PermissionLevel.ADMIN).default_gate() == "admin"
+def test_default_gate_is_always_off():
+    assert _FakeOp("x", permission=PermissionLevel.EVERYONE).default_gate() == "off"
+    assert _FakeOp("x", permission=PermissionLevel.ADMIN).default_gate() == "off"
 
 
 
@@ -50,7 +50,7 @@ def test_guild_override_wins_when_whitelisted():
     wl = {"send_message": True}
     assert ag.effective_gate(op, wl, {"send_message": "admin"}) == ag.GATE_ADMIN
     assert ag.effective_gate(op, wl, {"send_message": "off"}) == ag.GATE_OFF
-    assert ag.effective_gate(op, wl, None) == ag.GATE_EVERYONE  # its default
+    assert ag.effective_gate(op, wl, None) == ag.GATE_OFF  # default_gate is always off
 
 
 def test_guild_override_ignored_when_not_whitelisted():
@@ -60,8 +60,8 @@ def test_guild_override_ignored_when_not_whitelisted():
 
 
 def test_invalid_guild_gate_value_falls_back_to_default():
-    op = _FakeOp("kick_member")  # ADMIN floor ⇒ default_gate admin
-    assert ag.guild_gate(op, {"kick_member": "banana"}) == "admin"
+    op = _FakeOp("kick_member")
+    assert ag.guild_gate(op, {"kick_member": "banana"}) == "off"
 
 
 # ---- call-time admin requirement ----

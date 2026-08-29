@@ -58,6 +58,11 @@ class LiterallyBot(commands.Bot):
                 logger.error("Login succeeded but saving the token failed; "
                              "the bot is running, you will be prompted again "
                              "next start.", exc_info=True)
+        from utils import points as points_mod
+        names = ops_registry.register_module_ops(points_mod)
+        if names:
+            logger.info(f"Registered {len(names)} op(s) from utils.points: "
+                        f"{', '.join(names)}")
         await load_cogs()
 
     async def add_cog(self, cog, **kwargs):

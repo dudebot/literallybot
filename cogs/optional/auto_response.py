@@ -319,6 +319,7 @@ class AutoResponse(commands.Cog):
             "second removal rather than reusing a stale index."),
         scope=OpScope.GUILD,
         group="auto-response",
+        group_label="Auto-responses",
     )
     async def op_list_autoresponses(self, ctx) -> dict:
         guild = getattr(ctx, "guild", None)
@@ -357,6 +358,7 @@ class AutoResponse(commands.Cog):
             "stored."),
         scope=OpScope.GUILD,
         group="auto-response",
+        group_label="Auto-responses",
     )
     async def op_add_autoresponse(self, ctx, triggers, responses,
                                   match: str = MATCH_FULL,
@@ -382,6 +384,7 @@ class AutoResponse(commands.Cog):
             "read — indexes are positional, not stable ids."),
         scope=OpScope.GUILD,
         group="auto-response",
+        group_label="Auto-responses",
     )
     async def op_remove_autoresponse(self, ctx, index: int) -> dict:
         guild = getattr(ctx, "guild", None)

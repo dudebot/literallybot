@@ -164,9 +164,9 @@ Security properties enforced centrally, so no frontend can skip them:
   `edit_automod_rule`, `delete_automod_rule`); the scheduled-event delete
   (`delete_scheduled_event`) and stage lifecycle (`create_stage`,
   `edit_stage`, `end_stage`); and the invite delete (`delete_invite`). Every
-  one is at least `PermissionLevel.ADMIN` and defaults its per-guild agent
-  gate to admin (derived from its permission floor by `default_gate()` in
-  `core/ops.py`) — none is ever `everyone`. Three carry
+  one is at least `PermissionLevel.ADMIN`. `default_gate()` is always off, so
+  a whitelist tick does not expose the op to members until a guild admin
+  opts it in. Three carry
   server-wide blast radius and are `PermissionLevel.SUPERADMIN`:
   `edit_guild_settings` (guild identity/verification posture), `bulk_ban`
   (up to 200 members in one call), and `purge_messages` (unbounded mass
@@ -191,7 +191,7 @@ why the defaults look permissive:
 |---|---------|--------|---------|
 | **`PermissionLevel`** (per op, in code) | **Whether a given actor may run it** | The op's declaration; not configurable at runtime | enforced always |
 | **`agent_ops_whitelist`** (global) | Whether the agent may *ever* see it | superadmin | empty ⇒ plain chat |
-| **`agent_ops_gate`** (per guild) | off / admin / everyone for that guild's agent | any bot admin of that guild | op's `default_gate()` |
+| **`agent_ops_gate`** (per guild) | off / admin / everyone for that guild's agent | any bot admin of that guild | `off` (`default_gate()`) |
 | **`mcp_tools_enabled`** (global) | Whether the MCP server *serves* it | superadmin | absent ⇒ **whole registry** |
 
 Enabling an op grants **exposure**, never **authorization**. Every call still

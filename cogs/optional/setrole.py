@@ -527,6 +527,7 @@ class SetRole(commands.Cog):
             "the user rather than silently retrying with replace_existing."),
         scope=OpScope.GUILD,
         group="role-automation",
+        group_label="Role automation",
     )
     async def op_add_emoji_role_toggle(self, ctx, channel, message_id: int,
                                        emoji: str, role,
@@ -550,6 +551,7 @@ class SetRole(commands.Cog):
             "deliberately leaves them in config for a human to decide on."),
         scope=OpScope.GUILD,
         group="role-automation",
+        group_label="Role automation",
     )
     async def op_sync_emoji_role_toggles(self, ctx) -> dict:
         guild = getattr(ctx, "guild", None)

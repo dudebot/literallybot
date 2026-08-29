@@ -56,12 +56,18 @@ def test_registry_is_not_empty():
 
 
 @pytest.mark.parametrize("name", ALL_OPS)
+def test_every_core_op_defaults_agent_gate_off(name):
+    assert registry.require(name).default_gate() == "off"
+
+
+@pytest.mark.parametrize("name", ALL_OPS)
 def test_every_op_declares_scope_and_known_group(name):
     o = registry.require(name)
     assert isinstance(o.scope, OpScope)
     assert o.group in OP_GROUPS, (
-        f"op '{name}' declares group '{o.group}', which is not in OP_GROUPS — "
-        f"add it there (with a display label) or use an existing group")
+        f"core op '{name}' declares group '{o.group}', which is not in "
+        f"OP_GROUPS — core primitives keep their groups in that catalog; "
+        f"cog/util groups self-register and must not be added here")
 
 
 @pytest.mark.parametrize("name", ALL_OPS)
@@ -3811,7 +3817,7 @@ def test_owner_tier_permission_floor(name):
                 else PermissionLevel.ADMIN)
     assert o.permission == expected, f"{name} floor {o.permission}"
     assert o.scope == OpScope.GUILD
-    assert o.default_gate() == "admin"  # derived from the ADMIN+ floor
+    assert o.default_gate() == "off"
 
 
 @pytest.mark.parametrize("name,group", sorted(OWNER_TIER_GROUPS.items()))

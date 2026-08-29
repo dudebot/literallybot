@@ -40,3 +40,20 @@ def test_set_points_clamps_at_zero():
     bot, user = _Bot(), _User()
     assert set_points(bot, user, -3) == 0
     assert get_points(bot, user) == 0
+
+
+def test_points_ops_register_from_the_module_not_the_cog():
+    """The store is the primitive; the Points cog is only UI. Tools must
+    exist even if that cog is in disabled_cogs."""
+    from core.ops import OpsRegistry
+    from utils import points as points_mod
+    reg = OpsRegistry()
+    names = set(reg.register_module_ops(points_mod))
+    assert names == {"get_user_points", "add_user_points", "set_user_points"}
+    assert reg.label_for("points") == "Points"
+    for name in names:
+        op = reg.require(name)
+        assert op.origin == "cog"
+        assert op.owner is points_mod
+        assert op.default_gate() == "off"
+        assert op.group == "points"

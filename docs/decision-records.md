@@ -478,5 +478,6 @@ Alongside it, agent exposure became **two-tier** (`core/agent_gate.py`): the
 global `agent_ops_whitelist` (superadmin ceiling, fail-closed) x the
 per-guild `agent_ops_gate` (off/admin/everyone tri-state, guild-admin
 savable). This superseded the per-guild `bot_tools_enabled` allowlist.
-The later `eab7105` deleted the redundant `agent_default` field — the admin
-default is derived from the op's permission floor by `default_gate()`.
+The later `eab7105` deleted the redundant `agent_default` field.
+`default_gate()` is always `"off"`: a whitelist tick does not expose an op
+to a guild's members until a guild admin picks Admin or Everyone.

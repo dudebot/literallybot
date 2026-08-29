@@ -313,6 +313,7 @@ class Media(commands.Cog):
             "tool; that is the admin `!media` panel."),
         scope=OpScope.GUILD,
         group="media",
+        group_label="Media library",
     )
     async def op_list_media(self, ctx) -> dict:
         guild = getattr(ctx, "guild", None)
@@ -339,6 +340,7 @@ class Media(commands.Cog):
             "matches nothing is an error, not an empty post."),
         scope=OpScope.GUILD,
         group="media",
+        group_label="Media library",
     )
     async def op_post_media(self, ctx, channel, name: str) -> dict:
         guild = getattr(channel, "guild", None)

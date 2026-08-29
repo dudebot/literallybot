@@ -11,8 +11,9 @@ top of each op's hardcoded `permission` floor:
 
 2. **Per-guild gate** — `agent_ops_gate` = {op_name: "off"|"admin"|"everyone"},
    set by a server admin. Missing entry falls back to the op's `default_gate()`
-   ("would a regular member reasonably ask for this?"). "off" hides the op from
-   that guild's agent and panel.
+   (always `"off"` — a whitelist tick does not expose the op to members until
+   a guild admin picks Admin or Everyone). "off" hides the op from that
+   guild's agent and panel.
 
 Resolution order for a guild + op: not whitelisted → OFF; else guild override if
 present; else the op's default. A super-admin invoking the agent bypasses the

@@ -160,14 +160,14 @@ OP_GROUPS: Dict[str, str] = {
     "automod": "AutoMod",               # automod rule create/edit/delete
     "dm": "Direct messages",
     "guild": "Guild",
-    # Cog-provided groups. Declared here (not invented ad hoc by the cog) so
-    # a panel section keeps a stable order and display label whether or not
-    # the owning cog happens to be loaded.
-    "role-automation": "Role automation",
+    # Shared by core webhook primitives AND the danbooru cog. The id stays
+    # here because core ops use it; the cog's group_label matches.
     "integrations": "Integrations",
-    "auto-response": "Auto-responses",   # auto_response.py
-    "media": "Media library",            # media.py
 }
+# Cog and util ops declare their own group id (+ optional group_label) on
+# `@op`. The live registry learns those groups at registration; they are
+# NOT listed here. This dict is the catalog of CORE primitive groups only
+# — a fork cog must never need a line in this file.
 
 # Where an op came from. Assigned by the REGISTRATION PATH, never accepted
 # as a decorator argument — a cog cannot claim to be core.
@@ -439,8 +439,10 @@ class Op:
     # it claimed to describe.
     scope: OpScope = OpScope.GUILD
     # Which group this op renders under in a frontend's grouped listing.
-    # Kebab-case key into OP_GROUPS.
+    # Core primitives use an OP_GROUPS key; cog/util ops pass any kebab-case
+    # id and an optional group_label (the registry learns the label live).
     group: str = "messaging"
+    group_label: Optional[str] = None
     # 'core' for ops registered inline in this module, 'cog' for ops a cog
     # contributed via register_cog_ops. Stamped by the registration path,
     # never passed in by the op author.
@@ -456,12 +458,15 @@ class Op:
     agent_guidance: Optional[str] = None
 
     def default_gate(self) -> str:
-        """The Off/Admin/Everyone default for this op's agent exposure, derived
-        from its permission floor: an EVERYONE-floor op defaults to everyone,
-        anything gated defaults to admin. (There is deliberately no per-op
-        override — see the two-tier gate in core/agent_gate; add one only when
-        an op genuinely needs a default that diverges from its floor.)"""
-        return "everyone" if self.permission == PermissionLevel.EVERYONE else "admin"
+        """The Off/Admin/Everyone default for this op's agent exposure.
+
+        Always off: an op the super-admin has whitelisted still does not
+        reach a guild's members until a guild admin picks Admin or Everyone
+        in /aisettings. PermissionLevel is the invoke floor, not the agent
+        default — mapping EVERYONE-floor ops to gate "everyone" would make
+        a single whitelist tick expose send_message (and friends) to every
+        member."""
+        return "off"
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
         allowed, reason = _check_permission(ctx, self.permission)
@@ -783,6 +788,7 @@ class OpSpec:
     agent_guidance: Optional[str] = None
     scope: OpScope = OpScope.GUILD
     group: str = "messaging"
+    group_label: Optional[str] = None
 
 
 # Attribute an OpSpec rides on. Mirrors how discord.py's CogMeta finds
@@ -796,8 +802,12 @@ def op(name: str, description: str, permission: PermissionLevel,
        serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
        agent_guidance: Optional[str] = None,
        scope: OpScope = OpScope.GUILD,
-       group: str = "messaging"):
-    """Declare a cog method as an op, WITHOUT registering it.
+       group: str = "messaging",
+       group_label: Optional[str] = None):
+    """Declare a function as an op, WITHOUT registering it.
+
+    Used on cog methods (registered in add_cog) and on util functions
+    (registered via register_module_ops). The spec is inert at import.
 
         class MyCog(commands.Cog):
             @op("do_thing", "Does the thing.", PermissionLevel.ADMIN)
@@ -818,6 +828,7 @@ def op(name: str, description: str, permission: PermissionLevel,
             name=name, description=description, permission=permission,
             params=tuple(params or []), serialize=serialize,
             agent_guidance=agent_guidance, scope=scope, group=group,
+            group_label=group_label,
         ))
         return func
     return decorator
@@ -827,7 +838,8 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
               impl: Callable[..., Any], params: Optional[List[OpParam]],
               serialize: Optional[Callable[[Any], Dict[str, Any]]],
               agent_guidance: Optional[str], scope: OpScope, group: str,
-              origin: str, owner: Any) -> Op:
+              origin: str, owner: Any,
+              group_label: Optional[str] = None) -> Op:
     """Validate and construct an Op. Shared by both registration paths so a
     cog op and a core op are held to exactly the same rules."""
     if not inspect.iscoroutinefunction(impl):
@@ -840,7 +852,7 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
         name=name, description=description, permission=permission,
         impl=impl, params=list(params or []), serialize=serialize,
         agent_guidance=agent_guidance, scope=scope, group=group,
-        origin=origin, owner=owner,
+        group_label=group_label, origin=origin, owner=owner,
     )
 
 
@@ -851,6 +863,28 @@ class OpsRegistry:
 
     def __init__(self):
         self._ops: Dict[str, Op] = {}
+        # gid -> label for groups that are NOT in OP_GROUPS (cog/util ops).
+        # Stamped at registration, pruned when the last op in that group
+        # unregisters. Core primitive groups stay in OP_GROUPS.
+        self._extra_groups: Dict[str, str] = {}
+
+    def label_for(self, gid: str) -> str:
+        """Display label for a group id: core catalog, then live cog/util
+        labels, then the raw id."""
+        return OP_GROUPS.get(gid) or self._extra_groups.get(gid) or gid
+
+    def _note_group(self, gid: str, label: Optional[str]) -> None:
+        if gid in OP_GROUPS:
+            return
+        if label:
+            self._extra_groups.setdefault(gid, label)
+        else:
+            self._extra_groups.setdefault(gid, gid)
+
+    def _prune_extra_groups(self) -> None:
+        used = {op.group for op in self._ops.values()}
+        self._extra_groups = {g: lab for g, lab in self._extra_groups.items()
+                              if g in used}
 
     def op(self, name: str, description: str, permission: PermissionLevel,
            params: Optional[List[OpParam]] = None,
@@ -940,10 +974,8 @@ class OpsRegistry:
                 ) -> List[Tuple[str, str, List[Op]]]:
         """Live listing partitioned by group, as (group_id, label, ops).
 
-        Ordered by OP_GROUPS declaration order so a panel's sections keep a
-        stable order across restarts; empty groups are omitted. Any group id
-        not in OP_GROUPS (a cog inventing its own) sorts after the known
-        ones and falls back to its raw id as the label."""
+        Ordered by OP_GROUPS (core primitives) then alphabetically for
+        cog/util groups learned at registration. Empty groups are omitted."""
         selected = self.ops(scope=scope, origin=origin)
         order = list(OP_GROUPS)
         seen: List[str] = []
@@ -953,7 +985,7 @@ class OpsRegistry:
         seen.sort(key=lambda g: (order.index(g) if g in order else len(order),
                                  g))
         return [
-            (gid, OP_GROUPS.get(gid, gid),
+            (gid, self.label_for(gid),
              [op for op in selected if op.group == gid])
             for gid in seen
         ]
@@ -1000,11 +1032,52 @@ class OpsRegistry:
                 permission=spec.permission, impl=bound,
                 params=list(spec.params), serialize=spec.serialize,
                 agent_guidance=spec.agent_guidance, scope=spec.scope,
-                group=spec.group, origin=ORIGIN_COG, owner=cog,
+                group=spec.group, group_label=spec.group_label,
+                origin=ORIGIN_COG, owner=cog,
             ))
-        # Preflight passed — commit.
+        return self._commit_batch(batch)
+
+    def register_module_ops(self, module: Any) -> List[str]:
+        """Register every `@op(...)`-decorated function on a module.
+
+        Same all-or-none batch as register_cog_ops. Origin is still 'cog'
+        (behavioral, not an API primitive); owner is the module object so
+        these outlive any one cog — used by utils.points, whose store
+        exists whether the Points UI cog is loaded.
+        """
+        batch: List[Op] = []
+        claimed: Dict[str, str] = {}
+        for attr in dir(module):
+            member = getattr(module, attr, None)
+            spec = getattr(member, OP_SPEC_ATTR, None)
+            if spec is None or inspect.isclass(member):
+                continue
+            if spec.name in claimed:
+                raise ValueError(
+                    f"Module {getattr(module, '__name__', module)} declares "
+                    f"op '{spec.name}' twice; no ops were registered."
+                )
+            if spec.name in self._ops:
+                raise ValueError(
+                    f"Module {getattr(module, '__name__', module)}.{attr} "
+                    f"declares op '{spec.name}', which is already registered; "
+                    f"no ops were registered."
+                )
+            claimed[spec.name] = attr
+            batch.append(_build_op(
+                name=spec.name, description=spec.description,
+                permission=spec.permission, impl=member,
+                params=list(spec.params), serialize=spec.serialize,
+                agent_guidance=spec.agent_guidance, scope=spec.scope,
+                group=spec.group, group_label=spec.group_label,
+                origin=ORIGIN_COG, owner=module,
+            ))
+        return self._commit_batch(batch)
+
+    def _commit_batch(self, batch: List[Op]) -> List[str]:
         for built in batch:
             self._insert(built)
+            self._note_group(built.group, built.group_label)
         return [built.name for built in batch]
 
     def unregister_owner(self, owner: Any) -> List[str]:
@@ -1019,6 +1092,7 @@ class OpsRegistry:
         removed = [name for name, op in self._ops.items() if op.owner is owner]
         for name in removed:
             del self._ops[name]
+        self._prune_extra_groups()
         return removed
 
     async def call(self, op_name: str, ctx: OpContext, **kwargs) -> OpResult:
@@ -5217,9 +5291,8 @@ async def list_automod_rules(ctx: OpContext, guild=None):
 #   - edit_guild_settings, bulk_ban and purge_messages are SUPERADMIN —
 #     server-wide blast radius (guild identity, 200-member ban, unbounded
 #     mass delete);
-#   - because every one is at least ADMIN, default_gate() derives "admin" for
-#     all of them automatically — the per-guild agent gate never defaults a
-#     destructive op to "everyone".
+#   - default_gate() is always off, so even a whitelisted destructive op
+#     stays hidden from a guild's agent until a guild admin opts it in.
 #
 # Snowflake-input rule as everywhere: ids on the wire are strings, results
 # keep ids as ints. Bulk operations cap their batch (bulk_ban <=200 per the

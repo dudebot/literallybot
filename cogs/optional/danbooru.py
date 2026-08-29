@@ -167,6 +167,7 @@ class Danbooru(commands.Cog):
             "may carry suggestions: better tag spellings to retry with."),
         scope=OpScope.GUILD,
         group="integrations",
+        group_label="Integrations",
     )
     async def op_search_danbooru(self, ctx, channel, tags: str) -> dict:
         return await self.search(str(tags).split(), channel)

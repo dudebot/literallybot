@@ -294,7 +294,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | **permission** | `PermissionLevel.EVERYONE` / `ADMIN` / `SUPERADMIN`, checked against the **invoking user** on every call, before any Discord id is resolved. Config never overrides this. |
 | **params** | Typed `OpParam`s. The registry generates the JSON schema *and* resolves Discord entities from ids — see the kinds below. |
 | **scope** | `OpScope.GUILD` / `DM` / `GLOBAL`. See below; this is a safety boundary, not a label. |
-| **group** | Kebab-case id from `OP_GROUPS` in `core/ops.py`; decides which panel section renders it. Each group must stay under Discord's 25-option select cap. |
+| **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog/util ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
 | **agent_guidance** | Optional. Extra instruction injected for the agent loop — use it for non-obvious result semantics ("status 'exists' means nothing was written"). |
 | **serialize** | **Required for any op that returns data.** Callable turning the return value into a JSON-safe dict. It is *not* optional-if-you-already-return-a-dict: with no serializer, `Op.serialize_result` returns `{}` and every frontend sees a bare `{"ok": true}` — your return value is discarded, silently. Omit it only for an op that genuinely returns nothing. |
 
@@ -373,7 +373,7 @@ config.
 - [ ] Description written for a model, including what it does *not* do
 - [ ] `permission` is the tier you'd require of a human running it
 - [ ] `scope=OpScope.GUILD` only if it genuinely cannot act outside the guild
-- [ ] `group` exists in `OP_GROUPS` (add it there if you need a new one)
+- [ ] `group` is a kebab-case id; new cog groups use `group_label=` on `@op`, not a line in `OP_GROUPS`
 - [ ] The bot restarts cleanly twice in a row with the cog in the boot set
       (no duplicate-name error from the batch registering again)
 

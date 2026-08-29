@@ -30,7 +30,7 @@ import logging
 
 import pytest
 
-from core.ops import (ORIGIN_COG, OP_GROUPS, OpResult, OpScope, OpsRegistry,
+from core.ops import (ORIGIN_COG, OpResult, OpScope, OpsRegistry,
                       PermissionLevel)
 
 from cogs.optional.auto_response import AutoResponse, find_response
@@ -118,9 +118,10 @@ def test_cog_ops_register_with_cog_origin(reg, bot, cog_class):
         assert o.origin == ORIGIN_COG, "cog ops must be stamped by the registration path"
         assert o.owner is cog
         assert o.scope == OpScope.GUILD
-        assert o.group in OP_GROUPS, (
-            f"op '{name}' declares group '{o.group}' — cog groups must be "
-            f"declared in OP_GROUPS so the panel can label them")
+        assert o.group, f"op '{name}' must declare a group id"
+        assert reg.label_for(o.group), (
+            f"op '{name}' group '{o.group}' has no label — pass group_label= "
+            f"on @op so the panel can name the section")
 
 
 @pytest.mark.parametrize("cog_class", COG_CLASSES, ids=lambda c: c.__name__)
