@@ -1,6 +1,6 @@
 # Configuration System
 
-A JSON-based key-value store with per-guild, per-user, and global scopes. Features write buffering, atomic saves, and live reloading when files change externally.
+A JSON-based key-value store with per-guild and global scopes. Features write buffering, atomic saves, and live reloading when files change externally.
 
 ## Storage Layout
 
@@ -8,7 +8,7 @@ A JSON-based key-value store with per-guild, per-user, and global scopes. Featur
 configs/
 ├── global.json              # Bot-wide settings (superadmins, global features)
 ├── 123456789.json           # Guild-specific (guild ID as filename)
-├── user_987654321.json      # User-specific (user ID as filename)
+├── user_<id>.json           # Per-user (points, …)
 └── ...
 ```
 
@@ -19,7 +19,7 @@ configs/
 | Write buffering | Changes batch for 5 seconds before writing to disk |
 | Atomic writes | Uses temp file + rename to prevent corruption |
 | Live reload | Polls every 2 seconds for external file changes |
-| Merge on conflict | External changes win; conflicts logged to console |
+| Merge on conflict | External changes win (file wins over memory) |
 | Thread-safe | Lock-protected timer operations |
 
 ## API Reference
@@ -35,10 +35,6 @@ value = config.get(ctx, "key", default)
 # Set a value
 config.set(ctx, "key", value)
 
-# Check if key exists
-if config.has(ctx, "key"):
-    ...
-
 # Remove a key (returns True if existed)
 removed = config.rem(ctx, "key")
 ```
@@ -49,14 +45,6 @@ removed = config.rem(ctx, "key")
 ```python
 config.get(ctx, "prefix", "!")
 config.set(ctx, "prefix", "?")
-```
-
-**User scope** - uses `ctx.author.id`:
-```python
-config.get_user(ctx, "timezone", "UTC")
-config.set_user(ctx, "theme", "dark")
-# Or with explicit scope:
-config.get(ctx, "timezone", scope="user")
 ```
 
 **Global scope** - bot-wide:
@@ -71,11 +59,7 @@ config.get(None, "superadmins", scope="global")
 
 When you have an ID but no Discord context:
 ```python
-# Guild by ID
 config.set(guild_id, "setting", value)
-
-# User by ID
-config.set_user(user_id, "preference", value)
 ```
 
 ## Key Registry
@@ -124,7 +108,9 @@ illustration; they are not real.)
 
 ### User scope (`user_<id>.json`)
 
-Currently **unused** — the API supports it but no live code writes user files.
+| Key | Shape | Written by | Notes |
+|-----|-------|-----------|-------|
+| `points` | `int` | `utils/points.py` (`add_points` / `set_points`) | Per-user balance; absent ⇒ 0. `add_points` clamps at 0 so a subtract cannot store a negative. Other cogs import the helpers; they do not import the Points cog |
 
 ### Conventions
 

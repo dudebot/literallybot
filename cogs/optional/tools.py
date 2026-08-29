@@ -24,11 +24,7 @@ class Tools(commands.Cog):
 
     @commands.command(name='ping')
     async def ping(self, ctx):
-        """Sends a message with bot's latency in ms in the channel where the command has been invoked.
-
-        Note:
-            `bot.latency` outputs the latency in seconds.
-        """
+        """Reply with the bot's latency in ms."""
         await ctx.send(f'🏓 {round(self.bot.latency * 1000)} ms.')
 
     @commands.command(name='info')

@@ -17,8 +17,9 @@ goes stale silently). Both surfaces apply the same rule:
   /help), the checks are EXECUTED and answer exactly;
 - without it — !help cannot run an Interaction-typed predicate, /help
   cannot run a Context-typed one — the fallback reads the tier the check
-  declares via core.utils' app_is_admin/app_is_superadmin factories, which
-  stamp `__gate__` on their predicates. A gate of unknown tier fails
+  declares via the `__gate__` stamp on core.utils' is_admin /
+  is_superadmin (the same functions `@commands.check` and
+  `@app_commands.check` both wrap). A gate of unknown tier fails
   closed (admin-or-better), never open.
 
 Two leaks this replaced: gating on `hidden` alone advertised an is_owner()
@@ -55,6 +56,24 @@ def _slash_entries(cmd):
         yield (f"/{cmd.name}", cmd.description or "")
 
 
+def _checks_of(cmd):
+    """Check predicates attached to a command or group.
+
+    Command stores them on `.checks`; Group stores them on
+    `__discord_app_commands_checks__` (Group has no `.checks` attribute).
+    A listing that only reads `.checks` treats every Group as ungated.
+    """
+    seen = []
+    for seq in (getattr(cmd, "checks", None),
+                getattr(cmd, "__discord_app_commands_checks__", None)):
+        if not seq:
+            continue
+        for check in seq:
+            if check not in seen:
+                seen.append(check)
+    return seen
+
+
 def _is_gated(cmd, cog=None):
     """Whether anything at all restricts who may run this command.
 
@@ -63,7 +82,7 @@ def _is_gated(cmd, cog=None):
     a "(superadmin)" suffix in help text is a string that goes stale and
     must never be what decides visibility.
     """
-    if getattr(cmd, "checks", None):
+    if _checks_of(cmd):
         return True
     if getattr(cmd, "default_permissions", None) is not None:
         return True
@@ -87,7 +106,7 @@ def _gate_tier(cmd):
     tiers = set()
     node = cmd
     while node is not None:
-        for check in (getattr(node, "checks", None) or []):
+        for check in _checks_of(node):
             tier = gate_of(check)
             if tier:
                 tiers.add(tier)
@@ -141,9 +160,9 @@ async def _slash_visible_to(ac, interaction, invoker_is_admin,
     """Whether a slash command belongs in this invoker's listing.
 
     The mirror of _visible_to. `default_permissions is None` used to stand
-    in for "public", but commands whose gate is this bot's own admin list
-    deliberately set no default_permissions — so that test advertised every
-    admin panel to everyone. Ask the decorator instead.
+    in for "public", which advertised every admin panel to everyone —
+    Discord's picker pin is not this bot's admin list. Ask the decorator
+    instead (`is_admin` / `is_superadmin` on the command's checks).
 
     With an Interaction the checks run for real; !help has only a Context,
     which an Interaction-typed predicate cannot accept, so it falls back to
@@ -151,9 +170,12 @@ async def _slash_visible_to(ac, interaction, invoker_is_admin,
     """
     if not _is_gated(ac):
         return True
-    if interaction is None:
+    checks = _checks_of(ac)
+    # No runnable predicate (a Group gated only by default_permissions,
+    # or a listing without an Interaction) — the declared tier, never open.
+    if interaction is None or not checks:
         return _passes_tier(ac, invoker_is_admin, invoker_is_superadmin)
-    for check in (getattr(ac, "checks", None) or []):
+    for check in checks:
         try:
             result = check(interaction)
             if inspect.isawaitable(result):

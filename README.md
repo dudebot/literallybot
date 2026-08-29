@@ -47,7 +47,7 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 
 ## ✨ Key Features
 
-- **🧭 One Ops Layer, Many Frontends** — 125 permission-checked Discord primitives declared once, driving the in-chat AI agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
+- **🧭 One Ops Layer, Many Frontends** — ~125 permission-checked Discord primitives declared once, driving the in-chat AI agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
 - **🤖 AI Chat + Agent** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory and personality, plus an optional agentic mode that performs real Discord actions under a two-tier permission model
 - **🧩 Modular Cogs** — self-contained features; disable any globally without deleting it (binds at restart); cogs can register their own ops
 - **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
@@ -83,7 +83,7 @@ newly registered ops alike.
 ```mermaid
 flowchart TB
     subgraph SRC["Where ops come from"]
-        CORE["core/ops.py<br/><i>125 API primitives</i><br/>@registry.op(...) · origin=core"]
+        CORE["core/ops.py<br/><i>API primitives</i><br/>@registry.op(...) · origin=core"]
         COG["Any cog — behavioral primitives<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
     end
 
@@ -171,10 +171,17 @@ Discord's Administrator bit, and gating on it caused a real lockout.
 Each panel exists twice: a hidden prefix command (`!aisettings`, `!autoresponse`,
 `!media`, `!cogs`, `!config`) and an **ephemeral slash twin** (`/aisettings`, …).
 Ephemeral is a property of an interaction response, so only the slash form keeps
-a guild's configuration from being read by everyone in the channel. Neither uses
-`app_commands.default_permissions` — the check is the bot's own gate at invoke
-time, and a non-admin gets an ephemeral refusal. Superadmin-only controls are
-*omitted* from a panel's render for non-superadmins rather than merely disabled.
+a guild's configuration from being read by everyone in the channel. The real
+gate is the bot's own `is_admin` / `is_superadmin` check at invoke time — a
+non-admin gets an ephemeral refusal. Prefix uses `@commands.check(is_admin)`;
+slash uses `@app_commands.check(is_admin)` — same predicate, two wrappers,
+because discord.py has two command systems. Gated slash commands additionally
+set `guild_only` + `default_permissions(administrator=True)` so Discord's
+picker hides them from ordinary members and DMs; the prefix twin remains for
+a bot admin/superadmin who is not a Discord Administrator (the #67 lockout
+was slash-as-the-only-surface). Superadmin-only
+controls are *omitted* from a panel's render for non-superadmins rather than merely
+disabled.
 
 Beyond the panels, the public surface is deliberately small — `/help` and
 `/role` — and `/help`/`!help` show each invoker exactly the commands they can run.
@@ -189,6 +196,7 @@ Beyond the panels, the public surface is deliberately small — `/help` and
 - `!remindme <duration> <message>` — e.g. `!remindme 10 minutes Check the oven`, `!remindme 1d12h Ship it` (aliases: `!r`, `!reminder`); deliveries come with snooze buttons scaled to the original duration
 - `!should <question>` — yes/no oracle; answers most interrogatives (`!is`, `!are`, `!will`, `!shall`, …)
 - `!ping` / `!info` — latency and bot info
+- `!points` (`!balance`, `!score`) / `!leaderboard` — per-user points; admins adjust with `!add_points` / `!set_points`
 - `!<name>` — post any file from this server's media library (see Media Libraries below)
 - **Reaction roles** — react to a configured message to toggle a role; admins manage mappings with `/role add`, `/role delete`, `/role sync`
 
@@ -229,7 +237,7 @@ token budget "thinking" can be tamed with `"reasoning_effort": "none"` per model
 ### Agentic AI (experimental)
 
 When enabled, the AI can **perform real Discord actions** — spanning the full
-125-op registry: messaging, channels, roles, members, moderation, threads,
+ops registry: messaging, channels, roles, members, moderation, threads,
 voice, events, emoji/stickers, invites, webhooks, automod, and DMs — plus
 anything a loaded cog contributes, instead of only describing them. It runs a
 tool-calling loop over the shared **ops registry** (`core/ops.py`), acting as
@@ -355,13 +363,13 @@ port if you set `mcp_ops_port`):
 ```
 
 **Exposed tools:** by default the full ops registry, queried live when the
-server starts — so ops a cog registered are included too. The 125 API primitives
+server starts — so ops a cog registered are included too. The API primitives
 span every corner of the Discord API surface, grouped in the registry as:
 
 > **messaging** · **message-mod** · **threads** · **channels** · **roles** ·
 > **members** · **moderation** · **automod** · **emojis & stickers** ·
 > **voice** · **scheduled events** · **invites** · **webhooks** ·
-> **guild info** · **direct messages** · **integrations**
+> **guild info** · **guild** · **direct messages** · **integrations**
 
 Reads (`list_*`, `get_*`, `search_*`) are mostly EVERYONE-gated; state writes are
 ADMIN; a handful with server-wide blast radius (`purge_messages`, `bulk_ban`,
@@ -460,10 +468,6 @@ LiterallyBot's config helper is available as `self.bot.config` in every cog:
 prefix = self.bot.config.get(ctx, "prefix", "!")
 self.bot.config.set(ctx, "prefix", "?")
 
-# Per-user
-timezone = self.bot.config.get_user(ctx, "timezone", "UTC")
-self.bot.config.set_user(ctx, "timezone", "UTC")
-
 # Global (bot-wide)
 superadmins = self.bot.config.get_global("superadmins", [])
 self.bot.config.set_global("maintenance_mode", True)
@@ -474,7 +478,7 @@ Lists are just Python lists — get, mutate, then `set` the updated list. Call
 immediately.
 
 ### Documentation
-- `docs/cog-development.md` — building cogs end-to-end
+- `docs/cog-development.md` — building cogs, including the command-gate recipe
 - `docs/config-system.md` — config API, patterns, and the config Key Registry
 - `docs/error-handling.md` — how errors flow and how to handle them
 - `docs/security.md` — permission model and the agentic/ops execution path

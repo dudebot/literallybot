@@ -8,7 +8,6 @@ configs/ as JSON.
 """
 from discord.ext import commands
 import discord
-from discord import app_commands
 from dotenv import load_dotenv
 import os
 import sys
@@ -33,29 +32,6 @@ logging.basicConfig(level=logging.INFO,
         logging.StreamHandler()
     ])
 logger = logging.getLogger(__name__)
-
-def get_prefix(bot, message):
-    """This function returns a Prefix for our bot's commands.
-    
-    Args:
-        bot (commands.Bot): The bot that is invoking this function.
-        message (discord.Message): The message that is invoking.
-        
-    Returns:
-        string or iterable conteining strings: A string containing prefix or an iterable containing prefixes
-    Notes:
-        Through a database (or even a json) this function can be modified to returns per server prefixes.
-        This function should returns only strings or iterable containing strings.
-        This function shouldn't returns numeric values (int, float, complex).
-        Empty strings as the prefix always matches, and should be avoided, at least in guilds. 
-    """
-    if not isinstance(message.guild, discord.Guild):
-        """Checks if the bot isn't inside of a guild. 
-        Returns a prefix string if true, otherwise passes.
-        """
-        return '!'
-
-    return ['!']
 
 class LiterallyBot(commands.Bot):
     async def setup_hook(self):
@@ -128,7 +104,7 @@ class LiterallyBot(commands.Bot):
                                 f"{', '.join(removed)}")
 
 
-bot = LiterallyBot(command_prefix=get_prefix, intents=discord.Intents.all())
+bot = LiterallyBot(command_prefix='!', intents=discord.Intents.all())
 # Attach central logger to bot for use in cogs
 bot.logger = logger
 bot.config = Config()
@@ -205,9 +181,6 @@ async def on_ready():
     # Report any failed cog loads to Discord now that we're connected
     if hasattr(bot, 'failed_cogs') and bot.failed_cogs:
         try:
-            from core.error_handler import log_error_to_discord, ErrorCategory, ErrorSeverity
-
-            # Create a custom exception for cog loading failures
             error_msg = f"Failed to load {len(bot.failed_cogs)} cog(s) during startup:\n\n"
             for cog_info in bot.failed_cogs:
                 error_msg += f"• **{cog_info['name']}**: {cog_info['type']} - {cog_info['error']}\n"
@@ -217,7 +190,6 @@ async def on_ready():
 
             error = CogLoadError(error_msg)
 
-            # Send to Discord with high severity
             await log_error_to_discord(
                 bot,
                 error,
@@ -327,4 +299,3 @@ if __name__ == "__main__":
         # Properly shutdown config system
         bot.config.shutdown()
         logger.info('Config system shutdown complete')
-    #Runs the bot with its token. Don't put code below this command.

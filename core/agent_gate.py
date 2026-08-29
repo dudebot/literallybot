@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from core.ops import OpScope, PermissionLevel, registry
+from core.ops import OpScope, registry
 
 WHITELIST_KEY = "agent_ops_whitelist"   # GLOBAL config: {op_name: bool}
 GATE_KEY = "agent_ops_gate"             # per-GUILD config: {op_name: "off"|"admin"|"everyone"}

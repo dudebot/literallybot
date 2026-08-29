@@ -1,6 +1,5 @@
 from discord.ext import commands
 import random
-import re
 
 class Interrogative(commands.Cog):
     """Ask any interrogative questions like !should I eat pizza?"""

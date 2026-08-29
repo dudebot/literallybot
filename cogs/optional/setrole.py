@@ -215,6 +215,7 @@ class SetRole(commands.Cog):
         guild_only=True,
         default_permissions=discord.Permissions(manage_roles=True),
     )
+    app_commands.check(is_admin)(role)
 
     async def _message_choices(self, interaction: discord.Interaction, current: str):
         channel = getattr(interaction.namespace, "channel", None)

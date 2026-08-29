@@ -20,7 +20,7 @@ CONFIGURATION:
 import discord
 import traceback
 from datetime import datetime, timedelta
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, List
 from enum import Enum
 
 
@@ -85,12 +85,10 @@ def _should_send_error(error_key: str, rate_limit_minutes: int = None) -> bool:
     now = datetime.now()
     cutoff = now - timedelta(minutes=rate_limit_minutes)
 
-    # Purge old entries (older than rate limit duration)
     keys_to_remove = [key for key, last_sent in _error_history.items() if last_sent < cutoff]
     for key in keys_to_remove:
         del _error_history[key]
 
-    # Check if we should send this error
     if error_key not in _error_history:
         _error_history[error_key] = now
         return True
@@ -99,11 +97,9 @@ def _should_send_error(error_key: str, rate_limit_minutes: int = None) -> bool:
     time_since_last = now - last_sent
 
     if time_since_last >= timedelta(minutes=rate_limit_minutes):
-        # Time to send again
         _error_history[error_key] = now
         return True
     else:
-        # Still in cooldown
         return False
 
 
@@ -129,17 +125,14 @@ def _get_target_channel(bot, config: dict, category: ErrorCategory, severity: Er
     if not config or not config.get("default_channel"):
         return None
 
-    # Check for category-specific routing
     category_channels = config.get("category_channels", {})
     if category.value in category_channels:
         return category_channels[category.value]
 
-    # Check for severity-specific routing
     severity_channels = config.get("severity_channels", {})
     if severity.severity_name in severity_channels:
         return severity_channels[severity.severity_name]
 
-    # Fallback to default channel
     return config.get("default_channel")
 
 
@@ -159,11 +152,9 @@ def _create_error_embed(
         timestamp=datetime.now()
     )
 
-    # Add guild context if available
     if guild_name:
         embed.add_field(name="Guild", value=f"`{guild_name}`", inline=True)
 
-    # Core error information
     embed.add_field(name="Severity", value=f"`{severity.severity_name.upper()}`", inline=True)
     embed.add_field(name="Category", value=f"`{category.value}`", inline=True)
     embed.add_field(name="Error Type", value=f"`{type(error).__name__}`", inline=True)
@@ -172,25 +163,21 @@ def _create_error_embed(
     # Add blank field for layout
     embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-    # Error message
     error_msg = str(error)
     if len(error_msg) > 1000:
         error_msg = error_msg[:997] + "..."
     embed.add_field(name="Error Message", value=f"```{error_msg}```", inline=False)
 
-    # Additional info
     if extra_info:
         if len(extra_info) > 1000:
             extra_info = extra_info[:997] + "..."
         embed.add_field(name="Additional Info", value=f"```{extra_info}```", inline=False)
 
-    # Traceback
     tb = traceback.format_exc()
     if len(tb) > 1000:
         tb = "..." + tb[-997:]
     embed.add_field(name="Traceback", value=f"```python\n{tb}\n```", inline=False)
 
-    # Footer with metadata
     embed.set_footer(text=f"Category: {category.value} | Severity: {severity.severity_name}")
 
     return embed
@@ -223,25 +210,20 @@ async def log_error_to_discord(
     if not hasattr(bot, 'config'):
         return
 
-    # Create error key for deduplication (per-guild)
     error_key = _create_error_key(error, context, category, guild_id)
 
-    # Get rate limit from global config (use global for consistency)
     global_config = bot.config.get_global("error_logging", {})
     rate_limit = global_config.get("rate_limit_minutes", _default_rate_limit_minutes)
 
-    # Check if we should send (using global rate limit)
     if not _should_send_error(error_key, rate_limit):
         return
 
-    # Get guild name if available
     guild_name = None
     if guild_id:
         guild = bot.get_guild(guild_id)
         if guild:
             guild_name = guild.name
 
-    # Create embed once for reuse
     embed = _create_error_embed(
         error=error,
         context=context,
@@ -251,7 +233,6 @@ async def log_error_to_discord(
         guild_name=guild_name
     )
 
-    # Track where we sent to avoid duplicates
     sent_channels = set()
 
     # 1. Send to guild channel if configured
@@ -276,11 +257,9 @@ async def log_error_to_discord(
             global_channel = bot.get_channel(global_channel_id)
             if global_channel:
                 try:
-                    # Add indicator that this is from another guild if applicable
                     if guild_id and global_channel_id not in sent_channels:
                         global_embed = embed.copy()
                         if guild_name:
-                            # Update footer to indicate source
                             current_footer = global_embed.footer.text if global_embed.footer else ""
                             global_embed.set_footer(
                                 text=f"From: {guild_name} | {current_footer}" if current_footer else f"From: {guild_name}"
@@ -336,7 +315,6 @@ async def handle_command_error(bot, ctx, error: Exception):
         command_name = ctx.command.name if ctx.command else 'unknown'
         severity = _determine_severity(error)
 
-        # Build extra info
         guild_info = f"Guild: {ctx.guild.name} (ID: {ctx.guild.id})" if ctx.guild else "DM"
         extra_info = (
             f"User: {ctx.author} (ID: {ctx.author.id})\n"
@@ -344,10 +322,8 @@ async def handle_command_error(bot, ctx, error: Exception):
             f"{guild_info}"
         )
 
-        # Get guild ID for per-guild logging
         guild_id = ctx.guild.id if ctx.guild else None
 
-        # Unwrap CommandInvokeError to get the actual error
         actual_error = error
         if isinstance(error, commands.CommandInvokeError):
             actual_error = error.original
@@ -379,7 +355,6 @@ async def handle_app_command_error(bot, interaction, error: Exception):
     try:
         severity = _determine_severity(error)
 
-        # Build extra info
         guild_info = f"Guild: {interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
         extra_info = (
             f"User: {interaction.user} (ID: {interaction.user.id})\n"
@@ -388,7 +363,6 @@ async def handle_app_command_error(bot, interaction, error: Exception):
             f"{guild_info}"
         )
 
-        # Get guild ID for per-guild logging
         guild_id = interaction.guild.id if interaction.guild else None
 
         asyncio.create_task(log_error_to_discord(
@@ -435,10 +409,8 @@ async def handle_event_error(bot, event: str, *args, **kwargs):
     try:
         err = sys.exc_info()[1]
         if err:
-            # Build extra info
             extra_info = f"Event: {event}\nArgs: {str(args)[:500]}"
 
-            # Try to extract guild context from args if available
             guild_id = None
             for arg in args:
                 if hasattr(arg, 'guild') and arg.guild:

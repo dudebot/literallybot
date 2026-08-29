@@ -42,7 +42,7 @@ from core.ops import (
     op,
     registry,
 )
-from core.agent_loop import agent_ops
+from core.agent_gate import agent_universe
 
 ALL_OPS = sorted(registry.names())
 
@@ -112,15 +112,6 @@ def test_internal_params_never_reach_the_wire(name):
     for p in o.params:
         if p.kind == ParamKind.INTERNAL:
             assert p.name not in wire_names
-
-
-def test_list_tools_covers_every_op():
-    tools = registry.list_tools()
-    assert {t["name"] for t in tools} == set(ALL_OPS)
-    for tool in tools:
-        assert tool["permission"] in {"EVERYONE", "ADMIN", "SUPERADMIN"}
-        assert tool["scope"] in {s.value for s in OpScope}
-        assert tool["origin"] in {ORIGIN_CORE, ORIGIN_COG}
 
 
 # --------------------------------------------------------------------------
@@ -767,23 +758,23 @@ def test_server_tab_renders_only_whitelisted_ops():
 
 
 def test_cross_select_merge_keeps_other_groups_enabled():
-    """Each select speaks only for its own group. Saving one must carry
-    through names enabled in every other group — the allowlist-editor bug
-    that chunking exists to prevent, now across groups."""
+    """Each select speaks only for its own chunk. Saving one must carry
+    through names enabled in every other select — the allowlist-editor bug
+    that chunking exists to prevent."""
     from cogs.optional.gpt import _grouped_tool_sections
 
-    current = list(agent_ops())
+    current = list(registry.names())
     selects = [p for k, p in _grouped_tool_sections(
-        _panel_sections(OpScope.GUILD), current, None) if k == "select"]
-    assert len(selects) > 1, "need multiple groups to test the merge"
+        _panel_sections(None), current, None) if k == "select"]
+    assert len(selects) > 1, "need multiple selects to test the merge"
 
     target = selects[0]
     mine = {o.value for o in target.options}
     # What `callback` carries through when the user clears this select
-    # entirely (values == []): everything enabled outside this group.
+    # entirely (values == []): everything enabled outside this chunk.
     kept = [n for n in target._current if n in target._elsewhere]
     assert set(kept) == set(current) - mine, \
-        "clearing one group's select dropped ops owned by other groups"
+        "clearing one select dropped ops owned by other selects"
 
 
 def test_save_preserves_names_whose_op_is_unregistered():

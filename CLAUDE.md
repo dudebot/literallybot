@@ -9,6 +9,7 @@ literallybot/
 │   ├── bootstrap.py    # Token resolution chain + first-run superadmin (#83)
 │   ├── config.py       # JSON config system (read docs/config-system.md)
 │   ├── ops.py          # Ops registry — every Discord action, declared once
+│   ├── agent_gate.py   # Two-tier agent exposure: global whitelist x per-guild gate
 │   ├── agent_loop.py   # Frontend: in-chat agent tools (guild-scoped ops)
 │   ├── mcp_server.py   # Frontend: MCP over loopback HTTP (whole registry)
 │   ├── error_handler.py # Error logging to Discord channels
@@ -21,6 +22,8 @@ literallybot/
 ├── configs/            # Runtime JSON storage (guild, user, global)
 ├── docs/               # Developer documentation — the canonical per-file
 │                       # index is README.md § Documentation (six files)
+├── utils/              # Headless helpers shared by cogs (not Discord-aware)
+│   └── points.py       # Per-user points store
 └── media/              # Audio/video files for !play and dynamic commands
 ```
 
@@ -88,9 +91,11 @@ Where new code should land, so seams don't re-greed:
   `!autoresponse`, `!media`, `!cogs`, `!config`): single-invoker Views gated
   by `is_admin`/`is_superadmin` — the BOT's admin concept, independent of
   the invoker's Discord permissions in whichever server they stand in.
-  Slash commands are reserved for parameterized one-liners where the typed
-  arg UI earns its place (`/role`) and truly public commands (`/help`) — so
-  the slash picker never advertises admin machinery to regular members.
+  Prefix uses `@commands.check(is_admin)`; slash twins use
+  `@app_commands.check(is_admin)` (same predicate) plus a picker pin
+  (`guild_only` + `default_permissions(administrator=True)`) so Discord's
+  picker does not advertise them to ordinary members. Public slash is
+  `/help`; parameterized one-liners (`/role`) still earn the typed-arg UI.
   Superadmin-only controls are OMITTED from a panel's render for
   non-superadmins (dynamic panel), not merely disabled.
 - Other parked (real-but-leave-it): error-handler module globals -> instance on

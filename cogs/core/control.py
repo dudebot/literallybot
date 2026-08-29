@@ -3,7 +3,7 @@ import discord
 from discord import app_commands
 from sys import version_info as sysv
 import sys
-from core.utils import (InvokerOnlyView, app_is_superadmin, is_superadmin,
+from core.utils import (InvokerOnlyView, is_superadmin,
                         safe_delete, list_cog_modules)
 
 class Control(commands.Cog):
@@ -25,22 +25,12 @@ class Control(commands.Cog):
         self.logger = bot.logger
 
     @commands.Cog.listener()
-    #This is the decorator for events (inside of cogs).
     async def on_ready(self):
         self.logger.info(f'Python {sysv.major}.{sysv.minor}.{sysv.micro} - Discord.py {discord.__version__}')
 
     def check_cog(self, cog):
-        """Returns the name of the cog in the correct format.
-        Args:
-            self
-            cog (str): The cogname to check
-
-        Returns:
-            cog if cog starts with `cogs.`, otherwise an fstring with this format`cogs.{cog}`_.
-        Note:
-            All cognames are made lowercase with `.lower()`_.
-        """
-        if (cog.lower()).startswith('cogs.optional.') == True:
+        """Prefix bare cog names with 'cogs.optional.'; lowercases input."""
+        if cog.lower().startswith('cogs.optional.'):
             return cog.lower()
         return f'cogs.optional.{cog.lower()}'
 
@@ -168,14 +158,19 @@ class Control(commands.Cog):
 
     @app_commands.command(name="cogs",
                           description="Open the cog-management panel")
-    @app_is_superadmin()
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.check(is_superadmin)
     async def cogs_slash(self, interaction: discord.Interaction):
-        """Ephemeral twin of `!cogs` (#76). The gate is the bot's own
-        superadmin list, not Discord permissions, so it rides on
-        @app_is_superadmin rather than default_permissions — that keeps the
-        decorator authoritative for both enforcement and /help visibility.
-        The body check stays as defense in depth and to render the friendly
-        denial for anyone who invokes past a stale client cache."""
+        """Ephemeral twin of `!cogs` (#76).
+
+        Discord's picker cannot filter on the bot's superadmin list, so
+        visibility is pinned two ways Discord *can* enforce: guild-only
+        (never in DMs) and Administrator (hidden from ordinary members).
+        `@app_commands.check(is_superadmin)` remains the real gate — a
+        Discord admin is not a bot superadmin, and the body check is
+        defense in depth against a stale client cache. Superadmins
+        without Discord Administrator still have `!cogs`."""
         if not is_superadmin(interaction):
             await interaction.response.send_message(
                 "Requires superadmin.", ephemeral=True)
@@ -187,14 +182,20 @@ class Control(commands.Cog):
 
     @app_commands.command(name="config",
                           description="Open the global-config editor")
-    @app_is_superadmin()
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.check(is_superadmin)
     async def config_slash(self, interaction: discord.Interaction):
         """Ephemeral twin of `!config` (#76).
 
-        The strongest case for ephemeral of all the panels: this one
-        ENUMERATES global config keys. Values that look secret are masked and
-        never prefilled, but the key list itself is a map of the bot's
-        configuration surface and does not belong in a public channel."""
+        This panel ENUMERATES global config keys (including API key names).
+        Discord's picker cannot filter on the bot's superadmin list, so
+        visibility is pinned two ways Discord *can* enforce: guild-only
+        (never in DMs) and Administrator (hidden from ordinary members).
+        `@app_commands.check(is_superadmin)` remains the real gate — a
+        Discord admin is not a bot superadmin, and the body check is
+        defense in depth against a stale client cache. Superadmins
+        without Discord Administrator still have `!config`."""
         if not is_superadmin(interaction):
             await interaction.response.send_message(
                 "Requires superadmin.", ephemeral=True)

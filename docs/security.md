@@ -20,6 +20,27 @@ and slash commands (`discord.Interaction`) route through the same `is_admin` /
 member with the Discord **Administrator** permission, or the guild owner.
 `is_superadmin` is global and id-only.
 
+### Command gates (prefix and slash)
+
+One predicate, two discord.py wrappers — `@commands.check(is_admin)` on
+prefix, `@app_commands.check(is_admin)` on slash. Same function; discord.py
+has two command systems and they do not accept each other's decorator. Do
+not invent a third wrapper.
+
+Gated slash commands also set `guild_only` +
+`default_permissions(administrator=True)` so Discord's picker hides them
+from ordinary members and DMs. That pin is **visibility, not
+authorization** — Discord cannot see the bot's admin list, and a Discord
+Administrator is not a bot superadmin. Bot admins without Discord
+Administrator still have the prefix twin. Treating the pin *as* the gate
+when slash was the only surface is what caused the #67 lockout.
+
+`/help` lists a command only if the invoker could run it, by reading the
+decorator. A body `if not is_admin` is defense in depth, not the gate.
+
+Authoring examples: [cog-development.md](cog-development.md) → Permission
+Management.
+
 ### Escalation guards (intentional)
 
 - **The bot's own account is never admin.** `is_admin` explicitly returns false
@@ -83,8 +104,9 @@ Security properties enforced centrally, so no frontend can skip them:
   Discord's 28-day cap) and ADMIN-gated moderation/admin-view reads
   (`list_bans`, `fetch_audit_logs`, `estimate_prune`, `list_integrations`,
   `list_invites`). Irreversible ejection (kick / ban / unban / prune) and
-  guild-settings writes are deliberately NOT ops — exposing those is an
-  owner decision, not a gap-fill. Profile reads any member can see in the
+  guild-settings writes were initially withheld; they shipped in the
+  owner-tier pass below at ADMIN/SUPERADMIN floors. Profile reads any
+  member can see in the
   client (`get_member`, `get_guild_info`, `search_members`) are EVERYONE,
   like the other guild-info reads.
 - **Expressive assets follow the emoji precedent; webhooks are read-only.**
@@ -98,9 +120,9 @@ Security properties enforced centrally, so no frontend can skip them:
   expiry; `revoke_invite` only deletes codes verified against the guild's
   own invite list). `list_webhooks` (ADMIN) deliberately NEVER serializes
   a webhook's url or token — either is a persistent unauthenticated
-  posting credential — and webhook create/edit/execute/delete are NOT ops:
-  minting or driving an impersonation-capable credential is an owner
-  decision, not a gap-fill. `send_message`'s optional `sticker_id` and
+  posting credential. Webhook create/edit/execute/delete were initially
+  withheld; they shipped in the owner-tier pass below (ADMIN, URL/token
+  still never serialized). `send_message`'s optional `sticker_id` and
   `edit_emoji`'s `role_ids` resolve strictly in-guild, preserving guild
   confinement.
 - **Voice moderation is client-parity and reversible; events are
@@ -115,13 +137,13 @@ Security properties enforced centrally, so no frontend can skip them:
   error), stage/event reads (`get_stage_instance`, `list_scheduled_events`,
   `get_scheduled_event`, `list_scheduled_event_users` — EVERYONE, same
   visibility any member has), and ADMIN event writes
-  (`create_scheduled_event`, `edit_scheduled_event` — event delete/cancel
-  is deliberately NOT an op and `edit_scheduled_event` refuses
-  status='canceled': cancellation irreversibly destroys the accrued RSVP
-  list, an owner decision). `list_automod_rules` is an ADMIN read on
-  purpose — keyword rules expose the guild's filtered-word lists, which
-  must not leak to members through a guild agent — and automod
-  create/edit/delete are NOT ops (guild-wide enforcement-policy CRUD).
+  (`create_scheduled_event`, `edit_scheduled_event` — cancellation
+  irreversibly destroys the accrued RSVP list, so `edit_scheduled_event`
+  refuses status='canceled' and delete/cancel is `delete_scheduled_event`'s
+  job in the owner-tier pass below). `list_automod_rules` is an ADMIN read
+  on purpose — keyword rules expose the guild's filtered-word lists, which
+  must not leak to members through a guild agent; automod create/edit/delete
+  shipped in the owner-tier pass below (guild-wide enforcement-policy CRUD).
   Bot voice PRESENCE (connect / play audio / its own request-to-speak) is
   structurally out of scope: a stateful gateway session, not an atomic
   request/response op.
@@ -142,17 +164,21 @@ Security properties enforced centrally, so no frontend can skip them:
   `edit_automod_rule`, `delete_automod_rule`); the scheduled-event delete
   (`delete_scheduled_event`) and stage lifecycle (`create_stage`,
   `edit_stage`, `end_stage`); and the invite delete (`delete_invite`). Every
-  one is at least `PermissionLevel.ADMIN` and seeds the per-guild agent gate
-  at `agent_default="admin"` — none is ever `everyone`. Three carry
+  one is at least `PermissionLevel.ADMIN` and defaults its per-guild agent
+  gate to admin (derived from its permission floor by `default_gate()` in
+  `core/ops.py`) — none is ever `everyone`. Three carry
   server-wide blast radius and are `PermissionLevel.SUPERADMIN`:
   `edit_guild_settings` (guild identity/verification posture), `bulk_ban`
   (up to 200 members in one call), and `purge_messages` (unbounded mass
   delete). Webhooks resolve against the guild's own webhook list and
   overwrite/ban/bulk targets are guild-confined, so a destructive op can
   never reach an entity outside the confined guild.
-- **Agentic mode is opt-in and per-tool.** Each guild has a `bot_tools_enabled`
-  allowlist (default empty, meaning `!gpt` is plain chat with no tools), managed
-  from the `!aisettings` panel. The MCP server consumes its own global
+- **Agentic mode is opt-in, two-tier, and per-tool** (`core/agent_gate.py`).
+  The bot owner whitelists which ops the agent may ever see
+  (`agent_ops_whitelist`, global, default empty ⇒ `!gpt` is plain chat with
+  no tools), and each guild's admins set every whitelisted op to
+  off/admin/everyone for their guild (`agent_ops_gate`) — both from the
+  `!aisettings` panel. The MCP server consumes its own global
   `mcp_tools_enabled` allowlist at build time.
 - **Every executed op is logged** at INFO (op name, params, actor id, ok/error).
 
@@ -164,7 +190,8 @@ why the defaults look permissive:
 | | Decides | Set by | Default |
 |---|---------|--------|---------|
 | **`PermissionLevel`** (per op, in code) | **Whether a given actor may run it** | The op's declaration; not configurable at runtime | enforced always |
-| **`bot_tools_enabled`** (per guild) | Whether the guild's agent is *offered* it | any bot admin of that guild | empty ⇒ plain chat |
+| **`agent_ops_whitelist`** (global) | Whether the agent may *ever* see it | superadmin | empty ⇒ plain chat |
+| **`agent_ops_gate`** (per guild) | off / admin / everyone for that guild's agent | any bot admin of that guild | op's `default_gate()` |
 | **`mcp_tools_enabled`** (global) | Whether the MCP server *serves* it | superadmin | absent ⇒ **whole registry** |
 
 Enabling an op grants **exposure**, never **authorization**. Every call still
@@ -182,10 +209,11 @@ server is useful would add friction without adding a boundary. The guild-side
 default is the opposite (empty ⇒ no tools) because there the exposure decision
 is also a *behavioral* one: a guild that hasn't opted in should get plain chat.
 
-**`bot_tools_enabled` is guild-admin-savable** (relaxed from superadmin in
-2026-08). Not an escalation path, for the structural reason above plus scope:
-the universe a guild admin picks from is guild-scoped ops only, so there is
-nothing in it that reaches outside the guild they already administer.
+**`agent_ops_gate` is guild-admin-savable.** Not an escalation path, for the
+structural reason above plus scope: the universe a guild admin picks from is
+whitelisted guild-scoped ops only, so there is nothing in it that reaches
+outside the guild they already administer, and the super-admin whitelist
+stays the ceiling.
 
 **Cog-registered ops** enter these universes the moment their cog loads and
 leave when it unloads, carrying the same declared `PermissionLevel` as any core

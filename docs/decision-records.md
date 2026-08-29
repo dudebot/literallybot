@@ -460,4 +460,23 @@ per-frontend wiring.
 **Shipped vs owner decision:** destructive, permission-expanding, and
 privacy-sensitive candidates (irreversible ejection — kick/ban/unban/prune —
 and guild-settings writes) were deliberately routed to owner decision instead
-of shipped — see the "deliberately NOT ops" bullets in `docs/security.md`.
+of shipped. *(Superseded by the owner-tier pass below: the owner decided, and
+those ops shipped — the 89-op / 78-9-2 arithmetic above is also superseded.)*
+
+## Owner-tier pass + two-tier agent permission model: 89 → 125 ops (2026-08-20)
+
+Commit `810e05a` (merge `7698948`). The owner ruled on every withheld
+candidate from the cross-reference campaign above: **36 destructive or
+privileged primitives shipped** in a NEEDS_OWNER tier (channel CRUD +
+overwrites, member ejection, message moderation, webhook CRUD + execute,
+automod CRUD, event delete, stage lifecycle, guild-settings writes), every
+one at least `PermissionLevel.ADMIN`, three SUPERADMIN
+(`edit_guild_settings`, `bulk_ban`, `purge_messages`). The registry now
+holds **125 core primitives: 114 GUILD / 9 DM / 2 GLOBAL**.
+
+Alongside it, agent exposure became **two-tier** (`core/agent_gate.py`): the
+global `agent_ops_whitelist` (superadmin ceiling, fail-closed) x the
+per-guild `agent_ops_gate` (off/admin/everyone tri-state, guild-admin
+savable). This superseded the per-guild `bot_tools_enabled` allowlist.
+The later `eab7105` deleted the redundant `agent_default` field — the admin
+default is derived from the op's permission floor by `default_gate()`.

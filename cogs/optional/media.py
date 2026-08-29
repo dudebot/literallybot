@@ -21,7 +21,7 @@ import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
-from core.utils import InvokerOnlyView, app_is_admin, is_admin
+from core.utils import InvokerOnlyView, is_admin
 
 
 def _serialize_media_list(result: dict) -> dict:
@@ -272,12 +272,10 @@ class Media(commands.Cog):
     @app_commands.command(name="media",
                           description="Open the media-library panel")
     @app_commands.guild_only()
-    @app_is_admin()
+    @app_commands.check(is_admin)
     async def media_slash(self, interaction: discord.Interaction):
-        """Ephemeral twin of `!media` (#76). The gate is the bot's own admin
-        concept, not Discord permissions, so it rides on @app_is_admin rather
-        than default_permissions — keeping the decorator authoritative for
-        both enforcement and /help visibility."""
+        """Ephemeral twin of `!media` (#76). The real gate is
+        `@app_commands.check(is_admin)` — same predicate as `!media`."""
         if not is_admin(interaction):
             await interaction.response.send_message(
                 "Requires admin.", ephemeral=True)

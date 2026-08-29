@@ -63,7 +63,6 @@ class Danbooru(commands.Cog):
         self.logger = bot.logger
         self.posted_danbooru = set()
         self.danbooru_base = "https://danbooru.donmai.us"
-        #self.danbooru_base = "https://testbooru.donmai.us"
 
     # --- service --------------------------------------------------------------
 

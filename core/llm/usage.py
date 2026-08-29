@@ -1,9 +1,7 @@
 """Usage and cost tracking for LLM calls.
 
-The original cog read `response.usage` off the OpenAI SDK response but
-never looked at it. This module gives that data a home: a small record
-type plus a best-effort USD cost estimate and an in-memory aggregator that
-cogs can use for `!aiinfo`-style reporting.
+A small record type plus a best-effort USD cost estimate, consumed as
+per-call log lines.
 
 Pricing table is intentionally coarse (per-provider/model prefix, USD per
 1M tokens) -- it exists to give a rough running total, not to reconcile
@@ -14,7 +12,7 @@ silently wrong number.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 import time
 
 # USD per 1,000,000 tokens: (prompt_price, completion_price).

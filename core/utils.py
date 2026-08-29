@@ -145,10 +145,17 @@ def is_admin(config_or_ctx: Any, maybe_ctx: Any = None) -> bool:
     return False
 
 
-# Gate tiers, stamped onto check predicates by the factories below so a
-# listing can ask "what does this command require?" without running it.
+# Gate tiers, stamped onto these functions so a listing can ask "what
+# does this command require?" without running it.
+# Prefix uses `@commands.check(is_admin)`; slash uses
+# `@app_commands.check(is_admin)`. Same predicate, two wrappers — discord.py
+# has two command systems and they do not accept each other's decorator.
+# /help has an Interaction, not a Context, so it cannot execute a prefix
+# check; an untagged superadmin command was listed to every guild admin.
 GATE_ADMIN = "admin"
 GATE_SUPERADMIN = "superadmin"
+is_admin.__gate__ = GATE_ADMIN
+is_superadmin.__gate__ = GATE_SUPERADMIN
 
 
 def gate_of(check) -> Union[str, None]:
@@ -159,29 +166,6 @@ def gate_of(check) -> Union[str, None]:
     still render the right listing. An untagged check is treated as gated
     but of unknown tier by callers, never as public."""
     return getattr(check, "__gate__", None)
-
-
-def app_is_admin():
-    """`@app_commands.check` form of is_admin, tagged with its tier.
-
-    Slash commands whose gate is this bot's admin list (not Discord's
-    permissions) must NOT use @app_commands.default_permissions: that field
-    means something different, and a listing reading it would either hide
-    the command from people who can run it or show it to people who can't.
-    Declaring the real gate here keeps enforcement and visibility on the
-    same decorator, so they cannot drift."""
-    async def predicate(interaction) -> bool:
-        return is_admin(interaction)
-    predicate.__gate__ = GATE_ADMIN
-    return discord.app_commands.check(predicate)
-
-
-def app_is_superadmin():
-    """`@app_commands.check` form of is_superadmin, tagged with its tier."""
-    async def predicate(interaction) -> bool:
-        return is_superadmin(interaction)
-    predicate.__gate__ = GATE_SUPERADMIN
-    return discord.app_commands.check(predicate)
 
 
 def list_cog_modules(group: str, config=None) -> List[str]:
@@ -339,8 +323,7 @@ async def safe_delete(ctx, logger=None):
 def recursive_split(text, max_size=2000):
     """Split text into Discord-size chunks, preferring newline/sentence/space
     boundaries and keeping fenced/inline code blocks intact across chunks.
-    The single shared implementation of Discord's 2000-char message limit —
-    moved here from cogs/optional/gpt.py (seam-machine claim 3)."""
+    The single shared implementation of Discord's 2000-char message limit."""
     if len(text) <= max_size:
         return [text]
     mid = len(text) // 2

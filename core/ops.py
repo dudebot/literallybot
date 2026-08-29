@@ -133,9 +133,8 @@ OP_GROUPS: Dict[str, str] = {
     # "guild-info": the reads stay browsable in guild-info, while this group
     # collects the ADMIN member-moderation write surface.
     "members": "Members",
-    # Moderation reads (ban list, automod rules; the ban/kick/prune WRITES
-    # are deliberately not ops — owner-tier decisions, see the guild gap
-    # sheet).
+    # Moderation reads (ban list, automod rules). The ban/kick/prune WRITES
+    # live in the NEEDS_OWNER-tier "members" surface below (ADMIN+ floors).
     "moderation": "Moderation",
     # Voice-state reads and the reversible client-parity voice writes
     # (move/disconnect/server-mute/deafen/stage suppress) from the 2026-08
@@ -143,13 +142,13 @@ OP_GROUPS: Dict[str, str] = {
     # scope — a stateful gateway session, not an atomic op.
     "voice": "Voice",
     # Guild scheduled events (2026-08 voice-domain pass): reads for everyone,
-    # create/edit for admins. Delete/cancel is deliberately NOT an op — it
-    # destroys the accrued RSVP list irreversibly and the client confirms it.
+    # create/edit for admins. Delete/cancel lives in the NEEDS_OWNER tier
+    # (delete_scheduled_event) — it destroys the accrued RSVP list.
     "events": "Scheduled events",
     # Invite lifecycle (2026-08 expressive-domain pass): admin list/create/
-    # revoke. Webhook create/edit/delete/execute are deliberately NOT ops —
-    # a webhook URL is a persistent unauthenticated posting credential, so
-    # exposing those is an owner decision, not a gap-fill.
+    # revoke. Webhook CRUD + execute live in the NEEDS_OWNER-tier "webhooks"
+    # group below — a webhook URL is a persistent unauthenticated posting
+    # credential.
     "invites": "Invites",
     # NEEDS_OWNER-tier destructive/privileged surfaces (2026-08 owner-tier
     # pass). Each fills the deliberately-omitted destructive half of a domain
@@ -549,19 +548,6 @@ class Op:
             "additionalProperties": False,
         }
 
-    def to_schema(self) -> Dict[str, Any]:
-        """A frontend-agnostic description of this op — enough for an MCP
-        tool listing or an agent-loop tool spec without importing discord.py."""
-        return {
-            "name": self.name,
-            "description": self.description,
-            "permission": self.permission.name,
-            "scope": self.scope.value,
-            "group": self.group,
-            "origin": self.origin,
-            "params": self.to_json_schema(),
-        }
-
     # -- id resolution ----------------------------------------------------
 
     async def resolve_kwargs(self, bot: Any, guild: Optional[Any], raw: Dict[str, Any],
@@ -909,9 +895,6 @@ class OpsRegistry:
             raise ValueError(f"Op '{name}' not found in the ops registry.")
         return op
 
-    def list_tools(self) -> List[Dict[str, Any]]:
-        return [op.to_schema() for op in self._ops.values()]
-
     def names(self) -> List[str]:
         return list(self._ops.keys())
 
@@ -947,8 +930,9 @@ class OpsRegistry:
         This replaces the former `agent=True` flag. The doctrine is that
         there is no code-level op subset — an op is available to the
         guild-confined agent loop exactly when it acts on a guild, and
-        WHICH of those a given guild enables is per-guild config
-        (`bot_tools_enabled`), not a constant in this file."""
+        WHICH of those a given guild enables is config (the global
+        `agent_ops_whitelist` x the per-guild `agent_ops_gate`, see
+        core/agent_gate.py), not a constant in this file."""
         return self.op_names(scope=OpScope.GUILD)
 
     def grouped(self, *, scope: Optional[OpScope] = None,
@@ -2201,13 +2185,11 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
 # takes only the recipient id) and open the DM channel from that user. A raw
 # DM channel id is never accepted from the wire.
 #
-# The former GUILD+MEMBER shape (guild_id required on the wire) was removed
-# 2026-08 by owner decision — one-to-one primitives; no invented params. The
-# membership confinement it provided was redundant: Discord itself refuses
-# bot DMs to users who share no guild. Consequence for the ADMIN gate: over
-# guild-less frontends (MCP) there is no guild admin list to consult, so DM
-# ops are effectively superadmin-only there; in-bot, ambient ctx.guild keeps
-# the per-guild admin check.
+# DM ops take a user id and nothing else — no membership check is needed,
+# because Discord itself refuses bot DMs to users who share no guild.
+# Consequence for the ADMIN gate: over guild-less frontends (MCP) there is
+# no guild admin list to consult, so DM ops are effectively superadmin-only
+# there; in-bot, ambient ctx.guild keeps the per-guild admin check.
 #
 # CONSENT IS DELIBERATELY NOT ENFORCED HERE. Whether a given user has opted in
 # is a per-deployment convention (one guild's opt-in role id is meaningless in
@@ -3708,9 +3690,9 @@ async def set_slowmode(ctx: OpContext, channel, seconds: int):
 @registry.op(
     "edit_channel",
     "Edit a channel's name, topic, or nsfw flag. Requires admin. Reversible "
-    "in-place edits only — position/category moves and permission "
-    "overwrites are deliberately NOT ops. Threads are refused (edit_thread "
-    "owns those).",
+    "in-place edits only — position/category moves are move_channel's job, "
+    "permission overwrites are set_channel_overwrite's. Threads are refused "
+    "(edit_thread owns those).",
     PermissionLevel.ADMIN,
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Discord channel id to edit."),
@@ -3852,9 +3834,8 @@ async def create_forum_post(ctx: OpContext, channel, name: str, content: str,
 # SAFE_NOW bar for this section: an admin could already do it by hand in the
 # Discord client without a confirmation dialog. That is why timeout_member is
 # here (duration picker, no confirm, reversible any moment via remove_timeout)
-# while kick/ban/prune/unban are deliberately NOT ops — the client confirms
-# those, they eject people irreversibly, and exposing them is an owner
-# decision, not a gap-fill.
+# while kick/ban/prune/unban live in the NEEDS_OWNER tier further down —
+# the client confirms those and they eject people irreversibly.
 #
 # Datetimes serialize as ISO strings; ids stay ints in results like every
 # serializer above (the string-snowflake rule is a WIRE-INPUT rule).
@@ -4522,8 +4503,8 @@ async def list_webhooks(ctx: OpContext, guild, channel=None):
 # either a read any member gets in the client (the voice sidebar, the events
 # tab) or a no-confirmation reversible client action (dragging a member
 # between voice channels, the server-mute checkbox). Kick/ban/prune, event
-# delete/cancel, automod CRUD, and stage go-live are deliberately NOT ops —
-# destructive or guild-notifying, owner decisions rather than gap-fills.
+# delete/cancel, automod CRUD, and stage go-live live in the NEEDS_OWNER
+# tier (2026-08 owner-tier pass) — destructive or guild-notifying.
 # Bot voice PRESENCE (connect/play) is structurally out of scope: a stateful
 # gateway session, not an atomic request/response op.
 #
@@ -5068,7 +5049,7 @@ async def create_scheduled_event(ctx: OpContext, name: str, start_time: str,
     "Edit a scheduled event: rename, retime, move, describe, or transition "
     "its status ('active' to start it, 'completed' to end an active one — "
     "forward-only per the API). Requires admin. All fields optional and "
-    "sparse; cancel/delete is deliberately NOT available.",
+    "sparse; cancel/delete is delete_scheduled_event's job.",
     PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD,
@@ -5129,7 +5110,7 @@ async def edit_scheduled_event(ctx: OpContext, event_id: int,
         if status not in ("active", "completed"):
             raise ValueError(
                 "status must be 'active' or 'completed' — cancellation is "
-                "deliberately not available through this op.")
+                "delete_scheduled_event's job.")
         kwargs["status"] = getattr(discord.EventStatus, status)
     if not kwargs:
         raise ValueError(
@@ -5197,8 +5178,8 @@ def _serialize_automod_rule(rule: Any) -> Dict[str, Any]:
     "Read a guild's automod rules (triggers, keyword lists, actions, "
     "exemptions) — the same view Server Settings → AutoMod shows an admin. "
     "Requires admin, NOT everyone: keyword rules expose the guild's "
-    "filtered-word lists. Read-only; automod create/edit/delete are "
-    "deliberately not ops.",
+    "filtered-word lists. Read-only; create_automod_rule / edit_automod_rule "
+    "/ delete_automod_rule own the writes.",
     PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD,
@@ -6706,8 +6687,7 @@ async def delete_invite(ctx: OpContext, guild, code: str):
 # ---------------------------------------------------------------------------
 
 def _print_schemas() -> None:
-    tools = registry.list_tools()
-    print(f"core.ops — {len(tools)} ops registered")
+    print(f"core.ops — {len(registry.names())} ops registered")
     for gid, label, ops in registry.grouped():
         print(f"\n{label} ({gid}) — {len(ops)} ops")
         for op_ in ops:

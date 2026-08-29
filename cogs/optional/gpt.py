@@ -1,6 +1,7 @@
 from discord.ext import commands
 from discord import app_commands
 import discord
+import logging
 import os
 import time
 import re
@@ -8,10 +9,10 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from core.utils import InvokerOnlyView, app_is_admin, is_admin, is_superadmin, recursive_split
+from core.utils import InvokerOnlyView, is_admin, is_superadmin, recursive_split
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
-from core.agent_loop import agent_ops, resolve_bot_tools
+from core.agent_gate import agent_universe
 from core.agent_gate import (
     GATE_ADMIN,
     GATE_EVERYONE,
@@ -222,7 +223,8 @@ class Gpt(commands.Cog):
         return models.get(pc["model"], {}) or {}
 
     def _resolve_bot_tools(self, ctx) -> List[str]:
-        """The guild's enabled bot-agent tools (resolved live from the whitelist + per-guild gate; this IS agent_ops() now).
+        """The guild's enabled bot-agent tools (resolved live from the
+        whitelist + per-guild gate — core.agent_gate.agent_universe).
 
         Empty (the default) means the plain-chat path runs: no tools, no
         agent loop. Stale op names whose op is not currently registered are
@@ -230,12 +232,11 @@ class Gpt(commands.Cog):
         """
         if not getattr(ctx, "guild", None):
             return []
-        from core.agent_loop import resolve_bot_tools
-        from core.utils import is_admin, is_superadmin
+        from core.utils import is_superadmin
         wl = self.bot.config.get_global("agent_ops_whitelist")
         gate = self.bot.config.get(ctx, "agent_ops_gate")
-        return resolve_bot_tools(wl, gate,
-                                 is_superadmin_actor=is_superadmin(ctx))
+        return agent_universe(wl, gate,
+                              is_superadmin_actor=is_superadmin(ctx))
 
     def cooldown_config(self):
         """(tier_bases, windows) — operator overrides merged over defaults.
@@ -339,11 +340,9 @@ class Gpt(commands.Cog):
 
     async def _build_history(self, ctx, agentic):
         """Scrape recent channel messages (plus referenced messages) into
-        OpenAI-style history turns and a user-id -> display-name mapping.
-        Moved verbatim out of process_askgpt (seam-machine claim 1)."""
+        OpenAI-style history turns and a user-id -> display-name mapping."""
         history = []
         messages = []
-        # Get the last 15 messages in the channel (increased for better context)
         async for msg in ctx.channel.history(limit=15):
             messages.append(msg)
         
@@ -360,12 +359,10 @@ class Gpt(commands.Cog):
         if reply_chain_ids:
             self.logger.debug(f"Found {len(reply_chain_ids)} referenced messages to fetch")
             for ref_id in reply_chain_ids:
-                # Skip if message is already in our history
                 if any(msg.id == ref_id for msg in messages):
                     continue
                 
                 try:
-                    # Try to fetch the referenced message
                     ref_msg = await ctx.channel.fetch_message(ref_id)
                     referenced_msgs[ref_id] = ref_msg
                 except Exception as e:
@@ -383,12 +380,9 @@ class Gpt(commands.Cog):
                         member = ctx.guild.get_member(int(uid))
                         user_mapping[uid] = member.display_name if member else name
         
-        # Prepare all messages for history (regular messages + referenced messages)
         all_messages_for_history = list(messages)
         
-        # Add referenced messages to the history preparation
         for ref_id, ref_msg in referenced_msgs.items():
-            # Add a special note indicating this is a referenced message
             modified_content = f"[REFERENCED MESSAGE] {ref_msg.content}"
             # Create a temporary copy with modified content to avoid changing the original
             ref_msg_copy = type('MessageCopy', (), {
@@ -400,7 +394,6 @@ class Gpt(commands.Cog):
             })
             all_messages_for_history.append(ref_msg_copy)
         
-        # Sort all messages chronologically to preserve conversation flow
         all_messages_for_history.sort(key=lambda x: getattr(x, 'created_at', 0))
         
         # Mark the most recent message (last in list after sorting)
@@ -409,10 +402,8 @@ class Gpt(commands.Cog):
         
         # Construct history with bot messages unchanged and non-bot with user ID prefix
         for msg in all_messages_for_history:
-            # Extract content including embeds
             full_content = getattr(msg, 'content', '')
             
-            # Add embed data if present
             if hasattr(msg, 'embeds') and msg.embeds:
                 embed_parts = []
                 for i, embed in enumerate(msg.embeds):
@@ -452,7 +443,6 @@ class Gpt(commands.Cog):
                 if embed_parts:
                     full_content = full_content + "\n" + "\n".join(embed_parts) if full_content else "\n".join(embed_parts)
             
-            # Add attachment info if present
             if hasattr(msg, 'attachments') and msg.attachments:
                 attachment_parts = []
                 for att in msg.attachments:
@@ -496,8 +486,7 @@ class Gpt(commands.Cog):
         agentic tool guidance, and active user memories.
 
         `tool_names` is the guild's resolved bot-tool allowlist. When empty
-        the agentic guidance block is omitted (plain-chat behavior).
-        Moved verbatim out of process_askgpt (seam-machine claim 1)."""
+        the agentic guidance block is omitted (plain-chat behavior)."""
         agentic = bool(tool_names)
         # Retrieve personality data (prompt and version)
         personality_data = self.bot.config.get(ctx, "gpt_personality_data")
@@ -592,7 +581,6 @@ class Gpt(commands.Cog):
             return
 
         async with ctx.typing():
-            # Get provider configuration
             provider_config = self.get_provider_config(ctx)
 
             # Agentic vs plain chat is decided by the guild's enabled bot
@@ -605,7 +593,6 @@ class Gpt(commands.Cog):
             history, user_mapping = await self._build_history(ctx, agentic)
             prompt = self._build_system_prompt(ctx, tool_names, user_mapping)
 
-            # Prepare messages for API
             api_messages = [
                 {
                     "role": "system",
@@ -635,7 +622,6 @@ class Gpt(commands.Cog):
                     await ctx.send("The model returned an empty response (likely spent its whole token budget thinking). Try again or check the model's reasoning_effort setting.")
                     return
                 
-                # Check if the response complies with our safety rules
                 is_compliant, checked_response = self.check_message_compliance(ctx, response)
                 if not is_compliant:
                     await ctx.send(f"I'm sorry {ctx.author.display_name}, I can't do that.")
@@ -786,7 +772,6 @@ class Gpt(commands.Cog):
         """Core logic for changing the AI provider. Returns the response text."""
         config = self.bot.config
 
-        # Apply alias if needed
         provider = self.provider_aliases.get(provider.lower(), provider.lower())
 
         provider_config = self.get_provider_config(ctx)
@@ -837,25 +822,20 @@ class Gpt(commands.Cog):
         """
         config = self.bot.config
 
-        # If no provider specified, use current provider
         if provider is None:
             provider_config = self.get_provider_config(ctx)
             provider = provider_config["provider"]
         else:
-            # Apply alias if needed
             provider = self.provider_aliases.get(provider.lower(), provider.lower())
 
-        # Get all providers
         all_providers = self.llm.get_all_providers()
 
         if provider not in all_providers:
             return f"Unknown provider '{provider}'. Available: {', '.join(all_providers.keys())}"
 
-        # Get provider info
         provider_info = all_providers[provider]
         models_dict = provider_info.get("models", {})
 
-        # Check if model already exists
         if model_name in models_dict:
             return f"Model '{model_name}' already exists for {provider}. Remove it first if you want to update it."
 
@@ -867,12 +847,10 @@ class Gpt(commands.Cog):
         if max_tokens:
             model_config["max_completion_tokens"] = max_tokens
 
-        # Add model to provider
         models_dict[model_name] = model_config
         provider_info["models"] = models_dict
         all_providers[provider] = provider_info
 
-        # Save back to global config
         self.llm.set_all_providers(all_providers)
 
         tier, base = cooldown_tier_for_cost(cost, self.cooldown_config()[0])
@@ -883,15 +861,12 @@ class Gpt(commands.Cog):
         """Core logic for removing a model from a provider. Returns the response text."""
         config = self.bot.config
 
-        # If no provider specified, use current provider
         if provider is None:
             provider_config = self.get_provider_config(ctx)
             provider = provider_config["provider"]
         else:
-            # Apply alias if needed
             provider = self.provider_aliases.get(provider.lower(), provider.lower())
 
-        # Get all providers
         all_providers = self.llm.get_all_providers()
 
         if provider not in all_providers:
@@ -900,7 +875,6 @@ class Gpt(commands.Cog):
         provider_info = all_providers[provider]
         models_dict = provider_info.get("models", {})
 
-        # Check if model exists
         if model_name not in models_dict:
             return f"Model '{model_name}' not found in {provider}"
 
@@ -910,7 +884,6 @@ class Gpt(commands.Cog):
 
         response_lines = []
 
-        # Check if this is the currently active model for this guild
         current_provider_config = self.get_provider_config(ctx)
         if current_provider_config["provider"] == provider and current_provider_config["model"] == model_name:
             # Clear guild's model selection, forcing fallback to provider default
@@ -918,12 +891,10 @@ class Gpt(commands.Cog):
                 config.rem(ctx, "current_ai_model")
                 response_lines.append(f"'{model_name}' was your active model. Cleared guild model selection (will use {provider}'s default: {provider_info['default_model']})")
 
-        # Remove the model
         del models_dict[model_name]
         provider_info["models"] = models_dict
         all_providers[provider] = provider_info
 
-        # Save back to global config
         self.llm.set_all_providers(all_providers)
 
         response_lines.append(f"Removed model '{model_name}' from {provider}")
@@ -971,23 +942,19 @@ class Gpt(commands.Cog):
         """
         config = self.bot.config
 
-        # Apply alias if needed
         provider = self.provider_aliases.get(provider.lower(), provider.lower())
 
-        # Get all providers
         all_providers = self.llm.get_all_providers()
 
         if provider not in all_providers:
             raise ValueError(f"Unknown provider '{provider}'. Available: {', '.join(all_providers.keys())}")
 
-        # Store the API key
         api_key_name = f"{provider.upper()}_API_KEY"
         config.set(None, api_key_name, api_key, scope="global")
 
         provider_info = all_providers[provider]
         lines = [f"API key set for {provider_info['name']}. Attempting to discover available models..."]
 
-        # Try to auto-discover models
         try:
             discovered_models = await self.discover_models(provider, api_key, provider_info)
 
@@ -1018,10 +985,8 @@ class Gpt(commands.Cog):
         if personality_data and isinstance(personality_data, dict):
             current_personality_version = personality_data.get("version", 0)
         
-        # Capture memories from all relevant messages
         await self.capture_and_store_memories(ctx, [message], current_personality_version)
         
-        # Skip messages from bots
         if message.author.bot:
             return
             
@@ -1158,10 +1123,7 @@ class Gpt(commands.Cog):
             {"pattern": r"\bI(?:'m| am) excited (?:about|for)\s+(.+)", "duration": 172800, "type": "enthusiasm"} # 2 days
         ]
         
-        # Scan messages for new memories
         for msg in messages:
-            # if msg.author.bot: # Do not capture memories from bot's own messages
-            #     continue
             content = msg.content
             for item in patterns:
                 m = re.search(item["pattern"], content, flags=re.I)
@@ -1181,20 +1143,18 @@ class Gpt(commands.Cog):
                         })()
                         if not is_admin(self.bot.config, sender_ctx):
                             continue
-                    text = m.group(0) # Capture the whole matched text
+                    text = m.group(0)
                     expires = time.time() + item["duration"]
                     newly_captured_memories.append({
                         'text': text,
                         'expires': expires,
                         'type': item["type"],
                         'sender': msg.author.id,
-                        'personality_version': current_personality_version, # Tag with current personality version
-                        'stored_at': time.time() # Add stored_at timestamp
+                        'personality_version': current_personality_version,
+                        'stored_at': time.time()
                     })
         
-        # Skip further processing if no new memories were captured
         if not newly_captured_memories:
-            # Check if we need to purge expired memories
             if any(m.get('expires', 0) <= time.time() for m in all_server_memories):
                 active_server_memories = [m for m in all_server_memories if m.get('expires', 0) > time.time()]
                 if len(active_server_memories) != len(all_server_memories):
@@ -1209,7 +1169,6 @@ class Gpt(commands.Cog):
                 if (new_mem['text'] == existing_mem.get('text', '') and
                     new_mem['type'] == existing_mem.get('type', '') and
                     new_mem['sender'] == existing_mem.get('sender')):
-                    # If it's a duplicate fact, check if we need to update its properties
                     if (existing_mem.get('expires') != new_mem['expires'] or
                         existing_mem.get('personality_version') != new_mem['personality_version'] or
                         existing_mem.get('stored_at') != new_mem['stored_at']):
@@ -1233,7 +1192,6 @@ class Gpt(commands.Cog):
                 all_server_memories = active_server_memories
                 changes_made = True
         
-        # Only save if changes were made
         if changes_made:
             config.set(ctx, "gpt_memories", all_server_memories)
             self.logger.debug(f"Stored {len(newly_captured_memories)} new memories")
@@ -1300,7 +1258,8 @@ class Gpt(commands.Cog):
     @app_commands.command(name="aisettings",
                           description="Open the AI settings panel")
     @app_commands.guild_only()
-    @app_is_admin()
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.check(is_admin)
     async def aisettings_slash(self, interaction: discord.Interaction):
         """Ephemeral twin of `!aisettings` (#76).
 
@@ -1309,11 +1268,11 @@ class Gpt(commands.Cog):
         channel. Bystanders could never *click* it (see interaction_check),
         but they could read the guild's model/provider/tool configuration.
 
-        Deliberately NO app_commands.default_permissions: that gates on
-        DISCORD permissions, which the bot's own admins do not necessarily
-        hold, and is exactly what caused the /aisettings lockout that made
-        #67 move these to prefix-only. The gate is the bot's own admin
-        concept, checked here.
+        Discord's picker cannot filter on the bot's admin list, so
+        visibility is pinned guild-only + Administrator. The real gate is
+        `@app_commands.check(is_admin)`. The #67 lockout was slash-as-the-only
+        surface; bot admins without Discord Administrator still have
+        `!aisettings`.
         """
         if not is_admin(interaction):
             await interaction.response.send_message(
@@ -1355,6 +1314,33 @@ class Gpt(commands.Cog):
 # CHUNKED across as many selects as it takes.
 SELECT_MAX_OPTIONS = 25
 
+# Shared by the Agent Ops and MCP tabs. API primitives keep OP_GROUPS
+# (Discord-domain slices). Behavioral (cog-registered) ops are one flat
+# bucket — they are not a Discord domain and should not mint a select row
+# per cog. The two tabs pass this into the same renderer; only `current`
+# and the saver differ (in-chat agent whitelist vs MCP expose-list).
+API_SECTION = "**API primitives**"
+BEHAVIORAL_SECTION = "**Behavioral primitives**"
+BEHAVIORAL_GROUP_ID = "_behavioral"
+log = logging.getLogger(__name__)
+
+
+def tool_tab_sections(scope=None):
+    """Section structure for BOTH superadmin tool tabs (Agent Ops and MCP).
+
+    Same groups, same order, live from the registry. Consumers differ
+    (guild-confined agent vs host-side MCP) but the catalog they edit
+    is one shape.
+    """
+    api = registry.grouped(scope=scope, origin=ORIGIN_CORE)
+    cog_ops = registry.ops(scope=scope, origin=ORIGIN_COG)
+    behavioral = ([(BEHAVIORAL_GROUP_ID, "Behavioral", cog_ops)]
+                  if cog_ops else [])
+    return [
+        (API_SECTION, api),
+        (BEHAVIORAL_SECTION, behavioral),
+    ]
+
 
 def _tool_selects(universe, current, on_save):
     """Build one _ToolSelect per 25-op chunk of a FLAT `universe`.
@@ -1377,20 +1363,16 @@ def _tool_selects(universe, current, on_save):
 
 
 def _grouped_tool_sections(sections, current, on_save):
-    """Render an op universe as labelled sections of grouped selects.
+    """Render tool-tab sections as heading + 25-option selects.
 
-    `sections` is [(section_label, [(group_id, group_label, [Op, ...]), ...])]
-    — i.e. registry.grouped() output already partitioned by origin, so the
-    panel can show API primitives and behavioral primitives as visibly
-    separate territory. Yields (kind, payload) pairs: ("heading", markdown) and
-    ("select", _ToolSelect), which the caller wraps in the Components-V2
-    containers it needs.
+    `sections` is tool_tab_sections() output. API groups are flattened
+    into filled 25-option chunks (group name rides on the option
+    description); behavioral is already one bucket. Yields ("heading",
+    markdown) and ("select", _ToolSelect).
 
-    The CROSS-SELECT MERGE is the load-bearing part. Every select is handed
-    the full universe as `universe`, so on save it carries through names
-    enabled in any other group/chunk. Names whose op is currently
-    unregistered live outside the universe entirely and are preserved by the
-    saver (see `_save_bot_tools`), not here.
+    Every select is handed the full universe so a save carries through
+    names enabled in other selects. Unregistered stored names are
+    preserved by the saver, not here.
     """
     universe = [op.name for _label, groups in sections
                 for _gid, _glabel, ops in groups for op in ops]
@@ -1398,18 +1380,21 @@ def _grouped_tool_sections(sections, current, on_save):
         if not groups:
             continue
         yield "heading", section_label
-        for _gid, group_label, ops in groups:
-            names = [op.name for op in ops]
-            # A group over the cap is a registry-design bug (there is a test
-            # for it), but chunk rather than silently drop options.
-            chunks = [names[i:i + SELECT_MAX_OPTIONS]
-                      for i in range(0, len(names), SELECT_MAX_OPTIONS)]
-            for i, chunk in enumerate(chunks):
-                label = group_label
-                if len(chunks) > 1:
-                    label = f"{group_label} ({i + 1}/{len(chunks)})"
-                yield "select", _ToolSelect(chunk, current, on_save, universe,
-                                            label=label)
+        items = []
+        for gid, group_label, ops in groups:
+            for op in ops:
+                desc = None if gid == BEHAVIORAL_GROUP_ID else group_label
+                items.append((op.name, desc))
+        chunks = [items[i:i + SELECT_MAX_OPTIONS]
+                  for i in range(0, len(items), SELECT_MAX_OPTIONS)]
+        heading = section_label.strip("*")
+        for i, chunk in enumerate(chunks):
+            names = [n for n, _d in chunk]
+            descs = {n: d for n, d in chunk if d}
+            label = heading if len(chunks) == 1 else f"{heading} ({i + 1}/{len(chunks)})"
+            yield "select", _ToolSelect(
+                names, current, on_save, universe,
+                label=label, descriptions=descs or None)
 
 
 class _ToolSelect(discord.ui.Select):
@@ -1417,7 +1402,7 @@ class _ToolSelect(discord.ui.Select):
     change. Saves merge across chunks — see `callback`."""
 
     def __init__(self, chunk, current, on_save, universe=None,
-                 page=1, pages=1, label=None):
+                 page=1, pages=1, label=None, descriptions=None):
         self._on_save = on_save
         # Ops shown in OTHER selects, whose enabled state this select must
         # carry through untouched rather than clobber.
@@ -1426,10 +1411,14 @@ class _ToolSelect(discord.ui.Select):
                            if n not in set(self._chunk)]
         current_set = set(current)
         self._current = list(current)
-        options = [
-            discord.SelectOption(label=name, value=name, default=(name in current_set))
-            for name in self._chunk
-        ]
+        options = []
+        for name in self._chunk:
+            desc = (descriptions or {}).get(name)
+            kwargs = {"label": name, "value": name,
+                      "default": name in current_set}
+            if desc:
+                kwargs["description"] = desc[:100]
+            options.append(discord.SelectOption(**kwargs))
         if label is not None:
             placeholder = f"{label} — none = off"
         elif pages > 1:
@@ -1778,12 +1767,15 @@ class _PersonalityModal(discord.ui.Modal, title="Set AI personality"):
     def __init__(self, view: "AiSettingsView"):
         super().__init__()
         self._panel = view
+        # Discord TextInput ceiling is 4000. Truncate default so a longer
+        # JSON store cannot 400 the modal (control.py already does this).
+        stored = view.current_personality() or ""
         self.prompt = discord.ui.TextInput(
             label="Personality prompt",
             style=discord.TextStyle.paragraph,
             required=True,
-            max_length=2000,
-            default=view.current_personality() or "",
+            max_length=4000,
+            default=stored[:4000],
         )
         self.add_item(self.prompt)
 
@@ -1894,7 +1886,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         # Same resolver the agent loop uses — the panel's summary line must
         # show exactly the effective set (whitelist + per-guild gate), never
         # a private re-derivation of it.
-        return resolve_bot_tools(self._whitelist(), self._gate_cfg())
+        return agent_universe(self._whitelist(), self._gate_cfg())
 
     def _server_gate_ops(self):
         """The (group_label, [Op, ...]) sections the Server tab renders: only
@@ -1923,17 +1915,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         return row
 
     def _sections(self, *, scope=None):
-        """Live op universe for a tab, split into the two visible sections
-        (owner's terms): API primitives — raw Discord actions from
-        core/ops.py — first, then behavioral primitives — capabilities cogs
-        register with internal intelligence of their own. Both come from the
-        registry at RENDER time rather than from an import-time snapshot, so
-        the panel always shows the ops this boot's cog set actually
-        registered (the cog set is fixed at boot, #86)."""
-        return [
-            ("**API primitives**", registry.grouped(scope=scope, origin=ORIGIN_CORE)),
-            ("**Behavioral primitives**", registry.grouped(scope=scope, origin=ORIGIN_COG)),
-        ]
+        """Agent Ops and MCP share this catalog. See tool_tab_sections."""
+        return tool_tab_sections(scope)
 
     def _add_tool_sections(self, sections, current, on_save):
         """Add the section headings + per-group selects for a tool tab."""
@@ -2331,7 +2314,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         carried through verbatim: dropping them would silently destroy a
         guild's choice on the next panel save and never restore it when the
         cog comes back. The effective set is separately narrowed at read
-        time by resolve_bot_tools / resolve_mcp_tools."""
+        time by agent_universe / resolve_mcp_tools."""
         live = set(universe)
         merged, seen = [], set()
         # Offline names first so their relative order is stable, then the
@@ -2453,11 +2436,29 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
     # --- lifecycle -------------------------------------------------------
     async def rerender(self, interaction: discord.Interaction):
         self.refresh_state()
-        self._build()
-        if interaction.response.is_done():
-            await interaction.edit_original_response(view=self)
-        else:
-            await interaction.response.edit_message(view=self)
+        try:
+            self._build()
+        except ValueError as exc:
+            # A failed rebuild used to raise inside the button/select
+            # callback with no response, which Discord surfaces as a
+            # timeout. Answer instead so a save is not silently lost.
+            log.exception("aisettings _build failed")
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"Panel failed to render: {exc}", ephemeral=True)
+            return
+        try:
+            if interaction.response.is_done():
+                await interaction.edit_original_response(view=self)
+            else:
+                await interaction.response.edit_message(view=self)
+        except discord.HTTPException as exc:
+            log.error("aisettings rerender rejected by Discord: %s %s",
+                      exc.status, getattr(exc, "text", exc))
+            if not interaction.response.is_done():
+                await interaction.response.send_message(
+                    f"Discord rejected the panel ({exc.status}).",
+                    ephemeral=True)
 
 
 async def setup(bot):

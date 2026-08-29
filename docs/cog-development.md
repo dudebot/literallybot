@@ -46,62 +46,12 @@ async def setup(bot):
 
 ## Command Development
 
-### Basic Commands
-```python
-@commands.command(name="greet", aliases=["hello", "hi"])
-async def greet_command(self, ctx, *, name: str = None):
-    """Greet a user or yourself"""
-    if name:
-        await ctx.send(f"Hello {name}!")
-    else:
-        await ctx.send(f"Hello {ctx.author.mention}!")
-```
-
-### Commands with Arguments
-```python
-@commands.command()
-async def add(self, ctx, num1: int, num2: int):
-    """Add two numbers"""
-    result = num1 + num2
-    await ctx.send(f"{num1} + {num2} = {result}")
-
-@commands.command()
-async def say(self, ctx, *, message: str):
-    """Make the bot repeat a message"""
-    await ctx.send(message)
-```
-
-### Error Handling
-
-Unhandled errors are automatically logged to Discord channels via the global error handler. For user input validation, parse arguments yourself rather than relying on discord.py converters - see [error-handling.md](error-handling.md) for details.
-
-```python
-@commands.command()
-async def divide(self, ctx, *, args: str = None):
-    """Divide two numbers"""
-    usage = "Usage: `!divide <num1> <num2>`"
-
-    if not args:
-        await ctx.send(usage)
-        return
-
-    parts = args.split()
-    if len(parts) != 2:
-        await ctx.send(usage)
-        return
-
-    try:
-        num1, num2 = float(parts[0]), float(parts[1])
-    except ValueError:
-        await ctx.send(usage)
-        return
-
-    if num2 == 0:
-        await ctx.send("Cannot divide by zero!")
-        return
-
-    await ctx.send(f"{num1} / {num2} = {num1 / num2}")
-```
+Command mechanics (arguments, aliases, converters) are discord.py's territory —
+see the [discord.py commands docs](https://discordpy.readthedocs.io/en/stable/ext/commands/commands.html).
+The one repo rule: unhandled errors are automatically logged to Discord channels
+via the global error handler, and for user input validation you parse arguments
+yourself rather than relying on discord.py converters — see
+[error-handling.md](error-handling.md).
 
 ## Configuration Integration
 
@@ -120,82 +70,64 @@ async def get_prefix(self, ctx):
     await ctx.send(f"Current prefix: {prefix}")
 ```
 
-### User-Specific Settings
-```python
-@commands.command()
-async def set_timezone(self, ctx, timezone: str):
-    """Set your personal timezone"""
-    # You could add timezone validation here
-    self.bot.config.set_user(ctx, "timezone", timezone)
-    await ctx.send(f"Your timezone set to: {timezone}")
-
-@commands.command()
-async def my_settings(self, ctx):
-    """View your personal settings"""
-    timezone = self.bot.config.get_user(ctx, "timezone", "UTC")
-    theme = self.bot.config.get_user(ctx, "theme", "default")
-    await ctx.send(f"**Your Settings:**\nTimezone: {timezone}\nTheme: {theme}")
-```
-
 ### Managing Lists and Arrays
 ```python
 @commands.command()
 async def add_favorite(self, ctx, *, item: str):
-    """Add an item to your favorites list"""
-    favorites = self.bot.config.get_user(ctx, "favorites", [])
+    """Add an item to this server's favorites list"""
+    favorites = self.bot.config.get(ctx, "favorites", [])
     if item not in favorites:
         favorites.append(item)
-        self.bot.config.set_user(ctx, "favorites", favorites)
-        await ctx.send(f"Added '{item}' to your favorites!")
+        self.bot.config.set(ctx, "favorites", favorites)
+        await ctx.send(f"Added '{item}' to the favorites!")
     else:
-        await ctx.send("That's already in your favorites!")
-
-@commands.command()
-async def list_favorites(self, ctx):
-    """Show your favorites list"""
-    favorites = self.bot.config.get_user(ctx, "favorites", [])
-    if favorites:
-        items = "\n".join(f"• {item}" for item in favorites)
-        await ctx.send(f"**Your Favorites:**\n{items}")
-    else:
-        await ctx.send("You don't have any favorites yet!")
+        await ctx.send("That's already in the favorites!")
 ```
 
 ## Permission Management
 
-### Basic Permission Checks
+THE DECORATOR DECIDES. The gate is `core.utils.is_admin` / `is_superadmin` —
+the bot's admin list, not Discord's Administrator bit. discord.py has two
+command systems, so the same function takes two wrappers. Do not invent a
+third.
+
 ```python
-from core.utils import is_admin
+from discord import app_commands
+from core.utils import is_admin, is_superadmin
 
-@commands.command()
-async def admin_only(self, ctx):
-    """Command only admins can use"""
-    if not is_admin(self.bot.config, ctx):
-        await ctx.send("You don't have permission to use this command.")
-        return
+@commands.command(hidden=True)
+@commands.check(is_admin)          # prefix
+async def aisettings(self, ctx):
+    ...
 
-    await ctx.send("Admin command executed!")
-
-@commands.command()
-@commands.has_permissions(administrator=True)
-async def discord_admin_only(self, ctx):
-    """Command only Discord admins can use"""
-    await ctx.send("Discord admin command executed!")
+@app_commands.command(name="aisettings")
+@app_commands.guild_only()
+@app_commands.default_permissions(administrator=True)   # picker pin, not the gate
+@app_commands.check(is_admin)      # slash — same predicate
+async def aisettings_slash(self, interaction: discord.Interaction):
+    ...
 ```
 
-### Global Superadmin Check
-```python
-from core.utils import is_superadmin
+- Prefix: `@commands.check(is_admin)` or `@commands.check(is_superadmin)`.
+- Slash: `@app_commands.check(is_admin)` or `@app_commands.check(is_superadmin)`.
+- Gated slash also sets `guild_only` + `default_permissions(administrator=True)`.
+  Discord's picker cannot see the bot's admin list; without that pin the
+  command shows to everyone, including in DMs. The pin is visibility, not
+  authorization. A bot admin without Discord Administrator still has the
+  prefix twin. Issue #67 was the lockout from treating the pin *as* the
+  gate when slash was the only surface.
+- `/help` lists a command only if the invoker could run it, by reading the
+  decorator (`__gate__` on `is_admin` / `is_superadmin`). A body
+  `if not is_admin(...)` is defense in depth, not the gate — `/help`
+  cannot see it.
+- Bootstrap only: `!claimsuper` / `!claimadmin` have no decorator
+  (empty-list / Discord-admin-once). Everything else uses the decorator.
+- Never `@commands.has_permissions(administrator=True)` as the bot's admin
+  concept. That is Discord's bit, caused a real lockout, and is not
+  `is_admin`.
 
-@commands.command()
-async def superadmin_only(self, ctx):
-    """Command only bot superadmins can use."""
-    if not is_superadmin(self.bot.config, ctx.author.id):
-        await ctx.send("Only a bot superadmin can use this command.")
-        return
-    
-    await ctx.send("Superadmin command executed!")
-```
+The permission model itself (who is an admin, the escalation guards) lives
+in [security.md](security.md).
 
 ## Registering ops from a cog
 
@@ -358,7 +290,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | Field | What it does |
 |-------|--------------|
 | **name** | Unique registry-wide (core ops included). A collision fails the whole cog's batch — pick something specific. This is the literal tool name a model sees. |
-| **description** | Written *for a model*, not a changelog. State what it does, what it returns, and what it does **not** do. |
+| **description** | Written *for a model*, not a changelog. State what it does, what it returns, and what it does **not** do — and when the excluded action is another op's job, name that op instead of asserting nonexistence (descriptions claiming a sibling "is not an op" go stale the day it ships). |
 | **permission** | `PermissionLevel.EVERYONE` / `ADMIN` / `SUPERADMIN`, checked against the **invoking user** on every call, before any Discord id is resolved. Config never overrides this. |
 | **params** | Typed `OpParam`s. The registry generates the JSON schema *and* resolves Discord entities from ids — see the kinds below. |
 | **scope** | `OpScope.GUILD` / `DM` / `GLOBAL`. See below; this is a safety boundary, not a label. |
@@ -427,10 +359,11 @@ Every frontend queries the registry **live** — never a snapshot taken at impor
 — so your ops appear in the panel as soon as the cog is in the boot set.
 
 When a cog is not loaded (disabled via `disabled_cogs`), its op names stay in
-the stored `bot_tools_enabled` / `mcp_tools_enabled` config lists and are simply
-filtered out of the *effective* set. Re-enabling the cog restores the guild's
-choice instead of silently losing it. Don't write code that prunes unknown names
-out of stored config.
+the stored `agent_ops_whitelist` / `mcp_tools_enabled` config lists (and the
+per-guild `agent_ops_gate` entries survive the same way), simply filtered out
+of the *effective* set. Re-enabling the cog restores the guild's choice instead
+of silently losing it. Don't write code that prunes unknown names out of stored
+config.
 
 ### Checklist
 
@@ -455,56 +388,15 @@ admin-gated attachment surface in disguise).
 
 ## Advanced Features
 
-### Event Listeners
-```python
-@commands.Cog.listener()
-async def on_member_join(self, member):
-    """Triggered when someone joins the server"""
-    # Get welcome channel from config
-    channel_id = self.bot.config.get(member.guild, "welcome_channel")
-    if channel_id:
-        channel = member.guild.get_channel(channel_id)
-        if channel:
-            await channel.send(f"Welcome {member.mention}!")
+Event listeners (`@commands.Cog.listener()`) and background tasks
+(`@tasks.loop`) are standard discord.py — see the
+[discord.py docs](https://discordpy.readthedocs.io/en/stable/ext/tasks/).
+Repo rules: an `on_message` listener must return early on
+`message.author.bot`, and a background task started in `__init__` must be
+cancelled in `cog_unload`.
 
-@commands.Cog.listener()
-async def on_message(self, message):
-    """Triggered on every message (be careful with performance)"""
-    if message.author.bot:
-        return
-    
-    # Example: Track message count per user
-    count = self.bot.config.get_user(message.author.id, "message_count", 0)
-    self.bot.config.set_user(message.author.id, "message_count", count + 1)
-```
-
-### Background Tasks
-```python
-from discord.ext import tasks
-import asyncio
-
-class MyTaskCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.background_task.start()
-    
-    def cog_unload(self):
-        self.background_task.cancel()
-    
-    @tasks.loop(minutes=1)
-    async def background_task(self):
-        # Do something every minute
-        await asyncio.sleep(0)
-```
-
-### Dynamic Config Access without Context
-```python
-# Direct guild ID
-self.bot.config.set(1234567890, "setting_name", True)
-
-# Direct user ID
-self.bot.config.set_user(987654321, "preference", "value")
-```
+Config works without a live Context — pass a guild id directly:
+`self.bot.config.set(1234567890, "setting_name", True)`.
 
 ## Testing & Restarting Tips
 - **The cog set is fixed at boot (#86)** — there is no hot-reload. To pick up a

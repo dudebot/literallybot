@@ -6,7 +6,7 @@ from core.utils import smart_split
 
 
 class RNG(commands.Cog):
-    """This is a cog with dice roll commands, including !random."""
+    """Dice rolls and random picks."""
     def __init__(self, bot):
         self.bot = bot
 
@@ -65,8 +65,7 @@ class RNG(commands.Cog):
         if message.author.bot:
             return
 
-        # Determine the command prefix.
-        prefix = self.bot.command_prefix(self.bot,message) #wonky but it works
+        prefix = self.bot.command_prefix
         prefixes = prefix if isinstance(prefix, (list, tuple)) else [prefix]
 
         for p in prefixes:

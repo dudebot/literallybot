@@ -1,7 +1,5 @@
 from discord.ext import commands
 import discord
-import random
-from datetime import datetime
 
 class Logging(commands.Cog):
     """Writes status messages to a log channel."""

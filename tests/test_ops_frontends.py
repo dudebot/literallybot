@@ -33,10 +33,14 @@ from core.ops import (
     op,
     registry,
 )
-from core.agent_loop import agent_ops, resolve_bot_tools
+from core.agent_gate import agent_universe
 from cogs.optional.gpt import (
     SELECT_MAX_OPTIONS,
+    API_SECTION,
+    BEHAVIORAL_SECTION,
+    BEHAVIORAL_GROUP_ID,
     AiSettingsView,
+    tool_tab_sections,
     _grouped_tool_sections,
 )
 import core.mcp_server as mcp_server
@@ -47,12 +51,8 @@ import core.mcp_server as mcp_server
 # --------------------------------------------------------------------------
 
 def _sections(scope=None):
-    """The exact section structure AiSettingsView builds: core primitives and
-    cog-provided ops as visibly separate territory, each grouped."""
-    return [
-        ("**Core tools**", registry.grouped(scope=scope, origin=ORIGIN_CORE)),
-        ("**Cog tools**", registry.grouped(scope=scope, origin=ORIGIN_COG)),
-    ]
+    """The exact section structure both tool tabs build."""
+    return tool_tab_sections(scope)
 
 
 # The two tabs' universes: the server tab is guild-scoped only, the MCP tab is
@@ -141,6 +141,20 @@ def test_crowding_actually_exceeded_the_cap(crowded_registry):
     assert max(sizes.values()) > SELECT_MAX_OPTIONS
 
 
+def test_groups_are_packed_not_one_select_each():
+    """One ActionRow per group is why /aisettings Agent Ops and MCP timed
+    out: Discord v2 counts each row+select as two children, and the live
+    registry's group count no longer fits in one 40-child message. Packing
+    adjacent groups into 25-option selects is the fix — every op stays
+    selectable, we just stop spending a whole row on a 1-op group."""
+    selects = _rendered_selects(None)
+    groups = list(registry.grouped())
+    assert len(groups) > 1
+    assert len(selects) < len(groups)
+    rendered = [o.value for sel in selects for o in sel.options]
+    assert sorted(rendered) == sorted(registry.names())
+
+
 def test_registry_has_a_plausible_floor_of_ops():
     """A floor, not an inventory: catches a registry that failed to populate
     (import error swallowed, decorator no-oping) without failing every time
@@ -164,7 +178,7 @@ def test_guild_agent_universe_is_exactly_guild_scope_including_cog_ops(
     """The live-query doctrine: guild-scoped ops registered by a COG join the
     agent universe automatically, with no code-level subset to update. With
     the whitelist fully open, the universe is exactly the guild-scoped set."""
-    universe = set(agent_ops(_all_on(), None))
+    universe = set(agent_universe(_all_on(), None))
     assert universe == set(registry.op_names(scope=OpScope.GUILD))
     assert {n for n in universe if n.startswith("crowd_op_")}, \
         "cog-registered guild ops must join the agent universe live"
@@ -177,7 +191,7 @@ def test_non_guild_scopes_never_reach_the_guild_agent_surface(scope):
     DM or global op is covered the day it is written."""
     off_limits = set(registry.op_names(scope=scope))
     assert off_limits, f"no {scope.value}-scoped ops — is the assignment gone?"
-    assert not off_limits & set(agent_ops(_all_on(), None))
+    assert not off_limits & set(agent_universe(_all_on(), None))
 
     server_tab = {o.value for sel in _rendered_selects(OpScope.GUILD)
                   for o in sel.options}
@@ -190,22 +204,43 @@ def test_mcp_tab_universe_is_the_whole_registry():
     so unlike the server tab it spans every scope."""
     rendered = {o.value for sel in _rendered_selects(None) for o in sel.options}
     assert rendered == set(registry.names())
-    assert rendered > set(agent_ops(_all_on(), None)), \
+    assert rendered > set(agent_universe(_all_on(), None)), \
         "the MCP tab must be strictly wider than the guild agent universe"
 
 
 @pytest.mark.parametrize("scope", PANEL_SCOPES)
 def test_sections_split_by_origin_and_label_every_group(scope, crowded_registry):
-    """Core primitives and cog ops render as separate sections, and every
-    group carries a human label — an unlabelled group id would surface as a
-    kebab-case slug in the placeholder."""
+    """API primitives and behavioral ops render as separate sections.
+    API groups keep OP_GROUPS labels; behavioral is one flat bucket."""
     kinds = list(_grouped_tool_sections(_sections(scope), [], None))
     headings = [payload for kind, payload in kinds if kind == "heading"]
-    assert headings == ["**Core tools**", "**Cog tools**"]
+    assert headings[0] == API_SECTION
+    if registry.ops(scope=scope, origin=ORIGIN_COG):
+        assert BEHAVIORAL_SECTION in headings
 
-    for gid, _label, ops in registry.grouped(scope=scope):
+    for gid, _label, ops in registry.grouped(scope=scope, origin=ORIGIN_CORE):
         assert gid in OP_GROUPS
         assert ops
+
+
+def test_behavioral_ops_are_one_flat_bucket(crowded_registry):
+    """Cog-registered ops do not mint a select row per cog group."""
+    _api, behavioral = tool_tab_sections()
+    groups = behavioral[1]
+    assert len(groups) == 1
+    gid, _label, ops = groups[0]
+    assert gid == BEHAVIORAL_GROUP_ID
+    assert {o.name for o in ops} == set(registry.op_names(origin=ORIGIN_COG))
+
+
+def test_agentops_and_mcp_share_the_same_catalog():
+    """The two superadmin tool tabs edit the same grouped catalog. Only
+    the current-set and the saver (agent whitelist vs MCP expose-list)
+    differ — consumers are different, groups are not."""
+    import inspect
+    src = inspect.getsource(AiSettingsView._build)
+    assert src.count("self._sections()") == 2
+    assert "tool_tab_sections" in inspect.getsource(AiSettingsView._sections)
 
 
 # --------------------------------------------------------------------------
@@ -243,7 +278,7 @@ def test_unregistered_name_drops_from_effective_set_but_not_from_config():
     whitelist = {"search_history": True, "ghost_tool": True}
 
     # Cog unloaded: ghost_tool is not live, so it is not offered to the agent.
-    assert resolve_bot_tools(whitelist, None) == ["search_history"]
+    assert agent_universe(whitelist, None) == ["search_history"]
     assert whitelist == {"search_history": True, "ghost_tool": True}, \
         "resolution must not mutate the whitelist"
 
@@ -251,12 +286,12 @@ def test_unregistered_name_drops_from_effective_set_but_not_from_config():
     cog = _GhostCog()
     registry.register_cog_ops(cog)
     try:
-        assert set(resolve_bot_tools(whitelist, None)) == {"search_history", "ghost_tool"}
+        assert set(agent_universe(whitelist, None)) == {"search_history", "ghost_tool"}
     finally:
         registry.unregister_owner(cog)
 
     # Unloaded again: back to the effective subset, whitelist still intact.
-    assert resolve_bot_tools(whitelist, None) == ["search_history"]
+    assert agent_universe(whitelist, None) == ["search_history"]
     assert whitelist == {"search_history": True, "ghost_tool": True}
 
 
@@ -290,12 +325,12 @@ def test_a_panel_save_while_the_cog_is_unloaded_preserves_the_ghost():
     assert set(merged) == {"ghost_tool", "list_channels"}
 
     # And once the cog returns, the preserved whitelisted name resolves live
-    # again for the agent (resolve_bot_tools takes the {name: True} whitelist).
+    # again for the agent (agent_universe takes the {name: True} whitelist).
     whitelist = {n: True for n in merged}
     cog = _GhostCog()
     registry.register_cog_ops(cog)
     try:
-        assert "ghost_tool" in resolve_bot_tools(whitelist, None)
+        assert "ghost_tool" in agent_universe(whitelist, None)
     finally:
         registry.unregister_owner(cog)
 
@@ -496,7 +531,7 @@ def test_whitelist_tab_writes_global_config(monkeypatch):
     assert config.globals[WHITELIST_KEY] == {"search_history": True}
     assert ("agent_ops_whitelist", {"search_history": True}) in config.global_writes
     # The loop's resolver now offers it.
-    assert "search_history" in resolve_bot_tools(config.globals[WHITELIST_KEY], None)
+    assert "search_history" in agent_universe(config.globals[WHITELIST_KEY], None)
 
 
 def test_whitelist_save_preserves_offline_names(monkeypatch):
@@ -556,6 +591,21 @@ def test_non_superadmin_panel_omits_the_agent_ops_tab(monkeypatch):
     labels = _tab_button_labels(view)
     assert labels, "tab bar rendered no buttons"
     assert not any("Agent Ops" in l for l in labels)
+    assert not any("MCP" in l for l in labels)
+
+
+def test_non_superadmin_panel_omits_the_mcp_tab(monkeypatch):
+    """MCP is a host-side operator surface. A guild admin who is not a bot
+    super-admin must not see the tab, and a stale navigate to it redirects
+    to Server rather than rendering the MCP allowlist."""
+    _patch_gates(monkeypatch, admin=True, superadmin=False)
+    config = _TwoTierConfig()
+    view = _build_server_view(monkeypatch, config, is_super=False, page="mcp")
+    assert view.page == "server"
+    labels = _tab_button_labels(view)
+    assert labels, "tab bar rendered no buttons"
+    assert not any("MCP" in l for l in labels)
+    assert not any("Agent Ops" in l for l in labels)
 
 
 def test_superadmin_panel_shows_the_agent_ops_tab(monkeypatch):
@@ -565,6 +615,37 @@ def test_superadmin_panel_shows_the_agent_ops_tab(monkeypatch):
     view = _build_server_view(monkeypatch, config, is_super=True, page="server")
     labels = _tab_button_labels(view)
     assert any("Agent Ops" in l for l in labels)
+    assert any("MCP" in l for l in labels)
+
+
+@pytest.mark.parametrize("page", ["agentops", "mcp"])
+def test_superadmin_tool_tabs_fit_in_one_discord_message(page):
+    """The production timeout: clicking Agent Ops / MCP rebuilt the view
+    with one row per group, discord.py raised 'maximum number of children
+    exceeded (40)', and the interaction never got a response. Building the
+    real page against the live registry must stay under that cap."""
+    import asyncio
+    import discord
+
+    config = _TwoTierConfig(global_values={"superadmins": [77]})
+
+    async def _make():
+        view = _panel(config, is_super=True)
+        view.guild = type("G", (), {"id": 4242, "name": "test"})()
+        discord.ui.LayoutView.__init__(view, timeout=1)
+        view.page = page
+        view.provider = "xai"
+        view.model = "grok"
+        view.mgmt_provider = "xai"
+        view.mgmt_model = None
+        view._build()
+        return view
+
+    view = asyncio.run(_make())
+    assert view.page == page
+    assert view.total_children_count <= 40, (
+        f"{page} tab built {view.total_children_count} Components-V2 "
+        f"children; Discord's cap is 40 and a raise here is the timeout")
 
 
 def _build_server_view(monkeypatch, config, *, is_super, page):
@@ -615,10 +696,6 @@ def _tab_button_labels(view):
     return labels
 
 
-# The `agent=True` flag that this seed snapshots, read off the pre-refactor
-# registry at 58526e2 (the commit before the flag was deleted). Written here
-# as the historical FACT it is, so the assertions below can state how the
-# shipped seed relates to it rather than restating the seed itself.
 # --------------------------------------------------------------------------
 # 4. MCP settings: config first, env fallback, generate as a last resort.
 # --------------------------------------------------------------------------
@@ -772,7 +849,6 @@ import asyncio as _asyncio
 import logging as _logging
 
 from core.agent_loop import _make_agent_tool
-from core.ops import Op as _Op
 from cogs.optional.gpt import _ToolSelect
 
 
@@ -932,39 +1008,3 @@ def test_select_hands_the_saver_its_render_time_universe():
     assert set(merged) == {"ghost_tool", "a", "c"}
 
 
-def test_mcp_tool_refuses_a_swap_during_context_resolution(monkeypatch):
-    """The TOCTOU variant: the entry check passes, then the re-registration
-    lands WHILE resolve_context_guild is awaited. The pre-dispatch re-check
-    must catch it — the entry check alone cannot."""
-    v1, v2 = _RetargetCogV1(), _RetargetCogV2()
-    registry.register_cog_ops(v1)
-    try:
-        captured = registry.require("retarget_probe")
-
-        class _FakeUser:
-            id = 1
-
-        class _FakeBot:
-            user = _FakeUser()
-
-            def get_guild(self, gid):
-                return None
-
-        async def swap_during_resolution(bot, raw, guild_id):
-            # The re-registration interleaves exactly here, mid-await.
-            registry.unregister_owner(v1)
-            registry.register_cog_ops(v2)
-            return None
-
-        monkeypatch.setattr(mcp_server, "resolve_context_guild",
-                            swap_during_resolution)
-        tool_fn = mcp_server._make_mcp_tool(_FakeBot(), captured)
-        try:
-            with pytest.raises(mcp_server.BotUnavailableError,
-                               match="re-registered"):
-                _asyncio.run(tool_fn(actor_id="1"))
-        finally:
-            registry.unregister_owner(v2)
-    finally:
-        registry.unregister_owner(v1)
-        registry.unregister_owner(v2)

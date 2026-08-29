@@ -45,6 +45,7 @@ class ErrorLoggingAdmin(commands.Cog):
     # ==================== TEXT COMMANDS ====================
 
     @commands.group(name="errorlog", invoke_without_command=True, hidden=True)
+    @commands.check(is_admin)
     async def errorlog(self, ctx):
         """
         Error logging configuration commands.
@@ -187,7 +188,6 @@ class ErrorLoggingAdmin(commands.Cog):
         config["default_channel"] = channel.id
         self._set_guild_error_config(ctx.guild.id, config)
 
-        # Send confirmation to command channel (unless it's the same channel)
         if ctx.channel.id != channel.id:
             await ctx.send(f"✅ Error logging enabled for {ctx.guild.name} → {channel.mention}")
 
@@ -208,7 +208,6 @@ class ErrorLoggingAdmin(commands.Cog):
             await ctx.send("This command must be run in a guild.")
             return
 
-        # Validate category
         valid_categories = [c.value for c in ErrorCategory]
         if category not in valid_categories:
             await ctx.send(
@@ -244,7 +243,6 @@ class ErrorLoggingAdmin(commands.Cog):
             await ctx.send("This command must be run in a guild.")
             return
 
-        # Validate severity
         valid_severities = [s.severity_name for s in ErrorSeverity]
         if severity.lower() not in valid_severities:
             await ctx.send(
@@ -292,7 +290,6 @@ class ErrorLoggingAdmin(commands.Cog):
             await ctx.send("This command must be run in a guild.")
             return
 
-        # Remove the entire error_logging config for this guild
         if self.bot.config.rem(ctx.guild.id, "error_logging"):
             await ctx.send(f"Error logging disabled for {ctx.guild.name}. Use `!errorlog setchannel` to re-enable.")
         else:
@@ -307,7 +304,6 @@ class ErrorLoggingAdmin(commands.Cog):
         Usage: !errorlog setglobal #channel
         Usage: !errorlog setglobal disable
         """
-        # Show current if no arg
         if not channel:
             config = self.bot.config.get_global("error_logging", {})
             channel_id = config.get("default_channel") if config else None
@@ -318,7 +314,6 @@ class ErrorLoggingAdmin(commands.Cog):
                 await ctx.send("No global error channel configured.")
             return
 
-        # Handle disable
         if channel.lower() == "disable":
             if self.bot.config.rem_global("error_logging"):
                 await ctx.send("Global error logging disabled.")
@@ -326,9 +321,7 @@ class ErrorLoggingAdmin(commands.Cog):
                 await ctx.send("Global error logging is already disabled.")
             return
 
-        # Try to convert channel mention/ID to TextChannel
         try:
-            # Try to convert channel mention or ID
             converter = commands.TextChannelConverter()
             text_channel = await converter.convert(ctx, channel)
         except commands.BadArgument:
@@ -375,7 +368,6 @@ class ErrorLoggingAdmin(commands.Cog):
         config["default_channel"] = text_channel.id
         self.bot.config.set_global("error_logging", config)
 
-        # Send confirmation to command channel (unless it's the same channel)
         if ctx.channel.id != text_channel.id:
             await ctx.send(f"✅ Global error logging enabled → {text_channel.mention}")
 
