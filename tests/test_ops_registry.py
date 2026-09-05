@@ -1232,10 +1232,25 @@ class _NoActorCtx:
         self.guild = None
 
 
+class _FakeEmbed:
+    def __init__(self, title=None, description=None, fields=(), footer=None):
+        self.title = title
+        self.description = description
+        self.url = None
+        self.fields = fields
+        self.footer = type("F", (), {"text": footer})() if footer else None
+        self.author = None
+
+
 def test_get_message_serializer_ships_the_inspection_fields():
     class _Att:
         filename = "a.png"
         url = "https://cdn/a.png"
+
+    class _Field:
+        name = "Error Message"
+        value = "no attribute 'get_user'"
+        inline = False
 
     class _Msg:
         id = 7
@@ -1244,7 +1259,8 @@ def test_get_message_serializer_ships_the_inspection_fields():
         content = "hello"
         created_at = None
         attachments = [_Att()]
-        embeds = [object(), object()]
+        embeds = [_FakeEmbed("Error Detected", "boom", [_Field()],
+                             footer="event_error")]
         pinned = True
         jump_url = "https://discord.com/channels/1/8/7"
 
@@ -1252,9 +1268,74 @@ def test_get_message_serializer_ships_the_inspection_fields():
     assert payload["content"] == "hello"
     assert payload["attachments"] == [{"filename": "a.png",
                                        "url": "https://cdn/a.png"}]
-    assert payload["embeds"] == 2
+    assert payload["embeds"] == [{
+        "title": "Error Detected",
+        "description": "boom",
+        "url": None,
+        "fields": [{"name": "Error Message",
+                    "value": "no attribute 'get_user'",
+                    "inline": False}],
+        "footer": "event_error",
+        "author": None,
+    }]
     assert payload["pinned"] is True
     assert payload["jump_url"].endswith("/1/8/7")
+
+
+def test_serialize_message_embeds_empty_when_absent():
+    from core.ops import serialize_message
+    msg = _FakeMessage(1, type("C", (), {"id": 8})(), "hi")
+    payload = serialize_message(msg)
+    assert payload["embeds"] == []
+
+
+def test_serialize_embed_from_search_index_dict():
+    """The index HTTP path returns raw embed dicts, not discord.py Embeds."""
+    from core.ops import serialize_embeds
+    raw = [{
+        "title": "Error Detected",
+        "description": "",
+        "fields": [{"name": "Context", "value": "`event_on_message`",
+                    "inline": True}],
+        "footer": {"text": "Category: event_error"},
+        "author": {"name": "conditioner"},
+    }]
+    assert serialize_embeds(raw) == [{
+        "title": "Error Detected",
+        "description": "",
+        "url": None,
+        "fields": [{"name": "Context", "value": "`event_on_message`",
+                    "inline": True}],
+        "footer": "Category: event_error",
+        "author": "conditioner",
+    }]
+
+
+def test_search_history_fallback_matches_embed_text(monkeypatch):
+    """#log posts have empty content; Discord's index matches embed text,
+    so the fallback scan must too."""
+    import core.ops as ops_module
+
+    async def broken_index(*a, **k):
+        raise RuntimeError("index cold")
+    monkeypatch.setattr(ops_module, "_index_search", broken_index)
+
+    guild = _FakeGuild(1, [])
+    chan = _FakeChannel(10, _Perms(True, True), guild=guild)
+    hit = _FakeMessage(2, chan, "")
+    hit.embeds = [_FakeEmbed(description="Config has no attribute get_user")]
+    miss = _FakeMessage(1, chan, "")
+    miss.embeds = [_FakeEmbed(description="something else")]
+    chan._messages = [hit, miss]
+    guild._channels = {10: chan}
+
+    res = asyncio.run(registry.call(
+        "search_history", _search_ctx(guild), channels=[chan],
+        contains="get_user"))
+    assert res.ok
+    assert [m["id"] for m in res.value["messages"]] == [2]
+    assert res.value["messages"][0]["embeds"][0]["description"].endswith(
+        "get_user")
 
 
 class _HistoryChannel(_FakeChannel):

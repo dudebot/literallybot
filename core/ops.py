@@ -415,14 +415,77 @@ def _as_int(value: Any, wire_name: str) -> int:
 # every frontend so identical ops return identical payloads.
 # ---------------------------------------------------------------------------
 
+def serialize_embed(embed: Any) -> Dict[str, Any]:
+    """JSON shape for one Discord embed, from a discord.py Embed OR the
+    raw dict the search-index HTTP path returns. Title/description/fields
+    are the body — #log (and most bot status posts) have empty `content`
+    and live entirely in embeds."""
+    if isinstance(embed, dict):
+        footer = embed.get("footer") or {}
+        author = embed.get("author") or {}
+        raw_fields = embed.get("fields") or []
+        return {
+            "title": embed.get("title"),
+            "description": embed.get("description"),
+            "url": embed.get("url"),
+            "fields": [
+                {"name": f.get("name"), "value": f.get("value"),
+                 "inline": bool(f.get("inline"))}
+                for f in raw_fields
+            ],
+            "footer": footer.get("text") if isinstance(footer, dict) else None,
+            "author": author.get("name") if isinstance(author, dict) else None,
+        }
+    footer = getattr(embed, "footer", None)
+    author = getattr(embed, "author", None)
+    return {
+        "title": getattr(embed, "title", None),
+        "description": getattr(embed, "description", None),
+        "url": getattr(embed, "url", None),
+        "fields": [
+            {"name": getattr(f, "name", None),
+             "value": getattr(f, "value", None),
+             "inline": bool(getattr(f, "inline", False))}
+            for f in (getattr(embed, "fields", None) or [])
+        ],
+        "footer": getattr(footer, "text", None) if footer is not None else None,
+        "author": getattr(author, "name", None) if author is not None else None,
+    }
+
+
+def serialize_embeds(embeds: Any) -> list:
+    return [serialize_embed(e) for e in (embeds or [])]
+
+
 def serialize_message(message: Any) -> Dict[str, Any]:
+    created = getattr(message, "created_at", None)
     return {
         "id": message.id,
         "channel_id": message.channel.id,
         "author_id": message.author.id,
         "content": message.content,
-        "created_at": message.created_at.isoformat() if getattr(message, "created_at", None) else None,
+        "created_at": created.isoformat() if created else None,
+        "embeds": serialize_embeds(getattr(message, "embeds", None)),
     }
+
+
+def _message_search_text(message: Any) -> str:
+    """Content plus embed title/description/fields/footer.
+
+    Discord's search index matches text inside embeds. The fallback scan
+    used to search `content` only, so an embed-only channel (#log) was
+    invisible to `contains` whenever the index was cold.
+    """
+    parts = [getattr(message, "content", None) or ""]
+    for e in serialize_embeds(getattr(message, "embeds", None)):
+        parts.append(e.get("title") or "")
+        parts.append(e.get("description") or "")
+        for f in e.get("fields") or []:
+            parts.append(f.get("name") or "")
+            parts.append(f.get("value") or "")
+        parts.append(e.get("footer") or "")
+        parts.append(e.get("author") or "")
+    return "\n".join(parts)
 
 
 @dataclass
@@ -1424,6 +1487,7 @@ async def _index_search(bot, guild_id, channel_ids, limit, author_id, contains):
             "author_id": int(m["author"]["id"]),
             "content": m.get("content", ""),
             "created_at": m.get("timestamp"),
+            "embeds": serialize_embeds(m.get("embeds")),
         } for m in page)
         if total is not None and len(hits) >= int(total):
             break
@@ -1599,7 +1663,7 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
         async for message in scoped[0].history(limit=limit):
             if author_id is not None and message.author.id != author_id:
                 continue
-            if word is not None and not word.search(message.content):
+            if word is not None and not word.search(_message_search_text(message)):
                 continue
             results.append(serialize_message(message))
         note = (f"search index unavailable; scanned only the "
@@ -1611,13 +1675,14 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
 
 def _serialize_full_message(message: Any) -> Dict[str, Any]:
     """serialize_message plus the inspection fields get_message promises:
-    attachments (filename+url), embed count, pinned flag, jump_url."""
+    attachments (filename+url), pinned flag, jump_url. Embeds ride on
+    serialize_message (bodies, not a count) so read_history / search_history
+    / get_message share one shape."""
     payload = serialize_message(message)
     payload["attachments"] = [
         {"filename": a.filename, "url": a.url}
         for a in (message.attachments or [])
     ]
-    payload["embeds"] = len(message.embeds or [])
     payload["pinned"] = bool(getattr(message, "pinned", False))
     payload["jump_url"] = getattr(message, "jump_url", None)
     return payload
@@ -1626,7 +1691,8 @@ def _serialize_full_message(message: Any) -> Dict[str, Any]:
 @registry.op(
     "get_message",
     "Read a single message by id: content, author, attachments (filename "
-    "and url), embed count, pinned flag, and jump_url. Pure read.",
+    "and url), embeds (title/description/fields), pinned flag, and jump_url. "
+    "Pure read.",
     PermissionLevel.EVERYONE,
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to read.")],
     serialize=_serialize_full_message,
