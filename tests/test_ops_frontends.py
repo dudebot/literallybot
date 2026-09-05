@@ -36,9 +36,10 @@ from core.ops import (
 from core.agent_gate import agent_universe
 from cogs.optional.gpt import (
     SELECT_MAX_OPTIONS,
-    API_SECTION,
-    BEHAVIORAL_SECTION,
+    API_BUNDLES,
     BEHAVIORAL_GROUP_ID,
+    TAB_AGENTOPS,
+    TAB_MCP,
     AiSettingsView,
     tool_tab_sections,
     _grouped_tool_sections,
@@ -141,18 +142,38 @@ def test_crowding_actually_exceeded_the_cap(crowded_registry):
     assert max(sizes.values()) > SELECT_MAX_OPTIONS
 
 
-def test_groups_are_packed_not_one_select_each():
-    """One ActionRow per group is why /aisettings Agent Ops and MCP timed
-    out: Discord v2 counts each row+select as two children, and the live
-    registry's group count no longer fits in one 40-child message. Packing
-    adjacent groups into 25-option selects is the fix — every op stays
-    selectable, we just stop spending a whole row on a 1-op group."""
+def test_api_bundles_are_fewer_than_groups():
+    """One ActionRow per OP_GROUPS entry blew the 40-child cap. Bundles
+    compose groups conceptually (Messaging, Roles & emojis, …) so every
+    op stays selectable under a real title, without one row per 1-op group."""
     selects = _rendered_selects(None)
     groups = list(registry.grouped())
     assert len(groups) > 1
     assert len(selects) < len(groups)
     rendered = [o.value for sel in selects for o in sel.options]
     assert sorted(rendered) == sorted(registry.names())
+
+
+def test_api_bundles_cover_every_core_group_and_fit_the_select_cap():
+    """A core group missing from API_BUNDLES would render as untitled
+    'Other'; a bundle over 25 would 400 when the panel opens."""
+    bundled = [gid for _title, gids in API_BUNDLES for gid in gids]
+    assert sorted(bundled) == sorted(OP_GROUPS)
+    assert len(bundled) == len(set(bundled)), "a group sits in two bundles"
+    by_gid = {gid: ops for gid, _label, ops in registry.grouped(origin=ORIGIN_CORE)}
+    for title, gids in API_BUNDLES:
+        n = sum(len(by_gid.get(gid, [])) for gid in gids)
+        assert n <= SELECT_MAX_OPTIONS, (
+            f"bundle {title!r} has {n} core ops; Discord's select cap is "
+            f"{SELECT_MAX_OPTIONS}")
+
+
+def test_select_placeholder_is_the_bundle_title_not_none_equals_off():
+    selects = _rendered_selects(None)
+    assert selects
+    for sel in selects:
+        assert "none = off" not in (sel.placeholder or "").lower()
+        assert sel.placeholder  # titled, not a blank grey hint
 
 
 def test_registry_has_a_plausible_floor_of_ops():
@@ -196,15 +217,18 @@ def test_guild_agent_universe_is_exactly_guild_scope_including_cog_ops(
 def test_non_guild_scopes_never_reach_the_guild_agent_surface(scope):
     """A guild-confined, user-actored loop must not be handed an op that
     reaches outside the guild it is confined to. Asserted by SCOPE, so a new
-    DM or global op is covered the day it is written."""
+    DM or global op is covered the day it is written. Superadmin bypasses
+    the per-guild gate, not the guild-scope wall."""
     off_limits = set(registry.op_names(scope=scope))
     assert off_limits, f"no {scope.value}-scoped ops — is the assignment gone?"
     assert not off_limits & set(agent_universe(_all_on(), _all_in()))
+    assert not off_limits & set(agent_universe(
+        _all_on(), _all_in(), is_superadmin_actor=True))
 
-    server_tab = {o.value for sel in _rendered_selects(OpScope.GUILD)
+    inchat_tab = {o.value for sel in _rendered_selects(OpScope.GUILD)
                   for o in sel.options}
-    assert not off_limits & server_tab, \
-        "a guild admin must not be able to enable an out-of-guild op"
+    assert not off_limits & inchat_tab, \
+        "the In-chat ops tab must not whitelist an out-of-guild op"
 
 
 def test_mcp_tab_universe_is_the_whole_registry():
@@ -218,13 +242,13 @@ def test_mcp_tab_universe_is_the_whole_registry():
 
 @pytest.mark.parametrize("scope", PANEL_SCOPES)
 def test_sections_split_by_origin_and_label_every_group(scope, crowded_registry):
-    """API primitives and behavioral ops render as separate sections.
-    API groups keep OP_GROUPS labels; behavioral is one flat bucket."""
+    """API primitives render as named bundles; behavioral is one flat bucket."""
     kinds = list(_grouped_tool_sections(_sections(scope), [], None))
     headings = [payload for kind, payload in kinds if kind == "heading"]
-    assert headings[0] == API_SECTION
+    assert headings, "the panel rendered no bundle headings"
+    assert headings[0].startswith("**")
     if registry.ops(scope=scope, origin=ORIGIN_COG):
-        assert BEHAVIORAL_SECTION in headings
+        assert any(h.startswith("**Behavioral") for h in headings)
 
     for gid, _label, ops in registry.grouped(scope=scope, origin=ORIGIN_CORE):
         assert gid in OP_GROUPS
@@ -241,14 +265,21 @@ def test_behavioral_ops_are_one_flat_bucket(crowded_registry):
     assert {o.name for o in ops} == set(registry.op_names(origin=ORIGIN_COG))
 
 
-def test_agentops_and_mcp_share_the_same_catalog():
-    """The two superadmin tool tabs edit the same grouped catalog. Only
-    the current-set and the saver (agent whitelist vs MCP expose-list)
-    differ — consumers are different, groups are not."""
+def test_inchat_tab_is_guild_scoped_mcp_is_the_whole_registry():
+    """In-chat ops whitelist guild-scoped ops; MCP serves every scope.
+    Same renderer, different universes — DM tools are external-only."""
     import inspect
     src = inspect.getsource(AiSettingsView._build)
-    assert src.count("self._sections()") == 2
+    assert "self._sections(scope=OpScope.GUILD)" in src
+    assert "self._sections()" in src
     assert "tool_tab_sections" in inspect.getsource(AiSettingsView._sections)
+
+    inchat = {o.value for sel in _rendered_selects(OpScope.GUILD)
+              for o in sel.options}
+    mcp = {o.value for sel in _rendered_selects(None) for o in sel.options}
+    assert inchat == set(registry.op_names(scope=OpScope.GUILD))
+    assert mcp == set(registry.names())
+    assert mcp > inchat
 
 
 # --------------------------------------------------------------------------
@@ -525,6 +556,31 @@ def test_server_gate_requires_admin(monkeypatch):
     assert interaction.denied and "admin" in interaction.denied[0].lower()
 
 
+def test_server_gate_bucket_sets_selected_and_clears_deselected(monkeypatch):
+    """Admin only / Everyone are membership selects. Ticking an op writes
+    that bucket; unticking an op that was in it writes off."""
+    from core.agent_gate import GATE_ADMIN, GATE_EVERYONE, GATE_KEY, GATE_OFF
+
+    config = _TwoTierConfig(global_values={
+        "agent_ops_whitelist": {"search_history": True, "send_message": True}})
+    view = _panel(config, is_super=False)
+    _patch_gates(monkeypatch, admin=True, superadmin=False)
+    universe = ["search_history", "send_message"]
+
+    import asyncio
+    asyncio.run(view._save_gate_bucket(
+        _OkInteraction(), GATE_EVERYONE, ["search_history"], universe))
+    assert config.guild[GATE_KEY]["search_history"] == GATE_EVERYONE
+    asyncio.run(view._save_gate_bucket(
+        _OkInteraction(), GATE_ADMIN, ["send_message"], universe))
+    assert config.guild[GATE_KEY]["send_message"] == GATE_ADMIN
+    assert config.guild[GATE_KEY]["search_history"] == GATE_EVERYONE
+    asyncio.run(view._save_gate_bucket(
+        _OkInteraction(), GATE_EVERYONE, [], universe))
+    assert config.guild[GATE_KEY]["search_history"] == GATE_OFF
+    assert config.guild[GATE_KEY]["send_message"] == GATE_ADMIN
+
+
 def test_whitelist_tab_writes_global_config(monkeypatch):
     """The super-admin Agent Ops tab writes agent_ops_whitelist GLOBALLY, as a
     {name: True} map, and a saved op then resolves live for the agent."""
@@ -535,9 +591,10 @@ def test_whitelist_tab_writes_global_config(monkeypatch):
     _patch_gates(monkeypatch, admin=True, superadmin=True)
 
     import asyncio
-    # Save with search_history selected; universe is the whole registry.
+    # Save with search_history selected; universe is the guild-scoped set.
     asyncio.run(view._save_whitelist(
-        _OkInteraction(), ["search_history"], registry.names()))
+        _OkInteraction(), ["search_history"],
+        registry.op_names(scope=OpScope.GUILD)))
     assert config.globals[WHITELIST_KEY] == {"search_history": True}
     assert ("agent_ops_whitelist", {"search_history": True}) in config.global_writes
     # The loop's resolver now offers it.
@@ -563,9 +620,42 @@ def test_whitelist_save_preserves_offline_names(monkeypatch):
     # The panel can only render live ops; it re-selects the live one and the
     # offline ghost_tool is invisible — it must still survive.
     asyncio.run(view._save_whitelist(
-        _OkInteraction(), ["search_history"], registry.names()))
+        _OkInteraction(), ["search_history"],
+        registry.op_names(scope=OpScope.GUILD)))
     assert config.globals[WHITELIST_KEY] == {
         "search_history": True, "ghost_tool": True}
+
+
+def test_whitelist_save_drops_registered_dm_ops(monkeypatch):
+    """A leftover send_dm tick must not survive an In-chat ops save —
+    DM tools belong on MCP, not the guild agent."""
+    from core.agent_gate import WHITELIST_KEY
+
+    assert registry.require("send_dm").scope == OpScope.DM
+    config = _TwoTierConfig(
+        global_values={WHITELIST_KEY: {
+            "search_history": True, "send_dm": True}})
+    view = _panel(config, is_super=True)
+    _patch_gates(monkeypatch, admin=True, superadmin=True)
+
+    import asyncio
+    asyncio.run(view._save_whitelist(
+        _OkInteraction(), ["search_history"],
+        registry.op_names(scope=OpScope.GUILD)))
+    assert config.globals[WHITELIST_KEY] == {"search_history": True}
+    assert "send_dm" not in agent_universe(
+        config.globals[WHITELIST_KEY], {"send_dm": "admin"},
+        is_superadmin_actor=True)
+
+
+def test_superadmin_bypasses_guild_gate_not_scope():
+    """Owner running the in-chat agent still cannot reach DM/GLOBAL tools.
+    They do get guild ops the server has set to off."""
+    universe = set(agent_universe(_all_on(), None, is_superadmin_actor=True))
+    assert "send_message" in universe
+    assert "send_dm" not in universe
+    assert "list_guilds" not in universe
+    assert universe == set(registry.op_names(scope=OpScope.GUILD))
 
 
 def test_whitelist_tab_requires_superadmin(monkeypatch):
@@ -604,8 +694,8 @@ def test_non_superadmin_panel_omits_the_agent_ops_tab(monkeypatch):
     # No tab button advertises the whitelist editor.
     labels = _tab_button_labels(view)
     assert labels, "tab bar rendered no buttons"
-    assert not any("Agent Ops" in l for l in labels)
-    assert not any("MCP" in l for l in labels)
+    assert not any(TAB_AGENTOPS in l for l in labels)
+    assert not any(TAB_MCP in l for l in labels)
 
 
 def test_non_superadmin_panel_omits_the_mcp_tab(monkeypatch):
@@ -618,8 +708,8 @@ def test_non_superadmin_panel_omits_the_mcp_tab(monkeypatch):
     assert view.page == "server"
     labels = _tab_button_labels(view)
     assert labels, "tab bar rendered no buttons"
-    assert not any("MCP" in l for l in labels)
-    assert not any("Agent Ops" in l for l in labels)
+    assert not any(TAB_MCP in l for l in labels)
+    assert not any(TAB_AGENTOPS in l for l in labels)
 
 
 def test_superadmin_panel_shows_the_agent_ops_tab(monkeypatch):
@@ -628,8 +718,10 @@ def test_superadmin_panel_shows_the_agent_ops_tab(monkeypatch):
     config = _TwoTierConfig()
     view = _build_server_view(monkeypatch, config, is_super=True, page="server")
     labels = _tab_button_labels(view)
-    assert any("Agent Ops" in l for l in labels)
-    assert any("MCP" in l for l in labels)
+    assert any(TAB_AGENTOPS in l for l in labels)
+    assert any(TAB_MCP in l for l in labels)
+    assert len(TAB_AGENTOPS) < 16
+    assert len(TAB_MCP) < 16
 
 
 @pytest.mark.parametrize("page", ["agentops", "mcp"])
@@ -660,6 +752,42 @@ def test_superadmin_tool_tabs_fit_in_one_discord_message(page):
     assert view.total_children_count <= 40, (
         f"{page} tab built {view.total_children_count} Components-V2 "
         f"children; Discord's cap is 40 and a raise here is the timeout")
+
+
+def test_server_tab_with_full_whitelist_fits_in_one_discord_message(monkeypatch):
+    """One select per op blew the 40-child cap at ~16 tools (ActionRow+Select
+    is 2, trailing button row is 4). Building the Server tab against the
+    entire guild-scoped whitelist must stay under the cap."""
+    import asyncio
+    import discord
+    import cogs.optional.gpt as gpt_mod
+
+    wl = {n: True for n in registry.op_names(scope=OpScope.GUILD)}
+    config = _TwoTierConfig(global_values={
+        "superadmins": [77], "agent_ops_whitelist": wl})
+    stub = lambda *a, **k: discord.ui.Button(label="x")
+    monkeypatch.setattr(gpt_mod, "_ProviderSelect", stub)
+    monkeypatch.setattr(gpt_mod, "_ModelSelect", stub)
+
+    async def _make():
+        view = _panel(config, is_super=True)
+        view.guild = type("G", (), {"id": 4242, "name": "test"})()
+        discord.ui.LayoutView.__init__(view, timeout=1)
+        view.page = "server"
+        view.provider = "xai"
+        view.model = "grok"
+        view._text = lambda: "text"
+        view._ai_toggle_button = stub
+        view._personality_button = stub
+        view._nickname_button = stub
+        view._build()
+        return view
+
+    view = asyncio.run(_make())
+    assert view.page == "server"
+    assert view.total_children_count <= 40, (
+        f"server tab built {view.total_children_count} Components-V2 "
+        "children; Discord's cap is 40")
 
 
 def _build_server_view(monkeypatch, config, *, is_super, page):

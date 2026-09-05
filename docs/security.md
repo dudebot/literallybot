@@ -27,13 +27,14 @@ prefix, `@app_commands.check(is_admin)` on slash. Same function; discord.py
 has two command systems and they do not accept each other's decorator. Do
 not invent a third wrapper.
 
-Gated slash commands also set `guild_only` +
-`default_permissions(administrator=True)` so Discord's picker hides them
-from ordinary members and DMs. That pin is **visibility, not
-authorization** — Discord cannot see the bot's admin list, and a Discord
-Administrator is not a bot superadmin. Bot admins without Discord
-Administrator still have the prefix twin. Treating the pin *as* the gate
-when slash was the only surface is what caused the #67 lockout.
+Gated slash commands set `guild_only` (never in DMs) and pin
+`default_permissions(manage_messages=True)` so ordinary members do not
+see them in Discord's picker. Manage Messages is the typical moderator
+bit; Discord Administrator was too high a bar and locked out bot admins
+who are not server admins. Authorization is still `is_admin` /
+`is_superadmin`. A bot admin/superadmin without Manage Messages in that
+guild still has the prefix twin. `/help` hides anything the invoker
+could not run.
 
 `/help` lists a command only if the invoker could run it, by reading the
 decorator. A body `if not is_admin` is defense in depth, not the gate.

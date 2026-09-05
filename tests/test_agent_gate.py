@@ -2,7 +2,8 @@
 
 Pure config→decision logic, no Discord objects. Pins the resolution order,
 the whitelist ceiling, the per-guild off/admin/everyone override, the
-per-op default, and the super-admin bypass.
+per-op default, and the super-admin guild-gate bypass (in-chat stays
+guild-scoped).
 """
 from core import agent_gate as ag
 from core.ops import OpScope, PermissionLevel

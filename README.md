@@ -175,11 +175,12 @@ a guild's configuration from being read by everyone in the channel. The real
 gate is the bot's own `is_admin` / `is_superadmin` check at invoke time — a
 non-admin gets an ephemeral refusal. Prefix uses `@commands.check(is_admin)`;
 slash uses `@app_commands.check(is_admin)` — same predicate, two wrappers,
-because discord.py has two command systems. Gated slash commands additionally
-set `guild_only` + `default_permissions(administrator=True)` so Discord's
-picker hides them from ordinary members and DMs; the prefix twin remains for
-a bot admin/superadmin who is not a Discord Administrator (the #67 lockout
-was slash-as-the-only-surface). Superadmin-only
+because discord.py has two command systems. Gated slash commands are
+`guild_only` (never in DMs) and pinned to **Manage Messages** so ordinary
+members do not see them in Discord's picker; authorization is still the
+bot's admin list. A bot admin without that Discord bit in a given guild
+still has the prefix twin.
+Superadmin-only
 controls are *omitted* from a panel's render for non-superadmins rather than merely
 disabled.
 

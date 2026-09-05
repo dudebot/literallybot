@@ -173,7 +173,7 @@ def _create_error_embed(
             extra_info = extra_info[:997] + "..."
         embed.add_field(name="Additional Info", value=f"```{extra_info}```", inline=False)
 
-    tb = traceback.format_exc()
+    tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
     if len(tb) > 1000:
         tb = "..." + tb[-997:]
     embed.add_field(name="Traceback", value=f"```python\n{tb}\n```", inline=False)
@@ -273,15 +273,101 @@ async def log_error_to_discord(
                     print(f"Failed to send error to global channel: {send_error}")
 
 
+def _gate_denial_message(checks) -> Optional[str]:
+    """Map is_admin / is_superadmin predicates to the user-facing refusal.
+
+    Unknown checks return None so the caller can fall back to a generic
+    line rather than inventing a tier.
+    """
+    from core.utils import GATE_ADMIN, GATE_SUPERADMIN, gate_of
+
+    tier = None
+    for check in checks or []:
+        g = gate_of(check)
+        if g == GATE_SUPERADMIN:
+            return "Requires superadmin."
+        if g == GATE_ADMIN:
+            tier = GATE_ADMIN
+    if tier == GATE_ADMIN:
+        return "Requires admin."
+    return None
+
+
+def app_command_denial_message(interaction, error: Exception) -> str:
+    """User-facing text for an expected slash-command refusal."""
+    from discord import app_commands
+
+    if isinstance(error, app_commands.NoPrivateMessage):
+        return "This command can only be used in a server."
+    cmd = getattr(interaction, "command", None)
+    node = cmd
+    checks = []
+    while node is not None:
+        checks.extend(getattr(node, "checks", None) or [])
+        node = getattr(node, "parent", None)
+    return _gate_denial_message(checks) or (
+        "You don't have permission to use this command."
+    )
+
+
+def prefix_denial_message(ctx, error: Exception) -> str:
+    """User-facing text for an expected prefix-command refusal."""
+    from discord.ext import commands
+
+    if isinstance(error, commands.NoPrivateMessage):
+        return "This command can only be used in a server."
+    cmd = getattr(ctx, "command", None)
+    return _gate_denial_message(getattr(cmd, "checks", None)) or (
+        "You don't have permission to use this command."
+    )
+
+
+def _is_expected_app_denial(error: Exception) -> bool:
+    """True for a slash refusal the user caused (gate / guild_only).
+
+    BotMissingPermissions is the bot's own Discord permission gap.
+    CommandOnCooldown subclasses CheckFailure in app_commands — it is
+    not a permission refusal and must not be acked as one.
+    """
+    from discord import app_commands
+    if isinstance(error, app_commands.NoPrivateMessage):
+        return True
+    if isinstance(error, (app_commands.BotMissingPermissions,
+                          app_commands.CommandOnCooldown)):
+        return False
+    return isinstance(error, app_commands.CheckFailure)
+
+
+def _is_expected_prefix_denial(error: Exception) -> bool:
+    from discord.ext import commands
+    if isinstance(error, commands.NoPrivateMessage):
+        return True
+    if isinstance(error, commands.BotMissingPermissions):
+        return False
+    return isinstance(error, commands.CheckFailure)
+
+
+async def _ack_app_error(interaction, message: str) -> None:
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except (discord.InteractionResponded, discord.HTTPException):
+        pass
+
+
 def _determine_severity(error: Exception) -> ErrorSeverity:
     """Determine the severity level for an error based on its type."""
     # Import here to avoid circular dependency
     from discord.ext import commands
     from discord import app_commands
 
-    if isinstance(error, (commands.CommandNotFound, commands.MissingPermissions, commands.CommandOnCooldown)):
+    if isinstance(error, (commands.CommandNotFound, commands.MissingPermissions,
+                          commands.CheckFailure, commands.CommandOnCooldown)):
         return ErrorSeverity.WARNING
-    elif isinstance(error, app_commands.CommandOnCooldown):
+    elif isinstance(error, (app_commands.CommandOnCooldown,
+                            app_commands.CheckFailure)):
         return ErrorSeverity.WARNING
     else:
         return ErrorSeverity.ERROR
@@ -308,6 +394,35 @@ async def handle_command_error(bot, ctx, error: Exception):
                     return  # Hook says suppress this error
             except Exception:
                 pass  # Don't let a broken hook break error handling
+
+    if _is_expected_prefix_denial(error):
+        bot.logger.info("Command %s denied for %s: %s",
+                        getattr(ctx.command, "name", None),
+                        getattr(getattr(ctx, "author", None), "id", None),
+                        error)
+        try:
+            await ctx.send(prefix_denial_message(ctx, error))
+        except Exception:
+            pass
+        try:
+            command_name = ctx.command.name if ctx.command else "unknown"
+            guild_id = ctx.guild.id if ctx.guild else None
+            extra_info = (
+                f"User: {ctx.author} (ID: {ctx.author.id})\n"
+                f"Channel: {ctx.channel}\n"
+                f"{'Guild: ' + ctx.guild.name + f' (ID: {ctx.guild.id})' if ctx.guild else 'DM'}"
+            )
+            asyncio.create_task(log_error_to_discord(
+                bot, error, f"command_{command_name}",
+                category=ErrorCategory.COMMAND_ERROR,
+                severity=ErrorSeverity.WARNING,
+                extra_info=extra_info,
+                guild_id=guild_id,
+            ))
+        except Exception as log_error:
+            bot.logger.error(f"Failed to log error to Discord: {log_error}",
+                             exc_info=True)
+        return
 
     bot.logger.error(f'Error in command {ctx.command}: {error}', exc_info=True)
 
@@ -349,6 +464,33 @@ async def handle_app_command_error(bot, interaction, error: Exception):
         error: The exception that occurred
     """
     import asyncio
+
+    if _is_expected_app_denial(error):
+        cmd_name = interaction.command.name if interaction.command else "unknown"
+        bot.logger.info("Slash command /%s denied for %s: %s",
+                        cmd_name, getattr(interaction.user, "id", None), error)
+        await _ack_app_error(interaction,
+                             app_command_denial_message(interaction, error))
+        try:
+            guild_id = interaction.guild.id if interaction.guild else None
+            extra_info = (
+                f"User: {interaction.user} (ID: {interaction.user.id})\n"
+                f"Command: /{cmd_name}\n"
+                f"Channel: {interaction.channel}\n"
+                f"{'Guild: ' + interaction.guild.name + f' (ID: {interaction.guild.id})' if interaction.guild else 'DM'}"
+            )
+            asyncio.create_task(log_error_to_discord(
+                bot, error, f"slash_command_{cmd_name}",
+                category=ErrorCategory.COMMAND_ERROR,
+                severity=ErrorSeverity.WARNING,
+                extra_info=extra_info,
+                guild_id=guild_id,
+            ))
+        except Exception as log_error:
+            bot.logger.error(
+                f"Failed to log slash command error to Discord: {log_error}",
+                exc_info=True)
+        return
 
     bot.logger.exception(f'Unhandled exception in slash command', exc_info=True)
 

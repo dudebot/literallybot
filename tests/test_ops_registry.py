@@ -645,6 +645,42 @@ def test_core_decorator_refuses_duplicate_names(reg):
             return 2
 
 
+def test_two_member_params_are_refused_at_registration(reg):
+    """Two MEMBER params would both wire as user_id; the second would be
+    silently dropped. Refuse at registration so a cog author finds out
+    before a frontend ships a one-user tool."""
+    with pytest.raises(ValueError, match="user_id"):
+        @reg.op("two_users", "Nope.", PermissionLevel.EVERYONE,
+                params=[
+                    OpParam("moderator", ParamKind.MEMBER),
+                    OpParam("target", ParamKind.MEMBER),
+                ])
+        async def impl(ctx, moderator, target):
+            return None
+
+
+def test_member_plus_user_params_are_refused_at_registration(reg):
+    """MEMBER and USER both wire as user_id — kind-identity is not enough."""
+    with pytest.raises(ValueError, match="user_id"):
+        @reg.op("member_and_user", "Nope.", PermissionLevel.EVERYONE,
+                params=[
+                    OpParam("moderator", ParamKind.MEMBER),
+                    OpParam("target", ParamKind.USER),
+                ])
+        async def impl(ctx, moderator, target):
+            return None
+
+
+def test_omitted_serialize_passes_a_dict_through(reg):
+    @reg.op("echo_dict", "Echo.", PermissionLevel.EVERYONE)
+    async def impl(ctx):
+        return {"x": 1}
+
+    op = reg.require("echo_dict")
+    assert op.serialize_result({"x": 1}) == {"x": 1}
+    assert op.serialize_result(None) == {}
+
+
 def test_cog_op_params_are_declared_normally(reg):
     class _ParamCog:
         @op("fake_echo", "Echo.", PermissionLevel.EVERYONE,
@@ -787,9 +823,9 @@ def test_save_preserves_names_whose_op_is_unregistered():
     """A name whitelisted while its cog was loaded must survive a whitelist
     save made while that cog is unloaded — the select cannot render it, so a
     naive filter would silently and permanently destroy the super-admin's
-    choice. The whitelist universe is the WHOLE registry (all scopes), since
-    the Agent Ops tab is a plain global allowlist. (This property used to live
-    on the per-guild bot_tools_enabled list, which no longer exists.)"""
+    choice. Unregistered names are kept regardless of scope; the In-chat
+    ops saver then drops registered DM/GLOBAL names separately. (This
+    property used to live on the per-guild bot_tools_enabled list.)"""
     from cogs.optional.gpt import AiSettingsView
 
     universe = registry.names()

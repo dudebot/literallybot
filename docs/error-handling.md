@@ -148,7 +148,7 @@ Severity is auto-determined based on error type, but here's what each level mean
 
 | Severity | Color | Used For |
 |----------|-------|----------|
-| WARNING  | Gold  | CommandNotFound, MissingPermissions, CommandOnCooldown |
+| WARNING  | Gold  | CommandNotFound, MissingPermissions, CheckFailure, CommandOnCooldown |
 | ERROR    | Orange | Most other exceptions |
 | CRITICAL | Red   | (Reserved for manual use) |
 

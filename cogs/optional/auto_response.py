@@ -37,7 +37,7 @@ import random
 import re
 
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
-from core.utils import InvokerOnlyView, is_admin
+from core.utils import InvokerOnlyView, is_admin, panel_slash_pin
 
 MAX_ENTRIES = 25  # Discord select-menu option cap
 
@@ -273,16 +273,15 @@ class AutoResponse(commands.Cog):
     @app_commands.command(name="autoresponse",
                           description="Open the auto-response panel")
     @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
+    @panel_slash_pin()
     @app_commands.check(is_admin)
     async def autoresponse_slash(self, interaction: discord.Interaction):
         """Ephemeral twin of `!autoresponse` (#76).
 
-        Discord's picker cannot filter on the bot's admin list, so
-        visibility is pinned guild-only + Administrator. The real gate is
-        `@app_commands.check(is_admin)`. Bot admins without Discord
-        Administrator still have `!autoresponse`. The body check stays as
-        defense in depth and for the friendly denial."""
+        Authorization is `@app_commands.check(is_admin)`. The picker pin is
+        Manage Messages so ordinary members do not see the command; a bot
+        admin who is not a moderator in this guild still has
+        `!autoresponse`."""
         if not is_admin(interaction):
             await interaction.response.send_message(
                 "Requires admin.", ephemeral=True)

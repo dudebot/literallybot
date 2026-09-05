@@ -15,12 +15,29 @@ import os
 import re
 from typing import List, Union, Any
 import discord
+from discord import app_commands
 
 # The cogs/ groups, in load order. cogs/core/ is the recovery surface and is
 # never filtered by disabled_cogs; every other group is a deployment choice.
 # One owner for these names so the loader and the filter can never disagree.
 CORE_COG_GROUP = "core"
 COG_GROUPS = (CORE_COG_GROUP, "optional")
+
+# Discord picker pin for bot-gated slash panels. Manage Messages is the
+# typical moderator bit: ordinary members don't have it, and people we add
+# to the bot's guild-admin ACL generally do. This is VISIBILITY, not the
+# authorization gate — that remains is_admin / is_superadmin. A superadmin
+# who is not a moderator in a given guild still has the prefix twin
+# (`!aisettings`, `!cogs`, …); Discord will native-refuse the slash form.
+PANEL_SLASH_PERMISSIONS = discord.Permissions(manage_messages=True)
+
+
+def panel_slash_pin():
+    """Picker pin matching PANEL_SLASH_PERMISSIONS.
+
+    Visibility only — authorization stays is_admin / is_superadmin.
+    """
+    return app_commands.default_permissions(manage_messages=True)
 
 
 def _actor(ctx_or_interaction: Any) -> Any:

@@ -763,9 +763,10 @@ class Op:
 
     def serialize_result(self, value: Any) -> Dict[str, Any]:
         """JSON-safe payload for an op's return value; identical across
-        frontends. Ops without a registered serializer return {}."""
+        frontends. Ops without a registered serializer pass a dict through
+        unchanged and return {} for anything else (void actions)."""
         if self.serialize is None:
-            return {}
+            return value if isinstance(value, dict) else {}
         return self.serialize(value)
 
     def result_payload(self, result: OpResult) -> Dict[str, Any]:
@@ -911,6 +912,32 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
         raise TypeError(f"Op '{name}' scope must be an OpScope, got {scope!r}.")
     if not group or not isinstance(group, str):
         raise ValueError(f"Op '{name}' must declare a non-empty group id.")
+    # Wire names collapse per kind (MEMBER and USER both user_id). Two
+    # params that share a wire name would silently drop the second in
+    # wire_params(); CHANNEL + MESSAGE sharing channel_id is the one
+    # legal overlap. A second id of the same wire name must travel as a
+    # SNOWFLAKE (see forward_message).
+    def _wire_names_for(kind: ParamKind):
+        if kind == ParamKind.MESSAGE:
+            return ("channel_id", "message_id")
+        if kind == ParamKind.CHANNEL_LIST:
+            return ("channel_ids",)
+        if kind in _ENTITY_WIRE_NAMES:
+            return (_ENTITY_WIRE_NAMES[kind],)
+        return ()
+
+    seen_wire = set()
+    for p in (params or []):
+        for wn in _wire_names_for(p.kind):
+            if wn in seen_wire:
+                if wn == "channel_id":
+                    continue
+                raise ValueError(
+                    f"Op '{name}' declares two parameters that wire as "
+                    f"{wn}; they would share a name. Use a SNOWFLAKE "
+                    f"scalar for the second id (see forward_message)."
+                )
+            seen_wire.add(wn)
     return Op(
         name=name, description=description, permission=permission,
         impl=impl, params=list(params or []), serialize=serialize,

@@ -17,8 +17,8 @@ top of each op's hardcoded `permission` floor:
 
 Resolution order for a guild + op: not whitelisted → OFF; else guild override if
 present; else the op's default. A super-admin invoking the agent bypasses the
-per-guild gate entirely (they get the whole whitelisted universe, including
-non-guild scopes).
+per-guild gate, but the universe is still GUILD-scoped — DM and GLOBAL ops
+are MCP-only.
 
 This module is the SINGLE authority: gpt.py's tool builder, the /aisettings
 panels, and the call-time check all resolve through here so the panel shows
@@ -76,10 +76,13 @@ def effective_gate(op: Any, whitelist: Optional[Dict[str, bool]],
 def agent_universe(whitelist: Optional[Dict[str, bool]],
                    gate_cfg: Optional[Dict[str, str]],
                    *, is_superadmin_actor: bool = False) -> List[str]:
-    """The op names the agent may use in this guild, live from the registry.
+    """The op names the in-chat agent may use in this guild, live from the
+    registry. Always guild-scoped: DM and GLOBAL ops belong on the MCP
+    surface, not in a guild-confined loop.
 
-    - super-admin actor: every whitelisted op of ANY scope (incl. DM/GLOBAL
-      cross-guild ops) — the owner running the agent is the host operator.
+    - super-admin actor: every whitelisted GUILD op, ignoring the per-guild
+      off/admin/everyone gate — the owner running the agent still cannot
+      reach outside the guild from in-chat.
     - everyone else: whitelisted guild-scoped ops whose effective gate is not
       OFF. The per-user admin/everyone distinction is enforced at CALL time
       (call_gate below), not by hiding admin ops from the universe — the tool
@@ -90,10 +93,10 @@ def agent_universe(whitelist: Optional[Dict[str, bool]],
     for op in registry.ops():
         if not is_whitelisted(op.name, whitelist):
             continue
+        if op.scope != OpScope.GUILD:
+            continue
         if is_superadmin_actor:
             names.append(op.name)
-            continue
-        if op.scope != OpScope.GUILD:
             continue
         if guild_gate(op, gate_cfg) == GATE_OFF:
             continue

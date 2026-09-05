@@ -9,7 +9,8 @@ from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 
-from core.utils import InvokerOnlyView, is_admin, is_superadmin, recursive_split
+from core.utils import (InvokerOnlyView, is_admin, is_superadmin,
+                        panel_slash_pin, recursive_split)
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
 from core.agent_gate import agent_universe
@@ -1258,7 +1259,7 @@ class Gpt(commands.Cog):
     @app_commands.command(name="aisettings",
                           description="Open the AI settings panel")
     @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
+    @panel_slash_pin()
     @app_commands.check(is_admin)
     async def aisettings_slash(self, interaction: discord.Interaction):
         """Ephemeral twin of `!aisettings` (#76).
@@ -1268,11 +1269,10 @@ class Gpt(commands.Cog):
         channel. Bystanders could never *click* it (see interaction_check),
         but they could read the guild's model/provider/tool configuration.
 
-        Discord's picker cannot filter on the bot's admin list, so
-        visibility is pinned guild-only + Administrator. The real gate is
-        `@app_commands.check(is_admin)`. The #67 lockout was slash-as-the-only
-        surface; bot admins without Discord Administrator still have
-        `!aisettings`.
+        Authorization is `@app_commands.check(is_admin)`. The picker pin is
+        Manage Messages (typical moderator bit) so ordinary members do not
+        see the command; a superadmin who is not a moderator in this guild
+        still has `!aisettings`.
         """
         if not is_admin(interaction):
             await interaction.response.send_message(
@@ -1314,22 +1314,43 @@ class Gpt(commands.Cog):
 # CHUNKED across as many selects as it takes.
 SELECT_MAX_OPTIONS = 25
 
-# Shared by the Agent Ops and MCP tabs. API primitives keep OP_GROUPS
-# (Discord-domain slices). Behavioral (cog-registered) ops are one flat
-# bucket — they are not a Discord domain and should not mint a select row
-# per cog. The two tabs pass this into the same renderer; only `current`
-# and the saver differ (in-chat agent whitelist vs MCP expose-list).
+# Shared by the In-chat ops and MCP ops tabs. API primitives keep OP_GROUPS
+# (Discord-domain slices) conceptually bundled below. Behavioral
+# (cog-registered) ops are one flat bucket — they are not a Discord domain
+# and should not mint a select row per cog. The two tabs pass this into the
+# same renderer; only `current` and the saver differ (in-chat agent
+# whitelist vs MCP expose-list).
 API_SECTION = "**API primitives**"
-BEHAVIORAL_SECTION = "**Behavioral primitives**"
+BEHAVIORAL_SECTION = "**Behavioral**"
 BEHAVIORAL_GROUP_ID = "_behavioral"
+
+# Tab labels: glanceable consume-vs-provide, kept under 16 characters.
+TAB_AGENTOPS = "In-chat ops"
+TAB_MCP = "MCP ops"
+
+# Conceptual bundles for the API-primitive selects. Order is display
+# order; each bundle must stay ≤ SELECT_MAX_OPTIONS against the live
+# core registry. A group missing from this table is rendered under
+# "Other" rather than hidden; the coverage test fails if that happens
+# on the shipped registry.
+API_BUNDLES = (
+    ("Messaging", ("messaging",)),
+    ("Threads & cleanup", ("threads", "message-mod")),
+    ("Roles & emojis", ("roles", "emojis")),
+    ("Guild info", ("guild-info", "guild")),
+    ("Members & safety", ("members", "moderation", "automod")),
+    ("Voice & events", ("voice", "events")),
+    ("Channels & apps", ("channels", "invites", "webhooks", "integrations")),
+    ("Direct messages", ("dm",)),
+)
 log = logging.getLogger(__name__)
 
 
 def tool_tab_sections(scope=None):
-    """Section structure for BOTH superadmin tool tabs (Agent Ops and MCP).
+    """Section structure for BOTH superadmin tool tabs (In-chat ops and MCP ops).
 
     Same groups, same order, live from the registry. Consumers differ
-    (guild-confined agent vs host-side MCP) but the catalog they edit
+    (in-chat agent whitelist vs host-side MCP) but the catalog they edit
     is one shape.
     """
     api = registry.grouped(scope=scope, origin=ORIGIN_CORE)
@@ -1363,11 +1384,11 @@ def _tool_selects(universe, current, on_save):
 
 
 def _grouped_tool_sections(sections, current, on_save):
-    """Render tool-tab sections as heading + 25-option selects.
+    """Render tool-tab sections as titled heading + select per bundle.
 
-    `sections` is tool_tab_sections() output. API groups are flattened
-    into filled 25-option chunks (group name rides on the option
-    description); behavioral is already one bucket. Yields ("heading",
+    `sections` is tool_tab_sections() output. API groups are composed
+    into API_BUNDLES (conceptual, ≤25); behavioral is already one bucket
+    and still chunks if a cog dump exceeds the cap. Yields ("heading",
     markdown) and ("select", _ToolSelect).
 
     Every select is handed the full universe so a save carries through
@@ -1376,25 +1397,48 @@ def _grouped_tool_sections(sections, current, on_save):
     """
     universe = [op.name for _label, groups in sections
                 for _gid, _glabel, ops in groups for op in ops]
-    for section_label, groups in sections:
-        if not groups:
-            continue
-        yield "heading", section_label
-        items = []
+    by_gid = {}
+    behavioral_ops = []
+    for _section_label, groups in sections:
         for gid, group_label, ops in groups:
-            for op in ops:
-                desc = None if gid == BEHAVIORAL_GROUP_ID else group_label
-                items.append((op.name, desc))
+            if gid == BEHAVIORAL_GROUP_ID:
+                behavioral_ops.extend(ops)
+            else:
+                by_gid[gid] = (group_label, ops)
+
+    bundled_ids = {gid for _title, gids in API_BUNDLES for gid in gids}
+    leftover = tuple(gid for gid in by_gid if gid not in bundled_ids)
+    bundles = list(API_BUNDLES)
+    if leftover:
+        bundles.append(("Other", leftover))
+
+    def emit(title, items):
+        if not items:
+            return
         chunks = [items[i:i + SELECT_MAX_OPTIONS]
                   for i in range(0, len(items), SELECT_MAX_OPTIONS)]
-        heading = section_label.strip("*")
         for i, chunk in enumerate(chunks):
             names = [n for n, _d in chunk]
             descs = {n: d for n, d in chunk if d}
-            label = heading if len(chunks) == 1 else f"{heading} ({i + 1}/{len(chunks)})"
+            heading = title if len(chunks) == 1 else f"{title} ({i + 1}/{len(chunks)})"
+            yield "heading", f"**{heading}**"
             yield "select", _ToolSelect(
                 names, current, on_save, universe,
-                label=label, descriptions=descs or None)
+                label=heading, descriptions=descs or None)
+
+    for title, gids in bundles:
+        items = []
+        multi = len(gids) > 1
+        for gid in gids:
+            if gid not in by_gid:
+                continue
+            group_label, ops = by_gid[gid]
+            for op in ops:
+                items.append((op.name, group_label if multi else None))
+        yield from emit(title, items)
+
+    if behavioral_ops:
+        yield from emit("Behavioral", [(op.name, None) for op in behavioral_ops])
 
 
 class _ToolSelect(discord.ui.Select):
@@ -1420,11 +1464,11 @@ class _ToolSelect(discord.ui.Select):
                 kwargs["description"] = desc[:100]
             options.append(discord.SelectOption(**kwargs))
         if label is not None:
-            placeholder = f"{label} — none = off"
+            placeholder = label
         elif pages > 1:
-            placeholder = f"Enabled tools ({page}/{pages}) — none = off"
+            placeholder = f"Enabled tools ({page}/{pages})"
         else:
-            placeholder = "Select enabled tools (none = off)"
+            placeholder = "Enabled tools"
         super().__init__(
             placeholder=placeholder[:150],
             min_values=0,
@@ -1442,49 +1486,6 @@ class _ToolSelect(discord.ui.Select):
         kept = [n for n in self._current if n in self._elsewhere]
         await self._on_save(interaction, kept + list(self.values),
                             self._chunk + self._elsewhere)
-
-
-# The three agent-gate states a server admin can pick per whitelisted op, in
-# escalation order, with the SelectOption label/emoji each renders as.
-_GATE_CHOICES = (
-    (GATE_OFF, "Off", "🚫"),
-    (GATE_ADMIN, "Admin only", "🛡"),
-    (GATE_EVERYONE, "Everyone", "👥"),
-)
-
-
-class _OpGateSelect(discord.ui.Select):
-    """One per-op tri-state control for the Server tab: Off / Admin only /
-    Everyone. Rendered one select PER OP (not per group) because Discord
-    multi-selects express set membership, not per-row state — three states
-    per op can only be a single-choice select over three options. The server
-    tab renders only WHITELISTED guild-scoped ops, so this stays a small,
-    bounded set in practice (a super-admin curates the whitelist).
-
-    Value is encoded `op_name::state`; the callback decodes it and hands the
-    saver (op_name, state). The op's default_gate() is pre-selected when the
-    guild has no stored override."""
-
-    def __init__(self, op_name: str, current_state: str, on_save):
-        self._op_name = op_name
-        self._on_save = on_save
-        options = [
-            discord.SelectOption(
-                label=f"{op_name} — {label}",
-                value=f"{op_name}::{state}",
-                emoji=emoji,
-                default=(state == current_state),
-            )
-            for state, label, emoji in _GATE_CHOICES
-        ]
-        super().__init__(
-            placeholder=f"{op_name}: agent access"[:150],
-            min_values=1, max_values=1, options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        _op_name, _, state = self.values[0].partition("::")
-        await self._on_save(interaction, self._op_name, state)
 
 
 class _ProviderSelect(discord.ui.Select):
@@ -1926,52 +1927,97 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             else:
                 self.add_item(self._row(payload))
 
-    # Components V2 caps a message at 40 total components; each per-op gate
-    # select is its own ActionRow, and the tab also spends rows on the tab
-    # bar, text, provider/model selects and the button row. Cap the gate
-    # selects well under the ceiling and tell the admin to have the
-    # super-admin narrow the whitelist if it overflows.
-    _MAX_GATE_SELECTS = 22
+    # Components V2 caps a message at 40 total children. An ActionRow
+    # costs 1 + len(children), so a select is 2 and the trailing 3-button
+    # row is 4. One select PER op blew this with ~16 tools. The Server tab
+    # is two membership selects instead (Admin only / Everyone; Off =
+    # unselected). discord.py raises ValueError at 40 — never add past it.
+    _V2_CHILD_CAP = 40
+    _SERVER_TRAILING_COST = 4  # ActionRow + AI / Personality / Nickname
+
+    def _try_add(self, item, *, reserve=0) -> bool:
+        """Add `item` if it and `reserve` still fit under the v2 cap.
+
+        Returns False instead of letting discord.py raise 'maximum number
+        of children exceeded (40)' — that exception is an un-acked panel
+        timeout from the user's side.
+        """
+        cost = getattr(item, "_total_count", 1)
+        if self.total_children_count + cost + reserve > self._V2_CHILD_CAP:
+            return False
+        self.add_item(item)
+        return True
 
     def _add_gate_sections(self):
-        """Render the Server tab's per-op Off/Admin only/Everyone controls,
-        one select per whitelisted guild-scoped op, grouped by OP_GROUPS with
-        a heading per group. The current state is the guild override if set,
-        else the op's default_gate()."""
+        """Render the Server tab's agent-access controls.
+
+        Two multi-selects over the whitelisted guild-scoped ops: **Admin
+        only** and **Everyone**. An op in neither is Off. Group name rides
+        on the option description. Chunked at 25 like the other tool tabs.
+        """
         gate_cfg = self._gate_cfg()
         sections = self._server_gate_ops()
         if not sections:
             self.add_item(discord.ui.TextDisplay(
                 "*No agent ops are enabled for this bot. A bot super-admin "
-                "must whitelist ops on the 🛠 Agent Ops tab before this "
+                f"must whitelist ops on the {TAB_AGENTOPS} tab before this "
                 "server can grant agent access.*"))
             return
-        shown = 0
-        overflow = False
+        names = []
+        descs = {}
         for label, ops in sections:
-            if shown >= self._MAX_GATE_SELECTS:
-                overflow = True
-                break
-            self.add_item(discord.ui.TextDisplay(f"**{label}**"))
             for op in ops:
-                if shown >= self._MAX_GATE_SELECTS:
-                    overflow = True
-                    break
-                state = guild_gate(op, gate_cfg)
-                self.add_item(self._row(
-                    _OpGateSelect(op.name, state, self._save_op_gate)))
-                shown += 1
+                names.append(op.name)
+                descs[op.name] = label
+        reserve = self._SERVER_TRAILING_COST
+
+        def add_bucket(title, bucket):
+            if not self._try_add(discord.ui.TextDisplay(f"**{title}**"),
+                                 reserve=reserve):
+                return False
+            current = [n for n in names
+                       if guild_gate(registry.get(n), gate_cfg) == bucket]
+            chunks = [names[i:i + SELECT_MAX_OPTIONS]
+                      for i in range(0, len(names), SELECT_MAX_OPTIONS)] or [[]]
+            for i, chunk in enumerate(chunks):
+                label = (title if len(chunks) == 1
+                         else f"{title} ({i + 1}/{len(chunks)})")
+                sel = _ToolSelect(
+                    chunk, current,
+                    lambda ix, selected, universe, b=bucket: (
+                        self._save_gate_bucket(ix, b, selected, universe)),
+                    names, label=label, descriptions=descs)
+                if not self._try_add(self._row(sel), reserve=reserve):
+                    return False
+            return True
+
+        overflow = False
+        if not add_bucket("Admin only", GATE_ADMIN):
+            overflow = True
+        elif not add_bucket("Everyone", GATE_EVERYONE):
+            overflow = True
         if overflow:
-            self.add_item(discord.ui.TextDisplay(
+            self._try_add(discord.ui.TextDisplay(
                 "*More whitelisted ops exist than fit on one panel. Ask a bot "
-                "super-admin to trim the 🛠 Agent Ops whitelist so every op "
-                "you want to configure fits here.*"))
+                f"super-admin to trim the {TAB_AGENTOPS} whitelist so every op "
+                "you want to configure fits here.*"), reserve=reserve)
 
     def _whitelist_names(self):
-        """Op names the super-admin whitelist currently has set true — the
-        'current' allowlist the Agent Ops tab's selects render as enabled."""
+        """Guild-scoped (plus unregistered) names the whitelist has set true.
+
+        Unregistered names are kept so an unloaded cog's choice survives a
+        save. Registered DM/GLOBAL names are omitted: this tab cannot speak
+        for them, and they are not in-chat tools.
+        """
         wl = self._whitelist()
-        return [name for name, on in wl.items() if on]
+        names = []
+        for name, on in wl.items():
+            if not on:
+                continue
+            op = registry.get(name)
+            if op is None or op.scope == OpScope.GUILD:
+                names.append(name)
+        return names
 
     def _tab_button(self, label, page):
         style = (discord.ButtonStyle.primary if self.page == page
@@ -2002,8 +2048,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             # Global-scope pages: invisible to non-superadmins, not merely
             # disabled — a guild admin shouldn't even see the catalog knobs.
             tabs.append(self._tab_button("🧩 Models & Providers", "providers"))
-            tabs.append(self._tab_button("🛠 Agent Ops", "agentops"))
-            tabs.append(self._tab_button("🌐 MCP", "mcp"))
+            tabs.append(self._tab_button(TAB_AGENTOPS, "agentops"))
+            tabs.append(self._tab_button(TAB_MCP, "mcp"))
         self.add_item(self._row(*tabs))
         self.add_item(discord.ui.TextDisplay(self._text()))
 
@@ -2011,18 +2057,20 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             self.add_item(self._row(_ProviderSelect(self)))
             self.add_item(self._row(_ModelSelect(self)))
             # The server tab's universe is the WHITELISTED guild-scoped set:
-            # for each, a per-op Off/Admin only/Everyone control writing this
-            # guild's agent_ops_gate. Non-whitelisted ops are disabled
-            # globally and are not rendered at all (see _server_gate_ops).
+            # two membership selects (Admin only / Everyone; Off = unselected)
+            # writing this guild's agent_ops_gate. Non-whitelisted ops are
+            # disabled globally and are not rendered at all (see
+            # _server_gate_ops).
             self._add_gate_sections()
             self.add_item(self._row(self._ai_toggle_button(),
                                     self._personality_button(),
                                     self._nickname_button()))
         elif self.page == "agentops":
-            # Super-admin whitelist editor: the global on/off ceiling per op
-            # across ALL scopes. Reuses the plain allowlist _ToolSelect path.
+            # Super-admin whitelist editor: the global on/off ceiling per
+            # GUILD-scoped op. DM/GLOBAL ops are MCP-only; the in-chat
+            # agent is confined to the invoking guild.
             self._add_tool_sections(
-                self._sections(), self._whitelist_names(),
+                self._sections(scope=OpScope.GUILD), self._whitelist_names(),
                 self._save_whitelist)
             self.add_item(self._row(
                 self._preset_button("Clear all", self._clear_whitelist, []),
@@ -2087,8 +2135,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             f"## AI settings — {self.guild.name}\n"
             f"**AI replies:** {'ON — mention or reply to the bot' if self._ai_enabled() else 'OFF'}\n"
             f"**Provider / model:** {self.provider} / **{self.model}** ({tier}: {rate})\n"
-            "Set each agent op below to **Off**, **Admin only**, or "
-            "**Everyone**. Only ops a bot super-admin has enabled appear here.\n"
+            "Tick **Admin only** or **Everyone** below. Unticked is Off. "
+            "Only ops a bot super-admin has enabled appear here.\n"
             f"**Agent tools here:** "
             + (", ".join(bot_tools) if bot_tools else "*none — plain chat*")
         )
@@ -2100,11 +2148,12 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         note = (f"\n*{len(offline)} whitelisted name(s) belong to unloaded "
                 f"cogs and stay enabled: {', '.join(offline)}*") if offline else ""
         return (
-            "## AI settings — Agent Ops whitelist\n"
-            "Global ceiling — the ops the in-chat agent may EVER use, across "
-            "every server and DM. An op left off here is disabled everywhere "
-            "and never appears on any server's ⚙ tab. Each server admin then "
-            "sets Off/Admin/Everyone per op for their own guild.\n"
+            f"## AI settings — {TAB_AGENTOPS}\n"
+            "What the in-chat agent may consume inside a server. Guild-scoped "
+            "ops only — DMs and bot-wide lookups live on the MCP tab. An op "
+            "left off here is disabled everywhere and never appears on any "
+            "server's ⚙ tab. Each server admin then sets Off/Admin/Everyone "
+            "per op for their own guild.\n"
             f"**Enabled ops:** {len(live)} live"
             + (f" (+{len(offline)} offline)" if offline else "")
             + note
@@ -2158,10 +2207,10 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
     def _mcp_text(self):
         mcp_on = bool(self.bot.config.get_global(ENABLE_CONFIG_KEY, False))
         return (
-            "## AI settings — MCP\n"
-            "The functions external agent harnesses can call when this bot "
-            "runs as an MCP server (loopback-only, bearer-token auth). The "
-            "dropdowns below pick which ops are served, one per op group.\n"
+            f"## AI settings — {TAB_MCP}\n"
+            "What this bot provides to external agent harnesses when it runs "
+            "as an MCP server (loopback-only, bearer-token auth). The "
+            "selects below pick which ops are served.\n"
             f"**MCP server:** {'ON' if mcp_on else 'OFF'} — changes take "
             "effect on the next bot restart."
         )
@@ -2359,29 +2408,63 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         self.bot.config.set(self._cfg_ctx(), GATE_KEY, gate_cfg)
         await self.rerender(interaction)
 
+    async def _save_gate_bucket(self, interaction: discord.Interaction,
+                                bucket: str, selected, universe=None):
+        """Server tab membership select: selected names become `bucket`
+        (admin/everyone); names that WERE that bucket and got deselected
+        become off. Other buckets are left alone so the two selects don't
+        clobber each other. Last click wins if an op is ticked in both
+        before the rerender."""
+        if not is_admin(interaction):
+            await interaction.response.send_message(
+                "Requires admin.", ephemeral=True)
+            return
+        if bucket not in (GATE_ADMIN, GATE_EVERYONE):
+            self.flash(f"Unknown gate state '{bucket}'.")
+            await self.rerender(interaction)
+            return
+        live = list(universe) if universe is not None else [
+            o.name for _label, ops in self._server_gate_ops() for o in ops]
+        selected_set = set(selected)
+        wl = self._whitelist()
+        gate_cfg = dict(self._gate_cfg())
+        for name in live:
+            op = registry.get(name)
+            if op is None or not is_whitelisted(name, wl):
+                continue
+            if name in selected_set:
+                gate_cfg[name] = bucket
+            elif gate_cfg.get(name) == bucket:
+                gate_cfg[name] = GATE_OFF
+        self.bot.config.set(self._cfg_ctx(), GATE_KEY, gate_cfg)
+        await self.rerender(interaction)
+
     async def _save_whitelist(self, interaction: discord.Interaction, selected,
                               universe=None):
-        """Super-admin Agent Ops tab: the GLOBAL {op_name: bool} whitelist —
-        the ceiling for every guild. A plain allowlist over the whole
-        registry (all scopes). Reuses the offline-preserving merge so an op
-        whose cog is unloaded stays whitelisted across a save (the property
-        that used to live on bot_tools_enabled)."""
+        """Super-admin In-chat ops tab: the GLOBAL {op_name: bool} whitelist
+        of GUILD-scoped ops — the ceiling for every guild's in-chat agent.
+        Reuses the offline-preserving merge so an op whose cog is unloaded
+        stays whitelisted across a save. Registered DM/GLOBAL names are
+        dropped: they are not in-chat tools."""
         if not is_superadmin(interaction):
             await interaction.response.send_message(
                 "Requires superadmin (this edits global bot config).",
                 ephemeral=True)
             return
         stored = self._whitelist_names()
+        live_guild = registry.op_names(scope=OpScope.GUILD)
         merged = self._merge_stored(
             stored, selected,
-            registry.names() if universe is None else universe)
+            live_guild if universe is None else universe)
+        merged = [n for n in merged
+                  if (op := registry.get(n)) is None or op.scope == OpScope.GUILD]
         # Store as an explicit {name: True} map: absent/false both read as
         # disabled, so an off op simply drops out of the map.
         self.bot.config.set_global(WHITELIST_KEY, {n: True for n in merged})
         await self.rerender(interaction)
 
     async def _clear_whitelist(self, interaction: discord.Interaction, _selected):
-        """"Clear all" on the Agent Ops tab disables every op globally,
+        """"Clear all" on the In-chat ops tab disables every op globally,
         including names whose cog is currently unloaded — same reasoning as
         the MCP "Clear all": the super-admin locking the agent surface down is
         speaking for everything, so a carried-through offline name would sit

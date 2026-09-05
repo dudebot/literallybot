@@ -92,10 +92,11 @@ Where new code should land, so seams don't re-greed:
   by `is_admin`/`is_superadmin` — the BOT's admin concept, independent of
   the invoker's Discord permissions in whichever server they stand in.
   Prefix uses `@commands.check(is_admin)`; slash twins use
-  `@app_commands.check(is_admin)` (same predicate) plus a picker pin
-  (`guild_only` + `default_permissions(administrator=True)`) so Discord's
-  picker does not advertise them to ordinary members. Public slash is
-  `/help`; parameterized one-liners (`/role`) still earn the typed-arg UI.
+  `@app_commands.check(is_admin)` (same predicate) plus `guild_only` and
+  `default_permissions(manage_messages=True)` as the picker pin (typical
+  moderator bit — not Discord Administrator). Authorization is the bot's
+  admin list. Public slash is `/help`; `/help` hides anything the invoker
+  could not run.
   Superadmin-only controls are OMITTED from a panel's render for
   non-superadmins (dynamic panel), not merely disabled.
 - Other parked (real-but-leave-it): error-handler module globals -> instance on

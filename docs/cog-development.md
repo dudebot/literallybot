@@ -102,7 +102,7 @@ async def aisettings(self, ctx):
 
 @app_commands.command(name="aisettings")
 @app_commands.guild_only()
-@app_commands.default_permissions(administrator=True)   # picker pin, not the gate
+@app_commands.default_permissions(manage_messages=True)  # picker pin
 @app_commands.check(is_admin)      # slash — same predicate
 async def aisettings_slash(self, interaction: discord.Interaction):
     ...
@@ -110,12 +110,13 @@ async def aisettings_slash(self, interaction: discord.Interaction):
 
 - Prefix: `@commands.check(is_admin)` or `@commands.check(is_superadmin)`.
 - Slash: `@app_commands.check(is_admin)` or `@app_commands.check(is_superadmin)`.
-- Gated slash also sets `guild_only` + `default_permissions(administrator=True)`.
-  Discord's picker cannot see the bot's admin list; without that pin the
-  command shows to everyone, including in DMs. The pin is visibility, not
-  authorization. A bot admin without Discord Administrator still has the
-  prefix twin. Issue #67 was the lockout from treating the pin *as* the
-  gate when slash was the only surface.
+- Gated slash also sets `guild_only` (never in DMs) and pins
+  `default_permissions(manage_messages=True)` so ordinary members do not
+  see the command in Discord's picker. Manage Messages is the typical
+  moderator bit — not Discord Administrator, which locked out bot admins
+  who are not server admins. Authorization is still the check. A bot
+  admin/superadmin without Manage Messages in that guild still has the
+  prefix twin. `/help` lists a command only if the invoker could run it.
 - `/help` lists a command only if the invoker could run it, by reading the
   decorator (`__gate__` on `is_admin` / `is_superadmin`). A body
   `if not is_admin(...)` is defense in depth, not the gate — `/help`
