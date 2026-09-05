@@ -1,6 +1,6 @@
 # Configuration System
 
-A JSON-based key-value store with per-guild and global scopes. Features write buffering, atomic saves, and live reloading when files change externally.
+A JSON-based key-value store with per-guild, per-user, and global scopes. Features write buffering, atomic saves, and live reloading when files change externally.
 
 ## Storage Layout
 
@@ -54,6 +54,16 @@ config.set_global("maintenance", True)
 # Or:
 config.get(None, "superadmins", scope="global")
 ```
+
+**User scope** - `user_<id>.json`, via a User/Member (anything with `.id`) or a bare user id:
+```python
+config.get_user(user, "points", 0)
+config.set_user(user, "points", 10)
+# Or:
+config.get(user_id, "points", 0, scope="user")
+```
+
+`get_user` is read-only the same way `get` is: a missing user file returns the default and does **not** create `user_<id>.json`. Only `set_user` / `set(..., scope="user")` writes.
 
 ### Context-Free Access
 

@@ -65,6 +65,13 @@ class Config:
         """Resolve context to config file identifier"""
         if scope == 'global' or ctx is None:
             return 'global'
+        elif scope == 'user':
+            if hasattr(ctx, 'id'):
+                return f'user_{ctx.id}'
+            elif isinstance(ctx, int):
+                return f'user_{ctx}'
+            else:
+                raise ValueError("Cannot resolve user context")
         elif scope == 'guild':
             if hasattr(ctx, 'guild') and getattr(ctx.guild, 'id', None) is not None:
                 return str(ctx.guild.id)
@@ -167,14 +174,14 @@ class Config:
             return list(self._configs.get(config_id, {}).keys())
 
     def get(self, ctx, key, default=None, scope='guild'):
-        """Get a config value from guild or global scope. Read-only - does not persist defaults."""
+        """Get a config value from guild, user, or global scope. Read-only - does not persist defaults."""
         config_id = self._resolve_config_id(ctx, scope)
         with self._data_lock:
             cfg = self._configs.get(config_id, {})
             return cfg.get(key, default)
 
     def set(self, ctx, key, value, scope='guild'):
-        """Set a config value in guild or global scope"""
+        """Set a config value in guild, user, or global scope"""
         config_id = self._resolve_config_id(ctx, scope)
         with self._data_lock:
             cfg = self._configs.setdefault(config_id, {})
@@ -183,7 +190,7 @@ class Config:
         self._schedule_save()
 
     def rem(self, ctx, key, scope='guild'):
-        """Remove a config key from guild or global scope"""
+        """Remove a config key from guild, user, or global scope"""
         config_id = self._resolve_config_id(ctx, scope)
         with self._data_lock:
             if config_id in self._configs and key in self._configs[config_id]:
@@ -192,6 +199,28 @@ class Config:
                 self._schedule_save()
                 return True
         return False
+
+    def has(self, ctx, key, scope='guild'):
+        """Check if a config key exists in guild, user, or global scope"""
+        config_id = self._resolve_config_id(ctx, scope)
+        return config_id in self._configs and key in self._configs[config_id]
+
+    # Convenience methods for user configs
+    def get_user(self, ctx, key, default=None):
+        """Get a user-specific config value"""
+        return self.get(ctx, key, default, scope='user')
+
+    def set_user(self, ctx, key, value):
+        """Set a user-specific config value"""
+        self.set(ctx, key, value, scope='user')
+
+    def rem_user(self, ctx, key):
+        """Remove a user-specific config value"""
+        return self.rem(ctx, key, scope='user')
+
+    def has_user(self, ctx, key):
+        """Check if a user-specific config key exists"""
+        return self.has(ctx, key, scope='user')
 
     # Convenience methods for global configs
     def get_global(self, key, default=None):
@@ -205,6 +234,10 @@ class Config:
     def rem_global(self, key):
         """Remove a global config value"""
         return self.rem(None, key, scope='global')
+
+    def has_global(self, key):
+        """Check if a global config key exists"""
+        return self.has(None, key, scope='global')
 
     def _schedule_reload(self):
         """Schedule periodic check for external file changes"""
