@@ -1,5 +1,5 @@
 @echo off
-REM Start literallybot on Windows: build the venv if it isn't there, install
+REM Start the bot on Windows: build the venv if it isn't there, install
 REM requirements when they've changed, run the bot. The bot itself handles the
 REM token -- it reads %DISCORD_TOKEN%, else its saved config, else prompts you.
 REM

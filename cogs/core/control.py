@@ -218,15 +218,35 @@ class Control(commands.Cog):
 
     @commands.command(name='sync', hidden=True)
     @commands.check(is_superadmin)
-    async def sync(self, ctx):
-        """Sync application commands with Discord (canonical)."""
-        self.logger.info(f"{ctx.author} invoked sync for guild {getattr(ctx.guild, 'id', 'N/A')}")
+    async def sync(self, ctx, scope: str = "global"):
+        """Sync application commands with Discord.
+
+        `!sync` (or `!sync global`) pushes the global tree — that's what
+        DMs see. `!sync guild` copies the global tree onto this server
+        and pushes that (faster to propagate; also the way to drop a
+        stale guild copy of a deleted command)."""
+        scope = (scope or "global").lower()
+        self.logger.info(
+            f"{ctx.author} invoked sync scope={scope} "
+            f"guild={getattr(ctx.guild, 'id', 'N/A')}")
         message = await ctx.send('Syncing commands...')
         await safe_delete(ctx, self.logger)
         try:
-            self.bot.tree.copy_global_to(guild=ctx.guild)
-            await self.bot.tree.sync(guild=ctx.guild)
-            await message.edit(content='Application commands synced.', delete_after=20)
+            if scope == "guild":
+                if ctx.guild is None:
+                    await message.edit(
+                        content="Guild sync needs to be run in a server.",
+                        delete_after=20)
+                    return
+                self.bot.tree.copy_global_to(guild=ctx.guild)
+                synced = await self.bot.tree.sync(guild=ctx.guild)
+                where = "this server"
+            else:
+                synced = await self.bot.tree.sync()
+                where = "globally"
+            await message.edit(
+                content=f"Synced {len(synced)} commands {where}.",
+                delete_after=20)
         except Exception as exc:
             self.logger.error("Error during sync", exc_info=True)
             await message.edit(content=f'An error has occurred: {exc}', delete_after=20)

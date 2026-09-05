@@ -1,5 +1,5 @@
 #!/bin/sh
-# Start literallybot: build the venv if it isn't there, install requirements
+# Start the bot: build the venv if it isn't there, install requirements
 # when they've changed, run the bot. The bot itself handles the token — it
 # reads $DISCORD_TOKEN, else its saved config, else prompts you for one.
 #

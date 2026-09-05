@@ -479,6 +479,7 @@ Lists are just Python lists — get, mutate, then `set` the updated list. Call
 immediately.
 
 ### Documentation
+- `AGENTS.md` — working agreement for this tree and any downstream copy
 - `docs/cog-development.md` — building cogs, including the command-gate recipe
 - `docs/config-system.md` — config API, patterns, and the config Key Registry
 - `docs/error-handling.md` — how errors flow and how to handle them

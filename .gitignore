@@ -22,9 +22,15 @@ backups/
 
 # Development Tools
 .claude/
+.grok/
 .vscode/
 .pytest_cache/
 settings.local.json
+agent_notes/
+
+# nohup/job redirect residue
+*.err
+*.out
 
 # Bot-Specific: per-guild media libraries (media/<guild_id>/) are
 # runtime deployment data, never tracked

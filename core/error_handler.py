@@ -367,7 +367,8 @@ def _determine_severity(error: Exception) -> ErrorSeverity:
                           commands.CheckFailure, commands.CommandOnCooldown)):
         return ErrorSeverity.WARNING
     elif isinstance(error, (app_commands.CommandOnCooldown,
-                            app_commands.CheckFailure)):
+                            app_commands.CheckFailure,
+                            app_commands.CommandNotFound)):
         return ErrorSeverity.WARNING
     else:
         return ErrorSeverity.ERROR

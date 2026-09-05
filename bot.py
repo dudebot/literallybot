@@ -167,8 +167,13 @@ async def on_ready():
 
     # on_ready refires on reconnect — only sync the command tree once per
     # process (Control's !sync command handles manual re-syncs).
+    # Global first (what DMs see), then copy onto each guild so a deleted
+    # or re-permissioned command doesn't linger as a stale guild copy.
     if not getattr(bot, "_synced", False):
         await bot.tree.sync()
+        for guild in bot.guilds:
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
         bot._synced = True
 
     # MCP ops server — OFF unless the `mcp_ops_enabled` global config bool is

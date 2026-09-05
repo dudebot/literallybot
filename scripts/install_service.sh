@@ -1,5 +1,5 @@
 #!/bin/bash
-# Systemd service installer for LiterallyBot Discord Bot
+# Systemd service installer. Default unit name is the repo directory.
 
 set -e
 
@@ -13,16 +13,15 @@ NC='\033[0m' # No Color
 if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}Error: This script must be run with sudo${NC}"
     echo "Usage: sudo ./scripts/install_service.sh [service_name]"
-    echo "If no service name is provided, defaults to 'literallybot'"
+    echo "If no service name is provided, defaults to the directory name"
     exit 1
 fi
 
-# Get service name from argument or use default
-SERVICE_NAME="${1:-literallybot}"
-DESCRIPTION="LiterallyBot Discord Bot"
-
 # Detect current directory and user
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEFAULT_NAME="$(basename "$CURRENT_DIR")"
+SERVICE_NAME="${1:-$DEFAULT_NAME}"
+DESCRIPTION="${DEFAULT_NAME} Discord Bot"
 CURRENT_USER="${SUDO_USER:-$USER}"
 
 # Check if venv exists, use it if available
