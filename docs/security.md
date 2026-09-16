@@ -348,7 +348,7 @@ admin/superadmin list.
   connect a client. It is plaintext on disk like the provider keys, and it is a
   full-privilege credential for the ops surface, protected at rest by the same
   0700/0600 modes as the Discord token.
-- **`configs/` is gitignored in full**, so no per-guild data, memories, admin
+- **`configs/` is gitignored in full**, so no per-guild data, admin
   lists, or stored keys are committed. Verified: `git ls-files configs/` is empty.
 - **Keys never appear in-channel.** The key is typed into a Discord **modal**
   from the `!aisettings` → Models & Providers tab, which the panel answers
@@ -374,11 +374,6 @@ admin/superadmin list.
   `AllowedMentions(users=True, roles=False, everyone=False)` — user pings are an
   intended feature; role/everyone pings cannot fire even if the substring filter
   is bypassed.
-- **Memory capture runs on every message.** Regexes in
-  `capture_and_store_memories` extract statements ("my name is …", "you're to
-  always …", etc.) from *all* messages — not just `!gpt` invocations — and persist
-  them per-guild (`gpt_memories`), later injecting them into the system prompt for
-  future `!gpt` calls. See hardening checklist for the stored-injection implication.
 
 ## Known Accepted Risks (documented, not defects)
 
@@ -400,11 +395,6 @@ admin/superadmin list.
   intended feature, but model output can no longer ping roles or everyone. The
   ops `send_message` op additionally suppresses ALL mentions by default at the
   registry level (a caller must pass an explicit `allowed_mentions` to ping).
-- [x] **Directive memory capture is admin-gated** — `you're to always …`
-  directives are only persisted when the author passes the shared `is_admin`
-  gate; other members' directive-shaped messages are ignored. Non-directive
-  memory types (names, preferences, reminders) are still captured from anyone,
-  which only affects how the bot talks *about* that user.
 - [x] **Restrict filesystem access to `configs/`** so plaintext API keys and admin
   lists aren't world-readable — `configs/` is chmod 0700 at every startup and
   every config file lands 0600; the atomic-save temp file is created 0600 and

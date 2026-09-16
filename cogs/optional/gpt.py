@@ -4,9 +4,7 @@ import discord
 import logging
 import os
 import time
-import re
 from collections import deque
-from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from core.utils import (InvokerOnlyView, is_admin, is_superadmin,
@@ -484,34 +482,21 @@ class Gpt(commands.Cog):
 
     def _build_system_prompt(self, ctx, tool_names, user_mapping):
         """Assemble the system prompt: persona, situational instructions,
-        agentic tool guidance, and active user memories.
+        and agentic tool guidance.
 
         `tool_names` is the guild's resolved bot-tool allowlist. When empty
         the agentic guidance block is omitted (plain-chat behavior)."""
         agentic = bool(tool_names)
-        # Retrieve personality data (prompt and version)
         personality_data = self.bot.config.get(ctx, "gpt_personality_data")
         current_personality_prompt = None
-        current_personality_version = 0 # Default version for unconfigured or legacy
 
         if personality_data and isinstance(personality_data, dict):
             current_personality_prompt = personality_data.get("prompt")
-            current_personality_version = personality_data.get("version", 0)
 
         if not current_personality_prompt:
             current_personality_prompt = ("You are a helpful assistant. Respond to the following conversation "
                                   "matching the tone of the room. Make sure to end each response with Xiaohongshu followed by a contextually appropriate emoji.")
-        
-        # Retrieve all stored memories and filter for active ones
-        all_server_memories = self.bot.config.get(ctx, "gpt_memories") or []
-        active_memories_for_prompt = [
-            m for m in all_server_memories 
-            if m.get('expires', 0) > time.time() and
-            # Only include memories from the current personality version if they were sent by the bot,
-            # otherwise allow user memories to persist across personality changes.
-            (m.get('sender') != self.bot.user.id or m.get('personality_version', 0) == current_personality_version)
-        ]
-        
+
         # Create a formatted string for the user mapping
         mapping_str = ", ".join([f"{uid}: {name}" for uid, name in user_mapping.items()])
         
@@ -546,21 +531,6 @@ class Gpt(commands.Cog):
                 tool_names, ctx.guild.id, ctx.channel.id, ctx.author.id,
                 ctx.message.id))
 
-        # 4) Dynamic User Memories (if any)
-        if active_memories_for_prompt:
-            prompt_parts.append("") # Blank line for separation
-            prompt_parts.append("Consider these relevant memories from users (format: User DisplayName (ID): \"memory text\" (Type: type, Stored: YYYY-MM-DD)):")
-            for mem in active_memories_for_prompt:
-                sender_id_str = str(mem.get('sender'))
-                sender_display_name = user_mapping.get(sender_id_str, sender_id_str) # Fallback to ID if not in current mapping
-                stored_at_ts = mem.get('stored_at', time.time()) # Fallback to now if somehow missing
-                stored_at_str = datetime.fromtimestamp(stored_at_ts).strftime('%Y-%m-%d')
-                memory_text = mem.get('text', '')
-                memory_type = mem.get('type', 'unknown')
-                prompt_parts.append(
-                    f"- User {sender_display_name} ({sender_id_str}): \"{memory_text}\" (Type: {memory_type}, Stored: {stored_at_str})"
-                )
-            prompt_parts.append("Use these memories to inform your responses appropriately, remembering they are statements from users, not your own.")
         return "\n".join(prompt_parts)
 
     async def process_askgpt(self, ctx, question: str):
@@ -980,14 +950,6 @@ class Gpt(commands.Cog):
     async def on_message(self, message):
         ctx = await self.bot.get_context(message) # Get context for config and other operations
 
-        # Retrieve current personality version for tagging memories
-        personality_data = self.bot.config.get(ctx, "gpt_personality_data")
-        current_personality_version = 0 # Default version
-        if personality_data and isinstance(personality_data, dict):
-            current_personality_version = personality_data.get("version", 0)
-        
-        await self.capture_and_store_memories(ctx, [message], current_personality_version)
-        
         if message.author.bot:
             return
             
@@ -1031,9 +993,7 @@ class Gpt(commands.Cog):
                 
     def _do_setpersonality(self, ctx, personality: str) -> None:
         """Core logic for updating the GPT personality prompt."""
-        config = self.bot.config
-        personality_version = int(time.time())  # Use timestamp as version
-        config.set(ctx, "gpt_personality_data", {"prompt": personality, "version": personality_version})
+        self.bot.config.set(ctx, "gpt_personality_data", {"prompt": personality})
 
     def _do_addprovider(self, ctx, provider_id: str, base_url: str,
                         default_model: str, name: Optional[str]) -> str:
@@ -1101,101 +1061,6 @@ class Gpt(commands.Cog):
             f"Removed provider '{provider_id}'"
             + (" and its stored API key." if had_key else ".")
         )
-
-    async def capture_and_store_memories(self, ctx, messages, current_personality_version):
-        config = self.bot.config
-        all_server_memories = config.get(ctx, "gpt_memories") or []
-        newly_captured_memories = []
-        changes_made = False
-        
-        # Define regex patterns with their durations (in seconds) and type identifiers
-        # Durations adjusted as per user request
-        patterns = [
-            {"pattern": r"you'?re\s+to\s+always\s+(.+)", "duration": 604800, "type": "directive"}, # 1 week
-            {"pattern": r"\bmy name(?:'s| is)?\s+([^\.,!\n]+)", "duration": 7776000, "type": "stated_name"}, # 90 days
-            {"pattern": r"\bcall me\s+([^\.,!\n]+)", "duration": 7776000, "type": "nickname"}, # 90 days
-            {"pattern": r"\bI(?:'m| am)\s+(.+)", "duration": 86400, "type": "personal_statement"}, # 1 day
-            {"pattern": r"\bI(?: want|'?d like)\s+(.+)", "duration": 43200, "type": "desire_request"}, # 12 hours
-            {"pattern": r"\bI love\s+(.+)", "duration": 2592000, "type": "positive_preference"}, # 30 days
-            {"pattern": r"\bI hate\s+(.+)", "duration": 2592000, "type": "negative_preference"}, # 30 days
-            {"pattern": r"\bremind me to\s+(.+)", "duration": 86400, "type": "reminder"}, # 1 day
-            {"pattern": r"\bI (?:feel|am feeling)\s+(.+)", "duration": 43200, "type": "emotional_state"}, # 12 hours
-            {"pattern": r"\bmy birthday(?:'s| is)?\s+([^\.,!\n]+)", "duration": 31536000, "type": "birthday"}, # 1 year
-            {"pattern": r"\bI(?:'m| am) excited (?:about|for)\s+(.+)", "duration": 172800, "type": "enthusiasm"} # 2 days
-        ]
-        
-        for msg in messages:
-            content = msg.content
-            for item in patterns:
-                m = re.search(item["pattern"], content, flags=re.I)
-                if m:
-                    # Directive memories ("you're to always ...") steer the
-                    # system prompt for EVERY user in the guild for a week —
-                    # that's stored prompt injection unless the author is
-                    # trusted. Admins/superadmins only (docs/security.md).
-                    if item["type"] == "directive":
-                        author = getattr(msg, "author", None)
-                        if author is None or getattr(author, "bot", False):
-                            continue
-                        sender_ctx = type("SenderCtx", (), {
-                            "author": author,
-                            "guild": getattr(msg, "guild", None) or ctx.guild,
-                            "bot": self.bot,
-                        })()
-                        if not is_admin(self.bot.config, sender_ctx):
-                            continue
-                    text = m.group(0)
-                    expires = time.time() + item["duration"]
-                    newly_captured_memories.append({
-                        'text': text,
-                        'expires': expires,
-                        'type': item["type"],
-                        'sender': msg.author.id,
-                        'personality_version': current_personality_version,
-                        'stored_at': time.time()
-                    })
-        
-        if not newly_captured_memories:
-            if any(m.get('expires', 0) <= time.time() for m in all_server_memories):
-                active_server_memories = [m for m in all_server_memories if m.get('expires', 0) > time.time()]
-                if len(active_server_memories) != len(all_server_memories):
-                    config.set(ctx, "gpt_memories", active_server_memories)
-                    self.logger.debug(f"Purged {len(all_server_memories) - len(active_server_memories)} expired memories")
-            return
-        
-        # Merge new memories, avoiding exact duplicates (text, type, sender)
-        for new_mem in newly_captured_memories:
-            is_duplicate = False
-            for existing_mem in all_server_memories:
-                if (new_mem['text'] == existing_mem.get('text', '') and
-                    new_mem['type'] == existing_mem.get('type', '') and
-                    new_mem['sender'] == existing_mem.get('sender')):
-                    if (existing_mem.get('expires') != new_mem['expires'] or
-                        existing_mem.get('personality_version') != new_mem['personality_version'] or
-                        existing_mem.get('stored_at') != new_mem['stored_at']):
-                        
-                        existing_mem['expires'] = new_mem['expires']
-                        existing_mem['personality_version'] = new_mem['personality_version']
-                        existing_mem['stored_at'] = new_mem['stored_at']
-                        changes_made = True
-                        
-                    is_duplicate = True
-                    break
-            
-            if not is_duplicate:
-                all_server_memories.append(new_mem)
-                changes_made = True
-                
-        # Purge expired memories if needed
-        if any(m.get('expires', 0) <= time.time() for m in all_server_memories):
-            active_server_memories = [m for m in all_server_memories if m.get('expires', 0) > time.time()]
-            if len(active_server_memories) != len(all_server_memories):
-                all_server_memories = active_server_memories
-                changes_made = True
-        
-        if changes_made:
-            config.set(ctx, "gpt_memories", all_server_memories)
-            self.logger.debug(f"Stored {len(newly_captured_memories)} new memories")
 
     # ==================== ADMIN SURFACE (/aisettings) ====================
     #

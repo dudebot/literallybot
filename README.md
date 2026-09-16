@@ -48,7 +48,7 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 ## ✨ Key Features
 
 - **🧭 One Ops Layer, Many Frontends** — ~125 permission-checked Discord primitives declared once, driving the in-chat AI agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
-- **🤖 AI Chat + Agent** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with memory and personality, plus an optional agentic mode that performs real Discord actions under a two-tier permission model
+- **🤖 AI Chat + Agent** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with personality, plus an optional agentic mode that performs real Discord actions under a two-tier permission model
 - **🧩 Modular Cogs** — self-contained features; disable any globally without deleting it (binds at restart); cogs can register their own ops
 - **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
 - **⚙️ Smart Config** — per-server, per-user, and global JSON settings with write buffering, atomic saves, and live reload on external edits
