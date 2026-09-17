@@ -89,7 +89,7 @@ illustration; they are not real.)
 |-----|-------|-----------|-------|
 | `discord_token` | `str` | `core.bootstrap` first-run prompt only (no command surface; never a panel field) | The bot's own Discord token. Resolution order is **`DISCORD_TOKEN` env var → this key → interactive prompt → exit with instructions**; the env var is **NEVER persisted here** (a panel-supplied secret belongs only where the operator set it). Written only *after* discord.py confirms the login, so a typo'd token never lands on disk. Plaintext, protected by the store's 0600/0700 modes — see the hardening note below |
 | `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin`, plus the first-run bootstrap in `core.bootstrap` (any key also editable via the `!config` panel, superadmin) | Read through `core.utils.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes". On a first successful login with this list **empty or absent**, the Discord application owner (the team owner for team-owned apps) is added automatically and logged, retiring `!claimsuper` for new installs. Empty-list gate ONLY: an existing deployment is never touched |
-| `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?}}}}` | `!aisettings` → Models & Providers (superadmin) | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
+| `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?, cache_input_ratio?, cache_ttl_seconds?}}}}` | `!aisettings` → Models & Providers (superadmin) | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
 | `<PROVIDER>_API_KEY` | `str` (e.g. `XAI_API_KEY`) | `!aisettings` → Models & Providers key modal | Env var of the same name is the fallback; removed with its provider. Keys are entered ONLY via the panel modal (no slash parameter) |
 | `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
 | `cooldown_tier_bases` | `{tier: seconds}` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS`; the model modal's tier dropdown covers the common case |
@@ -111,6 +111,8 @@ illustration; they are not real.)
 | `admins` | `list[int]` user ids | `!addadmin` / `!removeadmin` / `!claimadmin` | Read via `core.utils.is_admin` |
 | `current_ai_provider` | `str` provider id | `!aisettings` → Server config | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
 | `current_ai_model` | `str` or absent | `!aisettings` → Server config | Absent ⇒ provider's `default_model` |
+| `ai_history_min_messages` | `int`, default 15 | `/aisettings` → Server → History | Fresh/sliding context size; 1–1000 messages |
+| `ai_history_max_messages` | `int`, default 30 | `/aisettings` → Server → History | Inchworm ceiling, at least the minimum and at most 1000. Equal bounds give fixed history; references may add supplemental messages. Previous anchor retained only inside the assumed TTL when estimated input cost decreases |
 | `gpt_personality_data` | `{prompt: str}` | `!aisettings` → Personality modal | Guild persona for `!gpt` |
 | `ai_enabled` | `bool` | `!aisettings` → Server config (💬 toggle) | Per-guild AI kill switch. Absent ⇒ ON. Gates the mention/reply chat path only — the panel stays reachable to turn it back on. Chat is guild-only: DMs never answer |
 | `agent_ops_gate` | `{op_name: "off"\|"admin"\|"everyone"}` | `!aisettings` → ⚙ Server config, per-op tri-state select (**guild admin**) | The per-guild agent gate (`core/agent_gate`), the second tier under the global `agent_ops_whitelist` ceiling. For each WHITELISTED guild-scoped op a server admin picks Off / Admin only / Everyone; a missing entry falls back to the op's `default_gate()` (always `"off"`). `off` hides the op from that guild's agent, `admin` limits agent invocation to bot admins, `everyone` opens it to any member (still subject to the op's own hardcoded `PermissionLevel` floor). Guild-admin-savable is not an escalation path: the surface is guild-scoped ops only, capped by the super-admin whitelist, and each op re-checks its floor at call time. Superseded `bot_tools_enabled` (the old single on/off allowlist) when the two-tier model landed |
@@ -272,3 +274,20 @@ config.flush()
 ```
 
 Useful before operations that might crash, or when you need guaranteed persistence.
+
+### Model cache policy
+
+`ai_providers[provider].models[model].cache_input_ratio` (global, default `0.10`)
+is the cached input price divided by uncached input price, not the cache hit
+rate. `cache_ttl_seconds` (default `300`, range 0–86400; 0 disables extension)
+is an assumed useful cache lifetime, not a provider retention guarantee.
+Superadmins edit these under `/aisettings` → Models & Providers → Input cache.
+The ratio is entered as a percentage. Known Grok 4.6 pricing implies **25%**,
+and Grok 4.5 **15%**; the generic default is 10%.
+Neither setting changes provider billing or forces cache retention.
+The selector uses a UTF-8 byte/4 token estimate and exact whole-message prefix
+matching. State is in memory, separated by guild/channel/provider/model/tools,
+bounded to 256 conversations, and committed only after a successful model call.
+Requests in one channel serialize. Stable system instructions precede history;
+changing user mappings and invoking IDs follow it. xAI requests use a stable
+`x-grok-conv-id`. Usage logs retain actual cached token counts per API request.

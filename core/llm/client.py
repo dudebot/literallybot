@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import os
 import asyncio
+import json
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -344,6 +346,11 @@ class LLMClient:
             if metadata is not None:
                 settings["extra_body"] = {"metadata": metadata}
                 settings["openai_store"] = True
+                host = urlparse(provider_info.get("base_url") or "").hostname or ""
+                if (host == "api.x.ai" or host.endswith(".api.x.ai")) and metadata.get("channel"):
+                    settings["extra_headers"] = {
+                        "x-grok-conv-id": f"literallybot:{metadata.get('guild', 'DM')}:{metadata['channel']}:{model}"
+                    }
 
         return settings  # type: ignore[return-value]
 
@@ -384,6 +391,7 @@ class LLMClient:
         ).strip()
         usage = _usage_from_pai(response.usage, provider=provider, model=model)
 
+        self._log_usage(usage, metadata)
         return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=response)
 
     # ------------------------------------------------------------------
@@ -437,8 +445,35 @@ class LLMClient:
         # attribute in pydantic-ai 2.x (not the v1 `.usage()` method) and
         # duck-types RequestUsage's input/output token fields.
         usage = _usage_from_pai(result.usage, provider=provider, model=model)
+        costs = []
+        for message in result.new_messages():
+            if isinstance(message, PaiModelResponse):
+                request_usage = _usage_from_pai(message.usage, provider=provider, model=model)
+                self._log_usage(request_usage, metadata)
+                if request_usage:
+                    costs.append(request_usage.estimated_cost_usd)
+        if usage and costs:
+            # Long-context tiers apply per request, never to an aggregate run.
+            usage.estimated_cost_usd = (round(sum(costs), 6)
+                                        if all(c is not None for c in costs) else None)
         text = (result.output or "").strip()
         return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=result)
+
+    def _log_usage(self, usage, metadata):
+        if usage is None:
+            return
+        self.logger.info("llm_usage %s", json.dumps({
+            "provider": usage.provider, "model": usage.model,
+            "guild": (metadata or {}).get("guild"),
+            "channel": (metadata or {}).get("channel"),
+            "message": (metadata or {}).get("message"),
+            "sender": (metadata or {}).get("sender"),
+            "prompt_tokens": usage.prompt_tokens,
+            "cached_prompt_tokens": usage.cached_prompt_tokens,
+            "completion_tokens": usage.completion_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "estimated_cost_usd": usage.estimated_cost_usd,
+        }, separators=(",", ":")))
 
     # ------------------------------------------------------------------
     # Model discovery
@@ -556,6 +591,8 @@ def _usage_from_pai(usage: Optional[RequestUsage], provider: str, model: str) ->
         # RunUsage (agent loop) carries tool_calls; RequestUsage (plain
         # chat) doesn't have the attribute — default to 0.
         tool_calls=getattr(usage, "tool_calls", 0) or 0,
+        cached_prompt_tokens=getattr(usage, "cache_read_tokens", 0) or 0,
+        reasoning_tokens=(getattr(usage, "details", {}) or {}).get("reasoning_tokens", 0),
     )
     record.estimated_cost_usd = estimate_cost(record)
     return record

@@ -33,6 +33,7 @@ _PRICING_USD_PER_MTOK: Dict[str, Dict[str, tuple]] = {
         "claude-opus-4-8": (5.00, 25.00),
     },
     "xai": {
+        "grok-4.6": (2.00, 6.00),   # verified 2026-09-17 (docs.x.ai)
         "grok-4.5": (2.00, 6.00),   # verified 2026-07 (x.ai)
         "grok-4.3": (1.25, 2.50),
         "grok-4.20-0309-reasoning": (1.25, 2.50),
@@ -84,6 +85,8 @@ class UsageRecord:
     # runs; 0 for plain chat). A zero here on an action request is the
     # "model narrated instead of acting" failure signature.
     tool_calls: int = 0
+    cached_prompt_tokens: int = 0
+    reasoning_tokens: int = 0
 
 
 def estimate_cost(record: UsageRecord) -> Optional[float]:
@@ -94,6 +97,20 @@ def estimate_cost(record: UsageRecord) -> Optional[float]:
         return None
 
     prompt_price, completion_price = prices
-    cost = (record.prompt_tokens / 1_000_000) * prompt_price
-    cost += (record.completion_tokens / 1_000_000) * completion_price
+    cached_price = prompt_price
+    # Published global xAI rates; regional/priority premiums are not modeled.
+    if record.provider == "xai":
+        for prefix, price in (("grok-4.6", 0.50), ("grok-4.5", 0.30),
+                              ("grok-4.3", 0.20), ("grok-4.20", 0.20)):
+            if record.model.startswith(prefix):
+                cached_price = price
+                if record.prompt_tokens >= 200_000:
+                    prompt_price *= 2
+                    cached_price *= 2
+                    completion_price *= 2
+                break
+    cached = max(0, min(record.prompt_tokens, record.cached_prompt_tokens))
+    cost = ((record.prompt_tokens - cached) * prompt_price
+            + cached * cached_price
+            + record.completion_tokens * completion_price) / 1_000_000
     return round(cost, 6)
