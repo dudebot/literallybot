@@ -90,8 +90,8 @@ def _is_gated(cmd, cog=None):
     if parent is not None and _is_gated(parent):
         return True
     cog = cog if cog is not None else getattr(cmd, "cog", None)
-    # A cog_check gates every command in the cog (how !errorlog is gated
-    # without any per-command decorator).
+    # A cog_check gates every command in the cog, even without a
+    # per-command decorator.
     if cog is not None and type(cog).cog_check is not commands.Cog.cog_check:
         return True
     return False
@@ -139,7 +139,7 @@ async def _visible_to(cmd, ctx, invoker_is_admin, invoker_is_superadmin):
 
     With a Context, can_run answers exactly. Without one (the /help path),
     fall back to the structural test rather than assuming public — that
-    assumption is what leaked cog_check-gated commands like !errorlog.
+    assumption previously leaked commands gated only by cog_check.
     """
     if cmd.hidden and not invoker_is_admin:
         return False

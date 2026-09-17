@@ -3,8 +3,13 @@ from discord.ext import commands
 import random
 import re
 from core.utils import smart_split
+from core.error_handler import suppress_command_not_found
 
 
+DICE_PATTERN = re.compile(r"(?P<rolls>\d+)?d(?P<sides>\d+)", re.IGNORECASE)
+
+
+@suppress_command_not_found(DICE_PATTERN)
 class RNG(commands.Cog):
     """Dice rolls and random picks."""
     def __init__(self, bot):
@@ -34,9 +39,8 @@ class RNG(commands.Cog):
             await ctx.send("No valid options given.")
 
 
-    async def handle_dice_roll(self, arg: str) -> str:
-        pattern = r"^(?P<rolls>\d+)?d(?P<sides>\d+)$"
-        match = re.fullmatch(pattern, arg, re.IGNORECASE)
+    async def handle_dice_roll(self, arg: str) -> str | None:
+        match = DICE_PATTERN.fullmatch(arg)
         if not match:
             return None  # signal that the pattern did not match
         roll_count = int(match.group("rolls")) if match.group("rolls") else 1
@@ -65,7 +69,7 @@ class RNG(commands.Cog):
         if message.author.bot:
             return
 
-        prefix = self.bot.command_prefix
+        prefix = await self.bot.get_prefix(message)
         prefixes = prefix if isinstance(prefix, (list, tuple)) else [prefix]
 
         for p in prefixes:

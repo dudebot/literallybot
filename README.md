@@ -284,12 +284,13 @@ config and take effect on the next restart:
 - `!restart` (alias `!kys`) — graceful shutdown (systemd restarts it)
 
 ### Error Logging (optional)
-- `!errorlog setchannel #channel` — set the error channel for this guild
-- `!errorlog setglobal #channel` — set the global error channel (superadmin)
-- `!errorlog setcategory` / `!errorlog setseverity` — category/severity routing
-- `!errorlog status` / `!errorlog disable` / `!errorlog ratelimit` — inspect, disable, tune
+- `/logsettings` — ephemeral admin panel; `!logsettings` opens the prefix twin.
+- Server tab: destination, category/severity routing, and optional command-not-found reports.
+- Global tab (superadmin): independent destination/routes, unknown-command toggle, and duplicate-alert interval modal.
 
-Errors are rate-limited globally to avoid spam. See `docs/error-handling.md`.
+Unexpected exceptions and command denials always reach configured destinations.
+Denials show required and actual access levels. Dice/media shortcuts are excluded
+from unknown-command reporting. See `docs/error-handling.md`.
 
 ## 🔧 Optional Integrations
 

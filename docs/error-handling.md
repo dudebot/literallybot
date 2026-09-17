@@ -13,14 +13,14 @@ Global handler (bot.py)
   - on_error              → handle_event_error()
         ↓
 core/error_handler.py
-  - Logs to bot.logger
-  - Checks whitelist hooks (can suppress)
+  - Suppresses recognized dynamic shortcuts (CommandNotFound only)
+  - Classifies and logs to bot.logger
   - Rate-limits duplicate errors
   - Sends embed to Discord channels
         ↓
 Discord error channels
   - Guild channel (if configured)
-  - Global channel (always, for superadmin visibility)
+  - Global channel (independent; unknown commands opt-in)
 ```
 
 All unhandled errors flow through this pipeline automatically. You don't need to do anything special for errors to be logged.
@@ -93,30 +93,42 @@ Just validate input in the command body instead.
 
 ## Suppressing CommandNotFound
 
-If your cog creates dynamic "commands" (like media files that respond to `!filename`), register a whitelist hook to suppress the CommandNotFound spam:
+Dynamic shortcuts run alongside discord.py command dispatch. A successful
+listener does not consume the message; the command dispatcher can still report
+`CommandNotFound`. Recognize the same input in both places; do not track message
+IDs or rely on listener execution order.
+
+For regex-based shortcuts, decorate the **cog class**:
 
 ```python
-from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
+import re
+from core.error_handler import suppress_command_not_found
 
-class Media(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        register_error_whitelist_hook(self._is_media_command)
+DICE_PATTERN = re.compile(r"(?P<rolls>\d+)?d(?P<sides>\d+)", re.IGNORECASE)
 
-    def cog_unload(self):
-        unregister_error_whitelist_hook(self._is_media_command)
-
-    def _is_media_command(self, ctx, error):
-        """Return True to suppress this error from logging."""
-        if not ctx.message.content.startswith('!'):
-            return False
-
-        cmd_name = ctx.message.content[1:].split()[0]
-        # Check if this matches a media file
-        return self._media_file_exists(cmd_name)
+@suppress_command_not_found(DICE_PATTERN)
+class RNG(commands.Cog):
+    ...  # The listener uses DICE_PATTERN.fullmatch(text), too.
 ```
 
-The hook receives `(ctx, error)` and returns `True` to suppress logging, `False` to let it through.
+The decorator accepts one or more regex strings or compiled patterns. They are
+compiled once and full-match the whole message after removing `ctx.prefix` and
+trimming surrounding whitespace. Only loaded cogs participate. Matching is
+restricted to human-authored prefix `CommandNotFound` errors; invocation failures,
+event exceptions, permission denials, and stale slash-command registrations are
+never suppressed. Regexes are code declarations, not user-configurable patterns.
+
+Match recognized syntax even when the cog returns a validation message:
+`!999d67` is handled by RNG's "too many dice" reply. `!2d20 extra` is not handled
+and stays an unknown command. Keep prefix handling, case, and whitespace rules
+identical between the listener and its suppression rule.
+
+For dynamic lookups such as media filenames, the existing callback API remains:
+register `register_error_whitelist_hook(self._is_media_command)` in `__init__`,
+unregister it in `cog_unload`, and return a boolean from `(ctx, error)`. The media
+hook and listener both check the entire filename. Hooks run only for prefix
+`CommandNotFound`. A hook exception is reported as an unexpected error and cannot
+silently suppress the original activity.
 
 ## Logging Errors Manually
 
@@ -142,25 +154,63 @@ except Exception as e:
     ))
 ```
 
-## Severity Levels
+## Severity and command activity
 
-Severity is auto-determined based on error type, but here's what each level means:
+| Situation | Severity | Discord behavior |
+|-----------|----------|------------------|
+| Recognized dice/media shortcut | — | Suppressed before logging |
+| Unknown prefix command | INFO | Local log always; Discord opt-in per destination |
+| Permission or server-only refusal | WARNING | Always sent to configured destinations as **Command denied** |
+| Cooldown or prefix input validation exception | WARNING | Command warning, without a traceback |
+| Unexpected command/event exception, bot missing permissions, stale slash registration | ERROR | Always sent to configured destinations, with traceback |
+| Explicit critical report | CRITICAL | Always sent to configured destinations, with traceback |
 
-| Severity | Color | Used For |
-|----------|-------|----------|
-| WARNING  | Gold  | CommandNotFound, MissingPermissions, CheckFailure, CommandOnCooldown |
-| ERROR    | Orange | Most other exceptions |
-| CRITICAL | Red   | (Reserved for manual use) |
+Unknown commands use category `command_not_found` and title **Command not found**.
+Denials use `command_denied` and include the **required** and **user** access levels
+in both the reply and log. Requirements come from `gate_of()` metadata on the
+existing `is_admin` / `is_superadmin` check decorators (including parent groups).
+The actual user tier is evaluated by those same helpers. Role/Discord-permission
+checks name their requirement; an untagged custom check is labeled as such rather
+than guessing an admin level. Bot permission failures are errors, not user denials.
 
-## Error Channel Configuration
+Both command frontends unwrap invocation failures for useful tracebacks, without
+mistaking an exception raised inside a command for a routine dispatcher refusal.
+Unknown-command local logs include the attempted name, user, guild, channel, and
+source message link. The Discord toggle affects only Discord delivery.
 
-Configured via `!errorlog` commands (see `!help errorlog`):
+## Log settings
 
-- **Guild channel**: `!errorlog setchannel #channel` - errors from this guild
-- **Global channel**: `!errorlog setglobal #channel` - all errors (superadmin only)
-- **Category routing**: `!errorlog setcategory command_error #channel`
-- **Severity routing**: `!errorlog setseverity critical #channel`
+Open **`/logsettings`** (ephemeral) or **`!logsettings`** for the prefix fallback.
+The panel follows `/aisettings`: invoker-only, guild-only, bot-admin-gated, and
+Manage Messages pinned in the slash picker. Every interaction and modal submission
+rechecks current permissions.
 
-## Rate Limiting
+- **Server:** edit this server's destination and routes; optionally enable
+  **Command not found** reports (default off).
+- **Global:** superadmins only. Edit the destination for all servers and DMs,
+  its independent unknown-command toggle, and the 1–60 minute duplicate-alert
+  interval modal (default 5). The panel cannot remove the global destination.
+- Select a route, then a text channel. **Reset route** removes an override.
+  **Remove server destination** disables local delivery but leaves global
+  reporting alone. The bot needs View Channel, Send Messages, and Embed Links.
 
-Duplicate errors are rate-limited (default 5 minutes). Same error won't spam the channel. Configurable via `!errorlog ratelimit <minutes>`.
+Exceptions and denials have no off toggle. A destination must still be configured
+and reachable. Selecting a channel in Global selects from the server where the
+panel was opened; an existing destination in another server is retained until
+explicitly changed. Stored settings are read on each report and take effect
+immediately; new code and cog declarations require a restart.
+
+Guild and global routing are **independent**, not fallback/override scopes.
+An event can go to both; the same destination receives only one copy. Within each
+scope: specific category → legacy `command_error` route for command activity →
+severity → default channel. The panel labels the legacy route **Commands (fallback)**.
+A default channel is required before any routes activate. Existing route maps are
+preserved when another setting changes. See `error_logging` in
+[config-system.md](config-system.md).
+
+## Duplicate alerts
+
+The global interval applies per destination, source guild, category, command/event,
+exception type, and message. Unknown commands and denials also distinguish users,
+so one user's activity cannot hide another's. Local logs are not rate-limited.
+Failed sends are logged locally and do not consume the next retry's cooldown.

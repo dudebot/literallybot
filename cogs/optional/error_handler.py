@@ -1,375 +1,253 @@
-"""
-Admin commands for configuring the error logging system (the `!errorlog`
-prefix command group).
-"""
+"""Log settings panel; reporting itself lives in core.error_handler."""
+
+from copy import deepcopy
 
 import discord
+from discord import app_commands
 from discord.ext import commands
-from core.error_handler import ErrorCategory, ErrorSeverity
-from core.utils import is_admin, is_superadmin
+
+from core.error_handler import ErrorCategory, ErrorSeverity, log_error_to_discord
+from core.utils import InvokerOnlyView, is_admin, is_superadmin, panel_slash_pin
 
 
 class ErrorLoggingAdmin(commands.Cog):
-    """Admin commands for configuring the enhanced error logging system."""
-
     def __init__(self, bot):
         self.bot = bot
 
-    def cog_check(self, ctx):
-        """Check if user has permission to use these commands.
-
-        Routes through the shared core.utils.is_admin gate (superadmins,
-        the per-guild `admins` config list, and Discord Administrator) —
-        the hand-rolled check this replaces silently excluded bot-admins
-        from the `admins` list.
-        """
-        return is_admin(self.bot.config, ctx)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        """Check if user has permission to use slash commands.
-
-        Same shared gate as cog_check — the hand-rolled version this
-        replaces omitted the per-guild `admins` config list, so slash and
-        prefix commands in this cog enforced different policies.
-        """
-        return is_admin(self.bot.config, interaction)
-
-    def _get_guild_error_config(self, guild_id: int) -> dict:
-        """Get error config for a specific guild only (no global fallback)."""
-        return self.bot.config.get(guild_id, "error_logging", {})
-
-    def _set_guild_error_config(self, guild_id: int, config: dict):
-        """Set error config for a specific guild."""
-        self.bot.config.set(guild_id, "error_logging", config)
-
-    # ==================== TEXT COMMANDS ====================
-
-    @commands.group(name="errorlog", invoke_without_command=True, hidden=True)
+    @commands.command(name="logsettings", hidden=True)
+    @commands.guild_only()
     @commands.check(is_admin)
-    async def errorlog(self, ctx):
-        """
-        Error logging configuration commands.
-        Use !errorlog help to see all subcommands.
-        """
-        await ctx.send_help(ctx.command)
+    async def logsettings(self, ctx):
+        """Configure log destinations and optional command-not-found reports."""
+        view = LogSettingsView(self.bot, ctx.author, ctx.guild)
+        view.message = await ctx.send(view=view)
 
-    @errorlog.command(name="status")
-    @commands.check(is_admin)
-    async def errorlog_status(self, ctx):
-        """Show current error logging configuration."""
-        if not ctx.guild:
-            await ctx.send("This command must be run in a guild.")
+    @app_commands.command(name="logsettings", description="Configure bot logging")
+    @app_commands.guild_only()
+    @panel_slash_pin()
+    @app_commands.check(is_admin)
+    async def logsettings_slash(self, interaction: discord.Interaction):
+        view = LogSettingsView(self.bot, interaction.user, interaction.guild)
+        await interaction.response.send_message(view=view, ephemeral=True)
+        view.message = await interaction.original_response()
+
+
+class _RateLimitModal(discord.ui.Modal, title="Duplicate alert interval"):
+    def __init__(self, panel):
+        super().__init__()
+        self.panel = panel
+        self.minutes = discord.ui.TextInput(
+            label="Minutes between identical alerts (1–60)", max_length=2,
+            default=str(panel.config("global").get("rate_limit_minutes", 5)))
+        self.add_item(self.minutes)
+
+    async def on_submit(self, interaction):
+        if not await self.panel.authorize(interaction, "global"):
             return
-
-        guild_config = self._get_guild_error_config(ctx.guild.id)
-        global_config = self.bot.config.get_global("error_logging", {})
-
-        embed = discord.Embed(
-            title="Error Logging Configuration",
-            color=discord.Color.blue()
-        )
-
-        # Guild config
-        default_channel_id = guild_config.get("default_channel") if guild_config else None
-        if default_channel_id:
-            embed.add_field(
-                name=f"Guild: {ctx.guild.name}",
-                value="✅ Enabled",
-                inline=False
-            )
-
-            channel = self.bot.get_channel(default_channel_id)
-            channel_str = channel.mention if channel else f"ID: {default_channel_id} (not found)"
-            embed.add_field(name="Guild Channel", value=channel_str, inline=True)
-
-            # Category routing
-            category_channels = guild_config.get("category_channels", {})
-            if category_channels:
-                cat_text = []
-                for cat, ch_id in category_channels.items():
-                    ch = self.bot.get_channel(ch_id)
-                    cat_text.append(f"`{cat}`: {ch.mention if ch else ch_id}")
-                embed.add_field(
-                    name="Category Routing",
-                    value="\n".join(cat_text) or "None",
-                    inline=False
-                )
-
-            # Severity routing
-            severity_channels = guild_config.get("severity_channels", {})
-            if severity_channels:
-                sev_text = []
-                for sev, ch_id in severity_channels.items():
-                    ch = self.bot.get_channel(ch_id)
-                    sev_text.append(f"`{sev}`: {ch.mention if ch else ch_id}")
-                embed.add_field(
-                    name="Severity Routing",
-                    value="\n".join(sev_text) or "None",
-                    inline=False
-                )
-        else:
-            embed.add_field(
-                name=f"Guild: {ctx.guild.name}",
-                value="❌ Disabled - Errors will go to global channel if configured.",
-                inline=False
-            )
-
-        # Global config (show if superadmin)
-        if is_superadmin(self.bot.config, ctx.author.id):
-            global_channel_id = global_config.get("default_channel") if global_config else None
-            if global_channel_id:
-                ch = self.bot.get_channel(global_channel_id)
-                embed.add_field(
-                    name="Global Channel (Superadmin)",
-                    value=ch.mention if ch else f"ID: {global_channel_id}",
-                    inline=False
-                )
-            else:
-                embed.add_field(
-                    name="Global Channel (Superadmin)",
-                    value="❌ Not configured",
-                    inline=False
-                )
-
-        await ctx.send(embed=embed)
-
-    @errorlog.command(name="setchannel")
-    @commands.check(is_admin)
-    async def errorlog_setchannel(self, ctx, channel: discord.TextChannel = None):
-        """
-        Set the default error logging channel for this guild.
-        Usage: !errorlog setchannel #channel
-        """
-        if not ctx.guild:
-            await ctx.send("This command must be run in a guild.")
-            return
-
-        if not channel:
-            await ctx.send("Please specify a channel. Usage: `!errorlog setchannel #channel`")
-            return
-
-        # Try sending to the target channel first (test permissions)
-        test_embed = discord.Embed(
-            title="Guild Error Logging Enabled",
-            description=f"This channel will receive error notifications from {ctx.guild.name}.",
-            color=discord.Color.blue()
-        )
-        test_embed.add_field(
-            name="What gets logged here:",
-            value=(
-                "• Command errors in this guild\n"
-                "• Event errors in this guild\n"
-                "• Can be customized with category/severity routing"
-            ),
-            inline=False
-        )
-        test_embed.add_field(
-            name="Additional Configuration",
-            value=(
-                "`!errorlog setcategory <category> #channel` - Route specific error types\n"
-                "`!errorlog setseverity <severity> #channel` - Route by severity\n"
-                "`!errorlog status` - View current config\n"
-                "`!errorlog disable` - Remove all error logging for this guild"
-            ),
-            inline=False
-        )
-
         try:
-            await channel.send(embed=test_embed)
-        except discord.Forbidden:
-            await ctx.send(f"❌ Cannot send messages to {channel.mention}. Please grant me message permissions in that channel.")
+            minutes = int(self.minutes.value)
+        except ValueError:
+            minutes = 0
+        if not 1 <= minutes <= 60:
+            await interaction.response.send_message("Enter a whole number from 1 to 60.", ephemeral=True)
             return
-        except Exception as e:
-            await ctx.send(f"❌ Failed to send test message to {channel.mention}: {e}")
-            return
-
-        # Only save config if we successfully sent to the channel
-        config = self._get_guild_error_config(ctx.guild.id)
-        config["default_channel"] = channel.id
-        self._set_guild_error_config(ctx.guild.id, config)
-
-        if ctx.channel.id != channel.id:
-            await ctx.send(f"✅ Error logging enabled for {ctx.guild.name} → {channel.mention}")
-
-    @errorlog.command(name="setcategory")
-    @commands.check(is_admin)
-    async def errorlog_setcategory(
-        self,
-        ctx,
-        category: str,
-        channel: discord.TextChannel
-    ):
-        """
-        Route a specific error category to a channel for this guild.
-        Categories: command_error, event_error, task_error, other
-        Usage: !errorlog setcategory command_error #channel
-        """
-        if not ctx.guild:
-            await ctx.send("This command must be run in a guild.")
-            return
-
-        valid_categories = [c.value for c in ErrorCategory]
-        if category not in valid_categories:
-            await ctx.send(
-                f"Invalid category. Valid categories: {', '.join(valid_categories)}"
-            )
-            return
-
-        config = self._get_guild_error_config(ctx.guild.id)
-        if "category_channels" not in config:
-            config["category_channels"] = {}
-
-        config["category_channels"][category] = channel.id
-        self._set_guild_error_config(ctx.guild.id, config)
-
-        await ctx.send(
-            f"Category `{category}` errors in {ctx.guild.name} will now be logged to {channel.mention}"
-        )
-
-    @errorlog.command(name="setseverity")
-    @commands.check(is_admin)
-    async def errorlog_setseverity(
-        self,
-        ctx,
-        severity: str,
-        channel: discord.TextChannel
-    ):
-        """
-        Route a specific severity level to a channel for this guild.
-        Severities: info, warning, error, critical
-        Usage: !errorlog setseverity critical #channel
-        """
-        if not ctx.guild:
-            await ctx.send("This command must be run in a guild.")
-            return
-
-        valid_severities = [s.severity_name for s in ErrorSeverity]
-        if severity.lower() not in valid_severities:
-            await ctx.send(
-                f"Invalid severity. Valid severities: {', '.join(valid_severities)}"
-            )
-            return
-
-        config = self._get_guild_error_config(ctx.guild.id)
-        if "severity_channels" not in config:
-            config["severity_channels"] = {}
-
-        config["severity_channels"][severity.lower()] = channel.id
-        self._set_guild_error_config(ctx.guild.id, config)
-
-        await ctx.send(
-            f"Severity `{severity}` errors in {ctx.guild.name} will now be logged to {channel.mention}"
-        )
-
-    @errorlog.command(name="ratelimit")
-    @commands.check(is_superadmin)
-    async def errorlog_ratelimit(self, ctx, minutes: int):
-        """
-        Set the global rate limit for duplicate errors in minutes.
-        This applies to all error deduplication across all guilds.
-        Usage: !errorlog ratelimit 10
-        """
-        if minutes < 1 or minutes > 60:
-            await ctx.send("Rate limit must be between 1 and 60 minutes.")
-            return
-
-        config = self.bot.config.get_global("error_logging", {})
+        config = self.panel.config("global")
         config["rate_limit_minutes"] = minutes
-        self.bot.config.set_global("error_logging", config)
+        self.panel.save("global", config)
+        await self.panel.rerender(interaction)
 
-        await ctx.send(f"Global rate limit set to {minutes} minutes between duplicate errors.")
+    async def on_error(self, interaction, error):
+        await self.panel.on_error(interaction, error, None)
 
-    @errorlog.command(name="disable")
-    @commands.check(is_admin)
-    async def errorlog_disable(self, ctx):
-        """
-        Disable error logging for this guild by removing all error config.
-        Re-enable with !errorlog setchannel
-        """
-        if not ctx.guild:
-            await ctx.send("This command must be run in a guild.")
-            return
 
-        if self.bot.config.rem(ctx.guild.id, "error_logging"):
-            await ctx.send(f"Error logging disabled for {ctx.guild.name}. Use `!errorlog setchannel` to re-enable.")
+class LogSettingsView(InvokerOnlyView, discord.ui.LayoutView):
+    panel_command = "`/logsettings`"
+    expiry_text = None
+
+    def __init__(self, bot, user, guild):
+        super().__init__(timeout=300)
+        self.bot = bot
+        self.invoker_id = user.id
+        self.guild = guild
+        self.page = "server"
+        self.route = "default_channel"
+        self.build()
+
+    @property
+    def is_super(self):
+        return is_superadmin(self.bot.config, self.invoker_id)
+
+    def config(self, scope):
+        # Work on a copy; a rejected edit must never mutate the store in place.
+        config = (self.bot.config.get_global("error_logging", {}) if scope == "global"
+                  else self.bot.config.get(self.guild.id, "error_logging", {}))
+        return deepcopy(config)
+
+    def save(self, scope, config):
+        if scope == "global":
+            self.bot.config.set_global("error_logging", config)
         else:
-            await ctx.send(f"Error logging is already disabled for {ctx.guild.name}.")
+            self.bot.config.set(self.guild.id, "error_logging", config)
 
-    @errorlog.command(name="setglobal")
-    @commands.check(is_superadmin)
-    async def errorlog_setglobal(self, ctx, *, channel: str = None):
-        """
-        Set or disable global error channel.
-        Receives errors from: cog load failures, DMs, uncaught errors, and guilds without their own config.
-        Usage: !errorlog setglobal #channel
-        Usage: !errorlog setglobal disable
-        """
-        if not channel:
-            config = self.bot.config.get_global("error_logging", {})
-            channel_id = config.get("default_channel") if config else None
-            if channel_id:
-                ch = self.bot.get_channel(channel_id)
-                await ctx.send(f"Current global error channel: {ch.mention if ch else f'ID: {channel_id}'}")
+    async def authorize(self, interaction, scope):
+        if not await super().interaction_check(interaction):
+            return False
+        if interaction.guild_id != self.guild.id or not is_admin(interaction):
+            await interaction.response.send_message("Requires admin in this server.", ephemeral=True)
+            return False
+        if scope == "global" and not is_superadmin(interaction):
+            await interaction.response.send_message("Requires superadmin.", ephemeral=True)
+            return False
+        return True
+
+    async def interaction_check(self, interaction):
+        return await self.authorize(interaction, self.page)
+
+    async def on_error(self, interaction, error, item):
+        self.bot.logger.error("Log settings interaction failed", exc_info=(type(error), error, error.__traceback__))
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Unable to update log settings. The error has been logged.", ephemeral=True)
+        await log_error_to_discord(self.bot, error, "logsettings", guild_id=self.guild.id)
+
+    def row(self, *items):
+        row = discord.ui.ActionRow()
+        for item in items:
+            row.add_item(item)
+        self.add_item(row)
+
+    async def rerender(self, interaction):
+        self.build()
+        if interaction.response.is_done():
+            if self.message:
+                await self.message.edit(view=self)
+        else:
+            await interaction.response.edit_message(view=self)
+
+    def build(self):
+        if self.page == "global" and not self.is_super:
+            self.page = "server"
+        self.clear_items()
+        tabs = []
+        for scope in (["server", "global"] if self.is_super else ["server"]):
+            button = discord.ui.Button(label=scope.title(), style=(
+                discord.ButtonStyle.primary if scope == self.page else discord.ButtonStyle.secondary))
+
+            async def switch(interaction, scope=scope):
+                if await self.authorize(interaction, scope):
+                    self.page = scope
+                    self.route = "default_channel"
+                    await self.rerender(interaction)
+            button.callback = switch
+            tabs.append(button)
+        self.row(*tabs)
+
+        scope, route = self.page, self.route
+        config = self.config(scope)
+        default = config.get("default_channel")
+        unknown = config.get("log_unknown_commands", False)
+        selected = (config.get(route) if route == "default_channel" else
+                    config.get(route.split(":")[0], {}).get(route.split(":")[1]))
+        interval = self.config("global").get("rate_limit_minutes", 5)
+        route_destination = (f"<#{selected}>" if selected else
+                             "Not configured" if route == "default_channel" else
+                             "No override (uses routing fallback)")
+        body = (
+            f"## Log settings — {scope.title()}\n"
+            + ("Reports from this server. Global reporting continues independently.\n" if scope == "server"
+               else "Reports from every server and DMs. Only superadmins can change these settings.\n")
+            + f"**Destination:** {f'<#{default}>' if default else 'Not configured'}\n"
+            "**Unexpected exceptions:** always reported to configured destinations.\n"
+            "**Command denied:** always reported, with required and user access levels.\n"
+            f"**Command not found:** {'On' if unknown else 'Off'} — optional activity reports.\n"
+            "Recognized dice and media shortcuts are excluded.\n"
+            f"**Duplicate alert interval:** {interval} minutes.\n\n"
+            f"**Selected route:** {route_destination}\n"
+            "Category routes take priority over severity routes. A default destination is required."
+        )
+        self.add_item(discord.ui.TextDisplay(body))
+        options = [discord.SelectOption(label="Default destination", value="default_channel")]
+        options.extend(discord.SelectOption(label=("Commands (fallback)" if c == ErrorCategory.COMMAND_ERROR
+                                                   else c.value.replace("_", " ").title()),
+                                            value=f"category_channels:{c.value}") for c in ErrorCategory)
+        options.extend(discord.SelectOption(label=f"Severity: {s.severity_name.upper()}",
+                                            value=f"severity_channels:{s.severity_name}") for s in ErrorSeverity)
+        for option in options:
+            option.default = option.value == route
+        routes = discord.ui.Select(placeholder="Choose a route", options=options)
+
+        async def choose_route(interaction):
+            if await self.authorize(interaction, scope):
+                self.route = routes.values[0]
+                await self.rerender(interaction)
+        routes.callback = choose_route
+        self.row(routes)
+        channels = discord.ui.ChannelSelect(placeholder="Set channel for selected route",
+                                             channel_types=[discord.ChannelType.text])
+
+        async def choose_channel(interaction):
+            await self.set_channel(interaction, scope, route, channels.values[0].id)
+        channels.callback = choose_channel
+        self.row(channels)
+        toggle = discord.ui.Button(label=f"Command not found: {'On' if unknown else 'Off'}",
+                                   style=discord.ButtonStyle.success if unknown else discord.ButtonStyle.secondary)
+
+        async def toggle_unknown(interaction):
+            if await self.authorize(interaction, scope):
+                current = self.config(scope)
+                current["log_unknown_commands"] = not current.get("log_unknown_commands", False)
+                self.save(scope, current)
+                await self.rerender(interaction)
+        toggle.callback = toggle_unknown
+        reset = discord.ui.Button(label=("Global destination required" if scope == "global"
+                                          else "Remove server destination")
+                                  if route == "default_channel" else "Reset route",
+                                  disabled=not selected or (scope == "global" and route == "default_channel"))
+
+        async def reset_route(interaction):
+            if not await self.authorize(interaction, scope):
+                return
+            if scope == "global" and route == "default_channel":
+                return  # Keep the global exception destination configured.
+            current = self.config(scope)
+            if route == "default_channel":
+                current.pop(route, None)
             else:
-                await ctx.send("No global error channel configured.")
+                group, key = route.split(":")
+                current.get(group, {}).pop(key, None)
+            self.save(scope, current)
+            await self.rerender(interaction)
+        reset.callback = reset_route
+        buttons = [toggle, reset]
+        if scope == "global":
+            interval_button = discord.ui.Button(label="Duplicate alert interval")
+
+            async def edit_interval(interaction):
+                if await self.authorize(interaction, "global"):
+                    await interaction.response.send_modal(_RateLimitModal(self))
+            interval_button.callback = edit_interval
+            buttons.append(interval_button)
+        self.row(*buttons)
+
+    async def set_channel(self, interaction, scope, route, channel_id):
+        if not await self.authorize(interaction, scope):
             return
-
-        if channel.lower() == "disable":
-            if self.bot.config.rem_global("error_logging"):
-                await ctx.send("Global error logging disabled.")
-            else:
-                await ctx.send("Global error logging is already disabled.")
+        channel = self.bot.get_channel(channel_id)
+        if channel is None or channel.guild.id != self.guild.id:
+            await interaction.response.send_message("Choose a text channel in this server.", ephemeral=True)
             return
-
-        try:
-            converter = commands.TextChannelConverter()
-            text_channel = await converter.convert(ctx, channel)
-        except commands.BadArgument:
-            await ctx.send("Please specify a valid channel mention or 'disable'. Usage: `!errorlog setglobal #channel` or `!errorlog setglobal disable`")
+        perms = channel.permissions_for(self.guild.me)
+        if not (perms.view_channel and perms.send_messages and perms.embed_links):
+            await interaction.response.send_message(
+                "I need View Channel, Send Messages, and Embed Links in that channel.", ephemeral=True)
             return
-
-        # Try sending to the target channel first (test permissions)
-        test_embed = discord.Embed(
-            title="Global Error Logging Enabled",
-            description="This channel will receive global error notifications.",
-            color=discord.Color.blue()
-        )
-        test_embed.add_field(
-            name="What gets logged here:",
-            value=(
-                "• All cog failures\n"
-                "• All DM errors\n"
-                "• All uncaught exceptions\n"
-                "• Errors from guilds without their own error channel"
-            ),
-            inline=False
-        )
-        test_embed.add_field(
-            name="Configuration (Superadmin)",
-            value=(
-                "`!errorlog ratelimit <minutes>` - Set global rate limit\n"
-                "`!errorlog setglobal disable` - Disable global error logging\n"
-                "`!errorlog status` - View current config"
-            ),
-            inline=False
-        )
-
-        try:
-            await text_channel.send(embed=test_embed)
-        except discord.Forbidden:
-            await ctx.send(f"❌ Cannot send messages to {text_channel.mention}. Please grant me message permissions in that channel.")
-            return
-        except Exception as e:
-            await ctx.send(f"❌ Failed to send test message to {text_channel.mention}: {e}")
-            return
-
-        # Only save config if we successfully sent to the channel
-        config = self.bot.config.get_global("error_logging", {})
-        config["default_channel"] = text_channel.id
-        self.bot.config.set_global("error_logging", config)
-
-        if ctx.channel.id != text_channel.id:
-            await ctx.send(f"✅ Global error logging enabled → {text_channel.mention}")
+        config = self.config(scope)
+        if route == "default_channel":
+            config[route] = channel_id
+        else:
+            group, key = route.split(":")
+            config.setdefault(group, {})[key] = channel_id
+        self.save(scope, config)
+        await self.rerender(interaction)
 
 
 async def setup(bot):

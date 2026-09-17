@@ -1,32 +1,29 @@
+"""Central exception and command-activity reporting.
+
+Guild and global destinations are independent; both receive unexpected errors
+and command denials. Unknown commands are opt-in per destination. See
+docs/error-handling.md for suppression, routing, and the settings panel.
 """
-Enhanced error logging system with categories, severity levels, and per-guild channels.
-
-ERROR ROUTING:
-- Guild errors (commands/events in a guild) go to:
-  1. Guild-specific channel if configured via !errorlog setchannel
-  2. Global channel if guild has no config (DMs, cog failures, uncaught errors always go to global)
-
-- Global channel receives:
-  1. All DM errors
-  2. Cog load failures
-  3. Uncaught exceptions
-  4. Errors from guilds without their own config
-
-CONFIGURATION:
-- Guild admins: !errorlog setchannel #channel (guild-specific)
-- Superadmins: !errorlog setglobal #channel (global fallback)
-"""
+import asyncio
+import logging
+import re
+import sys
+import traceback
+from collections.abc import Callable
+from datetime import datetime, timedelta
+from enum import Enum
+from typing import Optional
 
 import discord
-import traceback
-from datetime import datetime, timedelta
-from typing import Optional, Dict, List
-from enum import Enum
+from discord import app_commands
+from discord.ext import commands
 
 
 class ErrorCategory(Enum):
     """Error categories for better organization and routing."""
     COMMAND_ERROR = "command_error"
+    COMMAND_NOT_FOUND = "command_not_found"
+    COMMAND_DENIED = "command_denied"
     EVENT_ERROR = "event_error"
     TASK_ERROR = "task_error"
     OTHER = "other"
@@ -47,13 +44,13 @@ class ErrorSeverity(Enum):
 
 # Rate limiting storage: maps error_key to last_sent_time
 # Auto-purges entries older than rate limit to prevent unbounded growth
-_error_history: Dict[str, datetime] = {}
+_error_history: dict[str, datetime] = {}
 
 # Whitelist hooks: callables that take (ctx, error) and return True to suppress error logging
-_command_error_whitelist_hooks: List[callable] = []
+_command_error_whitelist_hooks: list[Callable] = []
 
 
-def register_error_whitelist_hook(hook: callable):
+def register_error_whitelist_hook(hook: Callable):
     """
     Register a hook to whitelist certain CommandNotFound errors.
     Hook should take (ctx, error) and return True if error should be suppressed.
@@ -62,10 +59,52 @@ def register_error_whitelist_hook(hook: callable):
         _command_error_whitelist_hooks.append(hook)
 
 
-def unregister_error_whitelist_hook(hook: callable):
+def unregister_error_whitelist_hook(hook: Callable):
     """Remove a previously registered whitelist hook."""
     if hook in _command_error_whitelist_hooks:
         _command_error_whitelist_hooks.remove(hook)
+
+
+def suppress_command_not_found(*patterns: str | re.Pattern):
+    """Cog-class decorator: full-match prefix-stripped, trimmed message text.
+
+    Patterns compile at definition time. Only loaded cogs participate; this
+    never suppresses invocation/event errors, even on matching messages.
+    Pass the SAME compiled pattern used by the listener to avoid drift.
+    """
+    compiled = tuple(re.compile(pattern) for pattern in patterns)
+
+    def decorate(cog_class):
+        cog_class.__command_not_found_patterns__ = (
+            getattr(cog_class, "__command_not_found_patterns__", ()) + compiled
+        )
+        return cog_class
+    return decorate
+
+
+def _suppresses_command_not_found(bot, ctx, error) -> bool:
+    if not isinstance(error, commands.CommandNotFound):
+        return False
+    prefix = getattr(ctx, "prefix", None)
+    content = ctx.message.content
+    if prefix and content.startswith(prefix) and not ctx.message.author.bot:
+        text = content[len(prefix):].strip()
+        for cog in getattr(bot, "cogs", {}).values():
+            for pattern in getattr(cog, "__command_not_found_patterns__", ()):
+                if pattern.fullmatch(text):
+                    return True
+    for hook in tuple(_command_error_whitelist_hooks):
+        try:
+            if hook(ctx, error):
+                return True
+        except Exception as hook_error:
+            # A failed suppression hook is itself an unexpected exception.
+            # Report it without passing through suppression again.
+            bot.logger.exception("Command suppression hook failed")
+            asyncio.create_task(log_error_to_discord(
+                bot, hook_error, "command_suppression_hook",
+                guild_id=ctx.guild.id if ctx.guild else None))
+    return False
 
 
 _default_rate_limit_minutes = 5
@@ -124,10 +163,19 @@ def _get_target_channel(bot, config: dict, category: ErrorCategory, severity: Er
     """
     if not config or not config.get("default_channel"):
         return None
+    if (category == ErrorCategory.COMMAND_NOT_FOUND
+            and not config.get("log_unknown_commands", False)):
+        return None
 
     category_channels = config.get("category_channels", {})
     if category.value in category_channels:
         return category_channels[category.value]
+
+    # Preserve existing command_error routes as the fallback for the new
+    # activity categories; a specific denial/not-found route wins above.
+    if category in (ErrorCategory.COMMAND_NOT_FOUND, ErrorCategory.COMMAND_DENIED):
+        if ErrorCategory.COMMAND_ERROR.value in category_channels:
+            return category_channels[ErrorCategory.COMMAND_ERROR.value]
 
     severity_channels = config.get("severity_channels", {})
     if severity.severity_name in severity_channels:
@@ -147,7 +195,11 @@ def _create_error_embed(
     """Create a rich embed for error logging."""
 
     embed = discord.Embed(
-        title=f"{severity.emoji} Error Detected",
+        title=f"{severity.emoji} " + {
+            ErrorCategory.COMMAND_NOT_FOUND: "Command not found",
+            ErrorCategory.COMMAND_DENIED: "Command denied",
+        }.get(category, "Error detected" if severity in (
+            ErrorSeverity.ERROR, ErrorSeverity.CRITICAL) else "Command warning"),
         color=severity.color,
         timestamp=datetime.now()
     )
@@ -158,7 +210,7 @@ def _create_error_embed(
     embed.add_field(name="Severity", value=f"`{severity.severity_name.upper()}`", inline=True)
     embed.add_field(name="Category", value=f"`{category.value}`", inline=True)
     embed.add_field(name="Error Type", value=f"`{type(error).__name__}`", inline=True)
-    embed.add_field(name="Context", value=f"`{context}`", inline=True)
+    embed.add_field(name="Context", value=f"`{context[:1000]}`", inline=True)
 
     # Add blank field for layout
     embed.add_field(name="\u200b", value="\u200b", inline=True)
@@ -173,10 +225,11 @@ def _create_error_embed(
             extra_info = extra_info[:997] + "..."
         embed.add_field(name="Additional Info", value=f"```{extra_info}```", inline=False)
 
-    tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
-    if len(tb) > 1000:
-        tb = "..." + tb[-997:]
-    embed.add_field(name="Traceback", value=f"```python\n{tb}\n```", inline=False)
+    if severity in (ErrorSeverity.ERROR, ErrorSeverity.CRITICAL):
+        tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        if len(tb) > 1000:
+            tb = "..." + tb[-997:]
+        embed.add_field(name="Traceback", value=f"```python\n{tb}\n```", inline=False)
 
     embed.set_footer(text=f"Category: {category.value} | Severity: {severity.severity_name}")
 
@@ -190,7 +243,8 @@ async def log_error_to_discord(
     category: ErrorCategory = ErrorCategory.OTHER,
     severity: ErrorSeverity = ErrorSeverity.ERROR,
     extra_info: str = "",
-    guild_id: Optional[int] = None
+    guild_id: Optional[int] = None,
+    actor_id: Optional[int] = None,
 ):
     """
     Log an error to Discord with enhanced categorization and routing.
@@ -206,120 +260,94 @@ async def log_error_to_discord(
         severity: Severity level for prioritization
         extra_info: Additional contextual information
         guild_id: Guild ID for per-guild logging (optional)
+        actor_id: Keep distinct users' command activity out of each other's cooldown
     """
     if not hasattr(bot, 'config'):
         return
 
-    error_key = _create_error_key(error, context, category, guild_id)
-
     global_config = bot.config.get_global("error_logging", {})
     rate_limit = global_config.get("rate_limit_minutes", _default_rate_limit_minutes)
-
-    if not _should_send_error(error_key, rate_limit):
-        return
-
-    guild_name = None
+    guild = bot.get_guild(guild_id) if guild_id else None
+    guild_name = guild.name if guild else None
+    embed = _create_error_embed(error, context, category, severity, extra_info, guild_name)
+    configs = [global_config]
     if guild_id:
-        guild = bot.get_guild(guild_id)
-        if guild:
-            guild_name = guild.name
-
-    embed = _create_error_embed(
-        error=error,
-        context=context,
-        category=category,
-        severity=severity,
-        extra_info=extra_info,
-        guild_name=guild_name
-    )
-
+        configs.insert(0, bot.config.get(guild_id, "error_logging", {}))
     sent_channels = set()
-
-    # 1. Send to guild channel if configured
-    # Only send to guild-specific channel if the guild has its own config (don't fallback to global here)
-    if guild_id:
-        guild_config = bot.config.get(guild_id, "error_logging", None)
-        if guild_config and guild_config.get("default_channel"):
-            guild_channel_id = _get_target_channel(bot, guild_config, category, severity)
-            if guild_channel_id and guild_channel_id not in sent_channels:
-                guild_channel = bot.get_channel(guild_channel_id)
-                if guild_channel:
-                    try:
-                        await guild_channel.send(embed=embed)
-                        sent_channels.add(guild_channel_id)
-                    except Exception as send_error:
-                        print(f"Failed to send error to guild channel: {send_error}")
-
-    # 2. ALWAYS send to global channel if configured (superadmin visibility)
-    if global_config and global_config.get("default_channel"):
-        global_channel_id = _get_target_channel(bot, global_config, category, severity)
-        if global_channel_id and global_channel_id not in sent_channels:
-            global_channel = bot.get_channel(global_channel_id)
-            if global_channel:
-                try:
-                    if guild_id and global_channel_id not in sent_channels:
-                        global_embed = embed.copy()
-                        if guild_name:
-                            current_footer = global_embed.footer.text if global_embed.footer else ""
-                            global_embed.set_footer(
-                                text=f"From: {guild_name} | {current_footer}" if current_footer else f"From: {guild_name}"
-                            )
-                    else:
-                        global_embed = embed
-
-                    await global_channel.send(embed=global_embed)
-                    sent_channels.add(global_channel_id)
-                except Exception as send_error:
-                    print(f"Failed to send error to global channel: {send_error}")
+    for config in configs:
+        channel_id = _get_target_channel(bot, config, category, severity)
+        if not channel_id or channel_id in sent_channels:
+            continue
+        channel = bot.get_channel(channel_id)
+        if channel is None:
+            bot.logger.warning("Log channel %s is unavailable", channel_id)
+            continue
+        error_key = f"{channel_id}:" + _create_error_key(error, context, category, guild_id)
+        if actor_id is not None and category in (
+                ErrorCategory.COMMAND_NOT_FOUND, ErrorCategory.COMMAND_DENIED):
+            error_key += f":actor:{actor_id}"
+        if not _should_send_error(error_key, rate_limit):
+            continue
+        try:
+            await channel.send(embed=embed)
+            sent_channels.add(channel_id)
+        except Exception:
+            # Permit a later attempt after a transient delivery failure.
+            _error_history.pop(error_key, None)
+            bot.logger.exception("Failed to send log to channel %s", channel_id)
 
 
-def _gate_denial_message(checks) -> Optional[str]:
-    """Map is_admin / is_superadmin predicates to the user-facing refusal.
-
-    Unknown checks return None so the caller can fall back to a generic
-    line rather than inventing a tier.
-    """
+def _required_gate(ctx) -> Optional[str]:
     from core.utils import GATE_ADMIN, GATE_SUPERADMIN, gate_of
 
-    tier = None
-    for check in checks or []:
-        g = gate_of(check)
-        if g == GATE_SUPERADMIN:
-            return "Requires superadmin."
-        if g == GATE_ADMIN:
-            tier = GATE_ADMIN
-    if tier == GATE_ADMIN:
-        return "Requires admin."
+    node = getattr(ctx, "command", None)
+    gates = set()
+    while node is not None:
+        gates.update(gate_of(check) for check in (getattr(node, "checks", None) or []))
+        node = getattr(node, "parent", None)
+    if GATE_SUPERADMIN in gates:
+        return GATE_SUPERADMIN
+    if GATE_ADMIN in gates:
+        return GATE_ADMIN
     return None
 
 
-def app_command_denial_message(interaction, error: Exception) -> str:
-    """User-facing text for an expected slash-command refusal."""
-    from discord import app_commands
+def _user_level(ctx) -> str:
+    from core.utils import is_admin, is_superadmin
 
-    if isinstance(error, app_commands.NoPrivateMessage):
-        return "This command can only be used in a server."
-    cmd = getattr(interaction, "command", None)
-    node = cmd
-    checks = []
-    while node is not None:
-        checks.extend(getattr(node, "checks", None) or [])
-        node = getattr(node, "parent", None)
-    return _gate_denial_message(checks) or (
-        "You don't have permission to use this command."
-    )
+    if is_superadmin(ctx):
+        return "superadmin"
+    if is_admin(ctx):
+        return "admin"
+    return "everyone"
+
+
+def _denial_details(ctx, error) -> str:
+    if isinstance(error, (commands.NoPrivateMessage, app_commands.NoPrivateMessage)):
+        requirement = "server context"
+    elif isinstance(error, (commands.MissingPermissions, app_commands.MissingPermissions)):
+        requirement = "Discord permissions: " + ", ".join(error.missing_permissions)
+    elif isinstance(error, commands.MissingRole):
+        requirement = f"Discord role: {error.missing_role}"
+    elif isinstance(error, commands.MissingAnyRole):
+        requirement = "one of Discord roles: " + ", ".join(map(str, error.missing_roles))
+    else:
+        requirement = _required_gate(ctx) or "custom command check (no declared level)"
+    return f"Required: {requirement}\nUser level: {_user_level(ctx)}"
+
+
+def _denial_message(ctx, error) -> str:
+    if isinstance(error, (commands.NoPrivateMessage, app_commands.NoPrivateMessage)):
+        return "This command can only be used in a server.\n" + _denial_details(ctx, error)
+    return "Command denied.\n" + _denial_details(ctx, error)
+
+
+def app_command_denial_message(interaction, error: Exception) -> str:
+    return _denial_message(interaction, error)
 
 
 def prefix_denial_message(ctx, error: Exception) -> str:
-    """User-facing text for an expected prefix-command refusal."""
-    from discord.ext import commands
-
-    if isinstance(error, commands.NoPrivateMessage):
-        return "This command can only be used in a server."
-    cmd = getattr(ctx, "command", None)
-    return _gate_denial_message(getattr(cmd, "checks", None)) or (
-        "You don't have permission to use this command."
-    )
+    return _denial_message(ctx, error)
 
 
 def _is_expected_app_denial(error: Exception) -> bool:
@@ -329,7 +357,6 @@ def _is_expected_app_denial(error: Exception) -> bool:
     CommandOnCooldown subclasses CheckFailure in app_commands — it is
     not a permission refusal and must not be acked as one.
     """
-    from discord import app_commands
     if isinstance(error, app_commands.NoPrivateMessage):
         return True
     if isinstance(error, (app_commands.BotMissingPermissions,
@@ -339,7 +366,6 @@ def _is_expected_app_denial(error: Exception) -> bool:
 
 
 def _is_expected_prefix_denial(error: Exception) -> bool:
-    from discord.ext import commands
     if isinstance(error, commands.NoPrivateMessage):
         return True
     if isinstance(error, commands.BotMissingPermissions):
@@ -358,179 +384,81 @@ async def _ack_app_error(interaction, message: str) -> None:
 
 
 def _determine_severity(error: Exception) -> ErrorSeverity:
-    """Determine the severity level for an error based on its type."""
-    # Import here to avoid circular dependency
-    from discord.ext import commands
-    from discord import app_commands
-
-    if isinstance(error, (commands.CommandNotFound, commands.MissingPermissions,
-                          commands.CheckFailure, commands.CommandOnCooldown)):
-        return ErrorSeverity.WARNING
-    elif isinstance(error, (app_commands.CommandOnCooldown,
-                            app_commands.CheckFailure,
-                            app_commands.CommandNotFound)):
-        return ErrorSeverity.WARNING
-    else:
+    if isinstance(error, commands.CommandNotFound):
+        return ErrorSeverity.INFO
+    # A stale slash registration and a bot permission gap need operator action.
+    if isinstance(error, (commands.BotMissingPermissions, app_commands.BotMissingPermissions,
+                          commands.CommandInvokeError, app_commands.CommandInvokeError,
+                          app_commands.CommandNotFound)):
         return ErrorSeverity.ERROR
+    if isinstance(error, (commands.CheckFailure, commands.CommandOnCooldown,
+                          commands.UserInputError, app_commands.CheckFailure)):
+        return ErrorSeverity.WARNING
+    return ErrorSeverity.ERROR
+
+
+def _command_info(ctx, *, slash: bool, denial: bool, error) -> tuple[str, str]:
+    cmd = getattr(ctx, "command", None)
+    name = (getattr(cmd, "qualified_name", None) or getattr(cmd, "name", None)
+            or getattr(ctx, "invoked_with", None) or "unknown")
+    actor = ctx.user if slash else ctx.author
+    guild = ctx.guild
+    info = (f"User: {actor} (ID: {actor.id})\n"
+            f"Command: {'/' if slash else getattr(ctx, 'prefix', '!')}{name}\n"
+            f"Channel: {ctx.channel} (ID: {getattr(ctx.channel, 'id', 'unknown')})\n"
+            f"{'Guild: ' + guild.name + f' (ID: {guild.id})' if guild else 'DM'}")
+    # Keep a source link for investigation without copying arbitrary message bodies.
+    link = getattr(getattr(ctx, "message", None), "jump_url", None)
+    if link:
+        info += f"\nMessage: {link}"
+    if denial:
+        info = _denial_details(ctx, error) + "\n" + info
+    return name, info
+
+
+async def _report_command_error(bot, ctx, error, *, slash: bool, denial: bool):
+    severity = _determine_severity(error)
+    category = (ErrorCategory.COMMAND_DENIED if denial else
+                ErrorCategory.COMMAND_NOT_FOUND if isinstance(error, commands.CommandNotFound)
+                else ErrorCategory.COMMAND_ERROR)
+    actual_error = (error.original if isinstance(error, (commands.CommandInvokeError,
+                    app_commands.CommandInvokeError)) else error)
+    name, info = _command_info(ctx, slash=slash, denial=denial, error=error)
+    level = getattr(logging, severity.severity_name.upper())
+    bot.logger.log(level, "%s: %s\n%s", category.value, actual_error, info,
+                   exc_info=(type(actual_error), actual_error, actual_error.__traceback__)
+                   if severity in (ErrorSeverity.ERROR, ErrorSeverity.CRITICAL) else None)
+    await log_error_to_discord(
+        bot, actual_error, f"{'slash_command' if slash else 'command'}_{name}",
+        category=category, severity=severity, extra_info=info,
+        guild_id=ctx.guild.id if ctx.guild else None,
+        actor_id=(ctx.user if slash else ctx.author).id)
 
 
 async def handle_command_error(bot, ctx, error: Exception):
-    """
-    Handle errors from text commands with enhanced logging.
-
-    Args:
-        bot: The Discord bot instance
-        ctx: Command context
-        error: The exception that occurred
-    """
-    # Import here to avoid issues
-    from discord.ext import commands
-    import asyncio
-
-    # Check whitelist hooks for CommandNotFound suppression
-    if isinstance(error, commands.CommandNotFound):
-        for hook in _command_error_whitelist_hooks:
-            try:
-                if hook(ctx, error):
-                    return  # Hook says suppress this error
-            except Exception:
-                pass  # Don't let a broken hook break error handling
-
-    if _is_expected_prefix_denial(error):
-        bot.logger.info("Command %s denied for %s: %s",
-                        getattr(ctx.command, "name", None),
-                        getattr(getattr(ctx, "author", None), "id", None),
-                        error)
+    if _suppresses_command_not_found(bot, ctx, error):
+        return
+    denial = _is_expected_prefix_denial(error)
+    if denial:
         try:
             await ctx.send(prefix_denial_message(ctx, error))
-        except Exception:
-            pass
-        try:
-            command_name = ctx.command.name if ctx.command else "unknown"
-            guild_id = ctx.guild.id if ctx.guild else None
-            extra_info = (
-                f"User: {ctx.author} (ID: {ctx.author.id})\n"
-                f"Channel: {ctx.channel}\n"
-                f"{'Guild: ' + ctx.guild.name + f' (ID: {ctx.guild.id})' if ctx.guild else 'DM'}"
-            )
-            asyncio.create_task(log_error_to_discord(
-                bot, error, f"command_{command_name}",
-                category=ErrorCategory.COMMAND_ERROR,
-                severity=ErrorSeverity.WARNING,
-                extra_info=extra_info,
-                guild_id=guild_id,
-            ))
-        except Exception as log_error:
-            bot.logger.error(f"Failed to log error to Discord: {log_error}",
-                             exc_info=True)
-        return
-
-    bot.logger.error(f'Error in command {ctx.command}: {error}', exc_info=True)
-
-    try:
-        command_name = ctx.command.name if ctx.command else 'unknown'
-        severity = _determine_severity(error)
-
-        guild_info = f"Guild: {ctx.guild.name} (ID: {ctx.guild.id})" if ctx.guild else "DM"
-        extra_info = (
-            f"User: {ctx.author} (ID: {ctx.author.id})\n"
-            f"Channel: {ctx.channel}\n"
-            f"{guild_info}"
-        )
-
-        guild_id = ctx.guild.id if ctx.guild else None
-
-        actual_error = error
-        if isinstance(error, commands.CommandInvokeError):
-            actual_error = error.original
-
-        asyncio.create_task(log_error_to_discord(
-            bot, actual_error, f'command_{command_name}',
-            category=ErrorCategory.COMMAND_ERROR,
-            severity=severity,
-            extra_info=extra_info,
-            guild_id=guild_id
-        ))
-    except Exception as log_error:
-        bot.logger.error(f"Failed to log error to Discord: {log_error}", exc_info=True)
+        except discord.HTTPException:
+            bot.logger.exception("Failed to send command denial")
+    await _report_command_error(bot, ctx, error, slash=False, denial=denial)
 
 
 async def handle_app_command_error(bot, interaction, error: Exception):
-    """
-    Handle errors from slash commands with enhanced logging.
-
-    Args:
-        bot: The Discord bot instance
-        interaction: Discord interaction object
-        error: The exception that occurred
-    """
-    import asyncio
-
-    if _is_expected_app_denial(error):
-        cmd_name = interaction.command.name if interaction.command else "unknown"
-        bot.logger.info("Slash command /%s denied for %s: %s",
-                        cmd_name, getattr(interaction.user, "id", None), error)
-        await _ack_app_error(interaction,
-                             app_command_denial_message(interaction, error))
-        try:
-            guild_id = interaction.guild.id if interaction.guild else None
-            extra_info = (
-                f"User: {interaction.user} (ID: {interaction.user.id})\n"
-                f"Command: /{cmd_name}\n"
-                f"Channel: {interaction.channel}\n"
-                f"{'Guild: ' + interaction.guild.name + f' (ID: {interaction.guild.id})' if interaction.guild else 'DM'}"
-            )
-            asyncio.create_task(log_error_to_discord(
-                bot, error, f"slash_command_{cmd_name}",
-                category=ErrorCategory.COMMAND_ERROR,
-                severity=ErrorSeverity.WARNING,
-                extra_info=extra_info,
-                guild_id=guild_id,
-            ))
-        except Exception as log_error:
-            bot.logger.error(
-                f"Failed to log slash command error to Discord: {log_error}",
-                exc_info=True)
-        return
-
-    bot.logger.exception(f'Unhandled exception in slash command', exc_info=True)
-
-    try:
-        severity = _determine_severity(error)
-
-        guild_info = f"Guild: {interaction.guild.name} (ID: {interaction.guild.id})" if interaction.guild else "DM"
-        extra_info = (
-            f"User: {interaction.user} (ID: {interaction.user.id})\n"
-            f"Command: /{interaction.command.name if interaction.command else 'unknown'}\n"
-            f"Channel: {interaction.channel}\n"
-            f"{guild_info}"
-        )
-
-        guild_id = interaction.guild.id if interaction.guild else None
-
-        asyncio.create_task(log_error_to_discord(
-            bot, error, f'slash_command_{interaction.command.name if interaction.command else "unknown"}',
-            category=ErrorCategory.COMMAND_ERROR,
-            severity=severity,
-            extra_info=extra_info,
-            guild_id=guild_id
-        ))
-    except Exception as log_error:
-        bot.logger.error(f"Failed to log slash command error to Discord: {log_error}", exc_info=True)
-
-    # Always give the user *some* acknowledgement: a command that raised
-    # before its first ack shows "The application did not respond", and one
-    # that raised after a defer hangs on "thinking..." forever.
-    try:
+    denial = _is_expected_app_denial(error)
+    if denial:
+        message = app_command_denial_message(interaction, error)
+    elif isinstance(error, app_commands.CommandOnCooldown):
+        message = f"Please try again in {error.retry_after:.0f} seconds."
+    elif isinstance(error, app_commands.CommandNotFound):
+        message = "Command not found. The bot's slash commands need to be synced."
+    else:
         message = "❌ Something went wrong running that command. The error has been logged."
-        if interaction.response.is_done():
-            await interaction.followup.send(message, ephemeral=True)
-        else:
-            await interaction.response.send_message(message, ephemeral=True)
-    except (discord.InteractionResponded, discord.HTTPException):
-        # Token expired (10062), already acked elsewhere, or channel gone —
-        # nothing further we can do for the user.
-        pass
+    await _ack_app_error(interaction, message)
+    await _report_command_error(bot, interaction, error, slash=True, denial=denial)
 
 
 async def handle_event_error(bot, event: str, *args, **kwargs):
@@ -543,10 +471,6 @@ async def handle_event_error(bot, event: str, *args, **kwargs):
         *args: Event arguments
         **kwargs: Event keyword arguments
     """
-    import asyncio
-    import sys
-    import discord
-
     bot.logger.exception(f'Unhandled exception in event {event}', exc_info=True)
 
     try:
@@ -565,12 +489,12 @@ async def handle_event_error(bot, event: str, *args, **kwargs):
                     extra_info += f"\nGuild: {arg.name} (ID: {guild_id})"
                     break
 
-            asyncio.create_task(log_error_to_discord(
+            await log_error_to_discord(
                 bot, err, f'event_{event}',
                 category=ErrorCategory.EVENT_ERROR,
                 severity=ErrorSeverity.ERROR,
                 extra_info=extra_info,
                 guild_id=guild_id
-            ))
+            )
     except Exception as log_error:
         bot.logger.error(f"Failed to log error to Discord: {log_error}", exc_info=True)

@@ -172,7 +172,7 @@ class TestSlashDenialCopy:
             user = type("U", (), {"id": 1})()
 
         msg = app_command_denial_message(_Ix(), app_commands.CheckFailure("x"))
-        assert msg == "Requires admin."
+        assert "Required: admin" in msg and "User level: everyone" in msg
 
     def test_cogs_denial_says_requires_superadmin(self):
         from core.error_handler import app_command_denial_message
@@ -185,7 +185,7 @@ class TestSlashDenialCopy:
             user = type("U", (), {"id": 1})()
 
         msg = app_command_denial_message(_Ix(), app_commands.CheckFailure("x"))
-        assert msg == "Requires superadmin."
+        assert "Required: superadmin" in msg and "User level: everyone" in msg
 
     def test_dm_prefix_denial_is_a_server_command(self):
         from core.error_handler import prefix_denial_message

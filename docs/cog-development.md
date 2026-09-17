@@ -16,7 +16,7 @@ anything else — back on from Discord alone?**
   way back. Adding a cog here should be rare and needs this justification.
 - **Optional Cogs (`cogs/optional/`)** - Everything else, and the main
   extension point. "Optional" means the deployment chooses, not that the
-  cog is unimportant — error handling's `!errorlog` surface lives here,
+  cog is unimportant — error handling's `/logsettings` surface lives here,
   since `bot.py` wires error handling from `core/error_handler.py` and
   does not need the cog loaded.
 

@@ -78,7 +78,7 @@ class Media(commands.Cog):
         invoking guild (suppress the CommandNotFound error)."""
         if ctx.guild is None or not ctx.message.content.startswith('!'):
             return False
-        file_name = ctx.message.content[1:].split()[0].lower()
+        file_name = ctx.message.content[1:]
         return self._find_file(ctx.guild, file_name) is not None
 
     # --- services ---------------------------------------------------------
