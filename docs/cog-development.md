@@ -228,9 +228,9 @@ from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 
 
 def _serialize_toggle(result: dict) -> dict:
-    """Every op that returns data needs one of these, or the frontend sees
-    only {"ok": true}. Snowflakes go out as STRINGS: ids exceed 2**53 and
-    would round in JSON transit, reporting the wrong message or role."""
+    """Adapt the result for the frontend. Snowflakes go out as STRINGS:
+    ids exceed 2**53 and would round in JSON transit, reporting the wrong
+    message or role."""
     payload = {"status": result["status"], "emoji": result["emoji"],
                "message_id": str(result["message_id"]),
                "role_id": str(result["role_id"])}
@@ -284,10 +284,9 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 > **`serialize` and `agent_guidance` are a pair.** Guidance that tells the
 > model to branch on a field (`"'exists' means nothing was written"`) is
 > unfollowable unless the serializer actually ships that field. If you write
-> one, check the other — and assert it in a test through
-> `op.result_payload(OpResult(ok=True, value=...))`, never through
-> `op.impl(...)`, which returns the rich dict whether or not a frontend would
-> ever receive it.
+> one, review the other. When a consequential regression warrants a test,
+> assert the frontend result through `op.result_payload(...)`. Do not create
+> a payload test for every op; follow the [test retention rules](testing.md).
 
 #### The fields
 
@@ -300,7 +299,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | **scope** | `OpScope.GUILD` / `DM` / `GLOBAL`. See below; this is a safety boundary, not a label. |
 | **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog/util ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
 | **agent_guidance** | Optional. Extra instruction injected for the agent loop — use it for non-obvious result semantics ("status 'exists' means nothing was written"). |
-| **serialize** | **Required for any op that returns data.** Callable turning the return value into a JSON-safe dict. It is *not* optional-if-you-already-return-a-dict: with no serializer, `Op.serialize_result` returns `{}` and every frontend sees a bare `{"ok": true}` — your return value is discarded, silently. Omit it only for an op that genuinely returns nothing. |
+| **serialize** | Callable adapting a return value to a JSON-safe dict. Without one, dict results pass through unchanged; other results become `{}`. Use it when objects or IDs need conversion. |
 
 There is deliberately **no `origin` parameter**. Origin is stamped by the
 registration *path* (`'core'` for `core/ops.py`'s inline registrations,
@@ -424,6 +423,10 @@ when needed for edits and timeout cleanup. Components V2 panels set
 `expiry_text = None` because their message has no separate content field.
 
 ## Testing & Restarting Tips
+
+Follow [the risk-based test policy](testing.md). A new cog or op does not
+require its own schema, metadata, forwarding, and payload test bundle.
+
 - **The cog set is fixed at boot (#86)** — there is no hot-reload. To pick up a
   code change, restart the bot: `!restart` in Discord (or the `!cogs` panel's
   Restart button — same exit path), or restart the service from the shell,

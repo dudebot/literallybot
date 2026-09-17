@@ -488,6 +488,7 @@ immediately.
 - `docs/error-handling.md` — how errors flow and how to handle them
 - `docs/security.md` — permission model and the agentic/ops execution path
 - `docs/agent-automation.md` — role-gated DM automation pattern for scheduled agents
+- [Test policy and audit](docs/testing.md) — retention rules and the 2026 suite reduction
 - `docs/decision-records.md` — durable architecture decision records
 
 ### Production Deployment

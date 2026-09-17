@@ -113,9 +113,8 @@ support comes from the `pytest-asyncio` development dependency.
 | `@pytest.mark.asyncio` | Runs an async test under pytest-asyncio. | [Logging tests](../tests/test_error_logging.py), [pytest-asyncio marker](https://pytest-asyncio.readthedocs.io/en/stable/reference/markers/index.html) |
 | `@pytest.mark.skipif(condition, reason=...)` | Skips tests when a stated prerequisite is absent. | [Testing](cog-development.md#testing--restarting-tips), [pytest skipping](https://docs.pytest.org/en/stable/how-to/skipping.html) |
 
-Tests also use the runtime decorators above. `@_op(...)` is an imported alias of
-`@op(...)`; `@reg.op(...)` is the same `OpRegistry.op` API on a test registry.
-They are not extra decorator implementations.
+Tests also use the runtime `@op(...)` decorator above; it is not a separate
+test API. Follow the [test retention policy](testing.md) when adding cases.
 
 ## Standard recipes
 

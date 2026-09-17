@@ -481,3 +481,11 @@ savable). This superseded the per-guild `bot_tools_enabled` allowlist.
 The later `eab7105` deleted the redundant `agent_default` field.
 `default_gate()` is always `"off"`: a whitelist tick does not expose an op
 to a guild's members until a guild admin picks Admin or Everyone.
+
+## 2026-09-17: risk-based test suite
+
+The [test audit](testing.md) supersedes the earlier instructions to retain
+mid-run cog-replacement tests and the skipped chat_stream test. Those runtime
+features are absent. The guards remain in production code; the suite now
+protects current failure paths, with 51 collected cases instead of 1,408.
+New ops do not require a schema/metadata/mock-forwarding test bundle.

@@ -143,3 +143,28 @@ python -m pytest tests/
 
 A test that fakes `Config` will not catch a missing method on the real
 class. Hit `core.config.Config` for store API.
+
+Keep this a small risk-based suite (about 50 collected cases; the September
+2026 audit retained 51). Test count and coverage percentage are not goals.
+Do not add a test by default just because code changed or an op was added.
+
+- A test must name a consequential failure: lost/cross-scope stored data,
+  unauthorized actions or disclosure, broken recovery, or a demonstrated
+  integration regression. Exercise the real local boundary and assert the
+  outcome. Mock external I/O, not the behavior being proved.
+- Extend or replace the existing test for that failure before adding another.
+  Keep distinct cases only when they exercise distinct failure paths. Count
+  parametrized cases, not just functions; never multiply a shared invariant
+  by the op inventory or hide that matrix in a loop to meet the budget.
+- No schema/metadata inventories, source-text assertions, trivial forwarding
+  tests, mock-testing-itself, cosmetic copy/layout checks, or speculative
+  tests for removed features. A real Discord component-limit outage is a
+  boundary regression; button labels are not.
+- Delete superseded tests and unused fixtures with the behavior they covered.
+  Use temporary storage; never import a running bot's config or touch live
+  credentials. The shared fixture uses real Config with manually driven timers.
+- When changing tests, report collected count before/after and the failure
+  each net addition protects. Growth beyond roughly 60 cases calls for a
+  suite-level pruning review, not raising a cap or compressing tests.
+
+See [docs/testing.md](docs/testing.md) for the audit and retention criteria.
