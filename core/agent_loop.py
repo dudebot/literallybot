@@ -42,13 +42,15 @@ AGENT_TOOL_BUDGET = 8
 BUDGET_COUNTDOWN_AT = 3
 
 LAST_CALL_NOTE = (
-    "That was your LAST tool call. Your next response MUST be your final "
-    "text answer — further tool calls will be refused."
+    "That was your LAST action tool call. Finish the run now with your final "
+    "answer or stay_quiet if no reply is needed — further action calls will "
+    "be refused."
 )
 BUDGET_EXHAUSTED_ERROR = (
-    "Tool budget exhausted — no more tool calls will run. Give your FINAL "
-    "text answer NOW using the results you already have, and be honest "
-    "about anything you could not check."
+    "Tool budget exhausted — no more action tool calls will run. Finish NOW "
+    "using the results you already have: give your final answer, or call "
+    "stay_quiet if no reply is needed. Be honest about anything you could "
+    "not check; do not hide failures that need explanation."
 )
 
 

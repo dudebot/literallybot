@@ -54,6 +54,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.output import OutputSpec
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.ollama import OllamaProvider
@@ -406,6 +407,8 @@ class LLMClient:
         metadata: Optional[Dict] = None,
         user_prompt: Optional[str] = None,
         max_tool_calls: int = 8,
+        *,
+        output_type: OutputSpec[str] = str,
     ) -> LLMResponse:
         """Run a multi-turn tool-calling agent loop via `pydantic_ai.Agent`.
 
@@ -413,7 +416,9 @@ class LLMClient:
         `_build_settings` / `_to_pai_messages`), so provider/model/token-cap
         /metadata behavior is identical to a plain chat call. `tools` are
         pydantic-ai `Tool` instances (see core/agent_loop.py, which
-        generates them from the ops registry).
+        generates them from the ops registry). `output_type` optionally
+        adds terminal output functions returning strings; their behavior
+        belongs to the caller, not this provider-agnostic client.
 
         The loop is bounded: at most `max_tool_calls` tool executions
         (pydantic-ai raises `UsageLimitExceeded` beyond that — callers
@@ -429,7 +434,8 @@ class LLMClient:
         pai_model = self._build_model(provider, model, provider_info, api_key)
         settings = self._build_settings(provider_info, model, metadata)
 
-        agent = Agent(model=pai_model, tools=tools, model_settings=settings)
+        agent = Agent(model=pai_model, tools=tools, model_settings=settings,
+                      output_type=output_type)
         result = await agent.run(
             user_prompt,
             message_history=_to_pai_messages(messages),

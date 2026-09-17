@@ -87,9 +87,19 @@ Security properties enforced centrally, so no frontend can skip them:
   run (`core/agent_loop.AGENT_TOOL_BUDGET`), shared across the run and any
   narration-nudge retry: the last 3 results carry a `tool_calls_remaining`
   countdown, and calls past the budget are refused with an answer-now error so
-  the model always authors its own final reply. pydantic-ai's hard cap sits at
-  2x (16) as a runaway backstop; even that path degrades to a model-authored
-  plain-chat answer, never a canned failure string.
+  the model finishes with a final reply or intentional silence. pydantic-ai's
+  hard cap sits at 2x (16) as a runaway backstop; even that path degrades to a
+  model-authored plain-chat answer, never a canned failure string.
+- **Intentional silence is agent-local.** When at least one registry tool is
+  enabled for the run, `gpt.py` also offers `stay_quiet()` as a Pydantic output
+  function. It ends the run successfully without another model request or an
+  automatic final Discord reply; previously executed actions/messages remain.
+  The decision is local to that invocation, including its narration-nudge retry.
+  This terminal control does not consume the eight-action budget and is never
+  registered as an op, exposed over MCP, or listed in op settings. Empty model
+  output remains an error, not an implicit silence signal. With no enabled
+  registry tools, GPT uses one direct `model_request` through `LLMClient.chat`:
+  no `Agent`, output tools, or agent retries.
 - **Scope is a structural boundary.** Every op declares an `OpScope`, and the
   in-guild agent's tool universe is *derived* as exactly the `GUILD`-scoped ops
   (`registry.guild_agent_names()`), queried live. DM-scoped ops (`send_dm`,

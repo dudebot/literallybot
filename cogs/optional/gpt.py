@@ -96,7 +96,8 @@ NUDGE_PROMPT = (
     "reply has NOT been posted yet. Choose one:\n"
     "1. If you meant to perform an action: emit the real function call(s) "
     "through the native tool-call channel NOW, then finish with the final "
-    "reply text for the channel. Do not describe the calls in text.\n"
+    "reply text for the channel, or call stay_quiet if no reply is needed. "
+    "Do not describe the calls in text.\n"
     "2. If your reply was already a complete answer that needed no tool: "
     f"respond with exactly {NUDGE_FALSE_ALARM_SENTINEL} (nothing else) and "
     "your original reply will be posted unchanged."
@@ -158,11 +159,18 @@ def build_agentic_guidance(tool_names, guild_id, channel_id):
         "function call — the tool's name plus a JSON arguments object — through "
         "the API's structured tool-call channel. A tool call is NOT text; "
         "nothing you write in your visible reply can execute anything.",
-        "- Every response you produce is one of exactly two things: (a) one or "
+        "- Every response you produce is one of three things: (a) one or "
         "more function calls — they execute for real and their results come "
-        "back for you to continue with; or (b) plain text — the run ENDS "
-        "immediately and that text is posted to the channel as your reply. "
-        "There is no third option. Decide which one BEFORE responding.",
+        "back for you to continue with; (b) plain text — the run ENDS "
+        "immediately and that text is posted to the channel as your reply; "
+        "or (c) the terminal stay_quiet call — the run ends WITHOUT a final "
+        "channel reply. Decide which one BEFORE responding.",
+        "- Call stay_quiet with no arguments when no final reply is needed "
+        "(for example, the user requested only a reaction or asked you not "
+        "to reply). Finish any requested actions and inspect their results "
+        "BEFORE calling it. Do not hide failed actions that need explanation. "
+        "It only suppresses the automatic final reply; messages already sent "
+        "by tools remain. Never use an empty text response to signal silence.",
         "- Because of (b), writing out an intended call as words — e.g. "
         "\"run tool search_history with channel_id is 1234 contains is pizza\" "
         "— executes nothing: the run just ends and that sentence gets posted "
@@ -621,6 +629,8 @@ class Gpt(commands.Cog):
                 else:
                     response = await self.call_ai_api(provider_config, api_messages, metadata)
                 self._history_windows.commit(history_key, anchor, api_messages, sent_at)
+                if response is None:  # Explicit stay_quiet outcome, not empty model output.
+                    return
                 response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
 
                 if not response.strip():
@@ -652,7 +662,7 @@ class Gpt(commands.Cog):
                 await ctx.send(f"Error calling {provider_config['provider']} API: {str(e)}")
                 return
 
-    async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question, tool_names) -> str:
+    async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question, tool_names) -> Optional[str]:
         """Run the request through the in-bot agent loop (ops-registry tools).
 
         The actor for every tool call is the INVOKING USER's Member (ctx
@@ -660,8 +670,10 @@ class Gpt(commands.Cog):
         and the loop is capped at 8 tool calls. `tool_names` is the guild's
         resolved bot-tool allowlist. The model's final text comes back to the
         caller and flows through the normal compliance/split/send path,
-        exactly like a plain chat response.
+        exactly like a plain chat response. None means the model explicitly
+        chose stay_quiet; an empty string still means an invalid response.
         """
+        from pydantic_ai import ToolOutput
         from pydantic_ai.exceptions import UsageLimitExceeded
         from core.agent_loop import build_agent_tools, AGENT_TOOL_BUDGET
 
@@ -691,10 +703,28 @@ class Gpt(commands.Cog):
             ctx, self.logger, tool_names,
             gate_check=_live_gate_check,
         )
+        # Local to this invocation: no registry entry, MCP exposure, or state
+        # shared with other runs. An output function terminates the Agent;
+        # an ordinary function tool would require another model response.
+        quiet = False
+
+        async def stay_quiet() -> str:
+            """End this turn without an automatic final Discord reply.
+
+            Use when no reply is needed. Complete actions and inspect their
+            results first; do not hide failures that need explanation.
+            Previously sent messages remain. Takes no arguments.
+            """
+            nonlocal quiet
+            quiet = True
+            return ""
+
+        output_type = [str, ToolOutput(stay_quiet, name="stay_quiet")]
+        available_names = [t.name for t in tools] + ["stay_quiet"]
         self.logger.info(
             f"agentic gpt run: guild={ctx.guild.id} channel={ctx.channel.id} "
             f"actor={ctx.author.id} provider={provider_config.provider} "
-            f"model={provider_config.model} tools={[t.name for t in tools]}"
+            f"model={provider_config.model} tools={available_names}"
         )
         command_turn = f"[COMMAND from user {ctx.author.id}] {question}"
         try:
@@ -702,6 +732,7 @@ class Gpt(commands.Cog):
                 provider_config,
                 api_messages,
                 tools=tools,
+                output_type=output_type,
                 metadata=metadata,
                 # The command text is repeated as the closing user turn so the
                 # actionable instruction is unambiguous even when the channel
@@ -719,7 +750,7 @@ class Gpt(commands.Cog):
             # positives invisible (original reply posts unchanged), so the
             # channel sees exactly one message either way.
             tool_calls = response.usage.tool_calls if response.usage else 0
-            if tool_calls == 0 and looks_like_narrated_call(response.text, tool_names):
+            if not quiet and tool_calls == 0 and looks_like_narrated_call(response.text, available_names):
                 self.logger.info(
                     "agentic reply names a tool but made no tool calls — nudging once")
                 retry = await self.llm.run_agent(
@@ -729,6 +760,7 @@ class Gpt(commands.Cog):
                         {"role": "assistant", "content": response.text},
                     ],
                     tools=tools,
+                    output_type=output_type,
                     metadata=metadata,
                     user_prompt=NUDGE_PROMPT,
                     max_tool_calls=AGENT_TOOL_BUDGET * 2,
@@ -753,6 +785,12 @@ class Gpt(commands.Cog):
             ], metadata)
             return fallback.text
 
+        if quiet:
+            self.logger.info(
+                "agentic stay_quiet: guild=%s channel=%s actor=%s",
+                ctx.guild.id, ctx.channel.id, ctx.author.id,
+            )
+            return None
         return response.text
 
     def _log_agentic_usage(self, response):

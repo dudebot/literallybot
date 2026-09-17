@@ -1,10 +1,14 @@
 """Agent and settings boundaries: live permissions, budgets, and stored choices."""
 import logging
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import discord
 import pytest
+from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
 from starlette.requests import Request
 from starlette.responses import Response
 
@@ -13,6 +17,99 @@ from core.agent_gate import agent_universe, call_requires_admin
 from core.agent_loop import build_agent_tools
 from core import mcp_server
 from core.ops import OpContext, registry
+
+
+@pytest.fixture
+def gpt_run(config, monkeypatch):
+    """Real GPT routing and LLM client, with only model/Discord I/O replaced."""
+    config.set_global('XAI_API_KEY', 'test-only')
+    guild = NS(id=7, owner=None)
+    author = NS(id=1, bot=False, display_name='User')
+    message = NS(id=20, author=author, content='hello', reference=None,
+                 mentions=[], created_at=datetime.now(timezone.utc))
+
+    async def history(**kwargs):
+        yield message
+
+    @asynccontextmanager
+    async def typing():
+        yield
+
+    channel = NS(id=10, guild=guild, history=history,
+                 send=AsyncMock(return_value=NS(id=21, attachments=[])))
+    bot = NS(config=config, logger=logging.getLogger('test.gpt'),
+             user=NS(id=999, display_name='Bot'), get_channel=lambda cid: channel)
+    ctx = NS(bot=bot, guild=guild, channel=channel, author=author,
+             message=message, typing=typing, send=AsyncMock())
+    gpt = Gpt(bot)
+
+    def responses(parts):
+        pending = iter(parts)
+        requests = []
+
+        def respond(messages, info):
+            requests.append(info)
+            return ModelResponse(parts=next(pending))
+
+        monkeypatch.setattr(gpt.llm, '_build_model', lambda *args: FunctionModel(respond))
+        return requests
+
+    return gpt, ctx, responses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('route', ['direct', 'after_action', 'parallel', 'nudge', 'budget'])
+async def test_explicit_quiet_ends_run_without_posting_or_leaking_to_next_turn(config, gpt_run, route):
+    gpt, ctx, responses = gpt_run
+    config.set_global('agent_ops_whitelist', {'send_message': True})
+    config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
+    actions = 8 if route == 'budget' else int(route in ('after_action', 'parallel'))
+    script = [[ToolCallPart('send_message', {'channel_id': '10', 'content': 'Done'})]
+              for _ in range(actions)]
+    if route == 'nudge':
+        script.append([TextPart('I will call stay_quiet')])
+    script.append([ToolCallPart('stay_quiet', {})])
+    if route == 'parallel':
+        # Even if the model batches an action with the terminal output, the
+        # Agent must finish the action rather than skip it on early exit.
+        script = [script[0] + script[1]]
+    requests = responses(script)
+
+    await gpt.process_askgpt(ctx, 'Do it quietly')
+
+    assert len(requests) == len(script)  # No model request after the terminal call.
+    ctx.send.assert_not_awaited()  # Includes the empty-response diagnostic.
+    assert ctx.channel.send.await_count == actions  # Prior actions still happened.
+    assert gpt._history_windows.states  # Successful silence still accounts for the run.
+
+    # A quiet decision must be scoped to one invocation, never the cog or client.
+    gpt._call_history.clear()
+    requests = responses([[TextPart('Hello again')]])
+    await gpt.process_askgpt(ctx, 'hello again')
+    assert len(requests) == 1
+    assert ctx.send.await_args.args[0] == 'Hello again'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('agentic', [False, True])
+async def test_unintentional_blank_is_not_silence_and_plain_chat_never_loops(config, gpt_run, monkeypatch, agentic):
+    gpt, ctx, responses = gpt_run
+    if agentic:
+        config.set_global('agent_ops_whitelist', {'send_message': True})
+        config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
+    else:
+        def unexpected_agent(**kwargs):
+            pytest.fail('Plain chat must not construct an Agent')
+        monkeypatch.setattr('core.llm.client.Agent', unexpected_agent)
+    requests = responses([[TextPart('   ')]] if agentic else [[]])
+
+    await gpt.process_askgpt(ctx, 'hello')
+
+    assert len(requests) == 1
+    ctx.send.assert_awaited_once()
+    assert 'empty response' in ctx.send.await_args.args[0]
+    if not agentic:
+        assert not requests[0].function_tools and not requests[0].output_tools
 
 
 def test_agent_exposure_requires_both_gates_and_never_includes_dm_or_global():
