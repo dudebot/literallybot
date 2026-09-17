@@ -424,7 +424,7 @@ when needed for edits and timeout cleanup. Components V2 panels set
 
 ## Testing & Restarting Tips
 
-Follow [the risk-based test policy](testing.md). A new cog or op does not
+Follow [the qualitative test policy](error-handling.md#test-quality-and-development-checks). A new cog or op does not
 require its own schema, metadata, forwarding, and payload test bundle.
 
 - **The cog set is fixed at boot (#86)** — there is no hot-reload. To pick up a
@@ -435,6 +435,17 @@ require its own schema, metadata, forwarding, and payload test bundle.
   to Discord at startup but simply won't be there.
 - Wrap risky code with try/except blocks and log errors
 - Keep commands async-friendly and avoid blocking calls
+
+For a systemd deployment, restart the installed unit's process:
+
+```bash
+kill $(systemctl show "$UNIT".service -p MainPID --value)
+```
+
+`$UNIT` is the name chosen by `scripts/install_service.sh` (the directory name
+by default). systemd relaunches it in about three seconds. Never use `pkill -f`
+(it can match its own command), or `sudo systemctl restart` from a session that
+cannot supply a password. `Restart=always` relaunches a killed process.
 
 ## Disabling Cogs Per Deployment
 - `!cogs` (superadmin panel) or `!disable my_cog` / `!enable my_cog` maintain

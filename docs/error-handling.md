@@ -214,3 +214,40 @@ The global interval applies per destination, source guild, category, command/eve
 exception type, and message. Unknown commands and denials also distinguish users,
 so one user's activity cannot hide another's. Local logs are not rate-limited.
 Failed sends are logged locally and do not consume the next retry's cooldown.
+
+## Test quality and development checks
+
+Keep regression tests whose failure would reveal a **plausible future mistake
+with consequences that matter**. There is no test-count or coverage target.
+A new feature does not automatically need a permanent test bundle.
+
+- Name the mistake and its consequence: a dropped permission check, wrong config
+  scope, lost write, suppressed real error, or broken library integration. A past
+  incident is useful evidence, not a prerequisite. Merely inventing a mutation
+  that makes an assertion fail does not establish a test's value.
+- Assert outcomes through real local behavior. Use real Config in temporary
+  storage and mock external I/O, not the behavior being proved. Never load a
+  running bot's config or credentials. Reuse `tests/conftest.py` for Config.
+- Extend an existing scenario when it protects the same failure mechanism.
+  Separate implementations of the same privacy/auth policy can deserve separate
+  tests; a helper test does not prove callers use it. Keep coherent scenarios,
+  not per-op matrices or unrelated assertions combined to shrink the count.
+- Remove copied schema/metadata inventories, trivial forwarding checks, cosmetic
+  assertions, tests of the fake itself, and checks for absent features. Actual
+  component-limit failures or leaked private data matter; button labels do not.
+  Discord validates API arguments, but cannot enforce the invoking user's privacy
+  on requests made with the bot's credentials.
+
+**Self-checks are temporary.** Tests and probes can validate an implementation
+while building it. Retain one only if it also meets the regression standard
+above: a credible future mistake and an actionable failure. Having helped during
+implementation, passing once, or being cheap to run is not enough.
+
+Before committing or handing off, review the tests introduced or changed during
+the work. Delete development-only checks and their unused fixtures without
+waiting for the user to ask; do not leave them skipped or in a permanent scratch
+suite. Explain retained additions and why existing tests do not protect that
+failure. For removals, identify the replacement or explain why the check is not
+worth keeping. Report collected count changes as context only, including
+parameterized cases. Never prune or combine valuable tests to reach a number.
+See the [historical audit](testing.md) for how the suite accumulated.

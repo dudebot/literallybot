@@ -1,30 +1,9 @@
-# Test policy and September 2026 audit
+# Test guidance and September 2026 audit
 
-Keep approximately 50 collected cases protecting failures that would matter
-in production. The working agreement is [AGENTS.md](../AGENTS.md#tests).
-Run `python -m pytest tests/` (or `venv/bin/python -m pytest tests/`).
-No coverage target and no obligation to add tests with every change.
-
-## What earns a test
-
-A test should fail for a plausible, consequential defect: lost settings,
-incorrect scope, a permission bypass, private data or credential disclosure,
-unusable recovery, or a demonstrated integration failure. Assert an observable
-outcome across the real local boundary. Use actual Config/files, permission
-helpers, registry dispatch, and library objects where their contracts matter.
-Replace network I/O with small doubles; do not replace the behavior being tested.
-
-Prefer one scenario per failure mechanism. A state transition may need several
-assertions (write, reopen, compare), and distinct implementations may warrant
-parameterization (prefix/slash errors). Neither technique should conceal an
-inventory of unrelated tests. Extend an existing scenario before adding another.
-
-Remove schema snapshots, metadata catalogs, cosmetic assertions, trivial wrapper
-forwarding, duplicate helper/consumer checks, tests of the fake itself, and tests
-for hypothetical future features. A lower-priority check can be removed without
-claiming that it was incapable of finding a bug. Review and Discord's own API
-validation remain appropriate for simple wrappers; this suite does not validate
-every API primitive or replace a deployment smoke check.
+The [qualitative test policy](error-handling.md#test-quality-and-development-checks)
+defines what belongs in the committed suite and what to remove after development.
+Run `venv/bin/python -m pytest tests/` (or `python -m pytest tests/`).
+The counts below are historical, not targets.
 
 ## Where the growth came from
 
@@ -64,10 +43,12 @@ unnecessary serializer tests. Both instructions have been corrected. Decision
 records preserving the obsolete tests are superseded by this audit.
 
 The November 2025 commit `8da7a8e` already removed "mock slop tests". Deletion
-alone did not prevent recurrence. AGENTS.md now makes additions justify a concrete
-failure, counts parameterized cases, rejects per-op test bundles, and calls for
-pruning review if the suite grows beyond roughly 60 cases. This is a review rule,
-not a CI quota that can be gamed by hiding cases in loops.
+alone did not prevent recurrence. The first version of this audit introduced a
+numeric suite target and pruning threshold. Those were based on a rough estimate,
+not an assessment of independent failure paths, and have been removed. The
+linked qualitative policy governs retention, including removal of temporary
+development checks before commits. The counts below record the original cleanup;
+they are not a target or an endorsement of every retention decision.
 
 ## Retained suite
 

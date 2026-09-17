@@ -37,7 +37,6 @@ def test_load_and_roundtrip_isolate_guild_user_and_global(config, config_factory
     assert reopened.get(NS(guild=None), 'value') == 'global'
     assert reopened.get_global('value') == 'global'
     assert reopened.guild_ids() == [7]
-    assert reopened.global_keys() == ['value']
 
 
 def test_mutating_a_loaded_list_then_setting_it_persists(config, config_factory):
@@ -61,7 +60,6 @@ def test_removals_survive_restart_without_dropping_other_keys(config, config_fac
     assert config.rem(7, 'remove')
     assert config.rem_user(7, 'remove')
     assert config.rem_global('remove')
-    assert not config.rem(7, 'remove')
     config.flush()
     reopened = config_factory(Path(config.config_dir))
     assert reopened.get(7, 'keep') == {'nested': [1]}

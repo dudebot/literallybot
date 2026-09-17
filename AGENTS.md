@@ -1,170 +1,45 @@
 # Agent notes
 
-Discord bot (discord.py, Python 3.12+). Cog loader, JSON config, ops
-registry. This file is the working agreement for anyone changing the
-tree — origin repo or a downstream copy. Same file either way.
+Discord bot, Python 3.12+ / discord.py. Keep changes focused, reuse existing
+patterns, and read the relevant guide before changing a subsystem.
 
-## Layout
+## Where to look
 
-```
-bot.py                 # entry, event handlers
-core/                  # config, ops registry, agent loop, MCP, errors, LLM
-cogs/core/             # recovery surface (control, admin) — never disableable
-cogs/optional/         # everything else; a deploy picks via disabled_cogs
-configs/               # runtime JSON (global, guild, user) — not in git
-docs/                  # per-system docs; README indexes them
-utils/                 # headless helpers shared by cogs
-```
+- **Commands (`!`, `/`), `@` decorators, and panels:**
+  [cog development](docs/cog-development.md) and [decorators](docs/decorators.md).
+  Templates: [RNG](cogs/optional/rng.py) for a small cog,
+  [log settings](cogs/optional/error_handler.py) for admin panels,
+  [reaction roles](cogs/optional/setrole.py) for shared command/op behavior.
+- **Config:** [API and key registry](docs/config-system.md). Use the central
+  Config store, choose the correct scope, and document new keys there.
+- **Auth, ops, MCP:** [security](docs/security.md) and
+  [op authoring](docs/cog-development.md#registering-ops-from-a-cog).
+  Reuse `core.utils.is_admin` / `is_superadmin`; register Discord actions as
+  ops and share headless logic with commands. No parallel permission system.
+- **Logging and test quality:** [error handling](docs/error-handling.md) and
+  [test guidance](docs/error-handling.md#test-quality-and-development-checks).
+  Use `self.bot.logger`; permission denials still log at WARNING.
+- **Other systems and decisions:** [README](README.md#documentation) and
+  [decision records](docs/decision-records.md).
 
-`cogs/core/` exists so that if an optional cog is off, you can still turn
-it — or anything else — back on from Discord. Adding a third file there
-needs that justification.
+## Working rules
 
-## Downstream copies
-
-This tree is meant to be merged as-is. Extra cogs, utils, tests, and docs
-that exist only in a copy never conflict.
-
-```bash
-git fetch upstream
-git merge upstream/main
-```
-
-No helper script. No `merge=ours`. Backbone (`bot.py`, `core/`, shared
-cogs under `cogs/core/` and the shared files in `cogs/optional/`) is
-edited **here first**. A copy that patches backbone will fight every
-merge; put the patch here instead.
-
-`disabled_cogs` (global config, bare cog names) is how a copy keeps
-unused cogs on disk without running them. Disable, never delete.
-
-If this tree is public, do not cherry-pick commits from a private copy
-into it — that publishes the copy's author identity. Re-author the
-change here.
-
-## Before changing anything
-
-1. Read the relevant `docs/` file for that subsystem.
-2. Match existing cog/op patterns. Don't invent a second one.
-3. Keep the diff to the failure mode you are fixing.
-
-## Config
-
-`docs/config-system.md` is the API and the key registry. Keep the
-registry current when adding keys. One data model per concept.
-
-```python
-bot.config.get(ctx, "key")              # guild
-bot.config.set(ctx, "key", value)
-bot.config.get_user(user, "key")        # user_<id>.json
-bot.config.set_user(user, "key", value)
-bot.config.get_global("key")
-bot.config.set_global("key", value)
-bot.config.flush()                      # 5s write buffer otherwise
-```
-
-`get` / `get_user` / `get_global` are read-only: a missing key returns
-the default and does not create a file.
-
-Timestamps in config are naive local time (the host timezone). Discord
-API times are UTC-aware — convert with
-`.astimezone().replace(tzinfo=None)` before comparing to stored values.
-
-## Seams
-
-Where new code should land, so seams don't re-greed:
-
-- **Auth**: `core.utils.is_admin` / `is_superadmin`. Never hand-roll a
-  gate.
-- **Message splitting**: `core.utils.recursive_split` is the Discord
-  2000-char splitter.
-- **Discord actions for agents/frontends**: register an op. An **API
-  primitive** (raw Discord action) goes inline in `core/ops.py` via
-  `@registry.op(...)` (`origin='core'`). A **behavioral primitive** goes
-  on a cog method via `@op(...)` from `core.ops` (`origin='cog'`). Factor
-  the logic into a headless service both the command and the op call.
-  Never expose an interaction handler as an op. Origin is stamped by the
-  registration path, never a decorator argument.
-- **No code-level op subsets.** An op declares `scope` (GUILD/DM/GLOBAL).
-  The in-chat agent universe IS the guild-scoped set, queried live.
-- **One cog per purpose.** Same purpose = same file.
-- **Admin surfaces** are panels behind hidden `!` commands, gated by
-  `is_admin` / `is_superadmin`. Slash twins use the same predicate plus
-  `guild_only` and `panel_slash_pin()` (Manage Messages — visibility, not
-  auth). Public slash is `/help`.
-- **CheckFailure is signal**, not noise: a user reaching for a command
-  they shouldn't have still logs to the error channel at WARNING. The
-  user-facing copy is a gate sentence, not "something went wrong".
-- **Config keys**: one key per concept. Inventory in
-  `docs/config-system.md`.
-- **Rate limiting** is the nested-window ladder in `gpt.py`. No
-  Cooldowns tab.
-
-## Cogs
-
-The set is fixed at boot. There is no live load/unload/reload. A code
-change or a `disabled_cogs` edit binds on restart (`!restart`, or the
-`!cogs` panel Restart button).
-
-New cogs go in `cogs/optional/`. Use the central logger
-(`self.bot.logger`). Prefix admin commands `hidden=True`; the check is
-what actually gates them. Any command that touches `ctx.guild.<attr>`
-needs `@commands.guild_only()` (in a DM `ctx.guild` is `None`).
-
-`is_admin(ctx)` is False in DMs unconditionally. `!help` in a DM is a
-public listing.
-
-## Ops and MCP
-
-`core/ops.py` is the registry. MCP (`core/mcp_server.py`) is a thin
-frontend over it — loopback, bearer token, opt-in via `mcp_ops_enabled`.
-Message reads (`read_history`, `search_history`, `get_message`) serialize
-embed bodies, not just `content`.
-
-## Restart
-
-Config, cogs, and MCP bind at boot. After a deploy:
-
-```bash
-kill $(systemctl show "$UNIT".service -p MainPID --value)
-```
-
-`$UNIT` is whatever `scripts/install_service.sh` installed (defaults to
-the directory name). systemd relaunches in ~3s. Never `pkill -f` (it
-matches its own command line). Never `sudo systemctl restart` from a
-session that cannot supply a password. With `Restart=always` you cannot
-stop the service, only restart it.
+- New cogs go in `cogs/optional/`, one per purpose. `cogs/core/` is the
+  never-disableable recovery surface. Shared helpers live in `utils/`.
+- Cogs are fixed at boot; disable via `disabled_cogs`, never delete or hot-reload.
+  Follow the [restart instructions](docs/cog-development.md#testing--restarting-tips).
+- Admin commands use the central checks, hidden prefix commands, and guild-only
+  slash twins with `panel_slash_pin()`. Guard guild-only prefix commands too.
+- Reuse `core.utils.recursive_split` for Discord message splitting.
+  Keep async handlers nonblocking and runtime data/credentials out of git.
+- Downstream copies merge upstream as-is. Fix shared backbone here first;
+  keep copy-only additions separate. No merge helpers or `merge=ours`.
+  Never cherry-pick private-copy commits into a public repo; re-author here.
 
 ## Tests
 
-```bash
-python -m pytest tests/
-```
-
-A test that fakes `Config` will not catch a missing method on the real
-class. Hit `core.config.Config` for store API.
-
-Keep this a small risk-based suite (about 50 collected cases; the September
-2026 audit retained 51). Test count and coverage percentage are not goals.
-Do not add a test by default just because code changed or an op was added.
-
-- A test must name a consequential failure: lost/cross-scope stored data,
-  unauthorized actions or disclosure, broken recovery, or a demonstrated
-  integration regression. Exercise the real local boundary and assert the
-  outcome. Mock external I/O, not the behavior being proved.
-- Extend or replace the existing test for that failure before adding another.
-  Keep distinct cases only when they exercise distinct failure paths. Count
-  parametrized cases, not just functions; never multiply a shared invariant
-  by the op inventory or hide that matrix in a loop to meet the budget.
-- No schema/metadata inventories, source-text assertions, trivial forwarding
-  tests, mock-testing-itself, cosmetic copy/layout checks, or speculative
-  tests for removed features. A real Discord component-limit outage is a
-  boundary regression; button labels are not.
-- Delete superseded tests and unused fixtures with the behavior they covered.
-  Use temporary storage; never import a running bot's config or touch live
-  credentials. The shared fixture uses real Config with manually driven timers.
-- When changing tests, report collected count before/after and the failure
-  each net addition protects. Growth beyond roughly 60 cases calls for a
-  suite-level pruning review, not raising a cap or compressing tests.
-
-See [docs/testing.md](docs/testing.md) for the audit and retention criteria.
+Keep tests for plausible regressions whose failure would matter, not test slop.
+Development self-checks are fine; delete temporary checks and unused fixtures
+before committing or handing off, without waiting to be asked. No count target.
+See the [qualitative policy](docs/error-handling.md#test-quality-and-development-checks).
+Use real Config with temporary storage; run `venv/bin/python -m pytest tests/`.

@@ -82,7 +82,6 @@ def test_search_history_drops_hits_where_actor_lacks_history_perm(monkeypatch):
     assert res.value["messages"] == [hit_a]
     assert res.value["count"] == 1
     assert "total_matches" not in res.value
-    assert "note" in res.value
 
 
 def test_search_history_fallback_refuses_history_denied_actor(monkeypatch):
@@ -261,14 +260,12 @@ def test_purge_messages_filters_by_author():
     from core.ops import purge_messages
     chan = _ModChannel()
     author = type("M", (), {"id": 42})()
-    payload = asyncio.run(purge_messages(_AuthorCtx(), chan, 50,
-                                         author=author))
+    asyncio.run(purge_messages(_AuthorCtx(), chan, 50, author=author))
     assert chan.purge_kwargs["limit"] == 50
     check = chan.purge_kwargs["check"]
     assert check(type("Msg", (), {"author": author})())
     assert not check(type("Msg", (), {
         "author": type("A", (), {"id": 99})()})())
-    assert payload == {"channel_id": 10, "deleted_count": 3}
 
 
 @pytest.mark.asyncio

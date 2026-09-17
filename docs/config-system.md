@@ -65,6 +65,10 @@ config.get(user_id, "points", 0, scope="user")
 
 `get_user` is read-only the same way `get` is: a missing user file returns the default and does **not** create `user_<id>.json`. Only `set_user` / `set(..., scope="user")` writes.
 
+Stored config timestamps are naive local time in the host timezone. Convert
+UTC-aware Discord timestamps with `.astimezone().replace(tzinfo=None)` before
+comparing them with stored values.
+
 ### Context-Free Access
 
 When you have an ID but no Discord context:
