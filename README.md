@@ -480,6 +480,8 @@ Lists are just Python lists — get, mutate, then `set` the updated list. Call
 immediately.
 
 ### Documentation
+
+- [Decorator reference](docs/decorators.md) — complete repository decorator inventory, recipes, and linked deep dives
 - `AGENTS.md` — working agreement for this tree and any downstream copy
 - `docs/cog-development.md` — building cogs, including the command-gate recipe
 - `docs/config-system.md` — config API, patterns, and the config Key Registry

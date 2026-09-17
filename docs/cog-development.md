@@ -46,6 +46,9 @@ async def setup(bot):
 
 ## Command Development
 
+See the [decorator reference](decorators.md) for the complete `@...` inventory
+and standard command/check stacks.
+
 Command mechanics (arguments, aliases, converters) are discord.py's territory —
 see the [discord.py commands docs](https://discordpy.readthedocs.io/en/stable/ext/commands/commands.html).
 The one repo rule: unhandled errors are automatically logged to Discord channels
@@ -398,6 +401,27 @@ cancelled in `cog_unload`.
 
 Config works without a live Context — pass a guild id directly:
 `self.bot.config.set(1234567890, "setting_name", True)`.
+
+### Panel components
+
+Use `InvokerOnlyView` from `core.utils` before the Discord view base in the
+inheritance list. It provides invoker checks and timeout cleanup. It does not
+replace `is_admin` / `is_superadmin`: recheck the relevant predicate on control
+callbacks and modal submissions, including after the invoker has been demoted.
+
+For a fixed `discord.ui.View`, `@discord.ui.button(...)` declares a button on an
+async method with `(self, interaction, button)`; see `_ConfirmEditView` in
+[setrole.py](../cogs/optional/setrole.py). A callback decorator does not supply
+permission checks.
+
+For dynamic settings, follow [AiSettingsView](../cogs/optional/gpt.py) or
+[LogSettingsView](../cogs/optional/error_handler.py): build a
+`discord.ui.LayoutView` from `TextDisplay`, `ActionRow`, buttons, and selectors,
+assign callbacks, and rebuild it from current config after an edit. Use a
+`discord.ui.Modal` for typed input. `on_submit` and `interaction_check` are
+methods, not decorators. Keep slash panels ephemeral and store the panel message
+when needed for edits and timeout cleanup. Components V2 panels set
+`expiry_text = None` because their message has no separate content field.
 
 ## Testing & Restarting Tips
 - **The cog set is fixed at boot (#86)** — there is no hot-reload. To pick up a
