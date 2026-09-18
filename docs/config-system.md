@@ -111,8 +111,8 @@ illustration; they are not real.)
 | `admins` | `list[int]` user ids | `!addadmin` / `!removeadmin` / `!claimadmin` | Read via `core.utils.is_admin` |
 | `current_ai_provider` | `str` provider id | `!aisettings` → Server config | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
 | `current_ai_model` | `str` or absent | `!aisettings` → Server config | Absent ⇒ provider's `default_model` |
-| `ai_history_min_messages` | `int`, default 15 | `/aisettings` → Server → History | Fresh/sliding context size; 1–1000 messages |
-| `ai_history_max_messages` | `int`, default 30 | `/aisettings` → Server → History | Inchworm ceiling, at least the minimum and at most 1000. Equal bounds give fixed history; references may add supplemental messages. Previous anchor retained only inside the assumed TTL when estimated input cost decreases |
+| `ai_history_min_messages` | `int`, default 15 | `/aisettings` → Server config → History Min / Max | Fresh/sliding context size; 1–1000 messages |
+| `ai_history_max_messages` | `int`, default 30 | `/aisettings` → Server config → History Min / Max | Cache-reuse ceiling, at least the minimum and at most 1000. Equal bounds give fixed history; references may add supplemental messages. Previous anchor retained only inside the assumed TTL when estimated input cost decreases |
 | `gpt_personality_data` | `{prompt: str}` | `!aisettings` → Personality modal | Guild persona for `!gpt` |
 | `ai_enabled` | `bool` | `!aisettings` → Server config (💬 toggle) | Per-guild AI kill switch. Absent ⇒ ON. Gates the mention/reply chat path only — the panel stays reachable to turn it back on. Chat is guild-only: DMs never answer |
 | `agent_ops_gate` | `{op_name: "off"\|"admin"\|"everyone"}` | `!aisettings` → ⚙ Server config, per-op tri-state select (**guild admin**) | The per-guild agent gate (`core/agent_gate`), the second tier under the global `agent_ops_whitelist` ceiling. For each WHITELISTED guild-scoped op a server admin picks Off / Admin only / Everyone; a missing entry falls back to the op's `default_gate()` (always `"off"`). `off` hides the op from that guild's agent, `admin` limits agent invocation to bot admins, `everyone` opens it to any member (still subject to the op's own hardcoded `PermissionLevel` floor). Guild-admin-savable is not an escalation path: the surface is guild-scoped ops only, capped by the super-admin whitelist, and each op re-checks its floor at call time. Superseded `bot_tools_enabled` (the old single on/off allowlist) when the two-tier model landed |
@@ -287,7 +287,8 @@ and Grok 4.5 **15%**; the generic default is 10%.
 Neither setting changes provider billing or forces cache retention.
 The selector uses a UTF-8 byte/4 token estimate and exact whole-message prefix
 matching. State is in memory, separated by guild/channel/provider/model/tools,
-bounded to 256 conversations, and committed only after a successful model call.
+bounded to 256 entries, and committed only after a successful model call.
+Reusing a window keeps its anchor ID and refreshes its last-send timestamp.
 Requests in one channel serialize. Stable system instructions precede history;
 changing user mappings and invoking IDs follow it. xAI requests use a stable
 `x-grok-conv-id`. Usage logs retain actual cached token counts per API request.

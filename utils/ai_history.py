@@ -62,12 +62,21 @@ def input_units(messages, previous, ratio):
 
 @dataclass
 class HistoryState:
+    """Last successful request: retained start ID, rendered prompt, send time."""
+
     anchor: int
     messages: list
     sent_at: float
 
 
 class HistoryWindows:
+    """Bounded map keyed by (guild, channel, provider, model, tool names).
+
+    Keep rendered messages to detect changed prefixes; IDs alone cannot do
+    that. OrderedDict provides expected O(1) lookup/update/oldest eviction.
+    Ordering follows successful commits, not reads or failed attempts.
+    """
+
     def __init__(self, capacity=256):
         self.states = OrderedDict()
         self.capacity = capacity
@@ -94,6 +103,7 @@ class HistoryWindows:
         return baseline
 
     def commit(self, key, anchor, messages, sent_at):
+        # An extension retains the anchor, but always refreshes prompt/time.
         self.states[key] = HistoryState(anchor, messages, sent_at)
         self.states.move_to_end(key)
         while len(self.states) > self.capacity:

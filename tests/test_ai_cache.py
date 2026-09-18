@@ -10,7 +10,7 @@ import pytest
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from cogs.optional.gpt import Gpt
+from cogs.optional.gpt import AiSettingsView, Gpt
 from core.llm.client import LLMClient, ProviderConfig
 
 
@@ -73,6 +73,101 @@ async def test_channel_window_honors_cost_edits_expiry_and_failed_calls(config):
 
 
 @pytest.mark.asyncio
+async def test_successful_calls_roll_anchor_lifetime_forward(config, monkeypatch):
+    config.set(1, 'ai_history_min_messages', 3)
+    config.set(1, 'ai_history_max_messages', 6)
+    author = NS(id=10, bot=False, display_name='A', name='A')
+    messages = [NS(id=i, author=author, content=f'message {i} ' * 30,
+                   created_at=datetime.fromtimestamp(i, timezone.utc),
+                   reference=None, mentions=[], embeds=[], attachments=[])
+                for i in range(1, 6)]
+    clock = 100
+    fetch_delay = 0
+    monkeypatch.setattr('cogs.optional.gpt.time', NS(monotonic=lambda: clock))
+
+    async def history(limit, before):
+        nonlocal clock
+        clock += fetch_delay
+        for m in [m for m in messages if m.id < before.id][-limit:][::-1]:
+            yield m
+
+    @asynccontextmanager
+    async def typing():
+        yield
+
+    async def send(*args, **kwargs):
+        pass
+
+    async def chat(*args, **kwargs):
+        return NS(text='hello', usage=None)
+
+    bot = NS(config=config, logger=logging.getLogger('test'), user=NS(id=99, display_name='Bot'))
+    gpt = Gpt(bot)
+    gpt.llm.chat = chat
+    ctx = NS(guild=NS(id=1), channel=NS(id=2, history=history),
+             author=author, typing=typing, send=send)
+    for clock, trigger in [(100, 2), (350, 3), (600, 4)]:
+        ctx.message = messages[trigger]
+        await gpt.process_askgpt(ctx, 'hello')
+        state, = gpt._history_windows.states.values()
+        assert state.anchor == 1
+        assert state.sent_at == clock
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError('network failed')
+
+    clock = 700
+    gpt.llm.chat = fail
+    await gpt.process_askgpt(ctx, 'hello')
+    state, = gpt._history_windows.states.values()
+    assert state.anchor == 1 and state.sent_at == 600
+    # Still warm when scraping starts, expired by the time Discord returns.
+    clock, fetch_delay = 899, 2
+    _, _, anchor, sent_at = await gpt._prepare_cached_history(ctx, gpt.get_provider_config(1), [])
+    assert anchor == 3 and sent_at == 901
+
+
+@pytest.mark.asyncio
+async def test_candidate_references_share_fetches_but_refresh_next_invocation(config):
+    config.set(1, 'ai_history_min_messages', 3)
+    config.set(1, 'ai_history_max_messages', 6)
+    author = NS(id=10, bot=False, display_name='A', name='A')
+    messages = [NS(id=i, author=author, content=f'message {i} ' * 30,
+                   created_at=datetime.fromtimestamp(i, timezone.utc),
+                   reference=NS(message_id=100) if i == 3 else None,
+                   mentions=[], embeds=[], attachments=[])
+                for i in range(1, 5)]
+    reference = NS(id=100, author=author, content='original reference',
+                   created_at=datetime.fromtimestamp(0, timezone.utc),
+                   reference=None, mentions=[])
+    fetched = []
+
+    async def fetch_message(message_id):
+        fetched.append(message_id)
+        return reference
+
+    async def history(limit, before):
+        for m in [m for m in messages if m.id < before.id][-limit:][::-1]:
+            yield m
+
+    bot = NS(config=config, logger=logging.getLogger('test'), user=NS(id=99, display_name='Bot'))
+    gpt = Gpt(bot)
+    ctx = NS(guild=NS(id=1), channel=NS(id=2, history=history, fetch_message=fetch_message),
+             author=author, message=messages[2])
+    pc = gpt.get_provider_config(1)
+    first, key, anchor, when = await gpt._prepare_cached_history(ctx, pc, [], now=100)
+    gpt._history_windows.commit(key, anchor, first, when)
+    ctx.message = messages[3]
+    reference.content = 'edited reference'
+    second, _, anchor, _ = await gpt._prepare_cached_history(ctx, pc, [], now=101)
+    assert anchor == 1
+    assert fetched == [100, 100]  # Once per invocation, not once per candidate.
+    assert second[:4] == first[:4]
+    assert 'edited reference' in second[-2]['content']
+    assert '[TRIGGER MESSAGE]' in second[-1]['content']
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('entry', ['chat', 'run_agent'])
 async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, monkeypatch, entry):
     headers = []
@@ -102,7 +197,7 @@ async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, mo
 
 
 @pytest.mark.asyncio
-async def test_history_and_model_cache_modals_keep_scopes_and_recheck_access(config):
+async def test_history_controls_and_model_cache_keep_scopes_and_recheck_access(config):
     from cogs.optional.gpt import _HistorySettingsModal, _CacheSettingsModal
     config.set(1, 'admins', [8])
     config.set_global('superadmins', [7])
@@ -123,6 +218,20 @@ async def test_history_and_model_cache_modals_keep_scopes_and_recheck_access(con
     await history.on_submit(interaction)
     assert config.get(1, 'ai_history_max_messages') == 40
     assert config.get_global('ai_history_max_messages') is None
+    view = AiSettingsView(gpt, interaction.user, NS(id=1, name='Test'))
+    view.rerender = render
+    minimum = view._history_select('min')
+    minimum._values = ['50']
+    await minimum.callback(interaction)
+    assert config.get(1, 'ai_history_min_messages') == 50
+    assert config.get(1, 'ai_history_max_messages') == 50
+    maximum = view._history_select('max')
+    maximum._values = ['100']
+    config.set(1, 'admins', [])
+    await maximum.callback(interaction)
+    assert config.get(1, 'ai_history_max_messages') == 50
+    assert config.get_global('ai_history_min_messages') is None
+    view.stop()
     cache = _CacheSettingsModal(panel)
     cache.ratio._value, cache.ttl._value = '25', '300'
     await cache.on_submit(interaction)

@@ -349,11 +349,16 @@ class Gpt(commands.Cog):
             )
         return response.text
 
-    async def _build_history(self, ctx, agentic, *, messages):
+    async def _build_history(self, ctx, agentic, *, messages, reference_cache=None):
         """Render selected channel messages (plus referenced messages) into
         OpenAI-style history turns and a user-id -> display-name mapping."""
         history = []
-        
+        selected_by_id = {msg.id: msg for msg in messages}
+        # Shared only within this invocation's candidate renders. Never reuse
+        # Discord message objects across calls: edits/deletions must be seen.
+        if reference_cache is None:
+            reference_cache = dict(selected_by_id)
+
         # Track referenced messages to include in context
         referenced_msgs = {}
         reply_chain_ids = set()
@@ -367,14 +372,16 @@ class Gpt(commands.Cog):
         if reply_chain_ids:
             self.logger.debug(f"Found {len(reply_chain_ids)} referenced messages to fetch")
             for ref_id in reply_chain_ids:
-                if any(msg.id == ref_id for msg in messages):
+                if ref_id in selected_by_id:
                     continue
-                
-                try:
-                    ref_msg = await ctx.channel.fetch_message(ref_id)
-                    referenced_msgs[ref_id] = ref_msg
-                except Exception as e:
-                    self.logger.warning(f"Failed to fetch referenced message {ref_id}: {e}")
+                if ref_id not in reference_cache:
+                    try:
+                        reference_cache[ref_id] = await ctx.channel.fetch_message(ref_id)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to fetch referenced message {ref_id}: {e}")
+                        reference_cache[ref_id] = None
+                if reference_cache[ref_id] is not None:
+                    referenced_msgs[ref_id] = reference_cache[ref_id]
         
         # Build a mapping from user IDs to display names for non-bot messages
         user_mapping = {}
@@ -406,6 +413,7 @@ class Gpt(commands.Cog):
             x.id in referenced_msgs,
             getattr(x, 'created_at', 0)))
         
+        reply_targets = {**selected_by_id, **referenced_msgs}
         # Construct history with bot messages unchanged and non-bot with user ID prefix
         for msg in all_messages_for_history:
             full_content = getattr(msg, 'content', '')
@@ -473,7 +481,7 @@ class Gpt(commands.Cog):
                 if hasattr(msg, 'reference') and msg.reference and msg.reference.message_id:
                     # Find who they're replying to
                     replied_to_id = msg.reference.message_id
-                    replied_to_msg = next((m for m in all_messages_for_history if hasattr(m, 'id') and m.id == replied_to_id), None)
+                    replied_to_msg = reply_targets.get(replied_to_id)
                     if replied_to_msg and hasattr(replied_to_msg, 'author'):
                         reply_context = f" [replying to {replied_to_msg.author.display_name}]"
                 
@@ -537,8 +545,8 @@ class Gpt(commands.Cog):
         ratio, ttl = cache_policy(model_info)
         key = (ctx.guild.id, ctx.channel.id, provider_config.provider,
                provider_config.model, tuple(tool_names))
-        now = time.monotonic() if now is None else now
-        previous = self._history_windows.previous(key, now, ttl)
+        checked_at = time.monotonic() if now is None else now
+        previous = self._history_windows.previous(key, checked_at, ttl)
         # Freeze the scrape at the trigger so later arrivals do not become the
         # target of this response. Re-fetch to honor edits/deletions.
         messages = [msg async for msg in ctx.channel.history(
@@ -548,11 +556,13 @@ class Gpt(commands.Cog):
         if not messages:
             messages = [ctx.message]
         baseline_messages = messages[-minimum:]
+        reference_cache = {msg.id: msg for msg in messages}
+        prompt = self._build_system_prompt(ctx, tool_names)
 
         async def render(selected):
             history, mapping = await self._build_history(
-                ctx, bool(tool_names), messages=selected)
-            prompt = self._build_system_prompt(ctx, tool_names)
+                ctx, bool(tool_names), messages=selected,
+                reference_cache=reference_cache)
             context = (
                 f"[REQUEST CONTEXT] Invoking user ID: {ctx.author.id}; "
                 f"trigger message ID: {ctx.message.id}. Respond to that message.\n"
@@ -572,11 +582,16 @@ class Gpt(commands.Cog):
         if previous:
             anchored = [msg for msg in messages if msg.id >= previous.anchor]
             if (anchored and anchored[0].id == previous.anchor
-                    and minimum <= len(anchored) <= maximum):
+                    and minimum < len(anchored) <= maximum):
                 extended = await render(anchored)
+        # Discord history/reference fetches may take long enough to exhaust
+        # the assumed TTL. Recheck before choosing, and timestamp this send
+        # rather than the start of the scrape. Commit still requires success.
+        sent_at = time.monotonic() if now is None else now
+        previous = self._history_windows.previous(key, sent_at, ttl)
         chosen = self._history_windows.choose(baseline, extended, previous, ratio)
         selected = anchored if chosen is extended else baseline_messages
-        return chosen, key, selected[0].id, now
+        return chosen, key, selected[0].id, sent_at
 
     async def process_askgpt(self, ctx, question: str):
         key = (ctx.guild.id, ctx.channel.id)
@@ -2061,6 +2076,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         if self.page == "server":
             self.add_item(self._row(_ProviderSelect(self)))
             self.add_item(self._row(_ModelSelect(self)))
+            self.add_item(self._row(self._history_select("min")))
+            self.add_item(self._row(self._history_select("max")))
             # The server tab's universe is the WHITELISTED guild-scoped set:
             # two membership selects (Admin only / Everyone; Off = unselected)
             # writing this guild's agent_ops_gate. Non-whitelisted ops are
@@ -2069,8 +2086,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             self._add_gate_sections()
             self.add_item(self._row(self._ai_toggle_button(),
                                     self._personality_button(),
-                                    self._nickname_button(),
-                                    self._history_button()))
+                                    self._nickname_button()))
         elif self.page == "agentops":
             # Super-admin whitelist editor: the global on/off ceiling per
             # GUILD-scoped op. DM/GLOBAL ops are MCP-only; the in-chat
@@ -2145,7 +2161,12 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             f"## AI settings — {self.guild.name}\n"
             f"**AI replies:** {'ON — mention or reply to the bot' if self._ai_enabled() else 'OFF'}\n"
             f"**Provider / model:** {self.provider} / **{self.model}** ({tier}: {rate})\n"
-            f"**History:** {minimum}–{maximum} messages · cached input {ratio:.0%} · assumed lifetime {ttl:g}s\n"
+            f"**History:** {minimum}–{maximum} messages\n"
+            "Min is the usual context size (when available). Recent calls may keep older "
+            "context up to Max when cache reuse is estimated to lower input cost.\n"
+            "Start with Max = 2× Min. Higher caps allow longer reuse; they do not "
+            "guarantee more context or savings. Reply references may add messages.\n"
+            f"**Cache assumptions:** {ratio:.0%} of regular input price · {ttl:g}s lifetime\n"
             "Tick **Admin only** or **Everyone** below. Unticked is Off. "
             "Only ops a bot super-admin has enabled appear here.\n"
             f"**Agent tools here:** "
@@ -2257,18 +2278,45 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         btn.callback = cb
         return btn
 
-    def _history_button(self):
-        btn = discord.ui.Button(label="History", style=discord.ButtonStyle.secondary)
+    def _history_select(self, bound):
+        minimum, maximum = history_bounds(self.bot.config, self._cfg_ctx())
+        current = minimum if bound == "min" else maximum
+        values = {1, 5, 10, 15, 20, 25, 30, 40, 50, 60, 75, 100,
+                  150, 200, 300, 500, 1000, minimum, maximum}
+        label = "Min" if bound == "min" else "Max"
+        options = [discord.SelectOption(
+            label=f"{label}: {value} messages", value=str(value), default=value == current)
+            for value in sorted(values) if bound == "min" or value >= minimum]
+        options.append(discord.SelectOption(
+            label="Custom min / max…", value="custom",
+            description="Enter any bounds from 1 to 1000 messages"))
+        select = discord.ui.Select(
+            placeholder=f"History {label}: {current} messages", options=options)
 
         async def cb(interaction):
-            if not is_admin(interaction):
+            if interaction.user.id != self.invoker_id or not is_admin(interaction):
                 self.bot.logger.warning("AI history settings denied actor=%s", interaction.user.id)
-                await interaction.response.send_message("Requires admin.", ephemeral=True)
+                await interaction.response.send_message("Requires the panel's admin.", ephemeral=True)
                 return
-            await interaction.response.send_modal(_HistorySettingsModal(self))
+            if select.values[0] == "custom":
+                await interaction.response.send_modal(_HistorySettingsModal(self))
+                return
+            value = int(select.values[0])
+            minimum, maximum = history_bounds(self.bot.config, self._cfg_ctx())
+            if bound == "min":
+                minimum, maximum = value, max(value, maximum)
+            elif value < minimum:
+                self.flash("Max must be at least Min. Settings refreshed; try again.")
+                await self.rerender(interaction)
+                return
+            else:
+                maximum = value
+            self.bot.config.set(self._cfg_ctx(), "ai_history_min_messages", minimum)
+            self.bot.config.set(self._cfg_ctx(), "ai_history_max_messages", maximum)
+            await self.rerender(interaction)
 
-        btn.callback = cb
-        return btn
+        select.callback = cb
+        return select
 
     def _nickname_button(self):
         btn = discord.ui.Button(label="🏷 Nickname",
