@@ -214,6 +214,32 @@ class Config:
         """Set a user-specific config value"""
         self.set(ctx, key, value, scope='user')
 
+    def update_user(self, ctx, mutate):
+        """Durably update a user's document as one atomic read/modify/write.
+
+        mutate receives a deep copy and returns an arbitrary result. It must
+        not call Config methods. Exceptions discard the copy. Used when a
+        balance and its associated receipt must survive a crash together.
+        """
+        from copy import deepcopy
+        config_id = self._resolve_config_id(ctx, 'user')
+        with self._lock:
+            with self._data_lock:
+                previous = self._configs.get(config_id)
+                updated = deepcopy(previous or {})
+                result = mutate(updated)
+                self._configs[config_id] = updated
+                try:
+                    self._immediate_save(config_id)
+                except Exception:
+                    if previous is None:
+                        self._configs.pop(config_id, None)
+                    else:
+                        self._configs[config_id] = previous
+                    raise
+                self._dirty_configs.discard(config_id)
+                return result
+
     def rem_user(self, ctx, key):
         """Remove a user-specific config value"""
         return self.rem(ctx, key, scope='user')

@@ -66,6 +66,30 @@ from pydantic_ai.usage import RequestUsage, UsageLimits
 
 from .usage import UsageRecord, estimate_cost
 
+class _OpenAIChatModel(OpenAIChatModel):
+    """Read Chat Completions counters without mutable pricing-data extractors.
+
+    pydantic-ai 2.5 delegates usage to genai-prices, whose data can add fields
+    RequestUsage does not accept; that adapter silently discards every counter.
+    These counters are part of the OpenAI-compatible response contract.
+    """
+
+    def _map_usage(self, response):
+        raw = response.usage
+        if raw is None:
+            return RequestUsage()
+        prompt = raw.prompt_tokens_details
+        completion = raw.completion_tokens_details
+        return RequestUsage(
+            input_tokens=raw.prompt_tokens or 0,
+            output_tokens=raw.completion_tokens or 0,
+            cache_read_tokens=getattr(prompt, "cached_tokens", 0) or 0,
+            input_audio_tokens=getattr(prompt, "audio_tokens", 0) or 0,
+            output_audio_tokens=getattr(completion, "audio_tokens", 0) or 0,
+            details=completion.model_dump(exclude_none=True) if completion else {},
+        )
+
+
 # Provider aliases (also used by the cog for command-level aliasing).
 PROVIDER_ALIASES: Dict[str, str] = {
     "oai": "openai",
@@ -288,7 +312,7 @@ class LLMClient:
             # `max_completion_tokens` (verified live), so force the plain
             # `max_tokens` wire field. The override merges on top of the
             # provider's per-model profile (qwen/llama/... detection).
-            return OpenAIChatModel(
+            return _OpenAIChatModel(
                 model,
                 provider=OllamaProvider(base_url=base_url, api_key=api_key),
                 profile=OpenAIModelProfile(openai_chat_supports_max_completion_tokens=False),
@@ -305,13 +329,13 @@ class LLMClient:
             # fallback that this migration dropped; this restores the wire shape.
             model_info = (provider_info.get("models", {}) or {}).get(model, {})
             if "max_completion_tokens" not in model_info:
-                return OpenAIChatModel(
+                return _OpenAIChatModel(
                     model,
                     provider=OpenAIProvider(base_url=base_url, api_key=api_key),
                     profile=OpenAIModelProfile(openai_chat_supports_max_completion_tokens=False),
                 )
-            return OpenAIChatModel(model, provider=OpenAIProvider(base_url=base_url, api_key=api_key))
-        return OpenAIChatModel(model, provider=OpenAIProvider(api_key=api_key))
+            return _OpenAIChatModel(model, provider=OpenAIProvider(base_url=base_url, api_key=api_key))
+        return _OpenAIChatModel(model, provider=OpenAIProvider(api_key=api_key))
 
     def _build_settings(
         self,

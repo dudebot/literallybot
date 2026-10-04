@@ -77,3 +77,9 @@ cache, token index, or background cleanup is needed for this bounded store.
 The `llm_usage` log records actual input, cached input, output, and available
 reasoning tokens per request. See the [config registry](config-system.md#model-cache-policy)
 for stored settings. Settings apply immediately; code changes require restart.
+
+OpenAI-compatible Chat Completions usage is read directly from the response
+by the LLM adapter. This avoids pricing-data extractor changes silently
+zeroing counters in pydantic-ai 2.5. Completion tokens remain the provider
+reported total; reasoning tokens are retained separately without adding them
+to that total again.

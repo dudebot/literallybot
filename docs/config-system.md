@@ -316,3 +316,12 @@ Verified vision seed: `ollama/qwen3.5:4b` supports image input per
 https://ollama.com/library/qwen3.5:4b . A bounded local inference with installed
 `qwen3.5:4b-gpu` and a synthetic image answered “Blue square” correctly through
 LLMClient on 2026-10-03. Other catalog entries remain opt-in until verified.
+
+### Atomic user-document updates
+
+`Config.update_user(user, mutate)` commits related values together immediately.
+The callback receives a deep copy, may modify it and return a result, and must not
+call Config methods. A callback or save failure leaves the previous in-memory
+state intact. Use this for balances and associated reservation receipts rather
+than multiple independent `set_user` calls; ordinary settings can keep using the
+existing deferred-save API.

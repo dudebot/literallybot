@@ -7,7 +7,6 @@ from types import SimpleNamespace as NS
 import httpx
 import openai
 import pytest
-from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
 from cogs.optional.gpt import AiSettingsView, Gpt
@@ -183,8 +182,8 @@ async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, mo
         sdk = openai.AsyncOpenAI(api_key='test-only', base_url='https://api.x.ai/v1', http_client=http)
         client = LLMClient(config)
         config.set_global('XAI_API_KEY', 'test-only')
-        monkeypatch.setattr(client, '_build_model', lambda *args: OpenAIChatModel(
-            'grok-4.6', provider=OpenAIProvider(openai_client=sdk)))
+        monkeypatch.setattr('core.llm.client.OpenAIProvider',
+                            lambda **kwargs: OpenAIProvider(openai_client=sdk))
         info = {'base_url': 'https://api.x.ai/v1', 'models': {'grok-4.6': {}}}
         pc = ProviderConfig('xai', 'grok-4.6', info, {})
         kwargs = {'tools': []} if entry == 'run_agent' else {}
