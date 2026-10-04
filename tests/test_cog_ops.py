@@ -36,15 +36,34 @@ async def test_role_conflict_preserves_stored_binding_and_reaches_frontend(confi
 
 
 @pytest.mark.asyncio
-async def test_danbooru_service_strips_explicit_rating_before_request(config, monkeypatch):
+async def test_danbooru_service_enforces_rating_on_query_and_response(config, monkeypatch):
+    import requests
+    from urllib.parse import parse_qs, urlsplit
+
     cog = Danbooru(NS(config=config, logger=logging.getLogger('test.search')))
-    request = Mock(return_value=NS(json=lambda: [{'id': 1, 'file_url': 'https://example.invalid/image.png'}]))
+    # Exercise the real service; only the HTTP boundary is replaced.
+    response = Mock()
+    response.json.return_value = [
+        {'id': 1, 'rating': 's', 'file_url': 'https://example.invalid/filtered.png'},
+        {'id': 2, 'file_url': 'https://example.invalid/unverified.png'},
+        {'id': 3, 'rating': 'g', 'file_url': 'https://example.invalid/image.png'},
+    ]
+    request = Mock(return_value=response)
     monkeypatch.setattr('cogs.optional.danbooru.requests.get', request)
-    result = await cog.search(['cat', 'rating:explicit', 'RATING:questionable'], NS(id=10, is_nsfw=lambda: False))
-    assert result['status'] == 'ok'
-    url = request.call_args.args[0]
-    assert 'rating%3Asafe' in url or 'rating:safe' in url
-    assert 'explicit' not in url and 'questionable' not in url
+    channel = NS(id=10, is_nsfw=lambda: False)
+    tag = 'cat&tags=landscape'
+    result = await cog.search([tag, 'rating:sensitive'], channel)
+    assert result['url'] == 'https://example.invalid/image.png'
+    prepared = requests.Request('GET', request.call_args.args[0],
+                                params=request.call_args.kwargs['params']).prepare()
+    assert parse_qs(urlsplit(prepared.url).query)['tags'] == [tag + ' rating:general']
+    assert cog.posted_danbooru == {3}
+
+    # API error objects and HTTP failures are errors, not post lists or no-results.
+    response.json.return_value = {'success': False, 'message': 'request rejected'}
+    assert (await cog.search(['cat'], channel))['status'] == 'error'
+    response.raise_for_status.side_effect = requests.HTTPError('unavailable')
+    assert (await cog.search(['cat'], channel))['status'] == 'error'
 
 
 def test_disabled_cogs_cannot_remove_the_recovery_surface(config, tmp_path, monkeypatch):

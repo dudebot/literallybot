@@ -3,7 +3,7 @@
 The rating policy lives in `search()` — the ONE service both the `!danbooru`
 command and the `search_danbooru` op call. In any channel that is not marked
 NSFW (and in DMs, which have no NSFW flag at all), user-supplied `rating:`
-tags are stripped and `rating:safe` is forced. Keeping the policy inside the
+tags are stripped and `rating:general` is forced. Keeping the policy inside the
 service is the point: a caller cannot obtain unrated results by forgetting to
 reimplement the check, because there is no path to the API that bypasses it.
 
@@ -33,11 +33,11 @@ def _channel_is_nsfw(channel) -> bool:
 
 
 def apply_rating_policy(tags: list, channel) -> list:
-    """Force rating:safe outside NSFW channels, stripping any user-supplied
+    """Force rating:general outside NSFW channels, stripping any user-supplied
     rating: tag so it can't be overridden with e.g. rating:explicit."""
     if _channel_is_nsfw(channel):
         return list(tags)
-    return [t for t in tags if not t.lower().startswith("rating:")] + ["rating:safe"]
+    return [t for t in tags if not t.lower().startswith("rating:")] + ["rating:general"]
 
 
 def _serialize_search(result: dict) -> dict:
@@ -82,20 +82,27 @@ class Danbooru(commands.Cog):
         config = self.bot.config
         api_key = config.get(None, "DANBOORU_API_KEY", scope="global") or os.getenv("DANBOORU_API_KEY")
         login = config.get(None, "DANBOORU_LOGIN", scope="global") or os.getenv("DANBOORU_LOGIN")
-        tag_string = "+".join(tags)
-        url = f"{self.danbooru_base}/posts.json?tags={tag_string}&limit=100"
-        if api_key and login:
-            url += f"&login={login}&api_key={api_key}"
+        url = f"{self.danbooru_base}/posts.json"
+        params = {"tags": " ".join(tags), "limit": 100}
+        auth = (login, api_key) if api_key and login else None
         try:
             # requests is blocking; run it off the event loop
             response = await asyncio.to_thread(requests.get, url,
+                                               params=params, auth=auth,
                                                headers=REQUEST_HEADERS, timeout=15)
+            response.raise_for_status()
             data = response.json()
+            if not isinstance(data, list) or any(not isinstance(post, dict) for post in data):
+                raise ValueError("Expected a list of posts")
         except Exception:
             self.logger.exception("Danbooru posts.json request failed")
             return {"status": "error", "message": "Error fetching from Danbooru API.",
                     "tags": tags}
         for post in data:
+            # Query syntax can express alternatives; enforce the channel policy
+            # on returned posts as well. Missing ratings are not verified safe.
+            if not _channel_is_nsfw(channel) and post.get("rating") != "g":
+                continue
             post_id = post.get("id")
             if post_id in self.posted_danbooru:
                 continue
@@ -110,11 +117,12 @@ class Danbooru(commands.Cog):
     async def _suggest(self, first_tag: str) -> list:
         """Alternative spellings for a tag that returned nothing, from the
         autocomplete endpoint (which answers in HTML, not JSON)."""
-        autocomplete_url = (f"{self.danbooru_base}/autocomplete?"
-                            f"search[query]={first_tag}&search[type]=tag_query")
+        autocomplete_url = f"{self.danbooru_base}/autocomplete"
         try:
             auto_resp = await asyncio.to_thread(requests.get, autocomplete_url,
+                                                params={"search[query]": first_tag, "search[type]": "tag_query"},
                                                 headers=REQUEST_HEADERS, timeout=15)
+            auto_resp.raise_for_status()
             soup = bs4.BeautifulSoup(auto_resp.text, "html.parser")
             li_tags = soup.find_all("li", class_="ui-menu-item")
             return [li.get("data-autocomplete-value") for li in li_tags][:5]
@@ -149,7 +157,7 @@ class Danbooru(commands.Cog):
         "search_danbooru",
         "Search Danbooru for an image matching space-separated tags and return "
         "its URL. Outside NSFW-marked channels the search is forced to "
-        "rating:safe. Returns the URL only — it does not post anything.",
+        "rating:general. Returns the URL only — it does not post anything.",
         PermissionLevel.EVERYONE,
         params=[
             OpParam("channel", ParamKind.CHANNEL,
