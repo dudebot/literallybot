@@ -1947,6 +1947,8 @@ def _reaction_matches(reaction: Any, emoji: str) -> bool:
                 "Max reactor user ids to return when emoji is given "
                 "(default 100, clamped to 100).",
                 required=False, default=100, minimum=1, maximum=100),
+        OpParam("after_user_id", ParamKind.SNOWFLAKE,
+                "Only reactors after this user ID; use the returned next_after_user_id.", required=False),
     ],
     serialize=lambda payload: payload,
     agent_guidance=(
@@ -1958,7 +1960,7 @@ def _reaction_matches(reaction: Any, emoji: str) -> bool:
     group="messaging",
 )
 async def list_reactions(ctx: OpContext, message, emoji: Optional[str] = None,
-                         limit: int = 100):
+                         limit: int = 100, after_user_id: Optional[int] = None):
     reactions = [
         {"emoji": str(r.emoji), "count": r.count, "me": bool(r.me)}
         for r in (message.reactions or [])
@@ -1969,9 +1971,11 @@ async def list_reactions(ctx: OpContext, message, emoji: Optional[str] = None,
                        if _reaction_matches(r, emoji)), None)
         users: List[int] = []
         if target is not None:
-            async for u in target.users(limit=limit):
+            async for u in target.users(limit=limit, after=discord.Object(id=after_user_id) if after_user_id is not None else None):
                 users.append(u.id)
         payload["users"] = users
+        payload["next_after_user_id"] = str(users[-1]) if len(users) == limit else None
+        payload["note"] = "Current reactors only; this does not measure historical activity."
     return payload
 
 
@@ -4107,6 +4111,28 @@ async def get_member(ctx: OpContext, member, guild=None):
     # The MEMBER resolver already fetched the member; bare pass-through to
     # the serializer, same as get_message.
     return member
+
+
+@registry.op(
+    "list_guild_members", "Page through current guild membership. Requires Members intent; not an activity history.",
+    PermissionLevel.ADMIN,
+    params=[OpParam("guild", ParamKind.GUILD, "Guild to enumerate."),
+            OpParam("limit", ParamKind.INTEGER, "Page size (maximum 1000).", required=False, default=100, minimum=1, maximum=1000),
+            OpParam("after_user_id", ParamKind.SNOWFLAKE, "Exclusive member cursor from prior page.", required=False)],
+    serialize=lambda payload: payload,
+    scope=OpScope.GUILD, group="guild-info",
+)
+async def list_guild_members(ctx: OpContext, guild, limit: int = 100, after_user_id: Optional[int] = None):
+    # REST pagination does not require an unbounded guild.chunk() or trust an
+    # incomplete cache. fetch_members is the installed discord.py primitive.
+    kwargs = {"limit": limit}
+    if after_user_id is not None:
+        kwargs["after"] = discord.Object(id=after_user_id)
+    rows = [{"id": str(member.id), "display_name": member.display_name,
+             "bot": bool(member.bot)} async for member in guild.fetch_members(**kwargs)]
+    return {"members": rows, "count": len(rows),
+            "next_after_user_id": rows[-1]["id"] if len(rows) == limit else None,
+            "note": "Current membership, not historical activity or complete presence."}
 
 
 @registry.op(

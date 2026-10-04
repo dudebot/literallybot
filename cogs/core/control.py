@@ -3,6 +3,8 @@ import discord
 from discord import app_commands
 from sys import version_info as sysv
 import sys
+import ast
+from pathlib import Path
 from core.utils import (InvokerOnlyView, is_superadmin, panel_slash_pin,
                         safe_delete, list_cog_modules)
 
@@ -258,7 +260,7 @@ class _CogSelect(discord.ui.Select):
         for name in panel.cog_names():
             state = panel.cog_state(name)
             options.append(discord.SelectOption(
-                label=name, value=name, description=state,
+                label=name, value=name, description=(panel.cog_description(name) or state)[:100],
                 default=(name == panel.selected)))
         if not options:
             options = [discord.SelectOption(label="(no cogs)", value="_none")]
@@ -293,6 +295,21 @@ class CogsView(InvokerOnlyView, discord.ui.View):
 
     def cog_names(self):
         return sorted(mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional'))
+
+    def cog_description(self, name):
+        # Read disabled modules without importing their optional dependencies.
+        path = Path(__file__).resolve().parents[1] / "optional" / f"{name}.py"
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef) and any(
+                    isinstance(base, ast.Attribute) and base.attr == "Cog"
+                    for base in node.bases
+                ):
+                    return (ast.get_docstring(node) or "").split("\n", 1)[0]
+        except (OSError, SyntaxError):
+            self.bot.logger.warning("Cannot read cog description for %s", name)
+        return ""
 
     def cog_state(self, name):
         """Configured state: what the NEXT boot will do with this cog."""
@@ -394,6 +411,9 @@ class CogsView(InvokerOnlyView, discord.ui.View):
                  + (" ⏳ *pending restart*" if self.is_pending(n) else "")
                  for n in self.cog_names()]
         e.add_field(name="Cogs", value="\n".join(lines)[:1024] or "*none*", inline=False)
+        if self.selected:
+            description = self.cog_description(self.selected)
+            e.add_field(name=self.selected, value=description[:1024] or self.selected, inline=False)
         if self.has_pending():
             e.add_field(
                 name="Pending",

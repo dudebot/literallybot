@@ -23,7 +23,7 @@ Loop safety: ALL bot-authored messages are ignored (message.author.bot),
 not just our own — two bots both running this cog once replied to each
 other's replies forever (the cope->seethe incident, 2026-08-07).
 
-Ops: `list_autoresponses`, `add_autoresponse` and `remove_autoresponse` are
+Ops: `list_autoresponses`, `add_autoresponse` and `edit_autoresponse` are
 cog-provided behavioral primitives (see docs/cog-development.md). They call
 the same services (`_list_entries` / `_add_entry` / `_remove_entry`) the
 panel does — the panel holds presentation only, so an agent and an admin
@@ -137,7 +137,7 @@ def _serialize_entry_list(result: dict) -> dict:
 
 
 def _serialize_entry_change(result: dict) -> dict:
-    """Wire payload for `add_autoresponse` / `remove_autoresponse`. `status`
+    """Wire payload for `add_autoresponse` / `edit_autoresponse`. `status`
     travels because the agent guidance branches on it, and `count` lets a
     caller see how close the guild is to the 25-entry cap."""
     entry = result.get("entry") or {}
@@ -369,27 +369,35 @@ class AutoResponse(commands.Cog):
                                match=match, auto_delete=bool(auto_delete))
 
     @op(
-        "remove_autoresponse",
-        "Remove one of this guild's auto-responses by its index, as reported "
-        "by list_autoresponses. Removing shifts every later index down by one.",
+        "edit_autoresponse", "Edit an entry in place, or delete it. Re-list after deletion.",
         PermissionLevel.ADMIN,
         params=[
-            OpParam("index", ParamKind.INTEGER,
-                    "Zero-based index from list_autoresponses.", minimum=0),
+            OpParam("index", ParamKind.INTEGER, "Index from list_autoresponses.", minimum=0),
+            OpParam("triggers", ParamKind.STRING_LIST, "Replacement triggers.", required=False),
+            OpParam("responses", ParamKind.STRING_LIST, "Replacement replies.", required=False),
+            OpParam("match", ParamKind.STRING, "full, contains, or regex.", required=False),
+            OpParam("auto_delete", ParamKind.BOOLEAN, "Delete triggering message.", required=False),
+            OpParam("delete", ParamKind.BOOLEAN, "Remove this entry.", required=False, default=False),
         ],
         serialize=_serialize_entry_change,
-        agent_guidance=(
-            "Call list_autoresponses first and remove by the index you just "
-            "read — indexes are positional, not stable ids."),
-        scope=OpScope.GUILD,
-        group="auto-response",
-        group_label="Auto-responses",
+        agent_guidance="List first. Omitted fields are preserved. Re-list after every deletion.",
+        scope=OpScope.GUILD, group="auto-response", group_label="Auto-responses",
     )
-    async def op_remove_autoresponse(self, ctx, index: int) -> dict:
-        guild = getattr(ctx, "guild", None)
-        if guild is None:
-            raise ValueError("remove_autoresponse must be called in a guild.")
-        return self._remove_entry(guild.id, int(index))
+    async def op_edit_autoresponse(self, ctx, index, triggers=None, responses=None,
+                                   match=None, auto_delete=None, delete=False):
+        if ctx.guild is None:
+            raise ValueError("edit_autoresponse must be called in a guild.")
+        if delete:
+            return self._remove_entry(ctx.guild.id, int(index))
+        entries = self._list_entries(ctx.guild.id)
+        if not 0 <= int(index) < len(entries):
+            raise ValueError(f"No entry at index {index}.")
+        old = entries[int(index)]
+        return self._add_entry(ctx.guild.id,
+            old['triggers'] if triggers is None else triggers,
+            old['responses'] if responses is None else responses,
+            old['match'] if match is None else match,
+            old['auto_delete'] if auto_delete is None else auto_delete, index=int(index))
 
 
 class _EntryModal(discord.ui.Modal):

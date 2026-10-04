@@ -207,6 +207,25 @@ class SetRole(commands.Cog):
                 "message_id": message_id, "role_id": role.id,
                 "channel_id": channel.id}
 
+    async def _remove_toggle(self, guild, message_id, emoji):
+        entries = self._entries(guild.id)
+        entry = next((e for e in entries if e["message_id"] == message_id
+                      and _emoji_matches(e["emoji"], _parse_emoji(emoji))), None)
+        if entry is None:
+            return {"status": "not_found", "reaction_removed": False}
+        self._save(guild.id, [e for e in entries if e is not entry])
+        result = {"status": "removed", "reaction_removed": False}
+        channel = guild.get_channel(entry["channel_id"]) if entry["channel_id"] else None
+        if channel:
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.remove_reaction(_parse_emoji(entry["emoji"]), self.bot.user)
+                result["reaction_removed"] = True
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                result["cleanup_error"] = type(exc).__name__
+                self.logger.warning("Removed role toggle but reaction cleanup failed: %s", exc)
+        return result
+
     # --- /role command group --------------------------------------------------
 
     role = app_commands.Group(
@@ -380,27 +399,11 @@ class SetRole(commands.Cog):
         if not guild:
             await interaction.followup.send("This command must be used in a guild.", ephemeral=True)
             return
-        partial_emoji = _parse_emoji(emoji)
-        entries = self._entries(guild.id)
-        entry = next((e for e in entries if e["message_id"] == message_id
-                      and _emoji_matches(e["emoji"], partial_emoji)), None)
-        if not entry:
-            await interaction.followup.send("No toggle found for that message + emoji.", ephemeral=True)
-            return
-        entries.remove(entry)
-        self._save(guild.id, entries)
-
-        # Best-effort: clear the emoji off the message so stale reactions don't linger.
-        cleanup = ""
-        channel = guild.get_channel(entry["channel_id"]) if entry["channel_id"] else None
-        if channel:
-            try:
-                target_message = await channel.fetch_message(message_id)
-                await target_message.clear_reaction(_parse_emoji(entry["emoji"]))
-                cleanup = " Reactions cleared from the message."
-            except Exception as e:
-                cleanup = f" (Could not clear reactions: {e})"
-        await interaction.followup.send(f"Toggle {entry['emoji']} removed.{cleanup}", ephemeral=True)
+        result = await self._remove_toggle(guild, message_id, emoji)
+        await interaction.followup.send(
+            "No toggle found." if result["status"] == "not_found" else
+            "Toggle removed." + (" Bot reaction removed." if result["reaction_removed"] else
+                                  " Bot reaction cleanup unavailable."), ephemeral=True)
 
     @role.command(name="sync", description="Reconcile configured toggles: re-add missing reactions, report broken entries")
     async def role_sync(self, interaction: discord.Interaction):
@@ -571,6 +574,43 @@ class SetRole(commands.Cog):
                 for entry, status in results
             ],
         }
+
+    @op("list_emoji_role_toggles", "List stored role toggles and observable health; does not repair.",
+        PermissionLevel.ADMIN, serialize=lambda result: result,
+        scope=OpScope.GUILD, group="role-automation", group_label="Role automation")
+    async def op_list_emoji_role_toggles(self, ctx):
+        if ctx.guild is None:
+            raise ValueError("Requires a guild.")
+        rows = []
+        for entry in self._entries(ctx.guild.id):
+            channel = ctx.guild.get_channel(entry["channel_id"]) if entry["channel_id"] else None
+            status = "unchecked"
+            if channel is None:
+                status = "channel missing or legacy entry"
+            elif ctx.guild.get_role(entry["role_id"]) is None:
+                status = "role missing"
+            else:
+                try:
+                    message = await channel.fetch_message(entry["message_id"])
+                    status = "ok" if any(r.me and _emoji_matches(entry["emoji"], _parse_emoji(str(r.emoji)))
+                                         for r in message.reactions) else "bot reaction missing"
+                except discord.NotFound:
+                    status = "message missing"
+                except (discord.Forbidden, discord.HTTPException):
+                    status = "message inaccessible"
+            rows.append({**{k: str(v) if k.endswith("_id") else v for k, v in entry.items()}, "status": status})
+        return {"entries": rows, "count": len(rows)}
+
+    @op("remove_emoji_role_toggle", "Remove a stored message/emoji binding and its bot reaction.",
+        PermissionLevel.ADMIN,
+        params=[OpParam("message_id", ParamKind.SNOWFLAKE, "Message ID from list."),
+                OpParam("emoji", ParamKind.STRING, "Emoji from list.")],
+        serialize=lambda result: result,
+        scope=OpScope.GUILD, group="role-automation", group_label="Role automation")
+    async def op_remove_emoji_role_toggle(self, ctx, message_id, emoji):
+        if ctx.guild is None:
+            raise ValueError("Requires a guild.")
+        return await self._remove_toggle(ctx.guild, int(message_id), emoji)
 
     @tasks.loop(count=1)
     async def startup_sync(self):

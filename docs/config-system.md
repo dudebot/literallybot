@@ -119,7 +119,7 @@ illustration; they are not real.)
 | `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
 | `emoji_role_toggles` | `list[{channel_id, message_id, emoji, role_id}]` | `/role add\|delete\|sync` (setrole.py) | emoji is canonical str form (unicode char or `<:name:id>`); channel_id None = legacy-migrated entry pending `/role sync`; legacy nested-dict shape auto-migrates on first read |
 | `error_logging` | as global, except `rate_limit_minutes` is global-only | `/logsettings` → Server (admin) | Independent destination/routes and `log_unknown_commands` toggle; cannot disable global reporting |
-| `auto_responses` | `list[{triggers: list[str], responses: list[str], match?: "full"\|"contains"\|"regex", full_match?: bool, auto_delete?: bool}]` | `!autoresponse` panel, `add_autoresponse` / `remove_autoresponse` ops | Per-guild canned replies. `match` (default `full`) = whole message equals a trigger; `contains` = substring hit anywhere (keyword automod); `regex` = trigger is a case-insensitive Python pattern (`\bword\b` for whole words), and an uncompilable one is rejected at write time. Legacy `full_match` bool is still read for entries written before `match` existed (true ⇒ full, false ⇒ contains). Regex triggers keep their case; all others are stored lowercased. `auto_delete` deletes the triggering message. Uniform-random response pick; capped at 25 entries (panel dropdown limit). Absent/empty ⇒ cog inert. First match wins — list order IS precedence, which is why `list_autoresponses` reports a positional index. Bot-authored messages are always ignored (two-bot loop guard) |
+| `auto_responses` | `list[{triggers: list[str], responses: list[str], match?: "full"\|"contains"\|"regex", full_match?: bool, auto_delete?: bool}]` | `!autoresponse` panel, `add_autoresponse` / `edit_autoresponse` ops | Per-guild canned replies. `match` (default `full`) = whole message equals a trigger; `contains` = substring hit anywhere (keyword automod); `regex` = trigger is a case-insensitive Python pattern (`\bword\b` for whole words), and an uncompilable one is rejected at write time. Legacy `full_match` bool is still read for entries written before `match` existed (true ⇒ full, false ⇒ contains). Regex triggers keep their case; all others are stored lowercased. `auto_delete` deletes the triggering message. Uniform-random response pick; capped at 25 entries (panel dropdown limit). Absent/empty ⇒ cog inert. First match wins — list order IS precedence, which is why `list_autoresponses` reports a positional index. Bot-authored messages are always ignored (two-bot loop guard) |
 
 ### User scope (`user_<id>.json`)
 
@@ -292,3 +292,27 @@ Reusing a window keeps its anchor ID and refreshes its last-send timestamp.
 Requests in one channel serialize. Stable system instructions precede history;
 changing user mappings and invoking IDs follow it. xAI requests use a stable
 `x-grok-conv-id`. Usage logs retain actual cached token counts per API request.
+
+### Guild tool effort
+
+`ai_tool_budget`: guild-scoped integer, default 8, read clamped to 1–16.
+Server config offers 4/8/12/16. The hard runaway cap is twice the selected budget.
+No op may change this setting.
+
+### Image input capability
+
+A model entry in `ai_providers.<provider>.models.<model>` may explicitly set
+`vision: true` after the operator verifies that exact provider/model supports
+image input. Missing/false stays text-only; model names are not guessed.
+Only the trigger contributes up to four unique Discord-hosted attachments or
+embed images. Other history and files remain text metadata. Provider usage
+accounting includes the resulting input tokens. Existing catalogs are not
+automatically migrated. Current xAI documentation demonstrates image input
+for grok-4.7, not the repository's older default model names:
+https://docs.x.ai/developers/model-capabilities/images/understanding .
+A live image-content answer is still required before declaring a model verified.
+
+Verified vision seed: `ollama/qwen3.5:4b` supports image input per
+https://ollama.com/library/qwen3.5:4b . A bounded local inference with installed
+`qwen3.5:4b-gpu` and a synthetic image answered “Blue square” correctly through
+LLMClient on 2026-10-03. Other catalog entries remain opt-in until verified.

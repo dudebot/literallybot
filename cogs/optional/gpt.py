@@ -28,6 +28,36 @@ from core.mcp_server import ENABLE_CONFIG_KEY, exposed_ops, resolve_mcp_tools
 from utils.ai_history import HistoryWindows, history_bounds, cache_policy
 
 PANEL_TIMEOUT = 180
+TOOL_BUDGET_VALUES = (4, 8, 12, 16)
+
+
+def trigger_images(message):
+    """Only the invoking message, four unique images, no history-wide fetch."""
+    from urllib.parse import urlparse
+    urls = []
+    for att in getattr(message, "attachments", []):
+        if getattr(att, "content_type", None) in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+            urls.append(att.url)
+    for embed in getattr(message, "embeds", []):
+        for field in (getattr(embed, "image", None), getattr(embed, "thumbnail", None)):
+            url = getattr(field, "proxy_url", None) or getattr(field, "url", None)
+            if url:
+                urls.append(url)
+    # Discord's hosted attachment/image proxies avoid sending arbitrary origins.
+    return list(dict.fromkeys(str(url) for url in urls
+        if urlparse(str(url)).scheme == "https" and urlparse(str(url)).hostname in
+        {"cdn.discordapp.com", "media.discordapp.net"}))[:4]
+
+
+
+def guild_tool_budget(config, ctx):
+    """A guild may tune effort, but cannot disable the runaway bound."""
+    try:
+        value = int(config.get(ctx, "ai_tool_budget", 8))
+    except (TypeError, ValueError, OverflowError):
+        value = 8
+    return max(1, min(TOOL_BUDGET_VALUES[-1], value))
+
 
 # Rate limiting is a nested-window ladder, not a flat per-message cooldown.
 # A model's declared cost per million OUTPUT tokens (`cost_per_mtok_output`)
@@ -558,6 +588,11 @@ class Gpt(commands.Cog):
         baseline_messages = messages[-minimum:]
         reference_cache = {msg.id: msg for msg in messages}
         prompt = self._build_system_prompt(ctx, tool_names)
+        images = trigger_images(ctx.message)
+        vision = model_info.get("vision") is True
+        prompt += ("\nAttached image inputs are available for this trigger only. Describe only what you can see."
+                   if vision and images else
+                   "\nNo image pixels are available in this request. Image URLs and filenames are metadata; do not infer their contents.")
 
         async def render(selected):
             history, mapping = await self._build_history(
@@ -574,7 +609,7 @@ class Gpt(commands.Cog):
                 # reference instead; agent mode already appends its command.
                 context += f"\n[TRIGGER MESSAGE] {ctx.message.content}"
             return [{"role": "system", "content": prompt}, *history,
-                    {"role": "user", "content": context}]
+                    {"role": "user", "content": context, **({"images": images} if vision and images else {})}]
 
         baseline = await render(baseline_messages)
         extended = None
@@ -646,6 +681,11 @@ class Gpt(commands.Cog):
                 self._history_windows.commit(history_key, anchor, api_messages, sent_at)
                 if response is None:  # Explicit stay_quiet outcome, not empty model output.
                     return
+                if response.rstrip().endswith("<|eos|>"):
+                    response = response.rstrip()[:-7].rstrip()
+                    if not response:
+                        self.logger.info("AI run produced only EOS residue")
+                        return
                 response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
 
                 if not response.strip():
@@ -682,7 +722,7 @@ class Gpt(commands.Cog):
 
         The actor for every tool call is the INVOKING USER's Member (ctx
         passes through as the OpContext), targets are confined to ctx.guild,
-        and the loop is capped at 8 tool calls. `tool_names` is the guild's
+        and the loop uses the guild-configured tool budget (default 8). `tool_names` is the guild's
         resolved bot-tool allowlist. The model's final text comes back to the
         caller and flows through the normal compliance/split/send path,
         exactly like a plain chat response. None means the model explicitly
@@ -690,7 +730,8 @@ class Gpt(commands.Cog):
         """
         from pydantic_ai import ToolOutput
         from pydantic_ai.exceptions import UsageLimitExceeded
-        from core.agent_loop import build_agent_tools, AGENT_TOOL_BUDGET
+        from core.agent_loop import build_agent_tools
+        tool_budget = guild_tool_budget(self.bot.config, ctx)
 
         # Soft tool budget (countdown + refusals) lives inside the tools
         # themselves — see core/agent_loop.py. The pydantic-ai limit below is
@@ -716,7 +757,7 @@ class Gpt(commands.Cog):
 
         tools = build_agent_tools(
             ctx, self.logger, tool_names,
-            gate_check=_live_gate_check,
+            gate_check=_live_gate_check, tool_budget=tool_budget,
         )
         # Local to this invocation: no registry entry, MCP exposure, or state
         # shared with other runs. An output function terminates the Agent;
@@ -754,7 +795,7 @@ class Gpt(commands.Cog):
                 # scrape attributed the invoking message oddly (e.g. a
                 # bot-authored mention landing in history as an assistant turn).
                 user_prompt=command_turn,
-                max_tool_calls=AGENT_TOOL_BUDGET * 2,
+                max_tool_calls=tool_budget * 2,
             )
             self._log_agentic_usage(response)
 
@@ -778,7 +819,7 @@ class Gpt(commands.Cog):
                     output_type=output_type,
                     metadata=metadata,
                     user_prompt=NUDGE_PROMPT,
-                    max_tool_calls=AGENT_TOOL_BUDGET * 2,
+                    max_tool_calls=tool_budget * 2,
                 )
                 self._log_agentic_usage(retry)
                 if is_nudge_false_alarm(retry.text):
@@ -2078,6 +2119,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             self.add_item(self._row(_ModelSelect(self)))
             self.add_item(self._row(self._history_select("min")))
             self.add_item(self._row(self._history_select("max")))
+            self.add_item(self._row(self._tool_budget_select()))
             # The server tab's universe is the WHITELISTED guild-scoped set:
             # two membership selects (Admin only / Everyone; Off = unselected)
             # writing this guild's agent_ops_gate. Non-whitelisted ops are
@@ -2277,6 +2319,24 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
 
         btn.callback = cb
         return btn
+
+    def _tool_budget_select(self):
+        current = guild_tool_budget(self.bot.config, self._cfg_ctx())
+        select = discord.ui.Select(
+            placeholder=f"Tool calls per run: {current}",
+            options=[discord.SelectOption(label=str(n), value=str(n), default=n == current)
+                     for n in TOOL_BUDGET_VALUES])
+
+        async def cb(interaction):
+            if interaction.user.id != self.invoker_id or not is_admin(interaction):
+                self.bot.logger.warning("AI tool budget denied actor=%s", interaction.user.id)
+                await interaction.response.send_message("Requires the panel's admin.", ephemeral=True)
+                return
+            self.bot.config.set(self._cfg_ctx(), "ai_tool_budget", int(select.values[0]))
+            await self.rerender(interaction)
+
+        select.callback = cb
+        return select
 
     def _history_select(self, bound):
         minimum, maximum = history_bounds(self.bot.config, self._cfg_ctx())

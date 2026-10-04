@@ -50,6 +50,7 @@ from pydantic_ai.messages import (
     SystemPromptPart,
     TextPart,
     UserPromptPart,
+    ImageUrl,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
@@ -117,7 +118,7 @@ DEFAULT_PROVIDERS: Dict[str, Any] = {
         "default_model": "qwen3.5:4b",
         "models": {
             # Local/free -> cheap tier (10s cooldown).
-            "qwen3.5:4b": {"reasoning_effort": "none",
+            "qwen3.5:4b": {"reasoning_effort": "none", "vision": True,
                            "cost_per_mtok_output": 0.0},
         },
     },
@@ -380,6 +381,8 @@ class LLMClient:
 
         pai_model = self._build_model(provider, model, provider_info, api_key)
         settings = self._build_settings(provider_info, model, metadata)
+        if any(message.get("images") for message in messages):
+            settings["openai_store"] = False
 
         response = await model_request(
             pai_model,
@@ -433,6 +436,8 @@ class LLMClient:
 
         pai_model = self._build_model(provider, model, provider_info, api_key)
         settings = self._build_settings(provider_info, model, metadata)
+        if any(message.get("images") for message in messages):
+            settings["openai_store"] = False
 
         agent = Agent(model=pai_model, tools=tools, model_settings=settings,
                       output_type=output_type)
@@ -575,7 +580,8 @@ def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
         elif role == "system":
             request_parts.append(SystemPromptPart(content=content))
         else:
-            request_parts.append(UserPromptPart(content=content))
+            request_parts.append(UserPromptPart(content=([content, *[ImageUrl(url) for url in msg["images"]]]
+                                                       if msg.get("images") else content)))
 
     if request_parts:
         pai_messages.append(PaiModelRequest(parts=request_parts))

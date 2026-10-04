@@ -357,3 +357,14 @@ async def test_public_send_cannot_ping_or_read_host_attachments(config, tmp_path
     denied = await registry.call('send_message', ctx, channel=channel, file_paths=[str(attachment)])
     assert not denied.ok and 'admin' in denied.error.lower()
     channel.send.assert_awaited_once()
+
+
+def test_history_cursors_preserve_chronology_without_new_api():
+    guild = _FakeGuild(1, [])
+    channel = _HistoryChannel(20, _Perms(True, True), guild=guild)
+    channel._messages = [_FakeMessage(n, channel, str(n)) for n in [15, 12, 10]]
+    guild._channels = {20: channel}
+    result = asyncio.run(registry.call('read_history', _search_ctx(guild), channel=channel,
+                                      before_message_id=20, after_message_id=9))
+    assert result.ok and [m['id'] for m in result.value['messages']] == [10, 12, 15]
+    assert tuple(c.id for c in channel.seen_cursors) == (20, 9)

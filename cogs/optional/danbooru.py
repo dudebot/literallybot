@@ -89,7 +89,7 @@ class Danbooru(commands.Cog):
         try:
             # requests is blocking; run it off the event loop
             response = await asyncio.to_thread(requests.get, url,
-                                               headers=REQUEST_HEADERS)
+                                               headers=REQUEST_HEADERS, timeout=15)
             data = response.json()
         except Exception:
             self.logger.exception("Danbooru posts.json request failed")
@@ -114,7 +114,7 @@ class Danbooru(commands.Cog):
                             f"search[query]={first_tag}&search[type]=tag_query")
         try:
             auto_resp = await asyncio.to_thread(requests.get, autocomplete_url,
-                                                headers=REQUEST_HEADERS)
+                                                headers=REQUEST_HEADERS, timeout=15)
             soup = bs4.BeautifulSoup(auto_resp.text, "html.parser")
             li_tags = soup.find_all("li", class_="ui-menu-item")
             return [li.get("data-autocomplete-value") for li in li_tags][:5]
