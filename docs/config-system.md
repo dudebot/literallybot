@@ -324,4 +324,5 @@ The callback receives a deep copy, may modify it and return a result, and must n
 call Config methods. A callback or save failure leaves the previous in-memory
 state intact. Use this for balances and associated reservation receipts rather
 than multiple independent `set_user` calls; ordinary settings can keep using the
-existing deferred-save API.
+existing deferred-save API. This uses the existing temporary-file rename; it
+is not an fsync-backed power-loss durability guarantee.

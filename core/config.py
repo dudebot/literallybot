@@ -196,9 +196,12 @@ class Config:
             if config_id in self._configs and key in self._configs[config_id]:
                 del self._configs[config_id][key]
                 self._dirty_configs.add(config_id)
-                self._schedule_save()
-                return True
-        return False
+                removed = True
+            else:
+                removed = False
+        if removed:
+            self._schedule_save()
+        return removed
 
     def has(self, ctx, key, scope='guild'):
         """Check if a config key exists in guild, user, or global scope"""
@@ -215,7 +218,7 @@ class Config:
         self.set(ctx, key, value, scope='user')
 
     def update_user(self, ctx, mutate):
-        """Durably update a user's document as one atomic read/modify/write.
+        """Commit a user's document immediately as one atomic read/modify/write.
 
         mutate receives a deep copy and returns an arbitrary result. It must
         not call Config methods. Exceptions discard the copy. Used when a
