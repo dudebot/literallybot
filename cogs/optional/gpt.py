@@ -46,7 +46,7 @@ def trigger_images(message):
     # Discord's hosted attachment/image proxies avoid sending arbitrary origins.
     return list(dict.fromkeys(str(url) for url in urls
         if urlparse(str(url)).scheme == "https" and urlparse(str(url)).hostname in
-        {"cdn.discordapp.com", "media.discordapp.net"}))[:4]
+        {"cdn.discordapp.com", "media.discordapp.net", "images-ext-1.discordapp.net", "images-ext-2.discordapp.net"}))[:4]
 
 
 
