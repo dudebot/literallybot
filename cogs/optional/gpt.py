@@ -2290,7 +2290,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         return (
             f"## AI settings — {TAB_MCP}\n"
             "What this bot provides to external agent harnesses when it runs "
-            "as an MCP server (loopback-only, bearer-token auth). The "
+            "as an MCP server (bearer-token auth; loopback unless MCP_OPS_HOST is set). The "
             "selects below pick which ops are served.\n"
             f"**MCP server:** {'ON' if mcp_on else 'OFF'} — changes take "
             "effect on the next bot restart."
@@ -2640,7 +2640,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
 
         The merge exists to protect names a per-group select could not speak
         for (their cog is unloaded), but an operator locking the MCP surface
-        down before exposing the loopback port is speaking for everything —
+        down before exposing the MCP port is speaking for everything —
         carrying an unrenderable name through would leave it silently armed
         to return on the next restart, with nothing in the UI to reveal it."""
         if not is_superadmin(interaction):
