@@ -309,13 +309,14 @@ class AutoResponse(commands.Cog):
     @op(
         "list_autoresponses",
         "List this guild's configured auto-responses in config order. The "
-        "index of each entry is what remove_autoresponse takes, and the order "
+        "index of each entry is what edit_autoresponse takes, and the order "
         "is the precedence: the FIRST matching entry wins.",
         PermissionLevel.ADMIN,
         serialize=_serialize_entry_list,
         agent_guidance=(
-            "Indexes shift when an entry is removed — list again before a "
-            "second removal rather than reusing a stale index."),
+            "Indexes shift when an entry is deleted — list again before a "
+            "second edit_autoresponse rather than reusing a stale index. "
+            "Delete by passing delete=true; there is no remove_autoresponse."),
         scope=OpScope.GUILD,
         group="auto-response",
         group_label="Auto-responses",

@@ -84,7 +84,7 @@ Security properties enforced centrally, so no frontend can skip them:
 - **Mentions suppressed.** Both frontends force `allowed_mentions=none` on
   `send_message`, so tool-driven sends never ping.
 - **Tool budget.** The agentic `!gpt` loop has a SOFT budget of 8 tool calls by default per
-  run (`core/agent_loop.AGENT_TOOL_BUDGET`), shared across the run and any
+  run (`ai_tool_budget`, clamped to 1–16; default `core/agent_loop.AGENT_TOOL_BUDGET`), shared across the run and any
   narration-nudge retry: the last 3 results carry a `tool_calls_remaining`
   countdown, and calls past the budget are refused with an answer-now error so
   the model finishes with a final reply or intentional silence. pydantic-ai's
@@ -214,7 +214,8 @@ get the same permission error they would have gotten anyway.
 That is why **`mcp_tools_enabled` fails open to the full registry** rather than
 closed to nothing. It is a deliberate owner decision, not an oversight: the MCP
 surface's actual security boundary is the set of gates that are *not*
-configurable — loopback-only bind, mandatory bearer token, and the per-call
+configurable — default loopback bind (explicit `MCP_OPS_HOST` opt-in), the
+Host/Origin allowlist for that bind, mandatory bearer token, and the per-call
 permission checks. A config list that an operator must populate before the
 server is useful would add friction without adding a boundary. The guild-side
 default is the opposite (empty ⇒ no tools) because there the exposure decision
@@ -249,23 +250,40 @@ callers that bypass `call_ids` and resolved nothing through the registry.
 
 `core/mcp_server.py` exposes a subset of the ops registry over HTTP, in-process
 with the bot (the standalone runner was deleted in 2026-08 — it opened a second
-Discord session on the same account and could not see cog-registered ops). All
-gates are fail-closed and independently required:
+Discord session on the same account and could not see cog-registered ops). The
+server stays off unless enabled. Every request still has to pass bearer auth
+and the Host/Origin allowlist for the bind.
 
 - **Off by default.** Refuses to start unless the `mcp_ops_enabled` global
   config boolean is true (toggled from `!aisettings` → MCP tab; moved out of
   `.env` 2026-08 so it's operable without shell access; binds on restart).
-- **Loopback-only bind.** Hard-coded `127.0.0.1`; there is no host parameter. A
-  legacy `MCP_OPS_HOST` set to any non-loopback value refuses startup rather than
-  rebinding.
+- **Bind.** Default `127.0.0.1`. `MCP_OPS_HOST`, when set, is an explicit
+  opt-in: an IP address, `localhost`, or a wildcard (`0.0.0.0` or `::`).
+  Unset or empty stays on loopback. Anything else refuses startup. A
+  concrete LAN address needs no further setting. Bearer auth stays
+  mandatory either way.
+- **DNS-rebinding protection stays on.** FastMCP turns the Host/Origin
+  check off for a non-loopback `host` unless `transport_security` is passed.
+  This server always passes one. A concrete bind allowlists that address
+  plus loopback (`127.0.0.1`, `localhost`, `[::1]`), any port. A wildcard
+  refuses to start unless `MCP_OPS_TRUSTED_HOSTS` lists the IPs or
+  hostnames clients actually send in `Host` (comma-separated). `0.0.0.0`
+  is not a Host value. No deployment address is built in. A missing
+  `Origin` is accepted (native clients omit it). A present `Origin` must
+  be `http://` plus an allowlisted host. A bad `Host` is 421 and a bad
+  `Origin` is 403, bearer or not. The allowlist is not a firewall and not
+  TLS; a wildcard still listens on every interface the OS accepts.
 - **Bearer token required.** Every request must carry
   `Authorization: Bearer <token>`; the token is compared with
-  `hmac.compare_digest` (constant-time). The token resolves config-first
+  `hmac.compare_digest` (constant-time) before the request reaches FastMCP.
+  The token resolves config-first
   (`mcp_ops_token` global key) with an `MCP_OPS_TOKEN` env fallback; when an
   operator enables the server with neither set, one is generated
   (`secrets.token_urlsafe(32)`) and written to global config. Generating is
   still fail-closed — the server is never reachable without a secret — and the
-  token value is never logged, only its storage location.
+  token value is never logged, only its storage location. The bearer is one
+  shared secret, not a per-user credential. Anyone who can reach the port
+  and present it is a full operator of the exposed tools.
 - **Mentions suppressed** on `send_message`, same as the agent loop.
 - **Full guild reach by design** (owner decision 2026-08; the former
   `MCP_OPS_GUILD_ALLOWLIST` gate was removed). MCP tools act as raw
@@ -285,13 +303,25 @@ gates are fail-closed and independently required:
 ### Accepted risk: caller-supplied `actor_id`
 
 The MCP frontend takes `actor_id` as a plain tool parameter — it is **not**
-credential-bound. A client that already holds the bearer token can present any
-user id (including a superadmin's) for permission purposes. This is acceptable
-**only** for localhost self-use, which the loopback bind + token enforce. Do not
-expose this server beyond loopback without adding real actor authentication.
-When `actor_id` doesn't match a real guild Member, a bare id-holder is used, which
-the permission helpers treat as an ordinary non-admin unless the id is in a config
-admin/superadmin list.
+credential-bound and it is **not** derived from the HTTP client. A client that
+already holds the bearer token can present any user id (including a
+superadmin's) for permission purposes. The ops gate then evaluates that id.
+When the id matches a guild Member in the bot's cache, that Member is the
+actor; otherwise a bare id-holder is used, which the permission helpers treat
+as an ordinary non-admin unless the id is in a config admin or superadmin list.
+
+The streamable-HTTP session id is a per-connection capability minted by the
+MCP library. An unknown session id is rejected. This server does not use MCP
+OAuth, so the library does not bind the session to a distinct user: any
+request that already passed the shared bearer can use a live session. Two
+different bearers are not two actors; there is one shared secret. Holding it
+is owner-equivalent for whatever `actor_id` the caller supplies and for
+whatever tools `mcp_tools_enabled` exposed at startup.
+
+That is acceptable when the operator treats the bearer as a host credential.
+It is the same risk on loopback and on an explicit LAN or wildcard bind.
+`serve()` logs it when the bind is not loopback. The Host/Origin allowlist
+does not change it. Do not publish the port or front it with a public proxy.
 
 ## API Keys and Secrets
 
@@ -387,8 +417,9 @@ admin/superadmin list.
 
 ## Known Accepted Risks (documented, not defects)
 
-1. **MCP `actor_id` is caller-supplied** — acceptable for localhost self-use only
-   (see above).
+1. **MCP `actor_id` is caller-supplied** — any bearer holder can act as any
+   actor. The HTTP boundary is the shared bearer plus the Host/Origin
+   allowlist, not the actor id (see above).
 2. **Superadmin tier is owner-level RCE-adjacent** — the global config editor,
    the `disabled_cogs` editor, restart, and bulk delete are intentionally
    available to superadmins. (Arbitrary cog load/reload and `git pull` were
@@ -410,9 +441,10 @@ admin/superadmin list.
   every config file lands 0600; the atomic-save temp file is created 0600 and
   `fchmod`'d before content is written (#83). Best-effort on non-POSIX
   filesystems.
-- [ ] **Keep the MCP server loopback-only.** Never front it with a reverse proxy or
-  bind it publicly without first replacing caller-supplied `actor_id` with real
-  actor authentication.
+- [ ] **Default the MCP server to loopback.** `MCP_OPS_HOST` is an explicit
+  address or wildcard opt-in. DNS-rebinding Host/Origin checks stay on for
+  that bind. Bearer auth stays mandatory, and any bearer holder can still
+  supply `actor_id`. Do not publish the port or front it with a public proxy.
 - [ ] **Audit `addmedia` targets** — it fetches arbitrary user-supplied URLs
   server-side (admin-gated); an admin could point it at internal/loopback or cloud
   metadata endpoints (SSRF). Consider an allowlist / private-IP block if the admin

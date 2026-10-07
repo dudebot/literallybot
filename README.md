@@ -50,7 +50,7 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 - **🧭 One Ops Layer, Many Frontends** — ~125 permission-checked Discord primitives declared once, driving the in-chat AI agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
 - **🤖 AI Chat + Agent** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with personality, plus an optional agentic mode that performs real Discord actions under a two-tier permission model
 - **🧩 Modular Cogs** — self-contained features; disable any globally without deleting it (binds at restart); cogs can register their own ops
-- **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over loopback HTTP with bearer auth
+- **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over authenticated HTTP (loopback by default)
 - **⚙️ Smart Config** — per-server, per-user, and global JSON settings with write buffering, atomic saves, and live reload on external edits
 - **🎲 Utilities & Fun** — dice, random picks, reminders with snooze buttons, auto-responses, per-guild media libraries, reaction roles
 - **🛠️ Developer Friendly** — comprehensive logging, error routing to Discord channels, one-command restart
@@ -318,7 +318,7 @@ see cog-registered ops.)
 
 **Security model (all gates fail closed):**
 - **Off by default** — refuses to start unless `mcp_ops_enabled` is true.
-- **Auth + loopback** — binds `127.0.0.1` only, and every request needs
+- **Auth + explicit bind** — defaults to `127.0.0.1`; `MCP_OPS_HOST` may select a LAN IP. Wildcard binds require `MCP_OPS_TRUSTED_HOSTS`. Host/Origin checks stay on, and every request needs
   `Authorization: Bearer <token>` (constant-time compared; missing/wrong → 401).
   The token comes from `mcp_ops_token` config or `MCP_OPS_TOKEN` env; if neither
   is set when you enable the server, one is generated into `configs/global.json`

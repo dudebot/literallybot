@@ -1,4 +1,5 @@
 """Shared bot wiring and stored configuration compatibility."""
+import asyncio
 import logging
 from types import SimpleNamespace as NS
 import discord
@@ -40,6 +41,11 @@ def test_legacy_reaction_roles_migrate_losslessly(config):
     assert discord.PartialEmoji.from_str(by_role[30]['emoji']).id == 100000000000000200
     assert cog._entries(10) == entries
     assert config.get(10, TOGGLES_KEY) == entries
+    listed = asyncio.run(cog.op_list_emoji_role_toggles(NS(guild=NS(
+        id=10, get_channel=lambda _channel_id: None, get_role=lambda _role_id: None))))
+    assert listed['entries']
+    assert all(row['channel_id'] is None for row in listed['entries'])
+    assert {row['message_id'] for row in listed['entries']} == {'100'}
 
 
 def test_reaction_identity_survives_custom_emoji_rename():

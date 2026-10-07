@@ -28,9 +28,11 @@ take effect on the next bot restart — deliberately, not incidentally.
 Guardrails (per the Codex review of the original spike, issue #58):
 - Shared-token bearer auth is mandatory — serve() refuses to run without a
   token, and BearerTokenMiddleware refuses to construct without one.
-- Binds to loopback ONLY. serve() hard-codes 127.0.0.1; there is no host
-  parameter on purpose, and a non-loopback legacy MCP_OPS_HOST is a refusal
-  to start, not a silent rebind.
+- Default bind is 127.0.0.1. MCP_OPS_HOST may set an IP, localhost, or a
+  wildcard (0.0.0.0 / ::). A concrete address allowlists that address plus
+  loopback. A wildcard refuses to start unless MCP_OPS_TRUSTED_HOSTS lists
+  the client-facing hosts. DNS-rebinding checks stay on either way.
+  Native clients omit Origin; that is accepted.
 - Guild reach is UNRESTRICTED by design (owner decision 2026-08): tools
   act as raw primitives across every guild the bot account is in; access
   control belongs upstream in the caller. The only guild confinement in
@@ -45,21 +47,26 @@ Guardrails (per the Codex review of the original spike, issue #58):
   declared on the op itself.
 - ACCEPTED RISK: `actor_id` is caller-supplied and not credential-bound, so a
   client that already holds the bearer token can act as any user id for
-  permission purposes. Acceptable for localhost self-use only; do not expose
-  this server beyond loopback without adding real actor authentication.
+  permission purposes. The bearer is the HTTP credential; the session id is
+  not a second user identity. Acceptable when the bearer is treated as
+  owner-equivalent. An explicit non-loopback bind does not add actor
+  authentication. Do not publish the port.
 """
 from __future__ import annotations
 
 import asyncio
 import hmac
 import inspect
+import ipaddress
 import logging
 import os
 import secrets
 from typing import Annotated, Any, List, Optional
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -82,10 +89,12 @@ PORT_CONFIG_KEY = "mcp_ops_port"        # global config int; env is fallback
 
 TOKEN_ENV_VAR = "MCP_OPS_TOKEN"
 PORT_ENV_VAR = "MCP_OPS_PORT"
-HOST_ENV_VAR = "MCP_OPS_HOST"  # legacy; only loopback values are accepted
+HOST_ENV_VAR = "MCP_OPS_HOST"  # explicit bind; unset or empty stays loopback
+TRUSTED_HOSTS_ENV_VAR = "MCP_OPS_TRUSTED_HOSTS"
 
 DEFAULT_PORT = 8765
-_LOOPBACK_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
+DEFAULT_HOST = "127.0.0.1"
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 
 # Fallback FastMCP server name when there's no live bot user to name it after
 # (schema-only builds). The live name is derived from the bot account at build
@@ -115,8 +124,9 @@ def exposed_ops() -> List[str]:
     Caveat: THIS frontend pre-resolves the context guild/channel (tool_fn
     must build the actor Member from the target guild before the gate can
     run), so guild/channel id EXISTENCE is observable to any token-holder —
-    accepted under the loopback + bearer-token trust model, same as
-    caller-supplied actor_id.
+    accepted under the bearer-token trust model, same as caller-supplied
+    actor_id. The default bind is loopback; an explicit MCP_OPS_HOST does
+    not add actor authentication.
 
     Gate what a deployment actually serves via the `mcp_tools_enabled`
     allowlist, not by editing this."""
@@ -274,7 +284,8 @@ def _server_name(bot: Any) -> str:
     return f"{slug}-ops" if slug else DEFAULT_SERVER_NAME
 
 
-def build_server(bot: Any = None, *, name: Optional[str] = None) -> FastMCP:
+def build_server(bot: Any = None, *, name: Optional[str] = None,
+                 host: str = DEFAULT_HOST) -> FastMCP:
     """Construct a FastMCP server whose tools are generated from the ops
     registry. Tools act as raw primitives across every guild the bot account
     is in — host-side MCP callers have full control.
@@ -283,6 +294,10 @@ def build_server(bot: Any = None, *, name: Optional[str] = None) -> FastMCP:
     attached, as bot.py does) so the tools can resolve channel/message ids
     and permission checks read the real config. If `bot` is None (schema-only
     smoke test), the tools raise BotUnavailableError when invoked.
+
+    `host` is the bind serve() uses. DNS-rebinding protection stays on for
+    that bind (see transport_security_for). FastMCP would otherwise disable
+    the check for any non-loopback host.
 
     The universe is queried LIVE here, but only HERE: see the module
     docstring on why the built surface is restart-bound afterwards.
@@ -294,14 +309,20 @@ def build_server(bot: Any = None, *, name: Optional[str] = None) -> FastMCP:
         getattr(bot, "config", None) if bot is not None else None)
 
     server_name = name or _server_name(bot)
-    mcp = FastMCP(name=server_name, instructions=(
-        f"Ops-registry bridge for the Discord bot '{server_name}'. Exposes a "
-        "subset of the bot's ops registry as MCP tools: "
-        + ", ".join(op_names) + ". "
-        "Every call is permission-checked the same way an in-bot command "
-        "would be, via the shared ops registry. Tools are raw primitives: "
-        "every guild the bot is in is reachable."
-    ))
+    bind = resolve_host(host)
+    mcp = FastMCP(
+        name=server_name,
+        host=bind,
+        transport_security=transport_security_for(bind),
+        instructions=(
+            f"Ops-registry bridge for the Discord bot '{server_name}'. Exposes a "
+            "subset of the bot's ops registry as MCP tools: "
+            + ", ".join(op_names) + ". "
+            "Every call is permission-checked the same way an in-bot command "
+            "would be, via the shared ops registry. Tools are raw primitives: "
+            "every guild the bot is in is reachable."
+        ),
+    )
 
     for op_name in op_names:
         op = registry.require(op_name)  # raises on registry drift
@@ -420,29 +441,126 @@ def load_port(config: Any) -> int:
     return port
 
 
-def _check_host_env() -> None:
-    """This server binds to 127.0.0.1 ONLY. If the legacy MCP_OPS_HOST var
-    is set to anything non-loopback, refuse to start rather than let an
-    operator believe they rebound it."""
-    host = os.environ.get(HOST_ENV_VAR, "").strip()
-    if host not in _LOOPBACK_HOSTS:
+def resolve_host(raw: Optional[str] = None) -> str:
+    """Bind address. Unset or empty stays on 127.0.0.1.
+
+    MCP_OPS_HOST may be an IP, localhost, or a wildcard (0.0.0.0 / ::).
+    """
+    if raw is None:
+        raw = os.environ.get(HOST_ENV_VAR, "")
+    text = (raw or "").strip()
+    if not text:
+        return DEFAULT_HOST
+    if text.lower() == "localhost":
+        return "localhost"
+    bare = text[1:-1] if text.startswith("[") and text.endswith("]") else text
+    try:
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
         raise RuntimeError(
-            f"{HOST_ENV_VAR}={host!r} is not loopback. This server binds to "
-            f"127.0.0.1 ONLY; unset {HOST_ENV_VAR}."
-        )
+            f"{HOST_ENV_VAR}={raw!r} is not an IP address, localhost, "
+            f"0.0.0.0, or ::. Unset {HOST_ENV_VAR} to keep {DEFAULT_HOST}."
+        ) from None
+    if ip.is_multicast:
+        raise RuntimeError(f"{HOST_ENV_VAR}={raw!r} is a multicast address.")
+    return str(ip)
 
 
-def _load_settings(config: Any) -> "tuple[str, int]":
-    """Resolve and validate token/port. Raises RuntimeError on any invalid
-    gate (fail closed)."""
-    _check_host_env()
-    return load_token(config), load_port(config)
+def host_is_loopback(host: str) -> bool:
+    if (host or "").strip().lower() == "localhost":
+        return True
+    try:
+        return bool(ipaddress.ip_address(host).is_loopback)
+    except ValueError:
+        return False
+
+
+def _is_wildcard(host: str) -> bool:
+    try:
+        return bool(ipaddress.ip_address(host).is_unspecified)
+    except ValueError:
+        return False
+
+
+def _client_host(value: str) -> str:
+    """Host-header form of one IP or hostname. urlsplit rejects junk."""
+    text = value.strip()
+    bare = text[1:-1] if text.startswith("[") and text.endswith("]") else text
+    try:
+        ip = ipaddress.ip_address(bare)
+    except ValueError:
+        parsed = urlsplit(text if "://" in text else f"//{text}")
+        if (
+            not parsed.hostname
+            or parsed.username
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or "*" in parsed.hostname
+            or (parsed.scheme and parsed.scheme not in {"http", "https"})
+        ):
+            raise RuntimeError(
+                f"{TRUSTED_HOSTS_ENV_VAR} entry {value!r} is not a host. "
+                "Use a comma-separated list of IPs or hostnames."
+            ) from None
+        return parsed.hostname
+    if isinstance(ip, ipaddress.IPv6Address):
+        return f"[{ip}]"
+    return str(ip)
+
+
+def _trusted_hosts() -> List[str]:
+    raw = os.environ.get(TRUSTED_HOSTS_ENV_VAR, "")
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
+def transport_security_for(bind: str) -> TransportSecuritySettings:
+    """Host/Origin allowlist for `bind`. Protection stays enabled.
+
+    A concrete address allows that address and loopback, on any port.
+    A wildcard allows loopback plus MCP_OPS_TRUSTED_HOSTS, and refuses
+    to build when that list is empty: clients send the address they
+    connected to, not 0.0.0.0. A missing Origin is accepted by the SDK.
+    """
+    names = list(_LOOPBACK_HOSTS)
+    if _is_wildcard(bind):
+        trusted = _trusted_hosts()
+        if not trusted:
+            raise RuntimeError(
+                f"{HOST_ENV_VAR}={bind} needs {TRUSTED_HOSTS_ENV_VAR} set to "
+                "the IP addresses or hostnames clients send in Host "
+                "(comma-separated). The wildcard is not itself a Host value."
+            )
+        for item in trusted:
+            token = _client_host(item)
+            if token not in names:
+                names.append(token)
+    else:
+        token = _client_host(bind)
+        if token not in names:
+            names.append(token)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[f"{name}:*" for name in names],
+        allowed_origins=[f"http://{name}:*" for name in names],
+    )
+
+
+def _load_settings(config: Any) -> "tuple[str, int, str]":
+    """Resolve token, port, and bind. Invalid host or a wildcard without
+    MCP_OPS_TRUSTED_HOSTS raises before a missing token is generated."""
+    host = resolve_host()
+    transport_security_for(host)
+    return load_token(config), load_port(config), host
 
 
 async def serve(bot: Any, *, port: int, token: str,
-                name: Optional[str] = None) -> None:
-    """Serve the ops MCP server over authenticated streamable HTTP, bound to
-    127.0.0.1 ONLY (no host parameter on purpose — do not add one).
+                host: Optional[str] = None, name: Optional[str] = None) -> None:
+    """Serve the ops MCP server over authenticated streamable HTTP.
+
+    Default bind is 127.0.0.1. An explicit MCP_OPS_HOST may be a LAN address
+    or a wildcard; a wildcard also requires MCP_OPS_TRUSTED_HOSTS. Bearer
+    auth stays mandatory. DNS-rebinding protection stays on.
 
     Runs until cancelled. Sole caller: maybe_start_in_bot (in-process, gated
     on the `mcp_ops_enabled` global config boolean).
@@ -450,12 +568,6 @@ async def serve(bot: Any, *, port: int, token: str,
     import contextlib
 
     import uvicorn
-
-    if not token:
-        raise ValueError(
-            f"serve() requires a non-empty auth token (global config "
-            f"'{TOKEN_CONFIG_KEY}' or {TOKEN_ENV_VAR})."
-        )
 
     class _NoSignalCaptureServer(uvicorn.Server):
         """uvicorn.Server.serve() normally takes over SIGINT/SIGTERM in the
@@ -466,17 +578,32 @@ async def serve(bot: Any, *, port: int, token: str,
         def capture_signals(self):
             yield
 
-    mcp = build_server(bot=bot, name=name)
+    bind = resolve_host() if host is None else resolve_host(host)
+    if not token:
+        raise ValueError(
+            f"serve() requires a non-empty auth token (global config "
+            f"'{TOKEN_CONFIG_KEY}' or {TOKEN_ENV_VAR})."
+        )
+    mcp = build_server(bot=bot, name=name, host=bind)
     app = wrap_with_auth(mcp.streamable_http_app(), token)
-
-    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="info")
+    config = uvicorn.Config(app, host=bind, port=port, log_level="info")
     server = _NoSignalCaptureServer(config)
-    logger.warning(
-        "Starting MCP ops server on 127.0.0.1:%s — auth REQUIRED (Bearer "
-        "token), loopback-only bind, unrestricted guild reach. Every tool "
-        "call runs as a live, authenticated Discord bot action.",
-        port,
-    )
+    if host_is_loopback(bind):
+        logger.warning(
+            "Starting MCP ops server on %s:%s — auth REQUIRED (Bearer "
+            "token), loopback bind, DNS-rebinding protection on, "
+            "unrestricted guild reach. Every tool call runs as a live, "
+            "authenticated Discord bot action.",
+            bind, port,
+        )
+    else:
+        logger.warning(
+            "MCP ops server BINDING OFF LOOPBACK on %s:%s. Bearer auth is "
+            "mandatory, but any bearer holder can supply actor_id and run "
+            "ops as that actor. DNS-rebinding protection stays on. Do not "
+            "publish this port.",
+            bind, port,
+        )
     await server.serve()
 
 
@@ -489,12 +616,12 @@ def maybe_start_in_bot(bot: Any) -> Optional[asyncio.Task]:
     if not is_enabled(bot.config):
         return None
     try:
-        token, port = _load_settings(bot.config)
+        token, port, host = _load_settings(bot.config)
     except RuntimeError as exc:
         logger.error("MCP ops server NOT started: %s", exc)
         return None
     task = asyncio.get_running_loop().create_task(
-        serve(bot, port=port, token=token),
+        serve(bot, port=port, token=token, host=host),
         name="mcp-ops-server",
     )
 

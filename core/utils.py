@@ -13,6 +13,7 @@ Normalization goals:
 """
 import os
 import re
+import unicodedata
 from typing import List, Union, Any
 import discord
 from discord import app_commands
@@ -335,6 +336,52 @@ async def safe_delete(ctx, logger=None):
             channel_name = getattr(ctx.channel, "name", ctx.channel.id)
             logger.warning(f"Unable to delete command message in {channel_name}: {exc}")
         return False
+
+
+# Cf we keep because they are part of emoji sequences, not hidden payloads.
+_KEEP_FORMAT = frozenset("\u200d\ufe0e\ufe0f")
+
+# Discord markdown only treats ASCII ` ' " as markup. NFKC folds fullwidth
+# grave (U+FF40) to ` but leaves curly quotes alone; these leftovers are
+# the lookalikes models actually emit.
+_MARKDOWN_PUNCT = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "\u201b": "'",
+    "\u2032": "'", "\u2035": "'", "\u02bc": "'", "\u00b4": "'",
+    "\u201c": '"', "\u201d": '"', "\u201e": '"', "\u201f": '"',
+    "\u2033": '"', "\u2036": '"',
+    "\u02cb": "`", "\u02f4": "`", "\u1fef": "`",
+})
+
+
+def sanitize_outbound_text(text: str) -> str:
+    """Fold lookalike punctuation and strip hidden Unicode from model text.
+
+    Applied on every model-originated Discord send so inline code actually
+    renders, and so zero-width / bidi / tag characters cannot hide a
+    payload. Keeps emoji ZWJ sequences and variation selectors. Does not
+    rewrite visible non-Latin letters.
+    """
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.translate(_MARKDOWN_PUNCT)
+    out = []
+    for ch in text:
+        if ch in _KEEP_FORMAT or ch in "\n\t":
+            out.append(ch)
+            continue
+        cat = unicodedata.category(ch)
+        if cat in {"Cf", "Cc"}:
+            continue
+        if cat == "Zs":
+            out.append(" ")
+            continue
+        if cat in {"Zl", "Zp"}:
+            out.append("\n")
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 def recursive_split(text, max_size=2000):

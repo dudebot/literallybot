@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from cogs.optional.danbooru import Danbooru
+from cogs.optional.danbooru import Danbooru, _serialize_search
 from cogs.optional.setrole import SetRole
 from core.ops import OpResult, OpsRegistry
 from core.utils import list_cog_modules
@@ -46,7 +46,8 @@ async def test_danbooru_service_enforces_rating_on_query_and_response(config, mo
     response.json.return_value = [
         {'id': 1, 'rating': 's', 'file_url': 'https://example.invalid/filtered.png'},
         {'id': 2, 'file_url': 'https://example.invalid/unverified.png'},
-        {'id': 3, 'rating': 'g', 'file_url': 'https://example.invalid/image.png'},
+        {'id': 3, 'rating': 'g', 'file_url': 'https://example.invalid/image.png',
+         'tag_string': '1girl cat cat_paws', 'score': 19, 'fav_count': 7},
     ]
     request = Mock(return_value=response)
     monkeypatch.setattr('cogs.optional.danbooru.requests.get', request)
@@ -54,6 +55,11 @@ async def test_danbooru_service_enforces_rating_on_query_and_response(config, mo
     tag = 'cat&tags=landscape'
     result = await cog.search([tag, 'rating:sensitive'], channel)
     assert result['url'] == 'https://example.invalid/image.png'
+    assert result['tags'] == ['1girl', 'cat', 'cat_paws']
+    assert result['score'] == 19 and result['favs'] == 7
+    assert _serialize_search(result)['score'] == 19
+    assert _serialize_search(result)['favs'] == 7
+    assert _serialize_search(result)['tags'] == ['1girl', 'cat', 'cat_paws']
     prepared = requests.Request('GET', request.call_args.args[0],
                                 params=request.call_args.kwargs['params']).prepare()
     assert parse_qs(urlsplit(prepared.url).query)['tags'] == [tag + ' rating:general']

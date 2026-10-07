@@ -74,7 +74,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import discord
 
 from core.dm_log import list_dm_users, load_dms, log_dm, row_from_message
-from core.utils import is_admin, is_superadmin
+from core.utils import is_admin, is_superadmin, sanitize_outbound_text
 
 # Shared history-scan cap: search_history never scans more than this many
 # messages regardless of the requested limit (silently clamped, matching
@@ -1348,7 +1348,7 @@ async def send_message(ctx: OpContext, channel, content: str = "",
     # explicit allowed_mentions. (Policy hoisted here from the agent-loop
     # and MCP frontends so no frontend can forget it.)
     _require_admin_for_attachments(ctx, file_paths)
-    text = content if content is not None else ""
+    text = sanitize_outbound_text(content if content is not None else "")
     if not str(text).strip() and not file_paths and sticker_id is None:
         raise ValueError("send_message requires non-empty content, a file "
                          "attachment, and/or a sticker")
@@ -1402,7 +1402,7 @@ async def send_message(ctx: OpContext, channel, content: str = "",
     group="messaging",
 )
 async def edit_message(ctx: OpContext, message, content: str):
-    return await message.edit(content=content)
+    return await message.edit(content=sanitize_outbound_text(content))
 
 
 @registry.op(
@@ -2402,7 +2402,7 @@ async def send_dm(ctx: OpContext, user, content: str = "",
                   file_paths: Optional[List[str]] = None,
                   allowed_mentions=None):
     # Same never-ping default as send_message; a DM notifies on its own.
-    text = content if content is not None else ""
+    text = sanitize_outbound_text(content if content is not None else "")
     if not str(text).strip() and not file_paths:
         raise ValueError("send_dm requires non-empty content and/or a file attachment")
     files = load_discord_attachments(file_paths)
@@ -2575,6 +2575,7 @@ async def delete_dm(ctx: OpContext, user, message_id: int):
     group="dm",
 )
 async def edit_dm(ctx: OpContext, user, message_id: int, content: str):
+    content = sanitize_outbound_text(content)
     if not str(content).strip():
         raise ValueError("edit_dm requires non-empty replacement content")
     channel = user.dm_channel or await user.create_dm()
@@ -6434,6 +6435,7 @@ async def delete_webhook(ctx: OpContext, guild, webhook_id: int):
 async def execute_webhook(ctx: OpContext, guild, webhook_id: int,
                           content: str, username: Optional[str] = None,
                           avatar_url: Optional[str] = None):
+    content = sanitize_outbound_text(content)
     if not str(content).strip():
         raise ValueError("execute_webhook requires non-empty content.")
     webhook = await _resolve_guild_webhook(

@@ -207,8 +207,7 @@ Settings became **config-first with env fallback**, matching the
 anywhere, one is **generated** (`secrets.token_urlsafe(32)`) and persisted to
 global config, logging that it did so and where — never the value. Generating
 rather than refusing is still fail-closed (the server is never unauthenticated);
-refusing would strand an operator who has no UI to set the secret. Host stays
-hard-coded `127.0.0.1`, and a non-loopback legacy `MCP_OPS_HOST` refuses startup.
+refusing would strand an operator who has no UI to set the secret. Host defaults to `127.0.0.1`. An explicit `MCP_OPS_HOST` now permits a LAN IP; wildcard binds require `MCP_OPS_TRUSTED_HOSTS`. Host/Origin checks and bearer authentication remain enabled.
 
 **The MCP tool surface stays restart-bound, deliberately.** It is built once at
 server start from a live registry query. FastMCP on mcp 1.x cannot reliably
@@ -264,8 +263,7 @@ exposure filter; authorization is the per-call `PermissionLevel` gate**, which
 `registry.call_ids` evaluates against the invoking user *before* resolving any
 Discord id (so a failed gate is not an id-probing oracle). Fail-open-to-full on
 the MCP side is safe only in combination with the gates that are not
-configurable: loopback bind, mandatory bearer token, and per-op permission
-checks.
+optional: mandatory bearer authentication, Host/Origin validation, and per-op permission checks. A LAN bind explicitly extends the network boundary; the bearer remains owner-equivalent.
 
 ## #86 — The cog set is fixed at boot (2026-08-11)
 

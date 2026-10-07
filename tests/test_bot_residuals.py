@@ -63,3 +63,9 @@ async def test_eos_reply_is_silent_without_empty_apology(config, monkeypatch):
     cog.call_ai_api=AsyncMock(return_value='Done. <|eos|>')
     await cog.process_askgpt(ctx,'hello')
     assert ctx.send.await_args.args[0]=='Done.'
+    cog.call_ai_api=AsyncMock(return_value='Done. <|eos|><|eos|>\u200b')
+    await cog.process_askgpt(ctx,'hello')
+    assert ctx.send.await_args.args[0]=='Done.'
+    cog.call_ai_api=AsyncMock(return_value='')
+    await cog.process_askgpt(ctx,'hello')
+    assert 'empty response' in ctx.send.await_args.args[0]

@@ -7,9 +7,10 @@ tags are stripped and `rating:general` is forced. Keeping the policy inside the
 service is the point: a caller cannot obtain unrated results by forgetting to
 reimplement the check, because there is no path to the API that bypasses it.
 
-Ops: `search_danbooru` returns the post URL; it does NOT post to Discord. The
-caller decides what to do with the result (issue #64 — a tool that needs
-`ctx.send` is not headless).
+Ops: `search_danbooru` returns the post URL plus that post's tags, score,
+and favorite count; it does NOT post to Discord. The caller decides what
+to do with the result (issue #64 — a tool that needs `ctx.send` is not
+headless).
 """
 import asyncio
 import os
@@ -50,6 +51,10 @@ def _serialize_search(result: dict) -> dict:
         payload["url"] = result["url"]
     if result.get("post_id") is not None:
         payload["post_id"] = str(result["post_id"])
+    if result.get("score") is not None:
+        payload["score"] = int(result["score"])
+    if result.get("favs") is not None:
+        payload["favs"] = int(result["favs"])
     if result.get("suggestions"):
         payload["suggestions"] = list(result["suggestions"])
     if result.get("message"):
@@ -71,7 +76,10 @@ class Danbooru(commands.Cog):
         policy for `channel`.
 
         Returns a result dict whose `status` is one of:
-        - "ok"          — `url` holds the post's file URL;
+        - "ok"          — `url` holds the post's file URL; `tags` is the
+                          post's `tag_string` split on spaces (not the query);
+                          `score` and `favs` are the post's net score and
+                          favorite count;
         - "no_results"  — nothing new matched; `suggestions` may hold
                           alternative tag spellings from the autocomplete API;
         - "error"       — `message` explains the failure.
@@ -110,7 +118,9 @@ class Danbooru(commands.Cog):
             if file_url:
                 self.posted_danbooru.add(post_id)
                 return {"status": "ok", "url": file_url, "post_id": post_id,
-                        "tags": tags}
+                        "tags": (post.get("tag_string") or "").split(),
+                        "score": post.get("score") or 0,
+                        "favs": post.get("fav_count") or 0}
         return {"status": "no_results", "tags": tags,
                 "suggestions": await self._suggest(tags[0]) if tags else []}
 
@@ -156,8 +166,8 @@ class Danbooru(commands.Cog):
     @op(
         "search_danbooru",
         "Search Danbooru for an image matching space-separated tags and return "
-        "its URL. Outside NSFW-marked channels the search is forced to "
-        "rating:general. Returns the URL only — it does not post anything.",
+        "its URL, tags, score, and favs. Outside NSFW-marked channels the "
+        "search is forced to rating:general. Does not post anything.",
         PermissionLevel.EVERYONE,
         params=[
             OpParam("channel", ParamKind.CHANNEL,
@@ -168,11 +178,15 @@ class Danbooru(commands.Cog):
         ],
         serialize=_serialize_search,
         agent_guidance=(
-            "Returns a URL, it does NOT post the image — send it yourself with "
-            "send_message if the user wanted it posted. Pass the channel the "
-            "image is destined for, not the one you were asked in, or the "
-            "rating check applies to the wrong channel. A 'no_results' status "
-            "may carry suggestions: better tag spellings to retry with."),
+            "Returns a URL, the pulled post's tags, score, and favs — it does "
+            "NOT post the image; send it yourself with send_message if the "
+            "user wanted it posted. On status ok, `tags` is the post's "
+            "tag_string, not the query (artist and character are already in "
+            "that list). On no_results, `tags` is still the query that was "
+            "searched. Pass the channel the image is destined for, not the "
+            "one you were asked in, or the rating check applies to the wrong "
+            "channel. A 'no_results' status may carry suggestions: better "
+            "tag spellings to retry with."),
         scope=OpScope.GUILD,
         group="integrations",
         group_label="Integrations",

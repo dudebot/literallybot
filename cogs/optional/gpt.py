@@ -10,7 +10,8 @@ from collections import deque
 from typing import Dict, List, Optional, Any
 
 from core.utils import (InvokerOnlyView, is_admin, is_superadmin,
-                        panel_slash_pin, recursive_split)
+                        panel_slash_pin, recursive_split,
+                        sanitize_outbound_text)
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
 from core.agent_gate import agent_universe
@@ -681,11 +682,17 @@ class Gpt(commands.Cog):
                 self._history_windows.commit(history_key, anchor, api_messages, sent_at)
                 if response is None:  # Explicit stay_quiet outcome, not empty model output.
                     return
-                if response.rstrip().endswith("<|eos|>"):
+                # Sanitize before the EOS check so a trailing format character
+                # cannot hide the token. Only an actual EOS strip may silence
+                # the turn; a genuinely empty reply still takes the error path.
+                response = sanitize_outbound_text(response)
+                stripped_eos = False
+                while response.rstrip().endswith("<|eos|>"):
                     response = response.rstrip()[:-7].rstrip()
-                    if not response:
-                        self.logger.info("AI run produced only EOS residue")
-                        return
+                    stripped_eos = True
+                if stripped_eos and not response:
+                    self.logger.info("AI run produced only EOS residue")
+                    return
                 response = response.replace("\n\n", "\n").replace("\\n\\n", "\\n")
 
                 if not response.strip():

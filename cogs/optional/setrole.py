@@ -598,7 +598,8 @@ class SetRole(commands.Cog):
                     status = "message missing"
                 except (discord.Forbidden, discord.HTTPException):
                     status = "message inaccessible"
-            rows.append({**{k: str(v) if k.endswith("_id") else v for k, v in entry.items()}, "status": status})
+            rows.append({**{k: (str(v) if v is not None else None) if k.endswith("_id") else v
+                            for k, v in entry.items()}, "status": status})
         return {"entries": rows, "count": len(rows)}
 
     @op("remove_emoji_role_toggle", "Remove a stored message/emoji binding and its bot reaction.",

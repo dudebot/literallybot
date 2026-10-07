@@ -206,14 +206,24 @@ async def test_mcp_select_save_preserves_offline_choices_but_clear_all_removes_t
 
 
 def test_mcp_settings_generate_a_stable_secret_without_logging_or_copying_env(config, monkeypatch, caplog):
-    for name in (mcp_server.TOKEN_ENV_VAR, mcp_server.PORT_ENV_VAR, mcp_server.HOST_ENV_VAR):
+    for name in (mcp_server.TOKEN_ENV_VAR, mcp_server.PORT_ENV_VAR,
+                 mcp_server.HOST_ENV_VAR, mcp_server.TRUSTED_HOSTS_ENV_VAR):
         monkeypatch.delenv(name, raising=False)
     assert not mcp_server.is_enabled(config)
     monkeypatch.setenv(mcp_server.HOST_ENV_VAR, '0.0.0.0')
-    with pytest.raises(RuntimeError, match='loopback'):
+    with pytest.raises(RuntimeError, match='MCP_OPS_TRUSTED_HOSTS'):
+        mcp_server._load_settings(config)
+    assert not config.has_global('mcp_ops_token')
+    monkeypatch.setenv(mcp_server.TRUSTED_HOSTS_ENV_VAR, '192.0.2.10')
+    monkeypatch.setenv(mcp_server.TOKEN_ENV_VAR, 'env-secret')
+    assert mcp_server._load_settings(config)[2] == '0.0.0.0'
+    assert not config.has_global('mcp_ops_token')
+    monkeypatch.setenv(mcp_server.HOST_ENV_VAR, 'not-a-bind')
+    with pytest.raises(RuntimeError, match='not an IP address'):
         mcp_server._load_settings(config)
     assert not config.has_global('mcp_ops_token')
     monkeypatch.delenv(mcp_server.HOST_ENV_VAR)
+    monkeypatch.delenv(mcp_server.TRUSTED_HOSTS_ENV_VAR)
     monkeypatch.setenv(mcp_server.TOKEN_ENV_VAR, 'env-secret')
     assert mcp_server.load_token(config) == 'env-secret'
     assert not config.has_global('mcp_ops_token')

@@ -177,8 +177,10 @@ async def on_ready():
         bot._synced = True
 
     # MCP ops server — OFF unless the `mcp_ops_enabled` global config bool is
-    # set; loopback-only, bearer auth mandatory (a token is generated and
-    # stored in global config if none is configured). See core/mcp_server.py.
+    # set. Default bind is 127.0.0.1. MCP_OPS_HOST may set a LAN address, or
+    # 0.0.0.0 / :: together with MCP_OPS_TRUSTED_HOSTS. Bearer auth stays
+    # mandatory (a token is generated and stored in global config if none is
+    # configured). See core/mcp_server.py.
     # Started here, not in setup_hook, so its tool surface is built from a
     # registry that already has every cog's ops in it.
     if getattr(bot, '_mcp_ops_task', None) is None:
