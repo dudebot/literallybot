@@ -1,0 +1,5 @@
+# Test-only dependencies — not needed to run the bot.
+# Install: venv/bin/pip install -r requirements-dev.txt
+# Run:     venv/bin/python -m pytest tests/
+pytest
+pytest-asyncio
