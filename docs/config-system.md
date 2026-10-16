@@ -89,13 +89,13 @@ cog already registers `list_media` and `post_media`; adding a second sending
 tool is unnecessary.
 
 1. Ensure the cog is loaded (`media` must not be in `disabled_cogs`).
-2. As superadmin, enable both names under `/aisettings` → Agent Ops. This
+2. As superadmin, enable both names under `/aisettings` → In-chat ops. This
    writes `agent_ops_whitelist` in **global** scope.
 3. Under Server config for the target guild, select Everyone or Admin for
    each tool. This writes `agent_ops_gate` in **guild** scope. A global tick
    alone leaves ordinary guild users with the default Off gate. Superadmin
    invocations bypass the guild gate, so they alone cannot prove member access.
-4. For external MCP callers, separately enable the names under the MCP tab
+4. For external MCP callers, separately enable the names under the MCP ops tab
    if `mcp_tools_enabled` is an explicit list. MCP uses neither agent gate.
 
 Use `/aisettings` (or `!aisettings`) for normal setup. Cogs declare their
