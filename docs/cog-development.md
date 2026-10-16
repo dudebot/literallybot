@@ -452,6 +452,15 @@ prefix material. Compare actual cached-input usage, total cost, latency and
 correct clip selection before adopting automatic injection. For the current
 small library, explicit listing keeps freshness and behavior simpler.
 
+## Registering event reports
+
+Features that emit guild event reports use the headless shared
+[event logging service](event-logging.md). Register stable categories in
+`cog_load`, unregister the owner in `cog_unload`, and call `report` from the
+producer. `/logsettings` discovers registrations; do not add feature listeners
+or feature inventories to a central logging cog. Error and permission-denial
+reporting continues through the independent mandatory error pipeline.
+
 ## Advanced Features
 
 Event listeners (`@commands.Cog.listener()`) and background tasks

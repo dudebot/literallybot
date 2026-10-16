@@ -187,6 +187,9 @@ rechecks current permissions.
 
 - **Server:** edit this server's destination and routes; optionally enable
   **Command not found** reports (default off).
+- **Activity:** guild admins configure [registered event reports](event-logging.md),
+  including membership/activity and honeypot. These controls are independent of
+  error routing and cannot suppress exceptions or permission denials.
 - **Global:** superadmins only. Edit the destination for all servers and DMs,
   its independent unknown-command toggle, and the 1–60 minute duplicate-alert
   interval modal (default 5). The panel cannot remove the global destination.

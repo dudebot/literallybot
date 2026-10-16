@@ -15,6 +15,7 @@ from core.config import Config
 from core import bootstrap
 from core.dm_log import log_dm, row_from_message
 from core.ops import registry as ops_registry
+from utils.event_logging import registry as event_registry
 from core.error_handler import (
     log_error_to_discord, ErrorCategory, ErrorSeverity,
     handle_command_error, handle_app_command_error, handle_event_error
@@ -80,11 +81,21 @@ class LiterallyBot(commands.Bot):
         again before the error propagates: discord.py must not end up
         holding a loaded cog whose ops silently aren't there.
         """
-        await super().add_cog(cog, **kwargs)
+        try:
+            await super().add_cog(cog, **kwargs)
+        except BaseException:
+            # cog_load may register reports before discord.py rejects a slash
+            # command collision; that path does not always invoke cog_unload.
+            if self.get_cog(cog.qualified_name) is not cog:
+                event_registry.unregister(cog)
+            raise
         try:
             names = ops_registry.register_cog_ops(cog)
         except Exception:
-            await super().remove_cog(cog.qualified_name)
+            try:
+                await super().remove_cog(cog.qualified_name)
+            finally:
+                event_registry.unregister(cog)
             raise
         if names:
             logger.info(f"Registered {len(names)} op(s) from {cog.qualified_name}: "
@@ -103,6 +114,7 @@ class LiterallyBot(commands.Bot):
             return await super().remove_cog(name, **kwargs)
         finally:
             if cog is not None:
+                event_registry.unregister(cog)
                 removed = ops_registry.unregister_owner(cog)
                 if removed:
                     logger.info(f"Unregistered {len(removed)} op(s) from {name}: "

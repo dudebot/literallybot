@@ -34,3 +34,31 @@ def config_factory(tmp_path, monkeypatch):
 @pytest.fixture
 def config(config_factory):
     return config_factory()
+
+
+@pytest.fixture
+def discord_environment(config):
+    """Local Discord permission/hierarchy behavior; network calls stay mocked."""
+    import logging
+    import discord
+    from discord.ext import commands
+
+    bot = commands.Bot(command_prefix='!', intents=discord.Intents(guilds=True, members=True))
+    bot.config = config
+    bot.logger = logging.getLogger('test.guild_events')
+    bot._connection.user = discord.ClientUser(state=bot._connection, data={
+        'id': '999', 'username': 'bot', 'discriminator': '0', 'avatar': None})
+    roles = [dict(id=str(rid), name=name, position=position, permissions=str(permissions),
+                  color=0, hoist=False, managed=False, mentionable=False)
+             for rid, name, position, permissions in [
+                 (42, '@everyone', 0, 1024 | 2048 | 65536), (50, 'Member', 1, 0),
+                 (51, 'Restricted', 2, 0), (52, 'Administrator', 3, 8), (53, 'Bot', 4, 8)]]
+    guild = discord.Guild(state=bot._connection, data={
+        'id': '42', 'name': 'Test guild', 'owner_id': '1000', 'roles': roles,
+        'members': [dict(user=dict(id=str(uid), username=str(uid), discriminator='0', avatar=None),
+                         roles=role_ids, joined_at='2026-01-01T00:00:00+00:00', flags=0)
+                    for uid, role_ids in [(1, ['50']), (2, ['52']), (999, ['53'])]],
+        'channels': [dict(id=str(cid), name=name, type=0, position=cid, permission_overwrites=[])
+                     for cid, name in [(10, 'trap'), (11, 'other'), (13, 'log')]]})
+    bot._connection._add_guild(guild)
+    return bot, guild

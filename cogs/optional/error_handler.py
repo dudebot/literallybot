@@ -8,6 +8,7 @@ from discord.ext import commands
 
 from core.error_handler import ErrorCategory, ErrorSeverity, log_error_to_discord
 from core.utils import InvokerOnlyView, is_admin, is_superadmin, panel_slash_pin
+from utils import event_logging
 
 
 class ErrorLoggingAdmin(commands.Cog):
@@ -71,6 +72,8 @@ class LogSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         self.guild = guild
         self.page = "server"
         self.route = "default_channel"
+        self.activity_route = "default"
+        self.activity_page = 0
         self.build()
 
     @property
@@ -128,7 +131,7 @@ class LogSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             self.page = "server"
         self.clear_items()
         tabs = []
-        for scope in (["server", "global"] if self.is_super else ["server"]):
+        for scope in (["server", "global", "activity"] if self.is_super else ["server", "activity"]):
             button = discord.ui.Button(label=scope.title(), style=(
                 discord.ButtonStyle.primary if scope == self.page else discord.ButtonStyle.secondary))
 
@@ -140,6 +143,10 @@ class LogSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             button.callback = switch
             tabs.append(button)
         self.row(*tabs)
+
+        if self.page == "activity":
+            self.build_activity()
+            return
 
         scope, route = self.page, self.route
         config = self.config(scope)
@@ -227,6 +234,88 @@ class LogSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             interval_button.callback = edit_interval
             buttons.append(interval_button)
         self.row(*buttons)
+
+    def build_activity(self):
+        available = event_logging.routes()
+        if self.activity_route not in dict(available):
+            self.activity_route = "default"
+        last_page = (len(available) - 1) // 25
+        self.activity_page = min(self.activity_page, last_page)
+        config = event_logging.settings(self.bot, self.guild)
+        route = self.activity_route
+        current = event_logging.route_settings(config, route)
+        key = "default_channel" if route == "default" else "channel_id"
+        destination = current.get(key)
+        self.add_item(discord.ui.TextDisplay(
+            "## Log settings — Activity\n"
+            "Guild event reports from registered features. Error and permission-denial reporting uses Server/Global settings independently.\n"
+            f"**Selected:** {dict(available)[route]}\n"
+            f"**Enabled here:** {'On' if current.get('enabled', True) else 'Off'}\n"
+            f"**Destination override:** {f'<#{destination}>' if destination else 'Default routing'}\n"
+            "Delivery requires All event reports, its feature, and its category to be On. "
+            "Routing: category → feature → all-event destination → #log. Mentions are suppressed."
+        ))
+        choices = discord.ui.Select(placeholder="Choose feature or category", options=[
+            discord.SelectOption(label=label[:100], value=value, default=value == route)
+            for value, label in available[self.activity_page * 25:(self.activity_page + 1) * 25]
+        ])
+
+        async def choose(interaction):
+            if await self.authorize(interaction, "activity"):
+                self.activity_route = choices.values[0]
+                await self.rerender(interaction)
+        choices.callback = choose
+        self.row(choices)
+        if last_page:
+            buttons = []
+            for offset, label in ((-1, "Previous categories"), (1, "Next categories")):
+                button = discord.ui.Button(label=label, disabled=not 0 <= self.activity_page + offset <= last_page)
+
+                async def turn(interaction, offset=offset):
+                    if await self.authorize(interaction, "activity"):
+                        self.activity_page += offset
+                        await self.rerender(interaction)
+                button.callback = turn
+                buttons.append(button)
+            self.row(*buttons)
+        channels = discord.ui.ChannelSelect(placeholder="Set event destination", channel_types=[discord.ChannelType.text])
+
+        async def destination_changed(interaction):
+            await self.set_activity_channel(interaction, route, channels.values[0].id)
+        channels.callback = destination_changed
+        self.row(channels)
+        toggle = discord.ui.Button(label="Turn off" if current.get("enabled", True) else "Turn on")
+
+        async def toggle_enabled(interaction):
+            if not await self.authorize(interaction, "activity"):
+                return
+            latest = event_logging.route_settings(event_logging.settings(self.bot, self.guild), route)
+            event_logging.update_route(self.bot, self.guild, route, enabled=not latest.get("enabled", True))
+            await self.rerender(interaction)
+        toggle.callback = toggle_enabled
+        reset = discord.ui.Button(label="Use #log" if route == "default" else "Inherit destination", disabled=not destination)
+
+        async def reset_destination(interaction):
+            if await self.authorize(interaction, "activity"):
+                event_logging.update_route(self.bot, self.guild, route, **{key: None})
+                await self.rerender(interaction)
+        reset.callback = reset_destination
+        self.row(toggle, reset)
+
+    async def set_activity_channel(self, interaction, route, channel_id):
+        if not await self.authorize(interaction, "activity"):
+            return
+        channel = self.guild.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel) or channel.guild.id != self.guild.id:
+            await interaction.response.send_message("Choose a text channel in this server.", ephemeral=True)
+            return
+        perms = channel.permissions_for(self.guild.me)
+        if not (perms.view_channel and perms.send_messages):
+            await interaction.response.send_message("I need View Channel and Send Messages there.", ephemeral=True)
+            return
+        key = "default_channel" if route == "default" else "channel_id"
+        event_logging.update_route(self.bot, self.guild, route, **{key: channel_id})
+        await self.rerender(interaction)
 
     async def set_channel(self, interaction, scope, route, channel_id):
         if not await self.authorize(interaction, scope):

@@ -294,14 +294,23 @@ config and take effect on the next restart:
 - `!sync` — sync slash commands
 - `!restart` (alias `!kys`) — graceful shutdown (systemd restarts it)
 
-### Error Logging (optional)
+### Logging controls (optional)
 - `/logsettings` — ephemeral admin panel; `!logsettings` opens the prefix twin.
 - Server tab: destination, category/severity routing, and optional command-not-found reports.
 - Global tab (superadmin): independent destination/routes, unknown-command toggle, and duplicate-alert interval modal.
+- Activity tab: registered event destinations and feature/category toggles; defaults to #log. See [event logging](docs/event-logging.md).
 
 Unexpected exceptions and command denials always reach configured destinations.
 Denials show required and actual access levels. Dice/media shortcuts are excluded
 from unknown-command reporting. See `docs/error-handling.md`.
+
+### Honeypot moderation
+
+`/honeypot` assigns an existing role and deletes a triggering member's recent
+messages across the guild. Optional stripping removes other manageable roles;
+bots and bot admins are exempt. Setup, permissions, cleanup limits, and prefix/op
+usage are in the [honeypot guide](docs/honeypot.md). No server resources are
+created automatically.
 
 ## 🔧 Optional Integrations
 
@@ -510,6 +519,8 @@ immediately.
 - `docs/cog-development.md` — building cogs, including the command-gate recipe
 - `docs/config-system.md` — config API, patterns, and the config Key Registry
 - `docs/error-handling.md` — how errors flow and how to handle them
+- [Event logging](docs/event-logging.md) — registration, routing and activity controls
+- [Honeypot moderation](docs/honeypot.md) — trap setup and cleanup behavior
 - `docs/security.md` — permission model and the agentic/ops execution path
 - `docs/agent-automation.md` — role-gated DM automation pattern for scheduled agents
 - [Test policy and audit](docs/testing.md) — retention rules and the 2026 suite reduction
