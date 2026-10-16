@@ -1,11 +1,14 @@
 """Media names must not escape the library or expose host files."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 from threading import Thread
 from types import SimpleNamespace as NS
 
 import pytest
 
 from cogs.optional.media import Media, MediaView
+from core import mcp_server
+from core.ops import OpContext, registry
 
 
 @pytest.fixture
@@ -17,6 +20,33 @@ def library(tmp_path, monkeypatch, config):
     directory.mkdir(parents=True)
     yield cog, guild, directory
     cog.cog_unload()
+
+
+@pytest.mark.asyncio
+async def test_media_listing_selects_mcp_guild_and_confines_chat(library, config):
+    cog, guild, directory = library
+    (directory / 'clip.mp4').write_bytes(b'clip')
+    other = NS(id=18, get_member=lambda uid: None)
+    guild.get_member = lambda uid: None
+    bot = NS(config=config, get_guild=lambda gid: {17: guild, 18: other}.get(gid))
+    config.set_global('mcp_tools_enabled', ['list_media'])
+    registry.register_cog_ops(cog)
+    try:
+        # FastMCP validates arguments against the generated schema; an
+        # undeclared guild_id would be discarded before context resolution.
+        server = mcp_server.build_server(bot)
+        blocks = await server.call_tool('list_media',
+                                        {'actor_id': '8', 'guild_id': '17'})
+        payload = json.loads(blocks[0].text)
+        assert payload == {'ok': True, 'names': ['clip.mp4'], 'count': 1}
+        ctx = OpContext(bot=bot, author=NS(id=8), guild=guild)
+        ambient = await registry.call_ids('list_media', ctx, allowed_guild_ids={17})
+        assert ambient.ok and ambient.value['names'] == ['clip.mp4']
+        refused = await registry.call_ids('list_media', ctx,
+                                          allowed_guild_ids={17}, guild_id='18')
+        assert not refused.ok
+    finally:
+        registry.unregister_owner(cog)
 
 
 def test_unsafe_names_cannot_download_or_cleanup_other_files(library, tmp_path):

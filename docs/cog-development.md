@@ -59,53 +59,60 @@ yourself rather than relying on discord.py converters — see
 ## Configuration Integration
 
 ### Basic Config Usage
-```python
-@commands.command()
-async def set_prefix(self, ctx, new_prefix: str):
-    """Set a custom prefix for this server"""
-    self.bot.config.set(ctx, "prefix", new_prefix)
-    await ctx.send(f"Prefix changed to: {new_prefix}")
 
-@commands.command()
-async def get_prefix(self, ctx):
-    """Show current server prefix"""
-    prefix = self.bot.config.get(ctx, "prefix", "!")
-    await ctx.send(f"Current prefix: {prefix}")
+Read settings where they are consumed; write settings in the authorized editor
+that owns them. For example, inside an admin-checked, guild-only AI settings
+callback (including a fresh permission check on submission):
+
+```python
+enabled = self.bot.config.get(interaction, "ai_enabled", True)
+self.bot.config.set(interaction, "ai_enabled", not enabled)
 ```
+
+The Config store does not authorize its callers. Do not add another public
+setter for an existing panel's keys or enable your own ops during cog startup.
+See [tool activation](config-system.md#enabling-cog-tools) for the stored JSON
+and the operator workflow.
 
 ### Managing Lists and Arrays
+
+For an illustrative guild-scoped list, inside its authorized settings handler:
+
 ```python
-@commands.command()
-async def add_favorite(self, ctx, *, item: str):
-    """Add an item to this server's favorites list"""
-    favorites = self.bot.config.get(ctx, "favorites", [])
-    if item not in favorites:
-        favorites.append(item)
-        self.bot.config.set(ctx, "favorites", favorites)
-        await ctx.send(f"Added '{item}' to the favorites!")
-    else:
-        await ctx.send("That's already in the favorites!")
+favorites = list(self.bot.config.get(ctx, "favorites", []))
+if item not in favorites:
+    favorites.append(item)
+    self.bot.config.set(ctx, "favorites", favorites)
 ```
+
+`favorites` is an example key, not a shipped feature. Require a guild before
+guild-scoped writes: a DM context falls back to global storage. Copying a list
+avoids mutating the stored value before `set`; a get/copy/set sequence is not
+an atomic transaction across concurrent writers.
 
 ## Permission Management
 
 THE DECORATOR DECIDES. The gate is `core.utils.is_admin` / `is_superadmin` —
-the bot's admin list, not Discord's Administrator bit. discord.py has two
-command systems, so the same function takes two wrappers. Do not invent a
+the central predicates, not a separate Discord-only check. `is_admin` includes
+superadmins, configured guild admins, Discord administrators and the guild
+owner, with the bot-account exclusion described in [security.md](security.md).
+discord.py has two command systems, so the same function takes two wrappers. Do not invent a
 third.
 
 ```python
+import discord
 from discord import app_commands
-from core.utils import is_admin, is_superadmin
+from core.utils import is_admin, is_superadmin, panel_slash_pin
 
 @commands.command(hidden=True)
+@commands.guild_only()
 @commands.check(is_admin)          # prefix
 async def aisettings(self, ctx):
     ...
 
 @app_commands.command(name="aisettings")
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_messages=True)  # picker pin
+@panel_slash_pin()                 # picker pin, not authorization
 @app_commands.check(is_admin)      # slash — same predicate
 async def aisettings_slash(self, interaction: discord.Interaction):
     ...
@@ -138,9 +145,10 @@ in [security.md](security.md).
 An **op** is one atomic Discord-affecting capability, declared once in the ops
 registry (`core/ops.py`) with its permission requirement and typed parameters.
 Every frontend — the in-chat agent loop, the MCP server, the `!aisettings`
-panel — is *generated* from those declarations. Registering an op from your cog
-therefore exposes your capability to all of them at once, without writing any
-frontend code.
+panel — is *generated* from those declarations. Registering an op makes it
+available for selection without frontend code; the configured exposure gates
+decide whether a frontend actually offers it. Registration must not change
+those settings.
 
 Two kinds share the registry: **API primitives** (raw Discord actions, declared
 inline in `core/ops.py`) and **behavioral primitives** (what YOU are writing
@@ -158,11 +166,11 @@ of interactive UI (a panel, a modal flow, a paginated browser).
 interaction handler as an op.
 
 A command handler and an op have incompatible contracts: the command handler
-owns presentation (it sends messages, edits embeds, answers an
-`Interaction` exactly once), while an op must return plain data and send
-nothing. Calling a command handler from an op means an agent's tool call
-side-effects a message into the channel, and an `Interaction`-typed handler
-simply cannot be called at all without one.
+owns presentation (it sends replies, edits panels, answers an
+`Interaction` exactly once), while an op returns plain data describing its
+declared action. Calling a command handler from an op couples the action to
+that command's UI and may produce duplicate replies. An `Interaction`-typed
+handler also requires an interaction that a headless caller does not have.
 
 So the logic goes in a third place both can call:
 
@@ -185,8 +193,12 @@ Three rules for a service function:
 
 1. **Plain objects in, plain data out.** Discord objects (`Guild`, `Member`,
    `Role`, channel) and scalars in; a JSON-serializable `dict` out.
-2. **It sends nothing.** No `ctx.send`, no `interaction.response`. The caller
-   decides how to present the result.
+2. **Separate action from presentation.** No `ctx.send` confirmation or
+   `interaction.response` in a shared service. If sending is the declared
+   action (for example `post_media`), the service may send the requested
+   attachment to the target channel and return the resulting message ID.
+   The frontend decides whether to add a confirmation; it must not repeat
+   the action.
 3. **Failures are raises or status fields, not messages.** Raise
    `RuntimeError` with a caller-presentable message for a hard failure; use a
    `status` field for expected outcomes the caller must branch on (`"created"`
@@ -202,8 +214,9 @@ disabling any cog safe: `disabled_cogs` can drop any optional cog without
 stranding a caller.
 
 When two cogs need the same capability, the capability belongs to neither cog:
-it lives in a headless module (`core/` today; a `utils/` package if a
-deployment grows one), and each cog is a thin Discord surface over it — the
+it lives in a shared headless module (`utils/` for feature helpers, as in
+`utils/points.py`; `core/` for infrastructure), and each cog is a thin Discord
+surface over it — the
 service-function pattern above, one level up.
 
 The one legitimate `get_cog()` call inside a cog is fetching **its own**
@@ -311,7 +324,8 @@ registration *path* (`'core'` for `core/ops.py`'s inline registrations,
 universe derivable instead of hand-listed:
 
 - **`OpScope.GUILD`** — acts on or inside a guild (channels, members, roles,
-  emojis). **The in-guild agent universe is exactly this set**, queried live.
+  emojis). The in-guild agent universe is selected from this set, queried live,
+  then narrowed by the configured exposure gates.
   This is what almost every cog op should be.
 - **`OpScope.DM`** — acts on a one-to-one DM conversation, no guild involved.
   Never offered to the guild-confined agent loop.
@@ -371,7 +385,8 @@ config.
 ### Checklist
 
 - [ ] Logic lives in a service method; command and op both call it
-- [ ] Op impl is `async`, returns a JSON-serializable dict, sends nothing
+- [ ] Op impl is `async`, returns plain result data, and leaves UI replies to
+      its frontend; declared send actions report what was sent
 - [ ] Name is unique registry-wide and reads as a tool name
 - [ ] Description written for a model, including what it does *not* do
 - [ ] `permission` is the tier you'd require of a human running it
@@ -388,6 +403,54 @@ factored out) and `cogs/optional/media.py` (two ops: `list_media`, and
 `post_media`, which ACTS rather than returning data, because the `!<name>`
 surface it mirrors is public while a returned host path would be the
 admin-gated attachment surface in disguise).
+
+### Media tools and discovery
+
+The media cog already supplies two behavioral primitives:
+
+| Tool | Action | Permission floor |
+|------|--------|------------------|
+| `list_media(guild_id?)` | Return sorted filenames; MCP must select a guild, chat defaults to the invoking guild | Everyone |
+| `post_media(channel_id, name)` | Send the matching library file to a visible guild channel | Everyone |
+
+`post_media` accepts a filename or prefix of at least two characters, like
+`!<name>`. Prefer a full filename returned by `list_media` when discovering
+an item. A successful result contains `status`, the matched `name`, and
+`message_id`; the attachment has already been sent. Use `stay_quiet` when
+the in-chat request needs only the clip and no final reply. Paths are never
+returned. Addition and deletion remain admin-panel actions (`/media`).
+If exposed later, both should have ADMIN floors and share panel services;
+deletion should take an exact filename, and download failures must produce
+tool errors rather than successful human-readable error strings.
+
+Activation uses the [global and guild gates](config-system.md#enabling-cog-tools).
+The stable `@op` description becomes the Pydantic tool schema description
+(`core/agent_loop.py`, `Tool.from_schema`). `agent_guidance` is separate
+code-authored text appended by `build_agentic_guidance` only for enabled
+tools. Neither field currently has a runtime config editor or catalog callback.
+There is no lazy schema discovery in the in-chat loop: enabled schemas are
+sent with the run; `list_media` discovers library data on demand.
+
+#### Dynamic catalog proposal (not implemented)
+
+Keep static schemas plus `list_media` as the default. For a future experiment,
+build a sorted, bounded catalog snapshot from the invoking guild only, once
+per run, and append it to the changing request context after reusable history.
+Include it only when media tools are enabled. Encode filenames as untrusted
+data, cap entries and bytes, and identify truncation with a `list_media`
+fallback. Resolve the actual file again at execution: a snapshot can become
+stale. Never mutate registry descriptions shared across guilds or put a
+guild catalog in the server-wide MCP schema.
+
+This saves a discovery call for vague requests but adds input tokens to every
+media-enabled run. Catalog changes in a tool description can invalidate cache
+reuse at or after that changed prefix; they do not inherently destroy every
+cached token. A stable sorted catalog need not change on every request, but
+the current history cost estimator does not model changing tool definitions.
+Keeping optional catalog data late in request context preserves more stable
+prefix material. Compare actual cached-input usage, total cost, latency and
+correct clip selection before adopting automatic injection. For the current
+small library, explicit listing keeps freshness and behavior simpler.
 
 ## Advanced Features
 
@@ -433,17 +496,27 @@ require its own schema, metadata, forwarding, and payload test bundle.
   which is also where deployment `git pull`s happen.
 - Run `pytest tests/` before restarting; a cog that fails to import is reported
   to Discord at startup but simply won't be there.
-- Wrap risky code with try/except blocks and log errors
+- Let unexpected failures reach the central error handler. Catch only when
+  recovering or adding context; explicitly report handled failures through
+  the [error pipeline](error-handling.md#logging-errors-manually).
 - Keep commands async-friendly and avoid blocking calls
 
 For a systemd deployment, restart the installed unit's process:
 
 ```bash
-kill $(systemctl show "$UNIT".service -p MainPID --value)
+bot_pid=$(systemctl show "$UNIT".service -p MainPID --value)
+if [[ "$bot_pid" =~ ^[1-9][0-9]*$ ]]; then
+    kill -INT "$bot_pid"
+else
+    echo "No running bot process found for $UNIT.service" >&2
+fi
 ```
 
 `$UNIT` is the name chosen by `scripts/install_service.sh` (the directory name
-by default). systemd relaunches it in about three seconds. Never use `pkill -f`
+by default). SIGINT lets the Python shutdown path flush buffered config;
+plain `kill` sends SIGTERM and can skip that finalizer. Validate the PID:
+`kill 0` would signal the caller's process group. systemd relaunches the bot
+in about three seconds. Never use `pkill -f`
 (it can match its own command), or `sudo systemctl restart` from a session that
 cannot supply a password. `Restart=always` relaunches a killed process.
 

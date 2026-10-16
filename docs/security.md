@@ -109,7 +109,8 @@ Security properties enforced centrally, so no frontend can skip them:
   therefore never offerable to a guild's agent surface at all — not by config, not by mistake.
   There is no hand-maintained "agent tools" list to drift (the former
   `agent=True` flag was removed in the 2026-08 refactor).
-- **Member moderation is reversible-only.** The 2026-08 guild-domain pass
+- **Member moderation includes admin-gated state changes and destructive actions.**
+  The 2026-08 guild-domain pass
   added ADMIN-gated member-state writes (`set_nickname`, `timeout_member`,
   `remove_timeout` — every one undoable, and timeouts auto-expire at
   Discord's 28-day cap) and ADMIN-gated moderation/admin-view reads
@@ -120,7 +121,7 @@ Security properties enforced centrally, so no frontend can skip them:
   member can see in the
   client (`get_member`, `get_guild_info`, `search_members`) are EVERYONE,
   like the other guild-info reads.
-- **Expressive assets follow the emoji precedent; webhooks are read-only.**
+- **Expressive assets follow the emoji precedent; webhook actions are admin-gated.**
   The 2026-08 expressive-domain pass added the sticker siblings of the
   emoji ops (`list_stickers` EVERYONE; `create_sticker`/`edit_sticker`/
   `delete_sticker` ADMIN, with the same managed/standard-asset refusals),
@@ -136,8 +137,8 @@ Security properties enforced centrally, so no frontend can skip them:
   still never serialized). `send_message`'s optional `sticker_id` and
   `edit_emoji`'s `role_ids` resolve strictly in-guild, preserving guild
   confinement.
-- **Voice moderation is client-parity and reversible; events are
-  create/edit only.** The 2026-08 voice-domain pass added voice-state reads
+- **Voice moderation is reversible; event creation, editing and deletion are admin-gated.**
+  The 2026-08 voice-domain pass added voice-state reads
   (`get_voice_state`, `list_voice_states` — EVERYONE, filtered by the
   invoking user's channel visibility exactly like the voice sidebar: a
   member you can't see reads as not-in-voice, a channel you can't see is
@@ -462,9 +463,12 @@ does not change it. Do not publish the port or front it with a public proxy.
 - [x] **Unauthenticated config-disclosure reads are gone.** The former `/ai
   status` and `!listmedia` — which showed any member which providers had keys
   configured, the model catalog, and the media inventory — no longer exist. That
-  state now lives only inside the admin-gated `!aisettings` / `!media` panels,
-  which additionally answer ephemerally in their slash form, so a bystander
-  cannot even read a panel someone else opened.
+  configuration state now lives inside the admin-gated `!aisettings` / `!media`
+  panels, which answer ephemerally in their slash form. The public media
+  inventory is also available through the cog's `list_media` op when exposed;
+  `post_media` mirrors the public `!<name>` shortcut. Both have EVERYONE floors
+  and remain subject to the agent's global/guild exposure settings or the
+  separate MCP allowlist. They never return host filesystem paths.
 
 Fixed in the 2026-07-05 consistency sweep (see git history for details):
 `!echo` is admin-gated (was open bot-impersonation), `!sethuebridgeip` was

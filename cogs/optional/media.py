@@ -375,6 +375,11 @@ class Media(commands.Cog):
         "them can be posted with post_media (or by a user typing !<name>). "
         "Returns names only, not file paths, and does not post anything.",
         PermissionLevel.EVERYONE,
+        params=[
+            OpParam("guild", ParamKind.GUILD,
+                    "Server whose library to list. Required over MCP; "
+                    "omit to use the invoking server in chat.", required=False),
+        ],
         serialize=_serialize_media_list,
         agent_guidance=(
             "The library is per guild — a name from another server is not "
@@ -384,8 +389,8 @@ class Media(commands.Cog):
         group="media",
         group_label="Media library",
     )
-    async def op_list_media(self, ctx) -> dict:
-        guild = getattr(ctx, "guild", None)
+    async def op_list_media(self, ctx, guild=None) -> dict:
+        guild = guild if guild is not None else getattr(ctx, "guild", None)
         if guild is None:
             raise ValueError("list_media must be called in a guild.")
         return {"names": sorted(self._guild_files(guild), key=str.lower)}

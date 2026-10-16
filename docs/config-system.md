@@ -1,6 +1,7 @@
 # Configuration System
 
-A JSON-based key-value store with per-guild, per-user, and global scopes. Features write buffering, atomic saves, and live reloading when files change externally.
+A JSON-based key-value store with per-guild, per-user, and global scopes.
+Features write buffering, temporary-file saves, and polling for external changes.
 
 ## Storage Layout
 
@@ -16,15 +17,18 @@ configs/
 
 | Feature | Details |
 |---------|---------|
-| Write buffering | Changes batch for 5 seconds before writing to disk |
-| Atomic writes | Uses temp file + rename to prevent corruption |
+| Write buffering | Saves are deferred until about 5 seconds after the latest write |
+| File replacement | Temp file + atomic rename on POSIX; Windows removes the old file before renaming |
 | Live reload | Polls every 2 seconds for external file changes |
-| Merge on conflict | External changes win (file wins over memory) |
-| Thread-safe | Lock-protected timer operations |
+| External reload | A detected newer file replaces that scope's in-memory document; no per-key merge |
+| Locking | Individual store operations and timer callbacks use locks; get/modify/set is not a transaction |
 
 ## API Reference
 
-Access via `self.bot.config` in any cog.
+Access via `self.bot.config` in any cog. This API stores data; it does not
+perform permission checks. Settings handlers must authorize the invoking user
+and validate scope before writing; feature consumers must not grant their own
+access. Prefer the existing panel for keys it already owns.
 
 ### CRUD Operations
 
@@ -65,9 +69,10 @@ config.get(user_id, "points", 0, scope="user")
 
 `get_user` is read-only the same way `get` is: a missing user file returns the default and does **not** create `user_<id>.json`. Only `set_user` / `set(..., scope="user")` writes.
 
-Stored config timestamps are naive local time in the host timezone. Convert
-UTC-aware Discord timestamps with `.astimezone().replace(tzinfo=None)` before
-comparing them with stored values.
+Config stores JSON values without a shared timestamp format. Follow each key's
+consumer when interpreting time: reminder `timestamp` values are integer Unix
+seconds, for example. Do not strip timezone information from Discord timestamps
+as a general conversion rule.
 
 ### Context-Free Access
 
@@ -75,6 +80,66 @@ When you have an ID but no Discord context:
 ```python
 config.set(guild_id, "setting", value)
 ```
+
+### Enabling cog tools
+
+API primitives (raw Discord actions) and behavioral primitives (cog services)
+share the ops registry and the same exposure settings. For example, the media
+cog already registers `list_media` and `post_media`; adding a second sending
+tool is unnecessary.
+
+1. Ensure the cog is loaded (`media` must not be in `disabled_cogs`).
+2. As superadmin, enable both names under `/aisettings` → Agent Ops. This
+   writes `agent_ops_whitelist` in **global** scope.
+3. Under Server config for the target guild, select Everyone or Admin for
+   each tool. This writes `agent_ops_gate` in **guild** scope. A global tick
+   alone leaves ordinary guild users with the default Off gate. Superadmin
+   invocations bypass the guild gate, so they alone cannot prove member access.
+4. For external MCP callers, separately enable the names under the MCP tab
+   if `mcp_tools_enabled` is an explicit list. MCP uses neither agent gate.
+
+Use `/aisettings` (or `!aisettings`) for normal setup. Cogs declare their
+capabilities; the superadmin and guild admins decide their exposure through
+the permission-checked settings handlers. A cog must not enable itself by
+writing these settings during registration, startup or tool execution.
+The Config API is a storage mechanism, not an authorization check.
+
+For inspecting stored configuration, these are **partial JSON examples**,
+not replacement files. Preserve unrelated keys, whitelist entries and gates.
+
+Global scope, `configs/global.json`:
+
+```json
+{
+  "agent_ops_whitelist": {
+    "list_media": true,
+    "post_media": true
+  },
+  "mcp_tools_enabled": ["list_media", "post_media"]
+}
+```
+
+The MCP array illustrates an explicit allowlist; retain any other enabled
+names in a real configuration. An absent `mcp_tools_enabled` already exposes
+the registered ops, while `[]` exposes none. MCP startup also requires the
+separate `mcp_ops_enabled` setting and authenticated connection.
+
+Guild scope, `configs/<guild_id>.json`:
+
+```json
+{
+  "agent_ops_gate": {
+    "list_media": "everyone",
+    "post_media": "everyone"
+  }
+}
+```
+
+Agent settings apply on the next invocation (external changes reload within
+about two seconds). MCP exposure and cog/code changes require a bot restart.
+Each op's hardcoded permission floor still applies. Validate both effective
+gates for a regular member; then ask the bot to call `list_media` and
+`post_media` with a returned filename and the current channel ID.
 
 ## Key Registry
 
@@ -141,7 +206,8 @@ keys, and the MCP bearer token — so the store is owner-only on disk:
 - `configs/` is chmod **0700** at `Config.__init__`, on every start. That
   re-tightens an existing install too: `os.makedirs(mode=...)` is ignored when
   the directory already exists, so the mode is set explicitly either way.
-- Every config file lands **0600**. The atomic tmp+rename is unchanged; the
+- Every config file lands **0600**. Saves use the temporary-file replacement
+  described above; the
   temp file is *created* with `os.open(..., 0o600)` **and `fchmod`'d on the
   open descriptor before any content is written**, so a secret is never on
   disk under a looser mode. Both steps are needed: O_CREAT's mode is masked by
@@ -183,7 +249,10 @@ admins.append(user_id)
 config.set(ctx, "admins", admins)  # Works, but admins is already modified in memory
 ```
 
-This is fine for normal use. Just don't assume `get()` returns a copy.
+Do not assume `get()` returns a copy. Prefer copying a collection before
+editing it so validation failures do not mutate the store before `set()`.
+Neither pattern makes a read/modify/write sequence atomic; use the scoped
+transaction API where one exists (`update_user` for user documents).
 
 ### DMs Fall Back to Global
 
@@ -202,8 +271,15 @@ The config system watches for external file changes every 2 seconds. If you edit
 
 1. Bot detects the mtime change
 2. Reloads the file into memory
-3. If there were unsaved in-memory changes, logs a conflict warning
-4. External changes win
+3. Replaces that scope's whole in-memory document and clears its pending-write flag
+4. Prints a reload notice (there is no separate conflict warning)
+
+This is polling, not coordination between concurrent writers. If the bot's
+buffered save runs before it notices an external edit, that save can overwrite
+the edit. Prefer the panel for normal configuration. For maintenance edits,
+stop the bot cleanly first, preserve unrelated data, and replace valid JSON
+with the documented owner-only permissions before starting it again. File
+deletion is not a supported live-reset operation; remove keys via the editor.
 
 This enables patterns like:
 - Hot-editing config without restarting the bot
@@ -263,7 +339,9 @@ For clean shutdown (flush pending writes, cancel timers):
 config.shutdown()
 ```
 
-Called automatically if you use the bot's shutdown handler.
+Called from `bot.py`'s finalizer on normal Python shutdown. Use `!restart` or
+the documented graceful shell signal; SIGTERM/SIGKILL do not guarantee that
+Python finalizers run, so pending buffered writes can be lost.
 
 ## Manual Flush
 
@@ -273,7 +351,10 @@ Force immediate write of all pending changes:
 config.flush()
 ```
 
-Useful before operations that might crash, or when you need guaranteed persistence.
+Use this to finish pending writes before a dependent action. It is not a
+power-loss durability guarantee: the store does not call `fsync`, and Windows
+replacement has a remove/rename gap. A successful flush is also not a lock
+against another process overwriting the file later.
 
 ### Model cache policy
 

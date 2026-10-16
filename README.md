@@ -164,9 +164,10 @@ the bot while the bot's own in-chat agent reaches out to external tools.
 ## 🧭 Command Surface Philosophy
 
 Administrative surfaces are **single-invoker interactive panels**, gated by the
-bot's own admin concept (`is_admin` / `is_superadmin`) rather than by the
-invoker's Discord permissions — the bot's admins do not necessarily hold
-Discord's Administrator bit, and gating on it caused a real lockout.
+central predicates (`is_admin` / `is_superadmin`). `is_admin` accepts configured
+bot admins, superadmins, Discord administrators and the guild owner, subject to
+the bot-account exclusion. Using only Discord's Administrator bit would lock
+out configured bot admins who do not hold it.
 
 Each panel exists twice: a hidden prefix command (`!aisettings`, `!autoresponse`,
 `!media`, `!cogs`, `!config`) and an **ephemeral slash twin** (`/aisettings`, …).
@@ -178,7 +179,7 @@ slash uses `@app_commands.check(is_admin)` — same predicate, two wrappers,
 because discord.py has two command systems. Gated slash commands are
 `guild_only` (never in DMs) and pinned to **Manage Messages** so ordinary
 members do not see them in Discord's picker; authorization is still the
-bot's admin list. A bot admin without that Discord bit in a given guild
+central predicate. A bot admin without that Discord bit in a given guild
 still has the prefix twin.
 Superadmin-only
 controls are *omitted* from a panel's render for non-superadmins rather than merely
@@ -221,11 +222,14 @@ ladder has no panel surface — it's hand-edited global config
 omitted from the panel entirely for non-superadmins.
 
 **API keys** live in global config (`configs/global.json`) or environment
-variables — set them from the panel, or directly:
+variables — set them from the panel. A partial stored-config example looks
+like this (preserve unrelated keys):
 ```json
-"XAI_API_KEY": "xai-XXXX",
-"OPENAI_API_KEY": "sk-XXXX",
-"ANTHROPIC_API_KEY": "sk-ant-XXXX"
+{
+  "XAI_API_KEY": "xai-XXXX",
+  "OPENAI_API_KEY": "sk-XXXX",
+  "ANTHROPIC_API_KEY": "sk-ant-XXXX"
+}
 ```
 Provider/model lists live under `ai_providers` in global config and are
 managed at runtime through the panel — no code change to add a model.
@@ -237,10 +241,11 @@ token budget "thinking" can be tamed with `"reasoning_effort": "none"` per model
 
 ### Agentic AI (experimental)
 
-When enabled, the AI can **perform real Discord actions** — spanning the full
-ops registry: messaging, channels, roles, members, moderation, threads,
-voice, events, emoji/stickers, invites, webhooks, automod, and DMs — plus
-anything a loaded cog contributes, instead of only describing them. It runs a
+When enabled, the AI can **perform real Discord actions** selected from the
+guild-scoped registry: messaging, channels, roles, members, moderation, threads,
+voice, events, emoji/stickers, invites, webhooks and automod — plus
+guild-scoped capabilities a loaded cog contributes. DM and global ops are
+available through MCP, not the in-chat agent. It runs a
 tool-calling loop over the shared **ops registry** (`core/ops.py`), acting as
 the **invoking user** (never the bot), confined to the current guild, with
 mentions suppressed and a per-run tool-call budget.
@@ -337,14 +342,19 @@ see cog-registered ops.)
   token, so any token-holder can act as any user id for permission purposes.
   Fine for localhost self-use; add real actor auth before wider exposure.
 
-**Run it:** turn it on, then restart the bot.
+**Run it:** as superadmin, turn it on under `/aisettings` (or `!aisettings`)
+→ MCP, then restart the bot. The stored global setting looks like this
+(a partial example, not a replacement for `configs/global.json`):
 
-```bash
-# enable the server in global config (or via !aisettings -> MCP tab):
-python3 -c "import json;p='configs/global.json';d=json.load(open(p));d['mcp_ops_enabled']=True;json.dump(d,open(p,'w'),indent=4)"
-# optional — set your own token/port instead of the generated ones:
-#   global config `mcp_ops_token` / `mcp_ops_port`, or MCP_OPS_TOKEN / MCP_OPS_PORT
+```json
+{
+  "mcp_ops_enabled": true
+}
 ```
+
+Optionally configure `mcp_ops_token` / `mcp_ops_port`, or their environment
+fallbacks `MCP_OPS_TOKEN` / `MCP_OPS_PORT`, as described in the
+[config registry](docs/config-system.md#global-scope-globaljson).
 
 On the next start the bot serves streamable-HTTP MCP at
 `http://127.0.0.1:<port>/mcp`. The port resolves config-first: the
@@ -436,6 +446,7 @@ op call it:
 
 ```python
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.utils import is_admin
 
 class MyFeature(commands.Cog):
     async def _do_thing(self, guild, target: str) -> dict:
@@ -444,7 +455,9 @@ class MyFeature(commands.Cog):
         ...
         return {"status": "ok", "target": target}
 
-    @commands.command()
+    @commands.command(hidden=True)
+    @commands.guild_only()
+    @commands.check(is_admin)
     async def thing(self, ctx, target: str):
         result = await self._do_thing(ctx.guild, target)
         await ctx.send(f"Done: {result['status']}")
@@ -460,6 +473,11 @@ class MyFeature(commands.Cog):
     async def op_do_thing(self, ctx, target: str) -> dict:
         return await self._do_thing(ctx.guild, target)
 ```
+
+The command's admin check matches the op's permission floor; the shared service
+does not authorize direct calls. Add a guild-only slash twin with
+`panel_slash_pin()` and `app_commands.check(is_admin)` for an admin command,
+following the [standard recipe](docs/decorators.md#standard-recipes).
 
 The ops register when the cog loads and unregister when it unloads. A batch is
 all-or-none, so a malformed op means zero ops registered rather than half — and

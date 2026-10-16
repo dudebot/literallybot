@@ -16,6 +16,9 @@ patterns, and read the relevant guide before changing a subsystem.
   [op authoring](docs/cog-development.md#registering-ops-from-a-cog).
   Reuse `core.utils.is_admin` / `is_superadmin`; register Discord actions as
   ops and share headless logic with commands. No parallel permission system.
+  For existing media tools and activation, see the
+  [media tool guide](docs/cog-development.md#media-tools-and-discovery) and
+  [two-tier config example](docs/config-system.md#enabling-cog-tools).
 - **Logging and test quality:** [error handling](docs/error-handling.md) and
   [test guidance](docs/error-handling.md#test-quality-and-development-checks).
   Use `self.bot.logger`; permission denials still log at WARNING.
@@ -30,6 +33,8 @@ patterns, and read the relevant guide before changing a subsystem.
   Follow the [restart instructions](docs/cog-development.md#testing--restarting-tips).
 - Admin commands use the central checks, hidden prefix commands, and guild-only
   slash twins with `panel_slash_pin()`. Guard guild-only prefix commands too.
+- Cogs declare capabilities; authorized operators configure their exposure.
+  Never auto-enable a cog's own tools or grant access from registration or execution.
 - Reuse `core.utils.recursive_split` for Discord message splitting.
   Keep async handlers nonblocking and runtime data/credentials out of git.
 - Downstream copies merge upstream as-is. Fix shared backbone here first;

@@ -12,10 +12,14 @@ shows up (accountability check-ins, event follow-ups, digest subscriptions).
 One Discord role, self-assignable, is the entire opt-in surface:
 
 - Holding the role = consent to be DMed by the automation. Nothing else is.
-- `list_role_members` at send time is the source of truth — never a cached
-  roster file. (Caveat: the op reads the member cache, chunking the guild
-  when the cache looks incomplete; pass a `limit` above the guild's size,
-  since the default is 100.)
+- Recheck the consent role at send time; never authorize a send from a saved
+  roster. The existing `list_role_members` reads Discord's member cache and
+  attempts guild chunking when incomplete. Its default limit is 100, its hard
+  maximum is 1000, and it has no pagination; a larger limit cannot produce an
+  unlimited or guaranteed fresh roster. Absence must refuse a send. An
+  implementation needing fresh per-target consent or complete large-role
+  enumeration needs an explicit membership-validation path rather than treating
+  this bounded listing as authoritative proof of completeness.
 - Removing the role = full stop, mechanically. No goodbye message, no
   "confirm you meant to leave" DM. (A send to someone who just dropped the
   role is the exact failure the gate exists to prevent.)
