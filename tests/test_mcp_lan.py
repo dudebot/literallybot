@@ -33,8 +33,9 @@ def _bot(config):
 
 def _app(config, host):
     mcp = mcp_server.build_server(bot=_bot(config), host=host)
-    app = mcp_server.wrap_with_auth(mcp.streamable_http_app(), "test-token")
-    assert mcp.settings.transport_security.enable_dns_rebinding_protection
+    app = mcp_server.wrap_with_auth(mcp_server.http_app(mcp), "test-token")
+    assert mcp_server.transport_security_for(
+        mcp._lb_bind).enable_dns_rebinding_protection
     return app
 
 

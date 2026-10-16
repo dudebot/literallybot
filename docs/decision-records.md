@@ -214,7 +214,7 @@ server start from a live registry query. FastMCP on mcp 1.x cannot reliably
 broadcast `notifications/tools/list_changed` to already-connected
 streamable-HTTP sessions, so a mid-flight surface change would leave clients
 holding a stale tool list with no way to learn better. `requirements.txt` pins
-`mcp>=1.28,<2`; a 2.x migration is deferred.
+`mcp>=2.3,<3` (ported to MCPServer; host and transport security are applied in `http_app()`).
 
 ### Panel doctrine: derived, grouped, admin-savable
 

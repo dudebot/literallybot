@@ -37,7 +37,7 @@ async def test_media_listing_selects_mcp_guild_and_confines_chat(library, config
         server = mcp_server.build_server(bot)
         blocks = await server.call_tool('list_media',
                                         {'actor_id': '8', 'guild_id': '17'})
-        payload = json.loads(blocks[0].text)
+        payload = json.loads(blocks.content[0].text)
         assert payload == {'ok': True, 'names': ['clip.mp4'], 'count': 1}
         ctx = OpContext(bot=bot, author=NS(id=8), guild=guild)
         ambient = await registry.call_ids('list_media', ctx, allowed_guild_ids={17})

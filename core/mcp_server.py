@@ -65,7 +65,7 @@ from typing import Annotated, Any, List, Optional
 from urllib.parse import urlsplit
 
 from pydantic import Field
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -285,7 +285,7 @@ def _server_name(bot: Any) -> str:
 
 
 def build_server(bot: Any = None, *, name: Optional[str] = None,
-                 host: str = DEFAULT_HOST) -> FastMCP:
+                 host: str = DEFAULT_HOST) -> MCPServer:
     """Construct a FastMCP server whose tools are generated from the ops
     registry. Tools act as raw primitives across every guild the bot account
     is in — host-side MCP callers have full control.
@@ -310,10 +310,8 @@ def build_server(bot: Any = None, *, name: Optional[str] = None,
 
     server_name = name or _server_name(bot)
     bind = resolve_host(host)
-    mcp = FastMCP(
+    mcp = MCPServer(
         name=server_name,
-        host=bind,
-        transport_security=transport_security_for(bind),
         instructions=(
             f"Ops-registry bridge for the Discord bot '{server_name}'. Exposes a "
             "subset of the bot's ops registry as MCP tools: "
@@ -329,7 +327,18 @@ def build_server(bot: Any = None, *, name: Optional[str] = None,
         mcp.add_tool(_make_mcp_tool(bot, op),
                      name=op.name, description=op.description)
 
+    # mcp 2.x moved host/transport security from the constructor to the
+    # app builder; remember the bind so http_app() can apply it.
+    mcp._lb_bind = bind
     return mcp
+
+
+def http_app(mcp: MCPServer) -> Starlette:
+    """Streamable-HTTP ASGI app for a server from build_server(), with
+    DNS-rebinding protection configured for its bind (mcp 2.x API)."""
+    bind = getattr(mcp, "_lb_bind", DEFAULT_HOST)
+    return mcp.streamable_http_app(
+        host=bind, transport_security=transport_security_for(bind))
 
 
 # --------------------------------------------------------------------------
@@ -585,7 +594,7 @@ async def serve(bot: Any, *, port: int, token: str,
             f"'{TOKEN_CONFIG_KEY}' or {TOKEN_ENV_VAR})."
         )
     mcp = build_server(bot=bot, name=name, host=bind)
-    app = wrap_with_auth(mcp.streamable_http_app(), token)
+    app = wrap_with_auth(http_app(mcp), token)
     config = uvicorn.Config(app, host=bind, port=port, log_level="info")
     server = _NoSignalCaptureServer(config)
     if host_is_loopback(bind):
