@@ -72,7 +72,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from core.mcp_clients import ClientTrackingMiddleware
 from core.ops import (
     Op,
     OpContext,
@@ -313,7 +312,6 @@ def build_server(bot: Any = None, *, name: Optional[str] = None,
     bind = resolve_host(host)
     mcp = MCPServer(
         name=server_name,
-        middleware=[ClientTrackingMiddleware()],
         instructions=(
             f"Ops-registry bridge for the Discord bot '{server_name}'. Exposes a "
             "subset of the bot's ops registry as MCP tools: "
