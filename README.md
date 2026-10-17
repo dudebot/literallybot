@@ -49,10 +49,13 @@ it stays, so rotating it in your panel or unit file is the whole operation.
 
 - **🧭 One Ops Layer, Many Frontends** — ~125 permission-checked Discord primitives declared once, driving the in-chat AI agent, an MCP server, and the admin panel alike (see [Architecture](#️-architecture-one-ops-layer-many-frontends))
 - **🤖 AI Chat + Agent** — provider-agnostic chat (xAI, OpenAI, Anthropic, local Ollama) with personality, plus an optional agentic mode that performs real Discord actions under a two-tier permission model
+- **👁️ Image Vision** — the AI sees image attachments, images in replied-to messages, and link-preview/embed images, and earlier images in the conversation stay visible on follow-up turns
 - **🧩 Modular Cogs** — self-contained features; disable any globally without deleting it (binds at restart); cogs can register their own ops
-- **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over authenticated HTTP (loopback by default)
+- **🔌 MCP Server** — drive your bot from Claude Code or any MCP client over authenticated HTTP (loopback by default), on mcp 2.x
+- **🍯 Honeypot Moderation** — a configurable trap channel: any non-exempt member who posts in it gets a role assigned and their recent messages deleted; incidents are reported through configurable activity logging
+- **🧹 Bulk Cleanup** — superadmin commands to purge a user's messages and replies to them, or messages left by members who've departed, across the text channels the bot can moderate
 - **⚙️ Smart Config** — per-server, per-user, and global JSON settings with write buffering, atomic saves, and live reload on external edits
-- **🎲 Utilities & Fun** — dice, random picks, reminders with snooze buttons, auto-responses, per-guild media libraries, reaction roles
+- **🎲 Utilities & Fun** — dice, random picks, reminders with snooze buttons, auto-responses, per-guild media libraries, reaction roles, a points leaderboard
 - **🛠️ Developer Friendly** — comprehensive logging, error routing to Discord channels, one-command restart
 
 ## 🏛️ Architecture: one ops layer, many frontends
@@ -209,9 +212,11 @@ The AI layer lives in `core/llm/` (provider-agnostic client built on
 one interface: xAI (Grok), OpenAI, Anthropic (Claude), and any local
 OpenAI-compatible server such as [Ollama](https://ollama.com/).
 
-**Talking to it:** @mention the bot, reply to its messages, or use `!gpt`. Chat
-is guild-only, has a per-guild kill switch, and is rate-limited by a
-nested-window cooldown ladder.
+**Talking to it:** @mention the bot, reply to its messages, or use `!gpt`. All
+three run through **one agent path** — the same pydantic-ai agent run whether or
+not any ops are enabled, so a guild with no agent tools gets the same chat
+behavior, history and image handling as one with tools. Chat is guild-only, has a
+per-guild kill switch, and is rate-limited by a nested-window cooldown ladder.
 
 **Configuring it:** `/aisettings` (or hidden `!aisettings`; admin-only) opens
 the AI settings panel — pick provider/model, set API keys, edit the personality,
@@ -238,6 +243,33 @@ managed at runtime through the panel — no code change to add a model.
 `"base_url": "http://localhost:11434/v1"` and `"requires_api_key": false` in its
 `ai_providers` entry. Reasoning models that would otherwise spend their whole
 token budget "thinking" can be tamed with `"reasoning_effort": "none"` per model.
+
+### Images and vision
+
+The AI can see images in the conversation:
+- image **attachments** on the triggering message,
+- images in the message being **replied to**,
+- **link-preview / embed images** (embed image and thumbnail),
+- **earlier images** in channel history, which remain visible on follow-up turns
+  within the selected history and the per-request image budget.
+
+Images are downloaded, normalized, and sent as bytes (never as signed URLs).
+Normalized images are held in an **in-memory LRU cache** (64 images / 64 MB,
+nothing written to disk), and history image selection favors keeping the same
+images across turns to support provider prompt-cache reuse.
+
+**Safety limits** (`utils/ai_images.py`):
+- **Discord-hosted images only** — `https` URLs on `cdn.discordapp.com`,
+  `media.discordapp.net`, `images-ext-1.discordapp.net`, or `images-ext-2.discordapp.net`; anything else is ignored.
+- **Max 8 images per request.**
+- **Oversized images are rejected** — downloads over 8 MB, and images whose
+  decoded dimensions exceed 40 megapixels or 12,000 px on a side, are dropped.
+- **Pillow normalization** — every image is decoded and re-encoded as JPEG (PNG
+  when it has transparency), downscaled to 2048 px max side; animated GIFs use
+  their first frame; undecodable data is dropped.
+
+Vision is on by default for every model; set `"vision": false` on a model's
+entry in `ai_providers` to opt it out (it then gets text only).
 
 ### Agentic AI (experimental)
 
@@ -293,6 +325,14 @@ config and take effect on the next restart:
 - `!list_cogs` — the optional cogs on disk, disabled ones marked
 - `!sync` — sync slash commands
 - `!restart` (alias `!kys`) — graceful shutdown (systemd restarts it)
+
+**Message cleanup** (superadmin, `!cleanup <subcommand>`) — scans text channels
+the bot can read and moderate (threads and forum posts are not scanned):
+- `!cleanup user <user_id>` — delete a user's messages
+- `!cleanup gone` — delete messages by non-bot users who have left the server
+- `!cleanup replies <user_id>` — delete replies to a user
+- `!cleanup stale-replies` — delete replies to non-bot users who have left, plus replies whose referenced message Discord didn't resolve (already-deleted originals are skipped)
+- `!cleanup full <user_id>` — `user` + `replies` for that user, plus `stale-replies`
 
 ### Logging controls (optional)
 - `/logsettings` — ephemeral admin panel; `!logsettings` opens the prefix twin.
@@ -410,11 +450,13 @@ Loaded cogs add their own behavioral primitives on top (e.g.
 `search_danbooru` from `danbooru`), rendered under their own groups and visibly
 separated from the API primitives.
 
-The served subset is trimmable via the `mcp_tools_enabled` global config list
-(`/aisettings` → MCP tab) — what the panel shows is what gets served. The surface
-is built once per bot start: allowlist edits and newly loaded cog ops bind on the
-next restart (MCP's `tools/list_changed` is not reliably deliverable to live
-streamable-HTTP sessions on mcp 1.x).
+The server runs on the **mcp 2.x** SDK (`mcp>=2.3,<3`). Which ops it serves is
+**configuration, not code**: every op stays in the registry, and the served
+subset is trimmed via the `mcp_tools_enabled` list in `configs/global.json`
+(`/aisettings` → MCP tab) — what the panel shows is what gets served, and
+removing `mcp_tools_enabled` serves everything again. The surface is built once
+per bot start: allowlist edits and newly loaded cog ops bind on the next
+restart.
 
 `actor_id` is the Discord user id the call is made on behalf of — the
 registry runs the same permission check it would for an in-bot command,
