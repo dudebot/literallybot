@@ -1,4 +1,5 @@
 from discord.ext import commands
+from pydantic_ai.exceptions import ModelHTTPError
 from discord import app_commands
 import discord
 import logging
@@ -49,7 +50,10 @@ def trigger_images(message, referenced=None):
         if msg is None:
             continue
         for att in getattr(msg, "attachments", []):
-            if getattr(att, "content_type", None) in IMAGE_TYPES:
+            ctype = getattr(att, "content_type", None) or ""
+            name = (getattr(att, "filename", None) or "").lower()
+            if ctype.startswith("image/") or name.endswith(
+                    (".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".bmp")):
                 urls.append(att.url)
         for embed in getattr(msg, "embeds", []):
             for field in (getattr(embed, "image", None), getattr(embed, "thumbnail", None)):
@@ -62,9 +66,36 @@ def trigger_images(message, referenced=None):
         and urlparse(str(url)).hostname in IMAGE_HOSTS))[:MAX_IMAGES]
 
 
+MAX_IMAGE_SIDE = 2048
+
+
+def normalize_image(data, *, max_side=MAX_IMAGE_SIDE):
+    """Decode with Pillow and re-encode as JPEG (or PNG when there is
+    transparency), downscaled to max_side. Animated GIFs use their first
+    frame. Returns {"data", "media_type"} or None for undecodable input,
+    so providers only ever receive complete jpeg/png payloads."""
+    import io
+    from PIL import Image
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.load()
+    except Exception:
+        return None
+    img.seek(0) if getattr(img, "is_animated", False) else None
+    img.thumbnail((max_side, max_side))
+    alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+    out = io.BytesIO()
+    if alpha:
+        img.convert("RGBA").save(out, "PNG", optimize=True)
+        return {"data": out.getvalue(), "media_type": "image/png"}
+    img.convert("RGB").save(out, "JPEG", quality=85)
+    return {"data": out.getvalue(), "media_type": "image/jpeg"}
+
+
 async def download_images(urls, *, max_bytes=MAX_IMAGE_BYTES, timeout=15):
     """Fetch image URLs to bytes so providers never need to reach Discord's
-    signed, expiring CDN links. Skips non-images, oversize files and errors.
+    signed, expiring CDN links. Reads the WHOLE body (capped), then
+    normalizes it to jpeg/png. Skips non-images, oversize files and errors.
     Returns [{"data": bytes, "media_type": str}]."""
     import aiohttp
     out = []
@@ -74,16 +105,34 @@ async def download_images(urls, *, max_bytes=MAX_IMAGE_BYTES, timeout=15):
             try:
                 async with session.get(url) as resp:
                     media_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
-                    if resp.status != 200 or media_type not in IMAGE_TYPES:
+                    if resp.status != 200 or not media_type.startswith("image/"):
                         continue
                     if (resp.content_length or 0) > max_bytes:
                         continue
-                    data = await resp.content.read(max_bytes + 1)
-                    if len(data) > max_bytes:
+                    body = bytearray()
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        body.extend(chunk)
+                        if len(body) > max_bytes:
+                            break
+                    if len(body) > max_bytes:
                         continue
-                    out.append({"data": data, "media_type": media_type})
+                image = normalize_image(bytes(body))
+                if image:
+                    out.append(image)
             except Exception:
                 logging.getLogger(__name__).warning("image download failed: %s", url.split("?")[0])
+    return out
+
+
+def strip_images(messages, note):
+    """Copy of messages with image parts removed and `note` appended to the
+    turn that carried them (provider-rejection fallback)."""
+    out = []
+    for m in messages:
+        if m.get("images"):
+            m = {k: v for k, v in m.items() if k != "images"}
+            m["content"] = (m.get("content") or "") + "\n" + note
+        out.append(m)
     return out
 
 
@@ -736,11 +785,23 @@ class Gpt(commands.Cog):
                 "guild": str(ctx.guild.id) if ctx.guild else "DM"
             }
 
-            try:
+            async def run(messages):
                 if agentic:
-                    response = await self._run_agentic(ctx, provider_config, api_messages, metadata, question, tool_names)
-                else:
-                    response = await self.call_ai_api(provider_config, api_messages, metadata)
+                    return await self._run_agentic(ctx, provider_config, messages, metadata, question, tool_names)
+                return await self.call_ai_api(provider_config, messages, metadata)
+
+            try:
+                try:
+                    response = await run(api_messages)
+                except ModelHTTPError as e:
+                    # A provider that rejects the image payload should not
+                    # cost the whole reply: retry once without pixels.
+                    if e.status_code != 400 or not any(m.get("images") for m in api_messages):
+                        raise
+                    self.logger.warning("provider rejected image input, retrying without images: %s", e)
+                    response = await run(strip_images(
+                        api_messages, "[SYSTEM] The attached image could not be processed. "
+                                      "Say briefly that you could not view it."))
                 self._history_windows.commit(history_key, anchor, api_messages, sent_at)
                 if response is None:  # Explicit stay_quiet outcome, not empty model output.
                     return
