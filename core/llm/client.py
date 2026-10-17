@@ -596,7 +596,8 @@ def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
 
     Consecutive system/user messages are grouped into a single ModelRequest;
     assistant messages become ModelResponses. Order is preserved 1:1 on the
-    wire.
+    wire. Only role/content/images are read; private history bookkeeping
+    such as _selected_images must never become provider fields.
     """
     pai_messages: List[ModelMessage] = []
     request_parts: List[Any] = []
@@ -609,6 +610,13 @@ def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
                 pai_messages.append(PaiModelRequest(parts=request_parts))
                 request_parts = []
             pai_messages.append(PaiModelResponse(parts=[TextPart(content=content)]))
+            if msg.get("images"):
+                # Response parts cannot carry input BinaryContent. Associate bot
+                # pixels with their text via the immediately following user part.
+                request_parts.append(UserPromptPart(content=[
+                    "[Images from the preceding bot message]",
+                    *[_image_part(i) for i in msg["images"]],
+                ]))
         elif role == "system":
             request_parts.append(SystemPromptPart(content=content))
         else:

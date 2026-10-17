@@ -17,8 +17,8 @@ from core/ops.py; the only policy here is the loop's:
 
 Wired up by cogs/optional/gpt.py when a guild's resolved agent universe (the
 super-admin `agent_ops_whitelist` ceiling narrowed by the per-guild
-`agent_ops_gate`, see core/agent_gate) is non-empty; the empty default routes
-to plain chat, and nothing imports this module otherwise.
+`agent_ops_gate`, see core/agent_gate) is non-empty. With no exposed bot tools, GPT uses the same agent runner
+without constructing registry tools.
 """
 from __future__ import annotations
 
@@ -65,9 +65,8 @@ def build_agent_tools(ctx: Any, logger: logging.Logger,
     user's real Member, in their real guild.
 
     `op_names` is the guild's resolved agent tool set (from
-    core.agent_gate.agent_universe). An empty list yields no tools —
-    callers should route those runs through the plain-chat path instead
-    (see gpt.py process_askgpt).
+    core.agent_gate.agent_universe). This builder is guild-only; callers
+    use an empty tool list directly for DMs or tool-less guilds.
 
     `gate_check` re-evaluates the per-guild admin gate at DISPATCH from live
     policy, not from a boolean snapshotted at build time (codex review

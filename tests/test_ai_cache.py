@@ -65,7 +65,7 @@ async def test_channel_window_honors_cost_edits_expiry_and_failed_calls(config):
     async def fail(*args, **kwargs):
         raise RuntimeError('network failed')
     ctx.typing, ctx.send = typing, send
-    gpt.llm.chat = fail
+    gpt.llm.run_agent = fail
     await gpt.process_askgpt(ctx, 'hello')
     assert not gpt._history_windows.states
     assert 'network failed' in sent[-1]
@@ -102,7 +102,7 @@ async def test_successful_calls_roll_anchor_lifetime_forward(config, monkeypatch
 
     bot = NS(config=config, logger=logging.getLogger('test'), user=NS(id=99, display_name='Bot'))
     gpt = Gpt(bot)
-    gpt.llm.chat = chat
+    gpt.llm.run_agent = chat
     ctx = NS(guild=NS(id=1), channel=NS(id=2, history=history),
              author=author, typing=typing, send=send)
     for clock, trigger in [(100, 2), (350, 3), (600, 4)]:
@@ -116,7 +116,7 @@ async def test_successful_calls_roll_anchor_lifetime_forward(config, monkeypatch
         raise RuntimeError('network failed')
 
     clock = 700
-    gpt.llm.chat = fail
+    gpt.llm.run_agent = fail
     await gpt.process_askgpt(ctx, 'hello')
     state, = gpt._history_windows.states.values()
     assert state.anchor == 1 and state.sent_at == 600
@@ -163,7 +163,7 @@ async def test_candidate_references_share_fetches_but_refresh_next_invocation(co
     assert fetched == [100, 100]  # Once per invocation, not once per candidate.
     assert second[:4] == first[:4]
     assert 'edited reference' in second[-2]['content']
-    assert '[TRIGGER MESSAGE]' in second[-1]['content']
+    assert '[REQUEST CONTEXT]' in second[-1]['content']
 
 
 @pytest.mark.asyncio

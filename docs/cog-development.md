@@ -452,6 +452,43 @@ prefix material. Compare actual cached-input usage, total cost, latency and
 correct clip selection before adopting automatic injection. For the current
 small library, explicit listing keeps freshness and behavior simpler.
 
+### GPT history and image inputs
+
+`!gpt` always uses `LLMClient.run_agent`, including tool-less guilds and DM
+command contexts. DMs expose zero bot tools; automatic mention/reply handling
+remains guild-only. `stay_quiet` is a terminal output tool on every run.
+The hard-budget fallback is another agent run with zero bot tools and the
+budget note. Existing tool authorization and guild confinement still apply.
+
+History turns always carry message IDs. Attachment images and embed images /
+thumbnails belong to their source turn, including referenced messages and bot
+posts; the closing request context has no pixels. Pydantic-ai response parts
+cannot contain input `BinaryContent`, so the adapter places bot-posted pixels
+in a labeled user part immediately after the corresponding assistant text.
+
+Each render sends at most eight images. Trigger images have first priority,
+then reply-target images, each in attachment/embed order. Remaining slots keep
+retained pins; only new required trigger/reply images can evict the oldest pins
+(by message ID and position). Vacancies fill from the newest other images.
+A bounded per-conversation memo preserves these selections while they remain
+in the window, so text-only follow-ups keep shared prefixes stable. Overflow
+images get `[image: filename]` placeholders, including excess explicit inputs.
+Failed downloads and images excluded by `vision: false` also get placeholders.
+Image availability never changes the system prompt. The history cost estimate
+includes a conservative 1,792 input tokens per image.
+
+`utils/ai_images.py` holds an LRU of normalized JPEG/PNG bytes keyed by attachment
+ID (or URL without query/fragment), bounded at 64 entries and 64 MiB. Failed
+loads are cached for 30 seconds. Up to four downloads/processes run concurrently;
+Pillow processing runs off the event loop. Inputs retain the Discord host
+allowlist, 8 MiB body cap, and 2048-pixel normalization; redirects are refused.
+A signed CDN 403/404 refreshes the source message once per preparation, then
+retries the same image identity. Eviction or failure expiry can cause a reload;
+deterministic normalization keeps successful image bytes stable. Failed loads
+log a WARNING with the URL query and fragment removed. History comparison
+snapshots retain image fingerprints rather than pixels; expired snapshots are
+pruned on successful commits.
+
 ## Registering event reports
 
 Features that emit guild event reports use the headless shared

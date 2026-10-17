@@ -7,6 +7,7 @@ History is fetched again on each invocation to reflect edits and deletions.
 from collections import OrderedDict
 from dataclasses import dataclass
 import math
+import hashlib
 
 
 DEFAULT_HISTORY_MIN = 15
@@ -41,13 +42,25 @@ def cache_policy(model_info):
 
 def estimate_message_tokens(message):
     """Cheap nonblocking cost proxy, not an invoice tokenizer (UTF-8 / 4)."""
-    return 4 + math.ceil(len(message.get("content", "").encode("utf-8")) / 4)
+    return (4 + math.ceil(len(message.get("content", "").encode("utf-8")) / 4)
+            + 1792 * len(message.get("images", ())))
+
+
+def comparison_message(message):
+    """Detach comparison state from image bytes without changing equality."""
+    snapshot = dict(message)
+    if 'images' in snapshot:
+        snapshot['images'] = [
+            (hashlib.sha256(image['data']).hexdigest(), image['media_type'], len(image['data']))
+            if isinstance(image, dict) else image
+            for image in snapshot['images']]
+    return snapshot
 
 
 def prefix_tokens(previous, current):
     total = 0
     for old, new in zip(previous, current):
-        if old != new:
+        if comparison_message(old) != comparison_message(new):
             break
         total += estimate_message_tokens(new)
     return total
@@ -62,18 +75,19 @@ def input_units(messages, previous, ratio):
 
 @dataclass
 class HistoryState:
-    """Last successful request: retained start ID, rendered prompt, send time."""
+    """Last successful request: anchor, comparison snapshot, and lifetime."""
 
     anchor: int
     messages: list
     sent_at: float
+    expires_at: float
 
 
 class HistoryWindows:
     """Bounded map keyed by (guild, channel, provider, model, tool names).
 
-    Keep rendered messages to detect changed prefixes; IDs alone cannot do
-    that. OrderedDict provides expected O(1) lookup/update/oldest eviction.
+    Keep rendered text and image fingerprints to detect changed prefixes;
+    IDs alone cannot do that. OrderedDict provides expected O(1) lookup/update/oldest eviction.
     Ordering follows successful commits, not reads or failed attempts.
     """
 
@@ -102,9 +116,12 @@ class HistoryWindows:
             return extended
         return baseline
 
-    def commit(self, key, anchor, messages, sent_at):
+    def commit(self, key, anchor, messages, sent_at, *, ttl=300):
         # An extension retains the anchor, but always refreshes prompt/time.
-        self.states[key] = HistoryState(anchor, messages, sent_at)
+        for expired in [k for k, state in self.states.items() if state.expires_at <= sent_at]:
+            del self.states[expired]
+        self.states[key] = HistoryState(
+            anchor, [comparison_message(message) for message in messages], sent_at, sent_at + ttl)
         self.states.move_to_end(key)
         while len(self.states) > self.capacity:
             self.states.popitem(last=False)

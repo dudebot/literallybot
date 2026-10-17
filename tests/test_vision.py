@@ -6,8 +6,8 @@ import pytest
 from PIL import Image
 from pydantic_ai.messages import BinaryContent
 
-from cogs.optional.gpt import (download_images, normalize_image, referenced_message,
-                               strip_images, trigger_images)
+from cogs.optional.gpt import strip_images
+from utils.ai_images import fetch_image, message_images, normalize_image
 from core.llm.client import _to_pai_messages
 
 
@@ -29,16 +29,8 @@ def test_collects_reply_target_and_embed_images_but_not_foreign_hosts():
     bot_post = NS(attachments=[att("b.webp", "image/webp")],
                   embeds=[NS(image=NS(proxy_url="https://media.discordapp.net/c.png", url=None),
                              thumbnail=NS(proxy_url=None, url="https://evil.example/x.png"))])
-    urls = trigger_images(trigger, bot_post)
+    urls = [item[2] for msg in (trigger, bot_post) for item in message_images(msg)]
     assert [u.split("/")[-1].split("?")[0] for u in urls] == ["a.png", "odd.jpg", "b.webp", "c.png"]
-
-
-@pytest.mark.asyncio
-async def test_referenced_message_prefers_resolved_then_cache():
-    target = NS(id=5)
-    ctx = NS(message=NS(reference=NS(message_id=5, resolved=None)), channel=None)
-    assert await referenced_message(ctx, {5: target}) is target
-    assert await referenced_message(NS(message=NS(reference=None))) is None
 
 
 @pytest.mark.parametrize("fmt,mode,expect", [
@@ -81,7 +73,7 @@ class FakeSession:
         return self
     async def __aexit__(self, *a):
         return False
-    def get(self, url):
+    def get(self, url, **kwargs):
         if "big" in url:
             return FakeResp("image/jpeg", b"x" * 10_000)
         if "html" in url:
@@ -93,9 +85,10 @@ class FakeSession:
 async def test_download_reads_whole_body_and_caps(monkeypatch):
     import aiohttp
     monkeypatch.setattr(aiohttp, "ClientSession", FakeSession)
-    got = await download_images(["https://cdn.discordapp.com/ok.jpg",
-                                 "https://cdn.discordapp.com/big.jpg",
-                                 "https://cdn.discordapp.com/html"], max_bytes=5_000)
+    results = [await fetch_image(url, max_bytes=5_000) for url in
+               ["https://cdn.discordapp.com/ok.jpg", "https://cdn.discordapp.com/big.jpg",
+                "https://cdn.discordapp.com/html"]]
+    got = [image for _, image in results if image]
     assert len(got) == 1 and got[0]["media_type"] == "image/jpeg"
     assert Image.open(io.BytesIO(got[0]["data"])).size == (64, 32)
 

@@ -7,7 +7,7 @@ import asyncio
 from weakref import WeakValueDictionary
 import os
 import time
-from collections import deque
+from collections import deque, OrderedDict
 from typing import Dict, List, Optional, Any
 
 from core.utils import (InvokerOnlyView, is_admin, is_superadmin,
@@ -28,100 +28,10 @@ from core.agent_gate import (
 from core.mcp_server import ENABLE_CONFIG_KEY, exposed_ops, resolve_mcp_tools
 
 from utils.ai_history import HistoryWindows, history_bounds, cache_policy
+from utils.ai_images import ImageCache, MAX_IMAGES, message_images
 
 PANEL_TIMEOUT = 180
 TOOL_BUDGET_VALUES = (4, 8, 12, 16)
-
-
-IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
-IMAGE_HOSTS = {"cdn.discordapp.com", "media.discordapp.net",
-               "images-ext-1.discordapp.net", "images-ext-2.discordapp.net"}
-MAX_IMAGES = 4
-MAX_IMAGE_BYTES = 8 * 1024 * 1024
-
-
-def trigger_images(message, referenced=None):
-    """Image URLs from the trigger message and the message it replies to
-    (attachments plus embed image/thumbnail), Discord-hosted only, deduped,
-    capped at MAX_IMAGES. The replied-to message may be the bot's own post."""
-    from urllib.parse import urlparse
-    urls = []
-    for msg in (message, referenced):
-        if msg is None:
-            continue
-        for att in getattr(msg, "attachments", []):
-            ctype = getattr(att, "content_type", None) or ""
-            name = (getattr(att, "filename", None) or "").lower()
-            if ctype.startswith("image/") or name.endswith(
-                    (".png", ".jpg", ".jpeg", ".webp", ".gif", ".heic", ".bmp")):
-                urls.append(att.url)
-        for embed in getattr(msg, "embeds", []):
-            for field in (getattr(embed, "image", None), getattr(embed, "thumbnail", None)):
-                url = getattr(field, "proxy_url", None) or getattr(field, "url", None)
-                if url:
-                    urls.append(url)
-    # Discord's hosted attachment/image proxies avoid sending arbitrary origins.
-    return list(dict.fromkeys(str(url) for url in urls
-        if urlparse(str(url)).scheme == "https"
-        and urlparse(str(url)).hostname in IMAGE_HOSTS))[:MAX_IMAGES]
-
-
-MAX_IMAGE_SIDE = 2048
-
-
-def normalize_image(data, *, max_side=MAX_IMAGE_SIDE):
-    """Decode with Pillow and re-encode as JPEG (or PNG when there is
-    transparency), downscaled to max_side. Animated GIFs use their first
-    frame. Returns {"data", "media_type"} or None for undecodable input,
-    so providers only ever receive complete jpeg/png payloads."""
-    import io
-    from PIL import Image
-    try:
-        img = Image.open(io.BytesIO(data))
-        img.load()
-    except Exception:
-        return None
-    img.seek(0) if getattr(img, "is_animated", False) else None
-    img.thumbnail((max_side, max_side))
-    alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
-    out = io.BytesIO()
-    if alpha:
-        img.convert("RGBA").save(out, "PNG", optimize=True)
-        return {"data": out.getvalue(), "media_type": "image/png"}
-    img.convert("RGB").save(out, "JPEG", quality=85)
-    return {"data": out.getvalue(), "media_type": "image/jpeg"}
-
-
-async def download_images(urls, *, max_bytes=MAX_IMAGE_BYTES, timeout=15):
-    """Fetch image URLs to bytes so providers never need to reach Discord's
-    signed, expiring CDN links. Reads the WHOLE body (capped), then
-    normalizes it to jpeg/png. Skips non-images, oversize files and errors.
-    Returns [{"data": bytes, "media_type": str}]."""
-    import aiohttp
-    out = []
-    async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=timeout)) as session:
-        for url in urls:
-            try:
-                async with session.get(url) as resp:
-                    media_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
-                    if resp.status != 200 or not media_type.startswith("image/"):
-                        continue
-                    if (resp.content_length or 0) > max_bytes:
-                        continue
-                    body = bytearray()
-                    async for chunk in resp.content.iter_chunked(64 * 1024):
-                        body.extend(chunk)
-                        if len(body) > max_bytes:
-                            break
-                    if len(body) > max_bytes:
-                        continue
-                image = normalize_image(bytes(body))
-                if image:
-                    out.append(image)
-            except Exception:
-                logging.getLogger(__name__).warning("image download failed: %s", url.split("?")[0])
-    return out
 
 
 def strip_images(messages, note):
@@ -134,26 +44,6 @@ def strip_images(messages, note):
             m["content"] = (m.get("content") or "") + "\n" + note
         out.append(m)
     return out
-
-
-async def referenced_message(ctx, cache=None):
-    """The message the trigger replies to, if any (resolved, cached, fetched)."""
-    ref = getattr(ctx.message, "reference", None)
-    if not ref or not getattr(ref, "message_id", None):
-        return None
-    resolved = getattr(ref, "resolved", None)
-    if isinstance(resolved, discord.Message):
-        return resolved
-    if cache is not None and ref.message_id in cache:
-        return cache[ref.message_id]
-    try:
-        msg = await ctx.channel.fetch_message(ref.message_id)
-    except Exception:
-        msg = None
-    if cache is not None:
-        cache[ref.message_id] = msg  # share the fetch with _build_history
-    return msg
-
 
 
 def guild_tool_budget(config, ctx):
@@ -312,12 +202,14 @@ def build_agentic_guidance(tool_names, guild_id, channel_id):
         "— executes nothing: the run just ends and that sentence gets posted "
         "to the channel verbatim, where everyone sees a malfunction. If you "
         "intend a tool call, EMIT the function call instead of describing it.",
-        "- Worked example: someone asks \"do i play factorio\" and the answer "
-        "isn't in the visible history. Correct: emit the function call "
-        "search_history with arguments {\"channel_ids\": [" + str(channel_id) +
-        "], \"author_id\": <invoking_user_id>, \"contains\": \"factorio\", "
-        "\"limit\": 100}, wait for the results, then answer in plain text. "
-        "Wrong: any reply that merely talks about searching.",
+        *([
+            "- Worked example: someone asks \"do i play factorio\" and the answer "
+            "isn't in the visible history. Correct: emit the function call "
+            "search_history with arguments {\"channel_ids\": [" + str(channel_id) +
+            "], \"author_id\": <invoking_user_id>, \"contains\": \"factorio\", "
+            "\"limit\": 100}, wait for the results, then answer in plain text. "
+            "Wrong: any reply that merely talks about searching.",
+        ] if "search_history" in tool_names else []),
         "",
         "- When an action would genuinely help (react, reply elsewhere, edit, "
         "search, list), use the matching tool. Prefer doing over describing.",
@@ -362,6 +254,8 @@ class Gpt(commands.Cog):
         self._call_history: Dict[int, deque] = {}
         self._history_windows = HistoryWindows()
         self._channel_locks = WeakValueDictionary()
+        self._image_cache = ImageCache(logger=self.logger)
+        self._image_selections = OrderedDict()
 
     def _current_model_info(self, ctx) -> Dict[str, Any]:
         """The stored config dict for the guild's current model (may be {})."""
@@ -373,9 +267,8 @@ class Gpt(commands.Cog):
         """The guild's enabled bot-agent tools (resolved live from the
         whitelist + per-guild gate — core.agent_gate.agent_universe).
 
-        Empty (the default) means the plain-chat path runs: no tools, no
-        agent loop. Stale op names whose op is not currently registered are
-        dropped by intersecting with the current universe.
+        Empty (the default) runs the same agent with no bot tools. Stale op
+        names are dropped by intersecting with the current universe.
         """
         if not getattr(ctx, "guild", None):
             return []
@@ -468,24 +361,8 @@ class Gpt(commands.Cog):
         """
         return self.llm.get_provider_config(ctx)
 
-    async def call_ai_api(self, provider_config: Dict[str, Any], messages: List[Dict], metadata: Dict) -> str:
-        """Call the appropriate AI API based on provider configuration.
-
-        Delegates to core.llm.LLMClient.chat(); returns plain text to match
-        the original signature. Usage/cost tracking happens inside the
-        client and is available via response.usage for callers that want it
-        (see LLMClient.chat for the richer LLMResponse).
-        """
-        response = await self.llm.chat(provider_config, messages, metadata)
-        if response.usage:
-            self.logger.debug(
-                f"AI usage: provider={response.usage.provider} model={response.usage.model} "
-                f"prompt={response.usage.prompt_tokens} completion={response.usage.completion_tokens} "
-                f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd}"
-            )
-        return response.text
-
-    async def _build_history(self, ctx, agentic, *, messages, reference_cache=None):
+    async def _build_history(self, ctx, *, messages, reference_cache=None,
+                             vision=True, retained=(), refreshed=None):
         """Render selected channel messages (plus referenced messages) into
         OpenAI-style history turns and a user-id -> display-name mapping."""
         history = []
@@ -503,11 +380,14 @@ class Gpt(commands.Cog):
         for msg in messages:
             if msg.reference and msg.reference.message_id:
                 reply_chain_ids.add(msg.reference.message_id)
+                resolved = getattr(msg.reference, "resolved", None)
+                if isinstance(resolved, discord.Message):
+                    reference_cache.setdefault(resolved.id, resolved)
         
         # Second pass: Fetch messages that are referenced but not in our current history
         if reply_chain_ids:
             self.logger.debug(f"Found {len(reply_chain_ids)} referenced messages to fetch")
-            for ref_id in reply_chain_ids:
+            for ref_id in sorted(reply_chain_ids):
                 if ref_id in selected_by_id:
                     continue
                 if ref_id not in reference_cache:
@@ -528,31 +408,44 @@ class Gpt(commands.Cog):
                 mentioned_ids = [(str(user.id), user.name) for user in msg.mentions]
                 for uid, name in mentioned_ids:
                     if uid not in user_mapping and uid != str(self.bot.user.id):
-                        member = ctx.guild.get_member(int(uid))
+                        member = ctx.guild.get_member(int(uid)) if ctx.guild else None
                         user_mapping[uid] = member.display_name if member else name
         
         all_messages_for_history = list(messages)
         
-        for ref_id, ref_msg in referenced_msgs.items():
-            modified_content = f"[REFERENCED MESSAGE] {ref_msg.content}"
-            # Create a temporary copy with modified content to avoid changing the original
-            ref_msg_copy = type('MessageCopy', (), {
-                'id': ref_msg.id,
-                'author': ref_msg.author,
-                'content': modified_content,
-                'created_at': ref_msg.created_at,
-                'reference': ref_msg.reference
-            })
-            all_messages_for_history.append(ref_msg_copy)
-        
-        all_messages_for_history.sort(key=lambda x: (
-            x.id in referenced_msgs,
-            getattr(x, 'created_at', 0)))
-        
+        all_messages_for_history.extend(referenced_msgs.values())
+        all_messages_for_history.sort(key=lambda msg: (msg.id in referenced_msgs, msg.id))
+        candidates = [(msg, item) for msg in sorted(all_messages_for_history, key=lambda m: m.id)
+                      for item in message_images(msg)]
+        identities = [(msg.id, item[0]) for msg, item in candidates]
+        reference = getattr(ctx.message, 'reference', None)
+        reply_id = getattr(reference, 'message_id', None)
+        # Explicit inputs take priority, in attachment/embed order, within a
+        # hard budget even when trigger/reply inputs alone exceed it.
+        required = [identity for source in (ctx.message.id, reply_id)
+                    for identity in identities if identity[0] == source]
+        required = list(dict.fromkeys(required))[:MAX_IMAGES]
+        pins = sorted(set(retained).intersection(identities).difference(required),
+                      key=identities.index)
+        # Only required inputs can displace pins; evict oldest source turns.
+        slots = MAX_IMAGES - len(required)
+        selected = set(required) | set(pins[-slots:] if slots else ())
+        for identity in reversed(identities):
+            if len(selected) >= MAX_IMAGES:
+                break
+            selected.add(identity)
+        selected = selected if vision else set()
+        refreshed = refreshed if refreshed is not None else {}
+        downloads = await asyncio.gather(*(self._image_cache.get(item, msg, ctx.channel, refreshed)
+            for msg, item in candidates if (msg.id, item[0]) in selected))
+        pixels = dict(zip((identity for identity in identities if identity in selected), downloads))
+
         reply_targets = {**selected_by_id, **referenced_msgs}
         # Construct history with bot messages unchanged and non-bot with user ID prefix
         for msg in all_messages_for_history:
             full_content = getattr(msg, 'content', '')
+            if msg.id in referenced_msgs:
+                full_content = '[REFERENCED MESSAGE] ' + full_content
             
             if hasattr(msg, 'embeds') and msg.embeds:
                 embed_parts = []
@@ -582,10 +475,6 @@ class Gpt(commands.Cog):
                             for field in embed.fields:
                                 field_value = field.value[:100] + "..." if len(field.value) > 100 else field.value
                                 embed_info.append(f"[{field.name}: {field_value}]")
-                        if embed.image and embed.image.url:
-                            embed_info.append(f"[Embedded Image: {embed.image.url}]")
-                        if embed.thumbnail and embed.thumbnail.url and not embed.image:
-                            embed_info.append(f"[Thumbnail: {embed.thumbnail.url}]")
                     
                     if embed_info:
                         embed_parts.extend(embed_info)
@@ -596,6 +485,8 @@ class Gpt(commands.Cog):
             if hasattr(msg, 'attachments') and msg.attachments:
                 attachment_parts = []
                 for att in msg.attachments:
+                    if any(item[2] == str(att.url) for item in message_images(msg)):
+                        continue
                     att_info = f"[Attachment: {att.filename}"
                     if att.content_type:
                         att_info += f" ({att.content_type})"
@@ -605,9 +496,7 @@ class Gpt(commands.Cog):
                 if attachment_parts:
                     full_content = full_content + "\n" + "\n".join(attachment_parts) if full_content else "\n".join(attachment_parts)
             
-            # Agentic histories need IDs for tool targeting. Plain chat's
-            # closing request repeats the trigger text instead.
-            id_tag = f"[msg_id: {msg.id}] " if agentic and hasattr(msg, 'id') else ""
+            id_tag = f"[msg_id: {msg.id}] "
 
             if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
                 history.append({"role": "assistant", "content": f"{id_tag}{full_content}"})
@@ -624,6 +513,20 @@ class Gpt(commands.Cog):
                 author_id = getattr(msg.author, 'id', 'unknown') if hasattr(msg, 'author') else 'unknown'
                 
                 history.append({"role": "user", "content": f"{id_tag}{author_id}{reply_context}: {full_content}"})
+            images, keys = [], []
+            for item in message_images(msg):
+                identity = (msg.id, item[0])
+                image = pixels.get(identity)
+                if identity in selected:
+                    keys.append(identity)
+                if image:
+                    images.append(image)
+                else:
+                    history[-1]['content'] += f"\n[image: {item[1]}]"
+            if images:
+                history[-1]['images'] = images
+            if keys:
+                history[-1]['_selected_images'] = keys
         return history, user_mapping
 
     def _build_system_prompt(self, ctx, tool_names):
@@ -631,8 +534,7 @@ class Gpt(commands.Cog):
         and agentic tool guidance.
 
         `tool_names` is the guild's resolved bot-tool allowlist. When empty
-        the agentic guidance block is omitted (plain-chat behavior)."""
-        agentic = bool(tool_names)
+        the agentic guidance block is omitted (no bot tools)."""
         personality_data = self.bot.config.get(ctx, "gpt_personality_data")
         current_personality_prompt = None
 
@@ -669,17 +571,19 @@ class Gpt(commands.Cog):
         ])
 
         prompt_parts.append("- Respond to the trigger message identified in the closing request context.")
-        if agentic:
+        if tool_names:
             prompt_parts.extend(build_agentic_guidance(
-                tool_names, ctx.guild.id, ctx.channel.id))
+                tool_names, getattr(ctx.guild, "id", "DM"), ctx.channel.id))
 
+        prompt_parts.append("Images attached to messages are visible to you as image inputs; text like [image: name] marks an image you cannot see.")
+        prompt_parts.append("You may call stay_quiet to end a turn without a reply. Never write [msg_id: ...] markers in replies.")
         return "\n".join(prompt_parts)
 
     async def _prepare_cached_history(self, ctx, provider_config, tool_names, *, now=None):
         minimum, maximum = history_bounds(self.bot.config, ctx)
         model_info = provider_config.provider_info.get("models", {}).get(provider_config.model, {}) or {}
         ratio, ttl = cache_policy(model_info)
-        key = (ctx.guild.id, ctx.channel.id, provider_config.provider,
+        key = (getattr(ctx.guild, "id", "DM"), ctx.channel.id, provider_config.provider,
                provider_config.model, tuple(tool_names))
         checked_at = time.monotonic() if now is None else now
         previous = self._history_windows.previous(key, checked_at, ttl)
@@ -697,31 +601,28 @@ class Gpt(commands.Cog):
         # Vision is on unless the catalog says otherwise: every configured
         # provider family is multimodal, and an explicit vision:false opts out.
         vision = model_info.get("vision") is not False
-        images = []
-        if vision:
-            urls = trigger_images(ctx.message,
-                                  await referenced_message(ctx, reference_cache))
-            images = await download_images(urls) if urls else []
-        prompt += ("\nImage inputs from the trigger message (and the message it replies to) are attached. Describe only what you can see."
-                   if vision and images else
-                   "\nNo image pixels are available in this request. Image URLs and filenames are metadata; do not infer their contents.")
+        retained = self._image_selections.get(key, ())
+        refreshed = {}
+
+        selections_by_candidate = {}
 
         async def render(selected):
             history, mapping = await self._build_history(
-                ctx, bool(tool_names), messages=selected,
-                reference_cache=reference_cache)
+                ctx, messages=selected, reference_cache=reference_cache,
+                vision=vision, retained=retained, refreshed=refreshed)
             context = (
                 f"[REQUEST CONTEXT] Invoking user ID: {ctx.author.id}; "
                 f"trigger message ID: {ctx.message.id}. Respond to that message.\n"
                 "User-ID → display-name mapping: "
                 + ", ".join(f"{uid}: {name}" for uid, name in sorted(mapping.items())))
-            if not tool_names:
-                # Supplemental references can follow the latest conversation
-                # turn. Repeat the trigger so plain chat cannot answer an old
-                # reference instead; agent mode already appends its command.
-                context += f"\n[TRIGGER MESSAGE] {ctx.message.content}"
-            return [{"role": "system", "content": prompt}, *history,
-                    {"role": "user", "content": context, **({"images": images} if vision and images else {})}]
+            # Selection bookkeeping is local: neither wire payloads nor cache
+            # prefix comparisons should depend on private rendering metadata.
+            selections = tuple(identity for turn in history
+                               for identity in turn.pop('_selected_images', ()))
+            rendered = [{"role": "system", "content": prompt}, *history,
+                        {"role": "user", "content": context}]
+            selections_by_candidate[id(rendered)] = selections
+            return rendered
 
         baseline = await render(baseline_messages)
         extended = None
@@ -738,10 +639,14 @@ class Gpt(commands.Cog):
         previous = self._history_windows.previous(key, sent_at, ttl)
         chosen = self._history_windows.choose(baseline, extended, previous, ratio)
         selected = anchored if chosen is extended else baseline_messages
+        self._image_selections[key] = selections_by_candidate[id(chosen)]
+        self._image_selections.move_to_end(key)
+        while len(self._image_selections) > 256:
+            self._image_selections.popitem(last=False)
         return chosen, key, selected[0].id, sent_at
 
     async def process_askgpt(self, ctx, question: str):
-        key = (ctx.guild.id, ctx.channel.id)
+        key = (getattr(ctx.guild, "id", "DM"), ctx.channel.id)
         lock = self._channel_locks.setdefault(key, asyncio.Lock())
         async with lock:
             await self._process_askgpt(ctx, question)
@@ -767,12 +672,7 @@ class Gpt(commands.Cog):
         async with ctx.typing():
             provider_config = self.get_provider_config(ctx)
 
-            # Agentic vs plain chat is decided by the guild's enabled bot
-            # tools: a non-empty allowlist runs the agent loop; empty (the
-            # default) runs the plain-chat path — which is byte-identical to
-            # the old non-agentic behavior (one request, no tool loop).
             tool_names = self._resolve_bot_tools(ctx)
-            agentic = bool(ctx.guild) and bool(tool_names)
 
             api_messages, history_key, anchor, sent_at = await self._prepare_cached_history(
                 ctx, provider_config, tool_names)
@@ -786,9 +686,7 @@ class Gpt(commands.Cog):
             }
 
             async def run(messages):
-                if agentic:
-                    return await self._run_agentic(ctx, provider_config, messages, metadata, question, tool_names)
-                return await self.call_ai_api(provider_config, messages, metadata)
+                return await self._run_agentic(ctx, provider_config, messages, metadata, question, tool_names)
 
             try:
                 try:
@@ -799,10 +697,13 @@ class Gpt(commands.Cog):
                     if e.status_code != 400 or not any(m.get("images") for m in api_messages):
                         raise
                     self.logger.warning("provider rejected image input, retrying without images: %s", e)
-                    response = await run(strip_images(
+                    api_messages = strip_images(
                         api_messages, "[SYSTEM] The attached image could not be processed. "
-                                      "Say briefly that you could not view it."))
-                self._history_windows.commit(history_key, anchor, api_messages, sent_at)
+                                      "Say briefly that you could not view it.")
+                    response = await run(api_messages)
+                model_info = provider_config.provider_info.get("models", {}).get(provider_config.model, {}) or {}
+                _, ttl = cache_policy(model_info)
+                self._history_windows.commit(history_key, anchor, api_messages, sent_at, ttl=ttl)
                 if response is None:  # Explicit stay_quiet outcome, not empty model output.
                     return
                 # Sanitize before the EOS check so a trailing format character
@@ -888,7 +789,7 @@ class Gpt(commands.Cog):
         tools = build_agent_tools(
             ctx, self.logger, tool_names,
             gate_check=_live_gate_check, tool_budget=tool_budget,
-        )
+        ) if tool_names and ctx.guild else []
         # Local to this invocation: no registry entry, MCP exposure, or state
         # shared with other runs. An output function terminates the Agent;
         # an ordinary function tool would require another model response.
@@ -908,7 +809,7 @@ class Gpt(commands.Cog):
         output_type = [str, ToolOutput(stay_quiet, name="stay_quiet")]
         available_names = [t.name for t in tools] + ["stay_quiet"]
         self.logger.info(
-            f"agentic gpt run: guild={ctx.guild.id} channel={ctx.channel.id} "
+            f"agentic gpt run: guild={getattr(ctx.guild, 'id', 'DM')} channel={ctx.channel.id} "
             f"actor={ctx.author.id} provider={provider_config.provider} "
             f"model={provider_config.model} tools={available_names}"
         )
@@ -961,20 +862,22 @@ class Gpt(commands.Cog):
             # refusals (pathological). Even then: a model-authored best-effort
             # answer, never a canned failure string.
             self.logger.warning(f"agentic gpt run blew the hard tool cap: {e}")
-            fallback = await self.llm.chat(provider_config, api_messages + [
+            quiet = False
+            fallback = await self.llm.run_agent(provider_config, api_messages + [
                 {"role": "user", "content": command_turn},
                 {"role": "user", "content": (
                     "[SYSTEM] The tool budget ran out before this request "
                     "finished. Answer in plain text with your best effort "
                     "from what you know, and say briefly what you could not "
                     "verify.")},
-            ], metadata)
-            return fallback.text
+            ], tools=[], metadata=metadata, output_type=output_type)
+            self._log_agentic_usage(fallback)
+            return None if quiet else fallback.text
 
         if quiet:
             self.logger.info(
                 "agentic stay_quiet: guild=%s channel=%s actor=%s",
-                ctx.guild.id, ctx.channel.id, ctx.author.id,
+                getattr(ctx.guild, "id", "DM"), ctx.channel.id, ctx.author.id,
             )
             return None
         return response.text

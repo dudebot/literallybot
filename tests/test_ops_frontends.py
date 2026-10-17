@@ -42,6 +42,7 @@ def gpt_run(config, monkeypatch):
     ctx = NS(bot=bot, guild=guild, channel=channel, author=author,
              message=message, typing=typing, send=AsyncMock())
     gpt = Gpt(bot)
+    monkeypatch.setattr(gpt.llm, "chat", AsyncMock(side_effect=AssertionError("chat called")))
 
     def responses(parts):
         pending = iter(parts)
@@ -92,16 +93,13 @@ async def test_explicit_quiet_ends_run_without_posting_or_leaking_to_next_turn(c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('agentic', [False, True])
-async def test_unintentional_blank_is_not_silence_and_plain_chat_never_loops(config, gpt_run, monkeypatch, agentic):
+async def test_unintentional_blank_is_not_silence_and_uses_agent(config, gpt_run, monkeypatch, agentic):
     gpt, ctx, responses = gpt_run
     if agentic:
         config.set_global('agent_ops_whitelist', {'send_message': True})
         config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
-    else:
-        def unexpected_agent(**kwargs):
-            pytest.fail('Plain chat must not construct an Agent')
-        monkeypatch.setattr('core.llm.client.Agent', unexpected_agent)
-    requests = responses([[TextPart('   ')]] if agentic else [[]])
+    monkeypatch.setattr(gpt.llm, 'chat', AsyncMock(side_effect=AssertionError('chat called')))
+    requests = responses([[TextPart('   ')]])
 
     await gpt.process_askgpt(ctx, 'hello')
 
@@ -109,7 +107,70 @@ async def test_unintentional_blank_is_not_silence_and_plain_chat_never_loops(con
     ctx.send.assert_awaited_once()
     assert 'empty response' in ctx.send.await_args.args[0]
     if not agentic:
-        assert not requests[0].function_tools and not requests[0].output_tools
+        assert not requests[0].function_tools
+        assert [tool.name for tool in requests[0].output_tools] == ['stay_quiet']
+
+
+@pytest.mark.asyncio
+async def test_dm_and_toolless_guild_use_same_agent(config, gpt_run, monkeypatch):
+    gpt, ctx, responses = gpt_run
+    # DM command contexts bypass cooldown and never expose guild tools.
+    ctx.guild = None
+    requests = responses([[TextPart('Hello DM')]])
+    run = AsyncMock(wraps=gpt.llm.run_agent)
+    monkeypatch.setattr(gpt.llm, 'run_agent', run)
+    await gpt.process_askgpt(ctx, 'hello')
+    assert run.await_args.kwargs['tools'] == []
+    assert len(requests) == 1
+    assert ctx.send.await_args.args[0] == 'Hello DM'
+    assert next(iter(gpt._history_windows.states))[0] == 'DM'
+
+
+@pytest.mark.asyncio
+async def test_budget_fallback_uses_agent_without_bot_tools(config, gpt_run, monkeypatch):
+    from pydantic_ai.exceptions import UsageLimitExceeded
+    gpt, ctx, _ = gpt_run
+    config.set_global('agent_ops_whitelist', {'send_message': True})
+    config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
+    run = AsyncMock(side_effect=[UsageLimitExceeded('test budget'), NS(text='Best effort', usage=None)])
+    monkeypatch.setattr(gpt.llm, 'run_agent', run)
+    await gpt.process_askgpt(ctx, 'hello')
+    first, fallback = run.await_args_list
+    assert first.kwargs['tools']
+    assert fallback.kwargs['tools'] == []
+    assert '[SYSTEM] The tool budget ran out' in fallback.args[1][-1]['content']
+    assert fallback.kwargs['output_type'][1].name == 'stay_quiet'
+    assert ctx.send.await_args.args[0] == 'Best effort'
+
+
+@pytest.mark.asyncio
+async def test_provider_image_400_retries_agent_with_pixels_stripped(gpt_run, monkeypatch):
+    from pydantic_ai.exceptions import ModelHTTPError
+    gpt, ctx, _ = gpt_run
+    messages = [{'role': 'user', 'content': '[msg_id: 18] photo',
+                 'images': [{'data': b'jpeg', 'media_type': 'image/jpeg'}]},
+                {'role': 'user', 'content': '[REQUEST CONTEXT] trigger 20'}]
+    monkeypatch.setattr(gpt, '_prepare_cached_history', AsyncMock(return_value=(messages, ('key',), 18, 0)))
+    run = AsyncMock(side_effect=[ModelHTTPError(400, 'test-model', 'invalid image'),
+                                NS(text='Could not view it', usage=None)])
+    monkeypatch.setattr(gpt.llm, 'run_agent', run)
+    await gpt.process_askgpt(ctx, 'look')
+    assert run.await_count == 2
+    assert run.await_args_list[0].args[1][0]['images']
+    stripped = run.await_args_list[1].args[1]
+    assert all('images' not in m for m in stripped)
+    assert 'could not be processed' in stripped[0]['content']
+    assert ctx.send.await_args.args[0] == 'Could not view it'
+
+
+@pytest.mark.asyncio
+async def test_toolless_agent_can_explicitly_stay_quiet(gpt_run):
+    gpt, ctx, responses = gpt_run
+    requests = responses([[ToolCallPart('stay_quiet', {})]])
+    await gpt.process_askgpt(ctx, 'no reply please')
+    assert len(requests) == 1 and not requests[0].function_tools
+    ctx.send.assert_not_awaited()
+    assert gpt._history_windows.states
 
 
 def test_agent_exposure_requires_both_gates_and_never_includes_dm_or_global():
