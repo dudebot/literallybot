@@ -50,6 +50,7 @@ from pydantic_ai.messages import (
     SystemPromptPart,
     TextPart,
     UserPromptPart,
+    BinaryContent,
     ImageUrl,
 )
 from pydantic_ai.models import Model
@@ -583,6 +584,13 @@ class _NullLogger:
     def error(self, *a, **k): pass
 
 
+def _image_part(image):
+    """A URL string becomes ImageUrl; {"data", "media_type"} becomes BinaryContent."""
+    if isinstance(image, dict):
+        return BinaryContent(data=image["data"], media_type=image["media_type"])
+    return ImageUrl(image)
+
+
 def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
     """Convert OpenAI-style role/content dicts to pydantic-ai messages.
 
@@ -604,7 +612,7 @@ def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
         elif role == "system":
             request_parts.append(SystemPromptPart(content=content))
         else:
-            request_parts.append(UserPromptPart(content=([content, *[ImageUrl(url) for url in msg["images"]]]
+            request_parts.append(UserPromptPart(content=([content, *[_image_part(i) for i in msg["images"]]]
                                                        if msg.get("images") else content)))
 
     if request_parts:

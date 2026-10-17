@@ -32,22 +32,78 @@ PANEL_TIMEOUT = 180
 TOOL_BUDGET_VALUES = (4, 8, 12, 16)
 
 
-def trigger_images(message):
-    """Only the invoking message, four unique images, no history-wide fetch."""
+IMAGE_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+IMAGE_HOSTS = {"cdn.discordapp.com", "media.discordapp.net",
+               "images-ext-1.discordapp.net", "images-ext-2.discordapp.net"}
+MAX_IMAGES = 4
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def trigger_images(message, referenced=None):
+    """Image URLs from the trigger message and the message it replies to
+    (attachments plus embed image/thumbnail), Discord-hosted only, deduped,
+    capped at MAX_IMAGES. The replied-to message may be the bot's own post."""
     from urllib.parse import urlparse
     urls = []
-    for att in getattr(message, "attachments", []):
-        if getattr(att, "content_type", None) in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
-            urls.append(att.url)
-    for embed in getattr(message, "embeds", []):
-        for field in (getattr(embed, "image", None), getattr(embed, "thumbnail", None)):
-            url = getattr(field, "proxy_url", None) or getattr(field, "url", None)
-            if url:
-                urls.append(url)
+    for msg in (message, referenced):
+        if msg is None:
+            continue
+        for att in getattr(msg, "attachments", []):
+            if getattr(att, "content_type", None) in IMAGE_TYPES:
+                urls.append(att.url)
+        for embed in getattr(msg, "embeds", []):
+            for field in (getattr(embed, "image", None), getattr(embed, "thumbnail", None)):
+                url = getattr(field, "proxy_url", None) or getattr(field, "url", None)
+                if url:
+                    urls.append(url)
     # Discord's hosted attachment/image proxies avoid sending arbitrary origins.
     return list(dict.fromkeys(str(url) for url in urls
-        if urlparse(str(url)).scheme == "https" and urlparse(str(url)).hostname in
-        {"cdn.discordapp.com", "media.discordapp.net", "images-ext-1.discordapp.net", "images-ext-2.discordapp.net"}))[:4]
+        if urlparse(str(url)).scheme == "https"
+        and urlparse(str(url)).hostname in IMAGE_HOSTS))[:MAX_IMAGES]
+
+
+async def download_images(urls, *, max_bytes=MAX_IMAGE_BYTES, timeout=15):
+    """Fetch image URLs to bytes so providers never need to reach Discord's
+    signed, expiring CDN links. Skips non-images, oversize files and errors.
+    Returns [{"data": bytes, "media_type": str}]."""
+    import aiohttp
+    out = []
+    async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        for url in urls:
+            try:
+                async with session.get(url) as resp:
+                    media_type = resp.headers.get("Content-Type", "").split(";")[0].strip()
+                    if resp.status != 200 or media_type not in IMAGE_TYPES:
+                        continue
+                    if (resp.content_length or 0) > max_bytes:
+                        continue
+                    data = await resp.content.read(max_bytes + 1)
+                    if len(data) > max_bytes:
+                        continue
+                    out.append({"data": data, "media_type": media_type})
+            except Exception:
+                logging.getLogger(__name__).warning("image download failed: %s", url.split("?")[0])
+    return out
+
+
+async def referenced_message(ctx, cache=None):
+    """The message the trigger replies to, if any (resolved, cached, fetched)."""
+    ref = getattr(ctx.message, "reference", None)
+    if not ref or not getattr(ref, "message_id", None):
+        return None
+    resolved = getattr(ref, "resolved", None)
+    if isinstance(resolved, discord.Message):
+        return resolved
+    if cache is not None and ref.message_id in cache:
+        return cache[ref.message_id]
+    try:
+        msg = await ctx.channel.fetch_message(ref.message_id)
+    except Exception:
+        msg = None
+    if cache is not None:
+        cache[ref.message_id] = msg  # share the fetch with _build_history
+    return msg
 
 
 
@@ -589,9 +645,15 @@ class Gpt(commands.Cog):
         baseline_messages = messages[-minimum:]
         reference_cache = {msg.id: msg for msg in messages}
         prompt = self._build_system_prompt(ctx, tool_names)
-        images = trigger_images(ctx.message)
-        vision = model_info.get("vision") is True
-        prompt += ("\nAttached image inputs are available for this trigger only. Describe only what you can see."
+        # Vision is on unless the catalog says otherwise: every configured
+        # provider family is multimodal, and an explicit vision:false opts out.
+        vision = model_info.get("vision") is not False
+        images = []
+        if vision:
+            urls = trigger_images(ctx.message,
+                                  await referenced_message(ctx, reference_cache))
+            images = await download_images(urls) if urls else []
+        prompt += ("\nImage inputs from the trigger message (and the message it replies to) are attached. Describe only what you can see."
                    if vision and images else
                    "\nNo image pixels are available in this request. Image URLs and filenames are metadata; do not infer their contents.")
 
