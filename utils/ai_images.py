@@ -128,6 +128,8 @@ async def fetch_image(url, *, max_bytes=MAX_IMAGE_BYTES, timeout=15):
 
 
 MAX_IMAGE_SIDE = 2048
+MAX_DECODE_PIXELS = 40_000_000
+MAX_DECODE_SIDE = 12_000
 
 
 def normalize_image(data, *, max_side=MAX_IMAGE_SIDE):
@@ -136,20 +138,28 @@ def normalize_image(data, *, max_side=MAX_IMAGE_SIDE):
     frame. Returns {"data", "media_type"} or None for undecodable input,
     so providers only ever receive complete jpeg/png payloads."""
     import io
+    import warnings
     from PIL import Image
     try:
-        img = Image.open(io.BytesIO(data))
-        img.load()
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as img:
+                width, height = img.size
+                if width * height > MAX_DECODE_PIXELS or max(width, height) > MAX_DECODE_SIDE:
+                    return None
+                if img.format == "JPEG":
+                    img.draft("RGB", (max_side, max_side))
+                img.load()
+                img.seek(0) if getattr(img, "is_animated", False) else None
+                img.thumbnail((max_side, max_side))
+                alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
+                out = io.BytesIO()
+                if alpha:
+                    img.convert("RGBA").save(out, "PNG", optimize=True)
+                    return {"data": out.getvalue(), "media_type": "image/png"}
+                img.convert("RGB").save(out, "JPEG", quality=85)
+                return {"data": out.getvalue(), "media_type": "image/jpeg"}
     except Exception:
         return None
-    img.seek(0) if getattr(img, "is_animated", False) else None
-    img.thumbnail((max_side, max_side))
-    alpha = img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)
-    out = io.BytesIO()
-    if alpha:
-        img.convert("RGBA").save(out, "PNG", optimize=True)
-        return {"data": out.getvalue(), "media_type": "image/png"}
-    img.convert("RGB").save(out, "JPEG", quality=85)
-    return {"data": out.getvalue(), "media_type": "image/jpeg"}
 
 

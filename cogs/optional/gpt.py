@@ -685,16 +685,23 @@ class Gpt(commands.Cog):
                 "guild": str(ctx.guild.id) if ctx.guild else "DM"
             }
 
+            tool_called = False
+
+            def mark_tool_called():
+                nonlocal tool_called
+                tool_called = True
+
             async def run(messages):
-                return await self._run_agentic(ctx, provider_config, messages, metadata, question, tool_names)
+                return await self._run_agentic(ctx, provider_config, messages, metadata, question, tool_names,
+                                               on_tool_call=mark_tool_called)
 
             try:
                 try:
                     response = await run(api_messages)
                 except ModelHTTPError as e:
                     # A provider that rejects the image payload should not
-                    # cost the whole reply: retry once without pixels.
-                    if e.status_code != 400 or not any(m.get("images") for m in api_messages):
+                    # cost the whole reply, but never replay tool actions.
+                    if tool_called or e.status_code != 400 or not any(m.get("images") for m in api_messages):
                         raise
                     self.logger.warning("provider rejected image input, retrying without images: %s", e)
                     api_messages = strip_images(
@@ -748,7 +755,8 @@ class Gpt(commands.Cog):
                 await ctx.send(f"Error calling {provider_config['provider']} API: {str(e)}")
                 return
 
-    async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question, tool_names) -> Optional[str]:
+    async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question, tool_names,
+                         *, on_tool_call=None) -> Optional[str]:
         """Run the request through the in-bot agent loop (ops-registry tools).
 
         The actor for every tool call is the INVOKING USER's Member (ctx
@@ -788,7 +796,7 @@ class Gpt(commands.Cog):
 
         tools = build_agent_tools(
             ctx, self.logger, tool_names,
-            gate_check=_live_gate_check, tool_budget=tool_budget,
+            gate_check=_live_gate_check, tool_budget=tool_budget, on_tool_call=on_tool_call,
         ) if tool_names and ctx.guild else []
         # Local to this invocation: no registry entry, MCP exposure, or state
         # shared with other runs. An output function terminates the Agent;

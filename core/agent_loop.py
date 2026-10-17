@@ -57,7 +57,7 @@ BUDGET_EXHAUSTED_ERROR = (
 def build_agent_tools(ctx: Any, logger: logging.Logger,
                       op_names: List[str],
                       tool_budget: int = AGENT_TOOL_BUDGET,
-                      *, gate_check) -> List[Tool]:
+                      *, gate_check, on_tool_call=None) -> List[Tool]:
     """Build the pydantic-ai tool list for one agentic `!gpt` run.
 
     `ctx` is the live commands.Context of the invoking user — it IS the
@@ -75,20 +75,23 @@ def build_agent_tools(ctx: Any, logger: logging.Logger,
 
     All tools from one call share a `tool_budget` counter (see the
     AGENT_TOOL_BUDGET comment above for why enforcement lives here).
+    `on_tool_call` marks a run as unsafe to replay before any dispatch.
     """
     if ctx.guild is None:
         raise ValueError("The agent loop only runs inside a guild.")
     allowed = frozenset({ctx.guild.id})
     budget = {"used": 0, "cap": tool_budget}
     return [_make_agent_tool(registry.require(op_name), ctx, allowed, logger,
-                             budget, gate_check=gate_check)
+                             budget, gate_check=gate_check, on_tool_call=on_tool_call)
             for op_name in op_names]
 
 
 def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
                      logger: logging.Logger, budget: dict,
-                     gate_check=None) -> Tool:
+                     gate_check=None, on_tool_call=None) -> Tool:
     async def tool_fn(**raw) -> dict:
+        if on_tool_call is not None:
+            on_tool_call()
         # Per-guild admin gate, re-evaluated LIVE at dispatch (not a snapshot):
         # a server admin set this op to "admin only" for agent use and the
         # invoking user is not an admin. Refuse before spending budget or

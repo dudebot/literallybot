@@ -1,6 +1,9 @@
 """Vision inputs: collection, full-body download, Pillow normalization, fallback."""
 import io
+import struct
+import zlib
 from types import SimpleNamespace as NS
+from unittest.mock import Mock
 
 import pytest
 from PIL import Image
@@ -48,6 +51,29 @@ def test_normalize_downscales_and_rejects_garbage():
     assert normalize_image(JPEG[:200]) is None  # truncated payload never reaches a provider
 
 
+@pytest.mark.parametrize('size', [(10000, 10000), (12001, 1)])
+def test_oversized_header_rejected_before_decode(monkeypatch, size):
+    # A real PNG header, without allocating the declared pixel buffer.
+    ihdr = b'IHDR' + struct.pack('>IIBBBBB', *size, 8, 2, 0, 0, 0)
+    data = b'\x89PNG\r\n\x1a\n' + struct.pack('>I', 13) + ihdr + struct.pack('>I', zlib.crc32(ihdr))
+    data += struct.pack('>I', 0) + b'IDAT' + struct.pack('>I', zlib.crc32(b'IDAT'))
+    # Disable Pillow's larger default limit to exercise our own header guard.
+    monkeypatch.setattr(Image, 'MAX_IMAGE_PIXELS', None)
+    load = Mock(side_effect=AssertionError('full decode attempted'))
+    monkeypatch.setattr(Image.Image, 'load', load)
+    assert normalize_image(data) is None
+    load.assert_not_called()
+
+
+@pytest.mark.parametrize('pixel_limit', [1500, 1000])
+def test_pillow_bomb_warning_and_error_are_failures(monkeypatch, pixel_limit):
+    monkeypatch.setattr(Image, 'MAX_IMAGE_PIXELS', pixel_limit)
+    load = Mock(side_effect=AssertionError('full decode attempted'))
+    monkeypatch.setattr(Image.Image, 'load', load)
+    assert normalize_image(JPEG) is None
+    load.assert_not_called()
+
+
 class FakeContent:
     def __init__(self, data):
         self.data = data
@@ -91,6 +117,31 @@ async def test_download_reads_whole_body_and_caps(monkeypatch):
     got = [image for _, image in results if image]
     assert len(got) == 1 and got[0]["media_type"] == "image/jpeg"
     assert Image.open(io.BytesIO(got[0]["data"])).size == (64, 32)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('status', [301, 302, 307, 308])
+async def test_download_refuses_redirects(monkeypatch, status):
+    response = FakeResp('image/jpeg', JPEG)
+    response.status = status
+    response.headers['Location'] = 'https://evil.example/image.jpg'
+    get = Mock(return_value=response)
+    monkeypatch.setattr(FakeSession, 'get', get)
+    monkeypatch.setattr('aiohttp.ClientSession', FakeSession)
+    assert await fetch_image('https://cdn.discordapp.com/image.jpg') == (status, None)
+    get.assert_called_once_with('https://cdn.discordapp.com/image.jpg', allow_redirects=False)
+
+
+@pytest.mark.asyncio
+async def test_download_caps_unknown_length_stream_before_normalizing(monkeypatch):
+    response = FakeResp('image/jpeg', JPEG)
+    response.content_length = None
+    monkeypatch.setattr(FakeSession, 'get', lambda *a, **k: response)
+    monkeypatch.setattr('aiohttp.ClientSession', FakeSession)
+    normalize = Mock(side_effect=AssertionError('oversized body normalized'))
+    monkeypatch.setattr('utils.ai_images.normalize_image', normalize)
+    assert await fetch_image('https://cdn.discordapp.com/image.jpg', max_bytes=len(JPEG) - 1) == (200, None)
+    normalize.assert_not_called()
 
 
 def test_bytes_become_binary_content_and_fallback_strips_them():

@@ -164,6 +164,34 @@ async def test_provider_image_400_retries_agent_with_pixels_stripped(gpt_run, mo
 
 
 @pytest.mark.asyncio
+async def test_provider_image_400_after_action_does_not_replay(config, gpt_run, monkeypatch):
+    from pydantic_ai.exceptions import ModelHTTPError
+    gpt, ctx, _ = gpt_run
+    config.set_global('agent_ops_whitelist', {'send_message': True})
+    config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
+    messages = [{'role': 'user', 'content': 'send it',
+                 'images': [{'data': b'jpeg', 'media_type': 'image/jpeg'}]}]
+    monkeypatch.setattr(gpt, '_prepare_cached_history', AsyncMock(return_value=(messages, ('key',), 18, 0)))
+    requests = 0
+
+    def respond(messages, info):
+        nonlocal requests
+        requests += 1
+        if requests == 2:
+            assert ctx.channel.send.await_count == 1
+            raise ModelHTTPError(400, 'test-model', 'invalid image')
+        return ModelResponse(parts=[ToolCallPart('send_message', {'channel_id': '10', 'content': 'Done'})])
+
+    monkeypatch.setattr(gpt.llm, '_build_model', lambda *args: FunctionModel(respond))
+    await gpt.process_askgpt(ctx, 'send it')
+
+    assert requests == 2
+    ctx.channel.send.assert_awaited_once()
+    assert 'Error calling' in ctx.send.await_args.args[0]
+    assert not gpt._history_windows.states
+
+
+@pytest.mark.asyncio
 async def test_toolless_agent_can_explicitly_stay_quiet(gpt_run):
     gpt, ctx, responses = gpt_run
     requests = responses([[ToolCallPart('stay_quiet', {})]])
