@@ -435,6 +435,33 @@ async def _report_command_error(bot, ctx, error, *, slash: bool, denial: bool):
         actor_id=(ctx.user if slash else ctx.author).id)
 
 
+async def handle_cog_load_failures(bot, failed_cogs):
+    """Report startup cog failures once Discord is connected."""
+    if not failed_cogs:
+        return
+    try:
+        error_msg = f"Failed to load {len(failed_cogs)} cog(s) during startup:\n\n"
+        for cog_info in failed_cogs:
+            error_msg += f"• **{cog_info['name']}**: {cog_info['type']} - {cog_info['error']}\n"
+
+        class CogLoadError(Exception):
+            pass
+
+        error = CogLoadError(error_msg)
+
+        await log_error_to_discord(
+            bot,
+            error,
+            "startup_cog_load",
+            category=ErrorCategory.OTHER,
+            severity=ErrorSeverity.CRITICAL,
+            extra_info=f"Total cogs failed: {len(failed_cogs)}"
+        )
+        bot.logger.info(f"Reported {len(failed_cogs)} cog loading failures to Discord")
+    except Exception as report_error:
+        bot.logger.error(f"Failed to report cog loading errors to Discord: {report_error}")
+
+
 async def handle_command_error(bot, ctx, error: Exception):
     if _suppresses_command_not_found(bot, ctx, error):
         return
