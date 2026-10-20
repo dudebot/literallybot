@@ -17,8 +17,8 @@ from core.dm_log import log_dm, row_from_message
 from core.ops import registry as ops_registry
 from utils.event_logging import registry as event_registry
 from core.error_handler import (
-    log_error_to_discord, ErrorCategory, ErrorSeverity,
-    handle_command_error, handle_app_command_error, handle_event_error
+    handle_command_error, handle_app_command_error, handle_event_error,
+    handle_cog_load_failures
 )
 # Logging setup
 import logging
@@ -202,29 +202,7 @@ async def on_ready():
         except Exception as e:
             logger.error(f"Failed to start MCP ops server: {e}", exc_info=True)
 
-    # Report any failed cog loads to Discord now that we're connected
-    if hasattr(bot, 'failed_cogs') and bot.failed_cogs:
-        try:
-            error_msg = f"Failed to load {len(bot.failed_cogs)} cog(s) during startup:\n\n"
-            for cog_info in bot.failed_cogs:
-                error_msg += f"• **{cog_info['name']}**: {cog_info['type']} - {cog_info['error']}\n"
-
-            class CogLoadError(Exception):
-                pass
-
-            error = CogLoadError(error_msg)
-
-            await log_error_to_discord(
-                bot,
-                error,
-                "startup_cog_load",
-                category=ErrorCategory.OTHER,
-                severity=ErrorSeverity.CRITICAL,
-                extra_info=f"Total cogs failed: {len(bot.failed_cogs)}"
-            )
-            logger.info(f"Reported {len(bot.failed_cogs)} cog loading failures to Discord")
-        except Exception as report_error:
-            logger.error(f"Failed to report cog loading errors to Discord: {report_error}")
+    await handle_cog_load_failures(bot, getattr(bot, "failed_cogs", None))
 
 @bot.event
 async def on_message(message):
