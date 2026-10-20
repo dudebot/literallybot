@@ -1043,6 +1043,15 @@ class Gpt(commands.Cog):
         response_lines.append(f"Removed model '{model_name}' from {provider}")
         return "\n".join(response_lines)
 
+    def _do_setdefaultmodel(self, provider: str, model: str) -> str:
+        """Set a provider's default model; caller enforces the superadmin gate."""
+        all_providers = self.llm.get_all_providers()
+        if model not in all_providers.get(provider, {}).get("models", {}):
+            return "That model no longer exists."
+        all_providers[provider]["default_model"] = model
+        self.llm.set_all_providers(all_providers)
+        return f"Default model for {provider} is now {model}."
+
     def _do_editmodel(self, model_name: str, provider: str,
                       cost: Optional[float], max_tokens: Optional[int]) -> str:
         """Update cost/max_tokens on an existing model (the only fields a model
@@ -2492,13 +2501,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                     "Requires superadmin (this edits global bot config).",
                     ephemeral=True)
                 return
-            all_providers = self.gpt.llm.get_all_providers()
-            if self.mgmt_model not in all_providers.get(self.mgmt_provider, {}).get("models", {}):
-                self.flash("That model no longer exists.")
-            else:
-                all_providers[self.mgmt_provider]["default_model"] = self.mgmt_model
-                self.gpt.llm.set_all_providers(all_providers)
-                self.flash(f"Default model for {self.mgmt_provider} is now {self.mgmt_model}.")
+            self.flash(self.gpt._do_setdefaultmodel(
+                self.mgmt_provider, self.mgmt_model))
             await self.rerender(interaction)
 
         btn.callback = cb
