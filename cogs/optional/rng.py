@@ -2,11 +2,21 @@ import discord
 from discord.ext import commands
 import random
 import re
-from core.utils import smart_split
 from core.error_handler import suppress_command_not_found
 
 
 DICE_PATTERN = re.compile(r"(?P<rolls>\d+)?d(?P<sides>\d+)", re.IGNORECASE)
+
+
+def smart_split(options):
+    """Split a user-supplied options string on 'or', commas, or whitespace."""
+    if re.search(r',? ?\bor\b ?|, ?', options.lower()) is not None:
+        values = re.split(r',? ?\bor\b ?|, ?', options.lower())
+    elif ' ' in options:
+        values = options.split(' ')
+    else:
+        values = re.split(r'\W', options)
+    return [value for value in values if value != ""]
 
 
 @suppress_command_not_found(DICE_PATTERN)
