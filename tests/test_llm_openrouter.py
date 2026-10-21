@@ -67,6 +67,7 @@ async def test_openrouter_agent_round_trip_keeps_reasoning_and_usage(config, mon
 @pytest.mark.asyncio
 async def test_openrouter_discovery_keeps_only_free_models(config, monkeypatch):
     listing = SimpleNamespace(data=[SimpleNamespace(id="a/free-one:free"),
+                                    SimpleNamespace(id="a/unpriced:free"),
                                     SimpleNamespace(id="a/paid-one")])
 
     class FakeOpenAI:
@@ -74,9 +75,12 @@ async def test_openrouter_discovery_keeps_only_free_models(config, monkeypatch):
             self.models = SimpleNamespace(list=lambda: listing)
 
     monkeypatch.setattr("core.llm.client.openai.OpenAI", FakeOpenAI)
-    info = {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "models": {}}
+    # A panel-added provider's default model starts unpriced.
+    info = {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1",
+            "models": {"a/unpriced:free": {}}}
     llm = LLMClient(config)
     found = await llm.discover_models("openrouter", "sk-or-test", info)
-    assert found == ["a/free-one:free"]
+    assert found == ["a/free-one:free", "a/unpriced:free"]
     stored = llm.get_all_providers()["openrouter"]["models"]
-    assert stored == {"a/free-one:free": {"cost_per_mtok_output": 0.0}}
+    assert stored == {"a/free-one:free": {"cost_per_mtok_output": 0.0},
+                      "a/unpriced:free": {"cost_per_mtok_output": 0.0}}

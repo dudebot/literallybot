@@ -596,9 +596,12 @@ class LLMClient:
 
                     discovered.append(model_id)
                     models_dict = provider_info.setdefault("models", {})
-                    if provider == "openrouter" and model_id not in models_dict:
-                        # Only :free ids reach here, and they bill nothing.
-                        models_dict[model_id] = {"cost_per_mtok_output": 0.0}
+                    if provider == "openrouter":
+                        # Only :free ids reach here, and they bill nothing;
+                        # an operator-set cost is kept.
+                        entry = models_dict.setdefault(model_id, {})
+                        if isinstance(entry, dict):
+                            entry.setdefault("cost_per_mtok_output", 0.0)
                     elif model_id not in models_dict:
                         # Discovery can't know pricing, so cost_per_mtok_output
                         # is left unset -> the pricy cooldown tier until an
