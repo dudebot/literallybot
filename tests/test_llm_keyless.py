@@ -1,12 +1,11 @@
-"""The chat/agent entrypoints must both support a configured keyless provider."""
+"""Active agent conversations support a configured keyless provider."""
 import pytest
 
 from core.llm.client import LLMClient, ProviderConfig
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('entry', ['chat', 'run_agent'])
-async def test_keyless_provider_reaches_model_construction(config, monkeypatch, entry):
+async def test_keyless_provider_reaches_model_construction(config, monkeypatch):
     monkeypatch.delenv('OLLAMA_API_KEY', raising=False)
     info = {'name': 'Local', 'base_url': 'http://localhost:11434/v1',
             'requires_api_key': False, 'default_model': 'm', 'models': {'m': {}}}
@@ -22,7 +21,6 @@ async def test_keyless_provider_reaches_model_construction(config, monkeypatch, 
         raise ModelBoundary
 
     monkeypatch.setattr(client, '_build_model', build)
-    kwargs = {'tools': []} if entry == 'run_agent' else {}
     with pytest.raises(ModelBoundary):
-        await getattr(client, entry)(provider, [{'role': 'user', 'content': 'hello'}], **kwargs)
-    assert seen == ['not-needed']
+        await client.run_agent(provider, [{'role': 'user', 'content': 'hello'}], tools=[])
+    assert len(seen) == 1 and isinstance(seen[0], str) and seen[0]

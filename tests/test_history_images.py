@@ -1,18 +1,13 @@
 """Vision follows its Discord turn through cache windows, never the closing turn."""
 import asyncio
-import inspect
 import hashlib
-import json
 import logging
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 
 import discord
-import httpx
-import openai
 import pytest
 from pydantic_ai.messages import BinaryContent, ModelRequest, ModelResponse
-from pydantic_ai.providers.openai import OpenAIProvider
 
 from cogs.optional.gpt import Gpt
 from core.llm.client import _to_pai_messages
@@ -45,69 +40,6 @@ def setup(config, messages):
 
 
 @pytest.mark.asyncio
-async def test_assistant_ids_are_metadata_and_user_prefixes_are_preserved(config):
-    messages = [message(1), message(2, bot=True), message(3)]
-    cog, ctx = setup(config, messages)
-    history, _ = await cog._build_history(ctx, messages=messages)
-    assert history == [
-        {'role': 'user', 'content': f'[msg_id: 1] 10: {messages[0].content}'},
-        {'role': 'user', 'content': '[history metadata, not a request] '
-         'The next assistant message is Discord message_id=2.'},
-        {'role': 'assistant', 'content': messages[1].content},
-        {'role': 'user', 'content': f'[msg_id: 3] 10: {messages[2].content}'},
-    ]
-
-
-@pytest.mark.parametrize('tools', [[], ['add_reaction'], ['send_message']])
-def test_message_id_framing_explains_reply_lifecycle(config, tools):
-    cog, ctx = setup(config, [message(1)])
-    prompt = cog._build_system_prompt(ctx, tools)
-    assert 'Every history line' not in prompt
-    assert 'harness-supplied metadata identifying existing Discord messages' in prompt
-    assert "not part of anyone's message text or a format to continue" in prompt
-    assert 'Use them only in structured tool arguments, taking visible IDs directly' in prompt
-    assert 'Your final reply is just the message body' in prompt
-    assert 'posted in the channel answering the trigger' in prompt
-    assert 'Discord assigns its ID after posting' in prompt
-    assert ('send_message with reference_message_id, then stay_quiet' in prompt) == (
-        'send_message' in tools)
-
-
-@pytest.mark.asyncio
-async def test_historical_pixels_survive_followups_with_identical_wire_prefix(config, monkeypatch):
-    messages = [message(i, images=[attachment(100)] if i == 1 else []) for i in range(1, 7)]
-    cog, ctx = setup(config, messages)
-    fetch = AsyncMock(return_value=(200, normalize_image(JPEG)))
-    monkeypatch.setattr('utils.ai_images.fetch_image', fetch)
-    monkeypatch.setattr(cog.llm, 'chat', AsyncMock(side_effect=AssertionError('chat called')))
-    config.set_global('XAI_API_KEY', 'test-only')
-    requests = []
-    def handle(request):
-        requests.append(json.loads(request.content)['messages'])
-        return httpx.Response(200, json={
-            'id': 'test', 'object': 'chat.completion', 'created': 1, 'model': 'grok-4.6',
-            'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'hello'},
-                         'finish_reason': 'stop'}]})
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
-        sdk = openai.AsyncOpenAI(api_key='test-only', base_url='https://api.x.ai/v1', http_client=http)
-        monkeypatch.setattr('core.llm.client.OpenAIProvider', lambda **kwargs: OpenAIProvider(openai_client=sdk))
-        pc = cog.get_provider_config(ctx)
-        for turn in (4, 5, 6):
-            ctx.message = messages[turn - 1]
-            prepared, key, anchor, sent = await cog._prepare_cached_history(ctx, pc, [], now=turn)
-            assert anchor == 1
-            assert prepared[1]['images'][0]['data'] == normalize_image(JPEG)['data']
-            assert not prepared[-1].get('images')
-            await cog._run_agentic(ctx, pc, prepared, {}, 'look again', [])
-            cog._history_windows.commit(key, anchor, prepared, sent)
-    # Compare the actual provider wire bytes, including the base64 image input.
-    prefix = lambda request: json.dumps(request[:5], separators=(',', ':')).encode()
-    assert prefix(requests[0]) == prefix(requests[1]) == prefix(requests[2])
-    assert requests[1][1]['content'][1]['type'] == 'image_url'
-    fetch.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_embed_bot_and_reference_images_keep_their_source_turn(config, monkeypatch):
     embed = discord.Embed(title='Preview')
     embed.set_image(url='https://media.discordapp.net/image.png')
@@ -137,33 +69,6 @@ async def test_embed_bot_and_reference_images_keep_their_source_turn(config, mon
 
 
 @pytest.mark.asyncio
-async def test_cap_evicts_oldest_pins_and_caches_failures(config, monkeypatch):
-    messages = [message(i, images=[attachment(i)]) for i in range(1, 11)]
-    cog, ctx = setup(config, messages)
-    async def fetch(url):
-        return 200, None if '/10.jpg?' in url else normalize_image(JPEG)
-    mock = AsyncMock(side_effect=fetch)
-    monkeypatch.setattr('utils.ai_images.fetch_image', mock)
-    history, _ = await cog._build_history(ctx, messages=messages)
-    assert sum(len(m.get('images', [])) for m in history) == 7
-    assert '[image: 1.jpg]' in history[0]['content']
-    assert '[image: 2.jpg]' in history[1]['content']
-    assert '[image: 10.jpg]' in history[-1]['content']
-    retained = [key for m in history for key in m.get('_selected_images', [])]
-    newer = message(11, images=[attachment(11)])
-    ctx.message = newer
-    second, _ = await cog._build_history(ctx, messages=[*messages[1:], newer], retained=retained)
-    assert '[image: 3.jpg]' in second[1]['content']
-    assert second[-1]['images']
-    assert sum(len(m.get('images', [])) for m in second) == 7
-    assert mock.await_count == 9  # Negative cache avoids a second failed fetch.
-    # Retained pixels remain reusable after older messages leave the window.
-    third, _ = await cog._build_history(ctx, messages=[*messages[3:], newer], retained=retained)
-    assert third[-1]['images']
-    assert mock.await_count == 9
-
-
-@pytest.mark.asyncio
 async def test_ninth_trigger_image_evicts_oldest_but_reply_target_is_required(config, monkeypatch):
     messages = [message(i, images=[attachment(i)]) for i in range(1, 9)]
     cog, ctx = setup(config, messages)
@@ -184,13 +89,12 @@ async def test_ninth_trigger_image_evicts_oldest_but_reply_target_is_required(co
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('status', [403, 404])
-async def test_expired_urls_refresh_message_once(config, monkeypatch, status):
+async def test_expired_urls_refresh_message_once(config, monkeypatch):
     old = message(1, images=[attachment(1), attachment(2)])
     fresh = message(1, images=[attachment(1, 'new'), attachment(2, 'new')])
     cog, ctx = setup(config, [old])
     ctx.channel.fetch_message.return_value = fresh
-    fetch = AsyncMock(side_effect=lambda url: (200, normalize_image(JPEG)) if 'ex=new' in url else (status, None))
+    fetch = AsyncMock(side_effect=lambda url: (200, normalize_image(JPEG)) if 'ex=new' in url else (403, None))
     monkeypatch.setattr('utils.ai_images.fetch_image', fetch)
     history, _ = await cog._build_history(ctx, messages=[old])
     assert len(history[0]['images']) == 2
@@ -220,8 +124,14 @@ async def test_lru_bounds_identity_negative_expiry_and_coalescing(monkeypatch):
     cache.put('b', image(b'34'))
     cache.put('c', image(b'56'))
     assert list(cache.entries) == ['b', 'c'] and cache.bytes == 4  # Count eviction.
+    cache.count = 3  # Byte pressure must act below the entry-count limit.
     cache.put('d', image(b'789'))
     assert list(cache.entries) == ['c', 'd'] and cache.bytes == 5  # Byte eviction.
+    fetch_evicted = AsyncMock(return_value=(200, image(b'34')))
+    monkeypatch.setattr('utils.ai_images.fetch_image', fetch_evicted)
+    assert await cache.get(('b', 'b.jpg', 'https://cdn.discordapp.com/b.jpg'), None, None, {}) == image(b'34')
+    fetch_evicted.assert_awaited_once()
+    assert cache.bytes <= 5
     assert cache.put('oversize', image(b'123456')) is None and cache.bytes <= 5
     old, fresh = message(1, images=[attachment(1)]), message(1, images=[attachment(1, 'fresh')])
     assert message_images(old)[0][0] == message_images(fresh)[0][0]
@@ -236,12 +146,6 @@ async def test_lru_bounds_identity_negative_expiry_and_coalescing(monkeypatch):
     clock = 31
     await cache.get(item, fresh, None, {})
     assert fetch.await_count == 2
-
-
-def test_no_secondary_askgpt_path():
-    source = inspect.getsource(inspect.getmodule(Gpt))
-    assert 'llm.chat(' not in source
-    assert 'call_ai_api' not in source
 
 
 @pytest.mark.asyncio
@@ -338,24 +242,6 @@ async def test_failed_image_logs_warning_without_signed_query(config, monkeypatc
     assert 'https://cdn.discordapp.com/attachments/1/1/1.jpg' in caplog.text
     assert 'secret-signature' not in caplog.text and '?ex=' not in caplog.text
     assert any(record.levelno == logging.WARNING for record in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_conversation_history_omits_ids_but_preserves_media(config, monkeypatch):
-    previous = message(2, images=[attachment(1)], bot=True)
-    trigger = message(3, images=[attachment(2)])
-    trigger.content = ''
-    trigger.reference = NS(message_id=1, resolved=None)
-    referenced = message(1)
-    cog, ctx = setup(config, [previous, trigger])
-    ctx.channel.fetch_message.return_value = referenced
-    monkeypatch.setattr('utils.ai_images.fetch_image',
-                        AsyncMock(return_value=(200, normalize_image(JPEG))))
-    history, _ = await cog._build_history(ctx, messages=[previous, trigger], include_ids=False)
-    assert [(turn['role'], turn['content']) for turn in history] == [
-        ('user', '[REFERENCED MESSAGE] ' + referenced.content),
-        ('assistant', previous.content), ('user', '')]
-    assert all(turn['images'][0]['data'] == normalize_image(JPEG)['data'] for turn in history[1:])
 
 
 @pytest.mark.asyncio

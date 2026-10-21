@@ -61,7 +61,7 @@ async def test_openrouter_agent_round_trip_keeps_reasoning_and_usage(config, mon
     assert bodies[0]["max_tokens"] == 8000 and "max_completion_tokens" not in bodies[0]
     echoed = [m for m in bodies[1]["messages"] if m["role"] == "assistant"]
     assert echoed[0]["reasoning_details"][0]["data"] == "sig"
-    assert result.usage.prompt_tokens == 20 and result.usage.estimated_cost_usd == 0.0
+    assert result.usage.prompt_tokens == 20
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 """Real config stores in temporary directories; drive timer callbacks explicitly."""
 import pytest
+import pytest_asyncio
 
 from core.config import Config
 
@@ -62,3 +63,31 @@ def discord_environment(config):
                      for cid, name in [(10, 'trap'), (11, 'other'), (13, 'log')]]})
     bot._connection._add_guild(guild)
     return bot, guild
+
+
+@pytest_asyncio.fixture
+async def isolated_bot_module(config, tmp_path, monkeypatch):
+    """Load the real entrypoint without opening deployment config or logs."""
+    import importlib.util
+    import logging
+    from pathlib import Path
+    from core.ops import OpsRegistry
+
+    source = Path(__file__).resolve().parents[1] / 'bot.py'
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('core.config.Config', lambda: config)
+    root_logger = logging.getLogger()
+    prior_handlers = set(root_logger.handlers)
+    prior_level = root_logger.level
+    spec = importlib.util.spec_from_file_location('isolated_test_bot', source)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, 'ops_registry', OpsRegistry())
+    try:
+        yield module
+    finally:
+        await module.bot.close()
+        for handler in set(root_logger.handlers) - prior_handlers:
+            root_logger.removeHandler(handler)
+            handler.close()
+        root_logger.setLevel(prior_level)

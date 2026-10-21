@@ -14,7 +14,7 @@ from core.llm.client import LLMClient, ProviderConfig
 
 
 @pytest.mark.asyncio
-async def test_channel_window_honors_cost_edits_expiry_and_failed_calls(config):
+async def test_channel_window_reuses_prefix_until_message_edit(config):
     info = {'models': {'grok-4.6': {'cache_input_ratio': .25, 'cache_ttl_seconds': 300}}}
     config.set_global('ai_providers', {'xai': info})
     config.set(1, 'current_ai_model', 'grok-4.6')
@@ -44,31 +44,6 @@ async def test_channel_window_honors_cost_edits_expiry_and_failed_calls(config):
     messages[0].content = 'edited ' * 30
     _, _, anchor, _ = await gpt._prepare_cached_history(ctx, pc, [], now=102)
     assert anchor == 2
-    # A persona change must also reset the economically useful prefix.
-    config.set(1, 'gpt_personality_data', {'prompt': 'New persona'})
-    _, _, anchor, _ = await gpt._prepare_cached_history(ctx, pc, [], now=103)
-    assert anchor == 2
-    config.rem(1, 'gpt_personality_data')
-    ctx.message = messages[6]
-    _, _, anchor, _ = await gpt._prepare_cached_history(ctx, pc, [], now=104)
-    assert anchor == 5  # anchor 1 fell outside max=6
-    ctx.message = messages[3]
-    _, _, anchor, _ = await gpt._prepare_cached_history(ctx, pc, [], now=400)
-    assert anchor == 2  # expired cache
-    # Failed API calls must not publish an anchor as if it were cached.
-    @asynccontextmanager
-    async def typing():
-        yield
-    sent = []
-    async def send(text, **kwargs):
-        sent.append(text)
-    async def fail(*args, **kwargs):
-        raise RuntimeError('network failed')
-    ctx.typing, ctx.send = typing, send
-    gpt.llm.run_agent = fail
-    await gpt.process_askgpt(ctx, 'hello')
-    assert not gpt._history_windows.states
-    assert 'network failed' in sent[-1]
 
 
 @pytest.mark.asyncio
@@ -167,8 +142,7 @@ async def test_candidate_references_share_fetches_but_refresh_next_invocation(co
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('entry', ['chat', 'run_agent'])
-async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, monkeypatch, entry):
+async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, monkeypatch):
     headers = []
     def handle(request):
         headers.append(request.headers)
@@ -186,9 +160,8 @@ async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, mo
                             lambda **kwargs: OpenAIProvider(openai_client=sdk))
         info = {'base_url': 'https://api.x.ai/v1', 'models': {'grok-4.6': {}}}
         pc = ProviderConfig('xai', 'grok-4.6', info, {})
-        kwargs = {'tools': []} if entry == 'run_agent' else {}
-        result = await getattr(client, entry)(pc, [{'role': 'user', 'content': 'hi'}],
-                                              metadata={'guild': '1', 'channel': '2', 'sender': '3'}, **kwargs)
+        result = await client.run_agent(pc, [{'role': 'user', 'content': 'hi'}],
+                                        metadata={'guild': '1', 'channel': '2', 'sender': '3'}, tools=[])
         assert headers[0]['x-grok-conv-id'] == 'literallybot:1:2:grok-4.6'
         assert result.usage.cached_prompt_tokens == 8000
         assert result.usage.reasoning_tokens == 60

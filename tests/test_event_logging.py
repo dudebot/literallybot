@@ -88,65 +88,36 @@ async def test_event_delivery_failure_is_local_and_cannot_disable_errors(activit
 
 
 @pytest.mark.asyncio
-async def test_registration_drives_paginated_admin_controls_and_rechecks_auth(activity):
+async def test_activity_channel_edit_preserves_settings_and_rechecks_auth(activity):
     cog, bot, guild = activity
-    owner = object()
-    # A future producer adds many categories without editing the logging cog/UI.
-    events.registry.register(owner, 'example', 'Example feature', {f'event_{i}': f'Event {i}' for i in range(30)})
-    panel = None
+    panel = LogSettingsView(bot, guild.get_member(2), guild)
+    panel.page, panel.activity_route = 'activity', 'category:membership.join'
+    ix = NS(client=bot, user=guild.get_member(2), guild=guild, guild_id=guild.id,
+            response=NS(is_done=lambda: False, send_message=AsyncMock(), edit_message=AsyncMock()))
+    bot.config.set(guild.id, events.KEY, {
+        'categories': {'disabled_feature.old': {'enabled': False}},
+    })
     try:
-        before = events.registry.categories()
-        with pytest.raises(ValueError):
-            events.registry.register(object(), 'bad', 'Invalid batch', {'ok': 'Valid', 'bad-key': 'Invalid'})
-        assert events.registry.categories() == before
-        panel = LogSettingsView(bot, guild.get_member(2), guild)
-        panel.page, panel.activity_route = 'activity', 'category:example.event_29'
-        panel.activity_page = [key for key, _ in events.routes()].index(panel.activity_route) // 25
-        panel.build()
-        option_values = [option.value for item in panel.walk_children() if isinstance(item, discord.ui.Select)
-                         for option in item.options]
-        assert 'category:example.event_29' in option_values
-        assert len(option_values) <= 25
-        button_labels = [item.label for item in panel.walk_children() if isinstance(item, discord.ui.Button)]
-        assert 'Previous categories' in button_labels
-        ix = NS(client=bot, user=guild.get_member(2), guild=guild, guild_id=guild.id,
-                response=NS(is_done=lambda: False, send_message=AsyncMock(), edit_message=AsyncMock()))
-        bot.config.set(guild.id, events.KEY, {'categories': {'disabled_feature.old': {'enabled': False}}})
         await panel.set_activity_channel(ix, panel.activity_route, 11)
-        assert events.settings(bot, guild)['categories'] == {
-            'disabled_feature.old': {'enabled': False}, 'example.event_29': {'channel_id': 11}}
-        # A formerly authorized panel invoker loses admin before clicking.
+        saved = events.settings(bot, guild)
+        assert saved['categories'] == {
+            'disabled_feature.old': {'enabled': False}, 'membership.join': {'channel_id': 11},
+        }
         ix.user._roles.remove(52)
         await panel.set_activity_channel(ix, panel.activity_route, 10)
-        assert events.settings(bot, guild)['categories']['example.event_29']['channel_id'] == 11
-        # Removing the producer clears controls but preserves its saved config.
-        events.registry.unregister(owner)
-        panel.build()
-        assert panel.activity_route == 'default'
-        assert events.settings(bot, guild)['categories']['example.event_29']['channel_id'] == 11
+        assert events.settings(bot, guild) == saved
+        assert ix.response.send_message.await_args.kwargs['ephemeral'] is True
     finally:
-        events.registry.unregister(owner)
-        if panel:
-            panel.stop()
+        panel.stop()
 
 
 @pytest.mark.asyncio
-async def test_bot_lifecycle_clears_registrations_on_failed_injection_and_teardown(config, tmp_path, monkeypatch):
-    import importlib.util
-    from pathlib import Path
+async def test_bot_lifecycle_clears_registrations_on_failed_injection_and_teardown(isolated_bot_module):
     from discord import app_commands
     from discord.ext import commands
     from cogs.optional.honeypot import Honeypot
 
-    # Import the actual lifecycle with a real temporary Config; never open a
-    # running deployment's config/logs and never connect to Discord.
-    source = Path(__file__).resolve().parents[1] / 'bot.py'
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr('core.config.Config', lambda: config)
-    spec = importlib.util.spec_from_file_location('event_lifecycle_bot', source)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    bot = module.bot
+    bot = isolated_bot_module.bot
 
     @app_commands.command(name='honeypot')
     async def collision(interaction: discord.Interaction):

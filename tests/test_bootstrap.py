@@ -31,8 +31,10 @@ def test_noninteractive_start_fails_without_prompting(config):
     assert error.value.code != 0
 
 
-def test_rejected_prompt_token_is_not_saved_before_verified_retry(config):
-    bot = NS(config=config)
+@pytest.mark.asyncio
+async def test_rejected_prompt_token_is_not_saved_before_verified_retry(config, isolated_bot_module, monkeypatch):
+    bot = isolated_bot_module.bot
+    monkeypatch.setattr(isolated_bot_module, 'load_cogs', AsyncMock())
     answers = iter(['typo', 'valid'])
     attempts = []
 
@@ -42,11 +44,14 @@ def test_rejected_prompt_token_is_not_saved_before_verified_retry(config):
         assert 'discord_token' not in json.loads((Path(config.config_dir) / 'global.json').read_text())
         if token == 'typo':
             raise discord.LoginFailure('bad token')
-        bootstrap.persist_token(config, bot._pending_token)
 
     bootstrap.run_bot(bot, run=login, env={}, stdin_is_tty=True,
                       prompt=lambda _: next(answers))
     assert attempts == ['typo', 'valid']
+    assert not config.has_global('discord_token')
+    assert bot._pending_token == 'valid'
+    await bot.setup_hook()
+    assert bot._pending_token is None
     assert json.loads((Path(config.config_dir) / 'global.json').read_text())['discord_token'] == 'valid'
 
 

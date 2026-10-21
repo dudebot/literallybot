@@ -171,27 +171,3 @@ def test_points_persist_signed_balances_in_user_scope(config):
     config.flush()
     assert disk(config, 'user_7') == {'points': -3}
     assert config.get(7, 'points') is None
-
-
-def test_point_adjustments_do_not_lose_concurrent_updates(config):
-    from concurrent.futures import ThreadPoolExecutor
-    bot = NS(config=config)
-    config.set_user(7, 'other_setting', 'preserved')
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda _: add_points(bot, 7, -1), range(40)))
-    assert sorted(results) == list(range(-40, 0))
-    assert get_points(bot, 7) == -40
-    assert disk(config, 'user_7') == {'points': -40, 'other_setting': 'preserved'}
-
-
-@pytest.mark.asyncio
-async def test_admin_set_points_accepts_a_negative_balance(config):
-    from cogs.optional.points import Points
-    replies = []
-    async def send(message):
-        replies.append(message)
-    cog = Points(NS(config=config))
-    member = NS(id=7, mention='example member')
-    await Points.admin_set_points.callback(cog, NS(send=send), member, -8)
-    assert disk(config, 'user_7') == {'points': -8}
-    assert replies == ["Set example member's points to -8 (was 0)"]

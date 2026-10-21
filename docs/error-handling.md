@@ -246,6 +246,19 @@ while building it. Retain one only if it also meets the regression standard
 above: a credible future mistake and an actionable failure. Having helped during
 implementation, passing once, or being cheap to run is not enough.
 
+Keep disposable probes in the task workspace while investigating input matrices,
+provider requests, prompt experiments, or alternative designs. Before retaining a
+scenario, name its supported caller, the consequential failure, and why existing
+retained tests would miss it. A hypothetical better test does not justify keeping
+a redundant or unreachable one. Assess parameter variants by failure mechanism,
+rather than retaining every example used during development.
+
+Experimental agent behavior needs product review before it becomes a permanent
+expectation. Stable authorization, privacy, storage, and cancellation boundaries
+can deserve regression checks while prompts and interaction design evolve.
+Local provider doubles establish request construction and lifecycle behavior;
+they do not establish model response quality or successful live Discord use.
+
 Before committing or handing off, review the tests introduced or changed during
 the work. Delete development-only checks and their unused fixtures without
 waiting for the user to ask; do not leave them skipped or in a permanent scratch

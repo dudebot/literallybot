@@ -5,22 +5,21 @@ from types import SimpleNamespace as NS
 import discord
 import pytest
 from discord.ext import commands
-from core.ops import op, PermissionLevel, registry
+from core.ops import op, PermissionLevel
 from core.utils import get_superadmins, is_superadmin, is_admin
 from cogs.optional.setrole import SetRole, TOGGLES_KEY, _emoji_matches
 
 
 @pytest.mark.asyncio
-async def test_bot_cog_lifecycle_registers_and_removes_operations(config):
-    from bot import LiterallyBot
+async def test_bot_cog_lifecycle_registers_and_removes_operations(isolated_bot_module):
     class Example(commands.Cog):
         @op('test_example_action', 'Example action.', PermissionLevel.EVERYONE,
             params=[], serialize=lambda result: result)
         async def action(self, ctx):
             return {'value': 1}
-    bot = LiterallyBot(command_prefix='!', intents=discord.Intents.none())
-    bot.config = config
-    bot.logger = logging.getLogger('test')
+
+    bot = isolated_bot_module.bot
+    registry = isolated_bot_module.ops_registry
     before = set(registry.names())
     cog = Example()
     try:

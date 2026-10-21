@@ -69,3 +69,22 @@ old cases skipped, or packing the same 1,408 checks into 51 functions. New tests
 fill storage and authorization gaps exposed by the audit. Timers are manually
 driven for determinism; file I/O and Config methods remain real. Tests never need
 live bot credentials, a Discord connection, or the deployment's config directory.
+
+## October 2026 follow-up
+
+A second review defended all 120 then-current test functions in 20 groups,
+followed by an independent challenge of each group's retention arguments.
+The applied cleanup removed 15 functions and repaired or pruned 17, reducing
+148 collected cases to 121. All 121 passed. These are historical results,
+not a suite-size target.
+
+Removals included inactive provider entrypoints, an unsupported DM route,
+prompt and typography inventories, and helper checks already exercised through
+the provider SDK. Repairs isolated entrypoint imports before Config and logging
+initialization, exercised the actual verified-token persistence hook, and made
+cache-byte-pressure and media-staging checks establish their claimed boundaries.
+Independent authorization, privacy, recovery, and destructive-action protections
+remain. Development probes are disposable; retained scenarios must satisfy the
+current [qualitative policy](error-handling.md#test-quality-and-development-checks).
+Passing local regression tests does not establish model response quality or
+successful live Discord behavior.
