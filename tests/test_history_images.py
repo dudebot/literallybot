@@ -338,3 +338,50 @@ async def test_failed_image_logs_warning_without_signed_query(config, monkeypatc
     assert 'https://cdn.discordapp.com/attachments/1/1/1.jpg' in caplog.text
     assert 'secret-signature' not in caplog.text and '?ex=' not in caplog.text
     assert any(record.levelno == logging.WARNING for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_omits_ids_but_preserves_media(config, monkeypatch):
+    previous = message(2, images=[attachment(1)], bot=True)
+    trigger = message(3, images=[attachment(2)])
+    trigger.content = ''
+    trigger.reference = NS(message_id=1, resolved=None)
+    referenced = message(1)
+    cog, ctx = setup(config, [previous, trigger])
+    ctx.channel.fetch_message.return_value = referenced
+    monkeypatch.setattr('utils.ai_images.fetch_image',
+                        AsyncMock(return_value=(200, normalize_image(JPEG))))
+    history, _ = await cog._build_history(ctx, messages=[previous, trigger], include_ids=False)
+    assert [(turn['role'], turn['content']) for turn in history] == [
+        ('user', '[REFERENCED MESSAGE] ' + referenced.content),
+        ('assistant', previous.content), ('user', '')]
+    assert all(turn['images'][0]['data'] == normalize_image(JPEG)['data'] for turn in history[1:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('activation,payload,enabled,expected', [
+    ('mention', 'image', True, True),
+    ('reply', 'file', True, True),
+    ('mention', 'none', True, False),
+    ('none', 'image', True, False),
+    ('mention', 'image', False, False),
+])
+async def test_media_only_invocation_requires_activation_and_enabled_ai(
+        config, activation, payload, enabled, expected):
+    trigger = message(2, images=[attachment(2)] if payload == 'image' else [])
+    cog, ctx = setup(config, [trigger])
+    trigger.guild = ctx.guild
+    trigger.content = '<@99>' if activation == 'mention' else ''
+    trigger.mentions = [cog.bot.user] if activation == 'mention' else []
+    if activation == 'reply':
+        trigger.reference = NS(message_id=1)
+        ctx.channel.fetch_message.return_value = message(1, bot=True)
+    if payload == 'file':
+        trigger.attachments = [NS(filename='notes.txt', content_type='text/plain', url='file')]
+    config.set(1, 'ai_enabled', enabled)
+    cog.bot.get_context = AsyncMock(return_value=ctx)
+    cog.process_askgpt = AsyncMock()
+    await cog.on_message(trigger)
+    assert cog.process_askgpt.await_count == int(expected)
+    if expected:
+        cog.process_askgpt.assert_awaited_once_with(ctx, '')
