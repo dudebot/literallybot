@@ -94,6 +94,7 @@ async def provider_server():
 @pytest.mark.parametrize('tools_enabled', [False, True], ids=['no-tools', 'tools'])
 async def test_prompt_cache_discord_to_provider(config, discord_environment, monkeypatch, tools_enabled):
     bot, guild = discord_environment
+    monkeypatch.setattr(bot.user, 'bot', True)
     channel, author = guild.get_channel(10), guild.get_member(1)
     messages, sent, calls = [], [], []
 
@@ -164,8 +165,9 @@ async def test_prompt_cache_discord_to_provider(config, discord_environment, mon
         # two more turns to prove extension resumes from that new start.
         for turn in range(7):
             if turn == 4:
-                for _ in range(20):
-                    post('Advance the inchworm window ' * 30)
+                for i in range(20):
+                    post('Advance the inchworm window ' * 30,
+                         author=bot.user if i == 19 else author)
             ctx.message = post(f'Follow-up {turn}: explain the pictures ' * 30)
             start = len(server.requests)
             await cog._process_askgpt(ctx, ctx.message.content)
@@ -197,8 +199,14 @@ async def test_prompt_cache_discord_to_provider(config, discord_environment, mon
                 continue  # Explicitly checked reset below.
             assert len(previous) < len(current)
             assert [wire(m) for m in previous] == [wire(m) for m in current[:len(previous)]]
-        assert prefixes[0][1]['content'][0]['text'].startswith('[msg_id: 1]')
-        assert len(prefixes[4]) == 5  # system + fresh minimum of four Discord messages
+        assert prefixes[0][1]['content'][0]['text'].startswith(f'[msg_id: 1] {author.id}: ')
+        assert prefixes[0][3] == {
+            'role': 'user', 'content': '[history metadata, not a request] '
+            'The next assistant message is Discord message_id=3.'}
+        assert prefixes[0][4] == {'role': 'assistant', 'content': messages[2].content}
+        assert prefixes[0][5]['content'][0]['text'] == '[Images from the preceding bot message]'
+        # Four Discord messages include one bot turn with separate metadata.
+        assert len(prefixes[4]) == 6
         reset_trigger = int(calls[4]['metadata']['message'])
         assert f'[msg_id: {reset_trigger - 3}]' in prefixes[4][1]['content']
         assert not image_urls(prefixes[4])

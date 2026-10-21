@@ -45,6 +45,35 @@ def setup(config, messages):
 
 
 @pytest.mark.asyncio
+async def test_assistant_ids_are_metadata_and_user_prefixes_are_preserved(config):
+    messages = [message(1), message(2, bot=True), message(3)]
+    cog, ctx = setup(config, messages)
+    history, _ = await cog._build_history(ctx, messages=messages)
+    assert history == [
+        {'role': 'user', 'content': f'[msg_id: 1] 10: {messages[0].content}'},
+        {'role': 'user', 'content': '[history metadata, not a request] '
+         'The next assistant message is Discord message_id=2.'},
+        {'role': 'assistant', 'content': messages[1].content},
+        {'role': 'user', 'content': f'[msg_id: 3] 10: {messages[2].content}'},
+    ]
+
+
+@pytest.mark.parametrize('tools', [[], ['add_reaction'], ['send_message']])
+def test_message_id_framing_explains_reply_lifecycle(config, tools):
+    cog, ctx = setup(config, [message(1)])
+    prompt = cog._build_system_prompt(ctx, tools)
+    assert 'Every history line' not in prompt
+    assert 'harness-supplied metadata identifying existing Discord messages' in prompt
+    assert "not part of anyone's message text or a format to continue" in prompt
+    assert 'Use them only in structured tool arguments, taking visible IDs directly' in prompt
+    assert 'Your final reply is just the message body' in prompt
+    assert 'posted in the channel answering the trigger' in prompt
+    assert 'Discord assigns its ID after posting' in prompt
+    assert ('send_message with reference_message_id, then stay_quiet' in prompt) == (
+        'send_message' in tools)
+
+
+@pytest.mark.asyncio
 async def test_historical_pixels_survive_followups_with_identical_wire_prefix(config, monkeypatch):
     messages = [message(i, images=[attachment(100)] if i == 1 else []) for i in range(1, 7)]
     cog, ctx = setup(config, messages)
@@ -93,7 +122,11 @@ async def test_embed_bot_and_reference_images_keep_their_source_turn(config, mon
     history, _ = await cog._build_history(ctx, messages=[posted, trigger])
     assert len(history[0]['images']) == 2
     assert history[-1]['role'] == 'assistant' and len(history[-1]['images']) == 1
-    assert '[REFERENCED MESSAGE]' in history[-1]['content']
+    assert history[-1]['content'] == '[REFERENCED MESSAGE] ' + target.content
+    assert history[-1]['_selected_images'] == [(1, ('attachment', 1))]
+    assert history[-2] == {
+        'role': 'user', 'content': '[history metadata, not a request] '
+        'The next assistant message is Discord message_id=1.'}
     converted = _to_pai_messages(history)
     bot_index = next(i for i, m in enumerate(converted) if isinstance(m, ModelResponse))
     assert isinstance(converted[bot_index + 1], ModelRequest)
