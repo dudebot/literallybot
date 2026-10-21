@@ -154,6 +154,16 @@ def is_nudge_false_alarm(text):
     return (text or "").strip().strip(".!").upper() == NUDGE_FALSE_ALARM_SENTINEL
 
 
+MESSAGE_ID_GUIDANCE = (
+    "Message IDs are harness-supplied metadata identifying existing Discord "
+    "messages, not part of anyone's message text or a format to continue. "
+    "Use them only in structured tool arguments, taking visible IDs directly "
+    "rather than guessing or searching. Your final reply is just the "
+    "message body, posted in the channel answering the trigger; Discord assigns "
+    "its ID after posting."
+)
+
+
 def build_agentic_guidance(tool_names, guild_id, channel_id):
     """System-prompt lines for agentic runs: available tools, target ids,
     and — critically — the MECHANICS of tool invocation.
@@ -174,10 +184,11 @@ def build_agentic_guidance(tool_names, guild_id, channel_id):
         "You have REAL Discord tools available: " + ", ".join(tool_names) + ".",
         f"- Current guild id: {guild_id}. Current channel id: {channel_id}.",
         "- The invoking user and trigger message IDs are in the closing request context.",
-        "- Every history line above is prefixed with [msg_id: ...]. Use those ids "
-        "DIRECTLY when reacting, editing, or replying — no guessing, and no "
-        "search_history when the target is already visible in the history. "
-        "NEVER write a [msg_id: ...] marker in your own reply text.",
+        "- " + MESSAGE_ID_GUIDANCE,
+        *([
+            "- For an explicit Discord reply to a specific message, call "
+            "send_message with reference_message_id, then stay_quiet.",
+        ] if "send_message" in tool_names else []),
         "",
         "HOW TOOL CALLS WORK (mechanics — this part is exact, not stylistic):",
         "- You are in an agent loop over the chat-completions API with function "
@@ -499,7 +510,13 @@ class Gpt(commands.Cog):
             id_tag = f"[msg_id: {msg.id}] "
 
             if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
-                history.append({"role": "assistant", "content": f"{id_tag}{full_content}"})
+                # Keep IDs out of assistant examples while preserving a stable
+                # per-message rendering and the following image attachment target.
+                history.append({"role": "user", "content": (
+                    "[history metadata, not a request] The next assistant message "
+                    f"is Discord message_id={msg.id}."
+                )})
+                history.append({"role": "assistant", "content": full_content})
             else:
                 # For user messages, add context about whether it's a reply
                 reply_context = ""
@@ -574,9 +591,11 @@ class Gpt(commands.Cog):
         if tool_names:
             prompt_parts.extend(build_agentic_guidance(
                 tool_names, getattr(ctx.guild, "id", "DM"), ctx.channel.id))
+        else:
+            prompt_parts.append(MESSAGE_ID_GUIDANCE)
 
         prompt_parts.append("Images attached to messages are visible to you as image inputs; text like [image: name] marks an image you cannot see.")
-        prompt_parts.append("You may call stay_quiet to end a turn without a reply. Never write [msg_id: ...] markers in replies.")
+        prompt_parts.append("You may call stay_quiet to end a turn without a reply.")
         return "\n".join(prompt_parts)
 
     async def _prepare_cached_history(self, ctx, provider_config, tool_names, *, now=None):
