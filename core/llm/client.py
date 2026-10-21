@@ -56,11 +56,13 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.models.openrouter import OpenRouterModel
 from pydantic_ai.output import OutputSpec
 from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from pydantic_ai.usage import RequestUsage, UsageLimits
@@ -89,6 +91,13 @@ class _OpenAIChatModel(OpenAIChatModel):
             output_audio_tokens=getattr(completion, "audio_tokens", 0) or 0,
             details=completion.model_dump(exclude_none=True) if completion else {},
         )
+
+
+class _OpenRouterModel(OpenRouterModel):
+    """OpenRouterModel keeps `reasoning_details` across tool round trips;
+    usage counters are read exactly as for other Chat Completions models."""
+
+    _map_usage = _OpenAIChatModel._map_usage
 
 
 # Provider aliases (also used by the cog for command-level aliasing).
@@ -134,6 +143,28 @@ DEFAULT_PROVIDERS: Dict[str, Any] = {
         "models": {
             "claude-haiku-4-5": {"cost_per_mtok_output": 5.0},
             "claude-sonnet-5": {"cost_per_mtok_output": 15.0},
+        },
+    },
+    "openrouter": {
+        # Free-tier (":free") models only; ids checked live 2026-10-21. Free
+        # models share OpenRouter's per-key free quota (~20 req/min, 50/day
+        # below $10 of purchased credit, 1000/day at or above it) and may be
+        # rate-limited upstream at busy times.
+        "name": "OpenRouter (free tier)",
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "models": {
+            "nvidia/nemotron-3-ultra-550b-a55b:free": {
+                "vision": False, "max_completion_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "google/gemma-4-31b-it:free": {"cost_per_mtok_output": 0.0},
+            "minimax/minimax-m3.1-flash:free": {
+                "max_completion_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "nvidia/nemotron-3.5-super-vl:free": {
+                "max_completion_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "dots-studio/dots-3-note-preview:free": {
+                "max_completion_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "poolside/laguna-s-2.1:free": {
+                "vision": False, "max_completion_tokens": 8000, "cost_per_mtok_output": 0.0},
         },
     },
     "ollama": {
@@ -308,6 +339,11 @@ class LLMClient:
             return AnthropicModel(model, provider=AnthropicProvider(api_key=api_key))
 
         base_url = provider_info.get("base_url")
+        if provider == "openrouter":
+            # OpenRouter's provider profile selects per-upstream model traits
+            # (e.g. Google schema handling) and the `max_tokens` wire field
+            # OpenRouter requires. It always uses OpenRouter's endpoint.
+            return _OpenRouterModel(model, provider=OpenRouterProvider(api_key=api_key))
         if provider == "ollama":
             # Ollama's OpenAI-compat endpoint silently ignores
             # `max_completion_tokens` (verified live), so force the plain
@@ -553,10 +589,20 @@ class LLMClient:
                         or model_id.startswith("chatgpt")
                     ):
                         continue
+                    # OpenRouter lists hundreds of paid models; only the
+                    # free tier is catalogued automatically.
+                    if provider == "openrouter" and not model_id.endswith(":free"):
+                        continue
 
                     discovered.append(model_id)
                     models_dict = provider_info.setdefault("models", {})
-                    if model_id not in models_dict:
+                    if provider == "openrouter":
+                        # Only :free ids reach here, and they bill nothing;
+                        # an operator-set cost is kept.
+                        entry = models_dict.setdefault(model_id, {})
+                        if isinstance(entry, dict):
+                            entry.setdefault("cost_per_mtok_output", 0.0)
+                    elif model_id not in models_dict:
                         # Discovery can't know pricing, so cost_per_mtok_output
                         # is left unset -> the pricy cooldown tier until an
                         # operator annotates a cost via !aisettings. Safe
