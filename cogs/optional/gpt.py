@@ -373,9 +373,10 @@ class Gpt(commands.Cog):
         return self.llm.get_provider_config(ctx)
 
     async def _build_history(self, ctx, *, messages, reference_cache=None,
-                             vision=True, retained=(), refreshed=None):
+                             vision=True, retained=(), refreshed=None, include_ids=True):
         """Render selected channel messages (plus referenced messages) into
-        OpenAI-style history turns and a user-id -> display-name mapping."""
+        OpenAI-style history turns and a user-id -> display-name mapping.
+        Set include_ids=False for one-to-one conversations without ID scaffolding."""
         history = []
         selected_by_id = {msg.id: msg for msg in messages}
         # Shared only within this invocation's candidate renders. Never reuse
@@ -413,7 +414,7 @@ class Gpt(commands.Cog):
         # Build a mapping from user IDs to display names for non-bot messages
         user_mapping = {}
         for msg in list(messages) + list(referenced_msgs.values()):
-            if not msg.author.bot:
+            if include_ids and not msg.author.bot:
                 user_mapping[str(msg.author.id)] = msg.author.display_name
                 # Extract user ids from user mentions in the message (formats like <@123456> and <@!123456>)
                 mentioned_ids = [(str(user.id), user.name) for user in msg.mentions]
@@ -425,7 +426,10 @@ class Gpt(commands.Cog):
         all_messages_for_history = list(messages)
         
         all_messages_for_history.extend(referenced_msgs.values())
-        all_messages_for_history.sort(key=lambda msg: (msg.id in referenced_msgs, msg.id))
+        # In a private conversation the final dialogue turn must remain the
+        # trigger, even when it replies to a message outside the history window.
+        all_messages_for_history.sort(
+            key=lambda msg: (msg.id in referenced_msgs if include_ids else False, msg.id))
         candidates = [(msg, item) for msg in sorted(all_messages_for_history, key=lambda m: m.id)
                       for item in message_images(msg)]
         identities = [(msg.id, item[0]) for msg, item in candidates]
@@ -512,10 +516,11 @@ class Gpt(commands.Cog):
             if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
                 # Keep IDs out of assistant examples while preserving a stable
                 # per-message rendering and the following image attachment target.
-                history.append({"role": "user", "content": (
-                    "[history metadata, not a request] The next assistant message "
-                    f"is Discord message_id={msg.id}."
-                )})
+                if include_ids:
+                    history.append({"role": "user", "content": (
+                        "[history metadata, not a request] The next assistant message "
+                        f"is Discord message_id={msg.id}."
+                    )})
                 history.append({"role": "assistant", "content": full_content})
             else:
                 # For user messages, add context about whether it's a reply
@@ -529,7 +534,8 @@ class Gpt(commands.Cog):
                 
                 author_id = getattr(msg.author, 'id', 'unknown') if hasattr(msg, 'author') else 'unknown'
                 
-                history.append({"role": "user", "content": f"{id_tag}{author_id}{reply_context}: {full_content}"})
+                content = f"{id_tag}{author_id}{reply_context}: {full_content}" if include_ids else full_content
+                history.append({"role": "user", "content": content})
             images, keys = [], []
             for item in message_images(msg):
                 identity = (msg.id, item[0])
@@ -1176,7 +1182,7 @@ class Gpt(commands.Cog):
         
         if should_respond:
             question = cleaned_content.strip()
-            if question:  # Ensure there's content
+            if question or message.attachments or message.embeds:
                 # Guild-only, full stop: DM chat is off for everyone until a
                 # deliberate DM story exists (quota control; owner decision
                 # 2026-08-07 — downstream DM machinery elsewhere is its own
