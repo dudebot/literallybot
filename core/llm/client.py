@@ -61,6 +61,7 @@ from pydantic_ai.profiles.openai import OpenAIModelProfile
 from pydantic_ai.providers.anthropic import AnthropicProvider
 from pydantic_ai.providers.ollama import OllamaProvider
 from pydantic_ai.providers.openai import OpenAIProvider
+from pydantic_ai.providers.openrouter import OpenRouterProvider
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.tools import Tool
 from pydantic_ai.usage import RequestUsage, UsageLimits
@@ -134,6 +135,28 @@ DEFAULT_PROVIDERS: Dict[str, Any] = {
         "models": {
             "claude-haiku-4-5": {"cost_per_mtok_output": 5.0},
             "claude-sonnet-5": {"cost_per_mtok_output": 15.0},
+        },
+    },
+    "openrouter": {
+        # Free-tier (":free") models only; ids checked live 2026-10-21. Free
+        # models share OpenRouter's per-key free quota (~20 req/min, 50/day
+        # below $10 of purchased credit, 1000/day at or above it) and may be
+        # rate-limited upstream at busy times.
+        "name": "OpenRouter (free tier)",
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "models": {
+            "nvidia/nemotron-3-ultra-550b-a55b:free": {
+                "vision": False, "max_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "google/gemma-4-31b-it:free": {"cost_per_mtok_output": 0.0},
+            "minimax/minimax-m3.1-flash:free": {
+                "max_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "nvidia/nemotron-3.5-super-vl:free": {
+                "max_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "dots-studio/dots-3-note-preview:free": {
+                "max_tokens": 8000, "cost_per_mtok_output": 0.0},
+            "poolside/laguna-s-2.1:free": {
+                "vision": False, "max_tokens": 8000, "cost_per_mtok_output": 0.0},
         },
     },
     "ollama": {
@@ -308,6 +331,11 @@ class LLMClient:
             return AnthropicModel(model, provider=AnthropicProvider(api_key=api_key))
 
         base_url = provider_info.get("base_url")
+        if provider == "openrouter":
+            # OpenRouter's provider profile selects per-upstream model traits
+            # (e.g. Google schema handling) and the `max_tokens` wire field
+            # OpenRouter requires. It always uses OpenRouter's endpoint.
+            return _OpenAIChatModel(model, provider=OpenRouterProvider(api_key=api_key))
         if provider == "ollama":
             # Ollama's OpenAI-compat endpoint silently ignores
             # `max_completion_tokens` (verified live), so force the plain
@@ -552,6 +580,10 @@ class LLMClient:
                         model_id.startswith("gpt-") or model_id.startswith("o")
                         or model_id.startswith("chatgpt")
                     ):
+                        continue
+                    # OpenRouter lists hundreds of paid models; only the
+                    # free tier is catalogued automatically.
+                    if provider == "openrouter" and not model_id.endswith(":free"):
                         continue
 
                     discovered.append(model_id)

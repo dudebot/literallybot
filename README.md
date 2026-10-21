@@ -239,6 +239,14 @@ like this (preserve unrelated keys):
 Provider/model lists live under `ai_providers` in global config and are
 managed at runtime through the panel — no code change to add a model.
 
+**OpenRouter (free tier):** the built-in `openrouter` provider uses
+OpenRouter's API with its own provider profile. Set `OPENROUTER_API_KEY` in
+global config, the panel, or the environment (`.env`). Only `:free` model ids
+are catalogued by key discovery; they cost nothing, so they get the cheap
+cooldown tier, but they share OpenRouter's per-key free quota (about 20
+requests/minute, and 50/day below $10 of purchased credit or 1000/day at or above it).
+Existing installs add the provider and its models from the panel.
+
 **Local models (Ollama):** point a provider at a local server with
 `"base_url": "http://localhost:11434/v1"` and `"requires_api_key": false` in its
 `ai_providers` entry. Reasoning models that would otherwise spend their whole

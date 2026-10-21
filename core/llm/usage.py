@@ -43,10 +43,17 @@ _PRICING_USD_PER_MTOK: Dict[str, Dict[str, tuple]] = {
 }
 
 
+def _is_openrouter_free(provider: str, model: str) -> bool:
+    """OpenRouter's ":free" variants bill no tokens."""
+    return provider == "openrouter" and model.endswith(":free")
+
+
 def _match_prices(provider: str, model: str) -> Optional[tuple]:
     """(prompt_price, completion_price) per Mtok for a model — exact match,
     then longest-prefix (so specific variants win over broader parents).
     None if the model isn't in the table (unknown, not zero)."""
+    if _is_openrouter_free(provider, model):
+        return (0.0, 0.0)
     provider_prices = _PRICING_USD_PER_MTOK.get(provider)
     if not provider_prices:
         return None
