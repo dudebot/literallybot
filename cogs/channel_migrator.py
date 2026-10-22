@@ -11,7 +11,7 @@ import aiohttp
 import discord
 from discord.ext import commands
 
-from core.utils import is_superadmin
+from core.permissions import is_superadmin
 
 
 ChannelTarget = Union[discord.TextChannel, discord.Thread]
@@ -493,11 +493,11 @@ class ChannelMigrator(commands.Cog):
         return None
 
     def _chunk_text(self, text: str, limit: int) -> List[str]:
-        # Shared Discord-limit splitter (core.utils) — this method kept as a
+        # Shared Discord-limit splitter (core.messages) — this method kept as a
         # thin named seam so callers keep their 1900-char headroom limit.
         if not text:
             return []
-        from core.utils import recursive_split
+        from core.messages import recursive_split
         return recursive_split(text, limit)
 
     def _collect_bundle_media_urls(self, bundle_path: Path) -> Set[str]:

@@ -219,7 +219,7 @@ async def bootstrap_superadmin(bot):
     team's pseudo-user and would be useless as a Discord id. See
     `_application_owner_id` — the attribute name there is a trap.
     """
-    from core.utils import get_superadmins
+    from core.permissions import get_superadmins
 
     if get_superadmins(bot.config):
         return None

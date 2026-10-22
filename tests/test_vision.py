@@ -8,7 +8,7 @@ from unittest.mock import Mock
 import pytest
 from PIL import Image
 
-from utils.ai_images import fetch_image, message_images, normalize_image
+from core.ai_images import fetch_image, message_images, normalize_image
 
 
 def encode(img, fmt, **k):
@@ -126,6 +126,6 @@ async def test_download_caps_unknown_length_stream_before_normalizing(monkeypatc
     monkeypatch.setattr(FakeSession, 'get', lambda *a, **k: response)
     monkeypatch.setattr('aiohttp.ClientSession', FakeSession)
     normalize = Mock(side_effect=AssertionError('oversized body normalized'))
-    monkeypatch.setattr('utils.ai_images.normalize_image', normalize)
+    monkeypatch.setattr('core.ai_images.normalize_image', normalize)
     assert await fetch_image('https://cdn.discordapp.com/image.jpg', max_bytes=len(JPEG) - 1) == (200, None)
     normalize.assert_not_called()

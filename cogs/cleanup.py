@@ -1,7 +1,8 @@
 from discord.ext import commands
 import discord
 import time
-from core.utils import is_superadmin, safe_delete
+from core.permissions import is_superadmin
+from core.messages import safe_delete
 
 
 class Cleanup(commands.Cog):
@@ -241,7 +242,7 @@ class Cleanup(commands.Cog):
         if len(summary) <= 2000:
             await status.edit(content=summary)
         else:
-            from core.utils import recursive_split
+            from core.messages import recursive_split
             chunks = recursive_split(summary, 2000)
             await status.edit(content=chunks[0])
             for chunk in chunks[1:]:

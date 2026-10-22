@@ -1,7 +1,12 @@
 from discord.ext import commands
 import discord
-from core.utils import is_admin
-from utils.points import get_points, add_points, set_points
+from core.permissions import is_admin
+from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.points import get_points, add_points, set_points
+
+
+def _payload(user, total: int) -> dict:
+    return {"user_id": str(getattr(user, "id", user)), "points": total}
 
 
 class Points(commands.Cog):
@@ -91,6 +96,56 @@ class Points(commands.Cog):
         set_points(self.bot, member, amount)
         await ctx.send(
             f"Set {member.mention}'s points to {amount:,} (was {old_balance:,})")
+
+
+    @op(
+        "get_user_points",
+        "Read a user's point balance. Does not change anything.",
+        PermissionLevel.EVERYONE,
+        params=[
+            OpParam("user", ParamKind.MEMBER, "Member whose balance to read."),
+        ],
+        serialize=lambda p: p,
+        scope=OpScope.GUILD,
+        group="points",
+        group_label="Points",
+    )
+    async def op_get_user_points(self, ctx, user) -> dict:
+        return _payload(user, get_points(self.bot, user))
+
+
+    @op(
+        "add_user_points",
+        "Add points to a user (negative amount subtracts). Negative balances are allowed.",
+        PermissionLevel.ADMIN,
+        params=[
+            OpParam("user", ParamKind.MEMBER, "Member to credit or debit."),
+            OpParam("amount", ParamKind.INTEGER, "Points to add; negative subtracts."),
+        ],
+        serialize=lambda p: p,
+        scope=OpScope.GUILD,
+        group="points",
+        group_label="Points",
+    )
+    async def op_add_user_points(self, ctx, user, amount: int) -> dict:
+        return _payload(user, add_points(self.bot, user, int(amount)))
+
+
+    @op(
+        "set_user_points",
+        "Set a user's point balance to an exact signed amount.",
+        PermissionLevel.ADMIN,
+        params=[
+            OpParam("user", ParamKind.MEMBER, "Member whose balance to set."),
+            OpParam("amount", ParamKind.INTEGER, "New balance (negative balances allowed)."),
+        ],
+        serialize=lambda p: p,
+        scope=OpScope.GUILD,
+        group="points",
+        group_label="Points",
+    )
+    async def op_set_user_points(self, ctx, user, amount: int) -> dict:
+        return _payload(user, set_points(self.bot, user, int(amount)))
 
 
 async def setup(bot):

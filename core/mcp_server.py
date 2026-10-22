@@ -171,7 +171,7 @@ def _require_bot(bot: Any) -> Any:
 def _build_context(bot: Any, actor_id: int, guild: Any) -> OpContext:
     """Build an OpContext from ids supplied over MCP (no discord.py Context
     exists on this frontend — that's the point of OpContext's duck-typed
-    shape). core.ops routes permission gates through core.utils.is_admin /
+    shape). core.ops routes permission gates through core.permissions.is_admin /
     is_superadmin, which read `ctx.bot.config`, `ctx.author.id`, and
     `ctx.guild` — so prefer the real guild Member (correct roles/permissions)
     and fall back to a bare id-holder, which those helpers treat as an

@@ -2,7 +2,9 @@
 
 Durable records of architecture decisions that otherwise live only in GitHub
 issue threads. Each entry names the issue that serves as the primary record
-and captures amendments verified against deployed code.
+and captures amendments verified against deployed code. Paths to surviving
+modules use their current locations; deleted historical modules retain their
+former paths. The 2026-10-21 entry records the current feature ownership policy.
 
 ## #58 — Core/LLM extraction + ops registry sprint (epic)
 
@@ -80,7 +82,7 @@ Supersedes the 2026-07-10 sentence "the narration-guard regex + retry nudge
 was removed" — a narrated-call backstop exists again, but it is NOT the
 word-list regex (that stays dead). Trigger: a live incident where grok-4.5
 posted "run tool search_history with channel_id is ..." verbatim with zero
-tool calls. The redesign (`cogs/optional/gpt.py`):
+tool calls. The redesign (`cogs/gpt.py`):
 
 - Detector fires ONLY on a verbatim enabled-tool snake_case name or explicit
   "run tool" phrasing in a zero-tool-call reply — never a generic word list.
@@ -106,7 +108,7 @@ as `!aisettings`.
 
 The 2026-07-10 amendment records "cheap <$1 = 10s, standard <$5 = 45s, pricy =
 300s" against a flat per-guild min-interval. Both the numbers and the mechanism
-are superseded by the nested-window ladder. Live values (`cogs/optional/gpt.py`
+are superseded by the nested-window ladder. Live values (`cogs/gpt.py`
 `COOLDOWN_TIERS` / `DEFAULT_COOLDOWN_WINDOWS`): base periods **2s / 8s / 20s**
 for cheap / standard / pricy, with the shared window ladder `1 per 1x · 10 per
 15x · 100 per 150x · 300 per 4320x` — a message must have room in *every*
@@ -118,7 +120,7 @@ surface for them since the 2026-08 UX pass.
 
 The 2026-07-10 amendment (and other historical references) locate the
 `!aisettings` panel in `cogs/optional/ai_admin.py`. That file no longer
-exists — it was merged back into `cogs/optional/gpt.py` under the
+exists — it was merged back into `cogs/gpt.py` under the
 one-cog-per-purpose standard (gpt.py owns ALL AI surface: chat paths, `_do_*`
 helpers, and the panel). Read historical `ai_admin.py` references accordingly.
 
@@ -273,7 +275,7 @@ The dynamic surface is deleted; the capability survives through restart.
 **Deleted outright:**
 
 - `!load`, `!unload`, `!reload` (including bare `!reload` = reload-all) in
-  `cogs/core/control.py`.
+  `cogs/control.py`.
 - `!update` — **entirely**, not just its reload step. Its purpose belonged to
   the desktop-dev era: develop and commit elsewhere, avoid logging into the
   server to pull. Development now happens on the server itself, so deployment
@@ -285,7 +287,7 @@ The dynamic surface is deleted; the capability survives through restart.
   likewise stopped unloading and loading.
 
 **End state.** `disabled_cogs` is read once, by startup, through
-`core.utils.list_cog_modules`. Every editor of that list — `!disable`,
+`core.cog_discovery.list_cog_modules`. Every editor of that list — `!disable`,
 `!enable`, and the `!cogs` panel — now writes config and nothing else. The
 panel gained a **Restart** button that calls `Control.do_restart`, the *same*
 exit path as `!restart`/`!kys` (`bot.close()` then `sys.exit()`, with systemd
@@ -332,7 +334,7 @@ is a **restart**, not a reload.
 
 **Docs retired with the surface:** the "hot-reload during development"
 guidance in `CLAUDE.md` and `docs/cog-development.md`, the `!reload setrole`
-apply-my-JSON-edits note in `cogs/optional/setrole.py` (`/role sync` already
+apply-my-JSON-edits note in `cogs/setrole.py` (`/role sync` already
 covers that case, through the same `_sync_guild` service), the `disabled_cogs`
 row in `docs/config-system.md`, the superadmin-tier inventory in
 `docs/security.md`, and the README's hot-reload claims.
@@ -487,3 +489,32 @@ mid-run cog-replacement tests and the skipped chat_stream test. Those runtime
 features are absent. The guards remain in production code; the suite now
 protects current failure paths, with 51 collected cases instead of 1,408.
 New ops do not require a schema/metadata/mock-forwarding test bundle.
+
+
+## Feature ownership and explicit recovery protection (2026-10-21)
+
+All feature adapters now live directly in `cogs/`. Shared implementations live
+in `core/`: points storage, AI history/images, event reporting, and the focused
+permissions, panels, messages and cog discovery modules. Private helpers can
+remain with their cog; cross-cog imports or calls remain disallowed.
+
+This supersedes the former `cogs/core/` versus `cogs/optional/` classification.
+`core.cog_discovery.PROTECTED_COGS` is the sole protection declaration: `control`
+and `admin`, each with a recovery reason. Loader and operator controls consult
+it. Discovery applies disabled IDs before importing feature modules; it does
+not import a cog to inspect protection metadata. Bare IDs remain stable, and
+current and historical qualified module names normalize to those IDs.
+
+Behavioral ops belong to the owning cog. The earlier module-owned Points op
+registration is removed: `core/points.py` remains a plain store, while the
+Points cog owns all three tool adapters. The store surviving a feature disable
+does not justify leaving its tools registered. Raw API primitives remain in
+`core/ops.py` under their own policy.
+
+The fixed-at-boot decision (#86) remains in force. Global `disabled_cogs` edits
+withdraw the feature's commands, listeners, tasks, views and behavioral tools
+on the next boot; they preserve state and existing Discord effects. Registration
+makes an op eligible, configured exposure chooses a frontend's tools, and
+per-call permissions authorize execution. MCP's unset allowlist still selects
+the full registered universe. No new exposure default or hot-unload contract
+is introduced by this refactor.

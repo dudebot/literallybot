@@ -3,9 +3,9 @@ import logging
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
 import pytest
-from cogs.optional.auto_response import AutoResponse
-from cogs.optional.setrole import SetRole
-from cogs.optional.gpt import guild_tool_budget
+from cogs.auto_response import AutoResponse
+from cogs.setrole import SetRole
+from cogs.gpt import guild_tool_budget
 
 @pytest.mark.asyncio
 async def test_autoresponse_edit_preserves_precedence_and_other_fields(config):
@@ -39,7 +39,7 @@ def test_budget_is_guild_local_and_bounded(config):
 @pytest.mark.asyncio
 async def test_eos_reply_is_silent_without_empty_apology(config, monkeypatch):
     from contextlib import asynccontextmanager
-    from cogs.optional.gpt import Gpt
+    from cogs.gpt import Gpt
 
     @asynccontextmanager
     async def typing():

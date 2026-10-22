@@ -47,8 +47,8 @@ module-level `op(...)` decorator, and `bot.py` calls
 discord.py cog lifecycle. It only knows how to run an op against an
 `OpContext`.
 
-Permission gates route through `core.utils.is_admin` / `is_superadmin`,
-the same helpers `cogs/optional/cleanup.py` and `cogs/optional/setrole.py`
+Permission gates route through `core.permissions.is_admin` / `is_superadmin`,
+the same helpers `cogs/cleanup.py` and `cogs/setrole.py`
 already use via `@commands.check(...)`. Those helpers expect a duck-typed
 ctx with `.author`, `.guild`, and `.bot.config` — `OpContext` below mirrors
 that shape so the existing helpers work unmodified.
@@ -74,7 +74,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import discord
 
 from core.dm_log import list_dm_users, load_dms, log_dm, row_from_message
-from core.utils import is_admin, is_superadmin, sanitize_outbound_text
+from core.permissions import is_admin, is_superadmin
+from core.messages import sanitize_outbound_text
 
 # Shared history-scan cap: search_history never scans more than this many
 # messages regardless of the requested limit (silently clamped, matching
@@ -272,7 +273,7 @@ class OpContext:
     """Minimal actor/target context an op needs to run.
 
     Duck-types the subset of `discord.ext.commands.Context` that
-    `core.utils.is_admin` / `is_superadmin` and the op implementations
+    `core.permissions.is_admin` / `is_superadmin` and the op implementations
     below actually touch: `.bot` (with `.config`), `.author`, and
     `.guild`. A real `commands.Context` satisfies this directly —
     pass it straight through. A non-cog frontend (agent loop, MCP server)
@@ -502,7 +503,7 @@ class Op:
     # it claimed to describe.
     scope: OpScope = OpScope.GUILD
     # Which group this op renders under in a frontend's grouped listing.
-    # Core primitives use an OP_GROUPS key; cog/util ops pass any kebab-case
+    # Core primitives use an OP_GROUPS key; cog ops pass any kebab-case
     # id and an optional group_label (the registry learns the label live).
     group: str = "messaging"
     group_label: Optional[str] = None
@@ -816,7 +817,7 @@ def _is_guild_channel(value: Any) -> bool:
 
 
 def _check_permission(ctx: OpContext, level: PermissionLevel) -> "tuple[bool, Optional[str]]":
-    """Route to core.utils.is_admin / is_superadmin, the same gates the
+    """Route to core.permissions.is_admin / is_superadmin, the same gates the
     existing cogs use via @commands.check(...). Those helpers read
     ctx.bot.config, ctx.author, and ctx.guild — see OpContext's docstring."""
     if level == PermissionLevel.EVERYONE:
@@ -870,8 +871,8 @@ def op(name: str, description: str, permission: PermissionLevel,
        group_label: Optional[str] = None):
     """Declare a function as an op, WITHOUT registering it.
 
-    Used on cog methods (registered in add_cog) and on util functions
-    (registered via register_module_ops). The spec is inert at import.
+    Used only on owning cog methods, registered in add_cog. Shared service
+    functions remain ordinary Python functions. The spec is inert at import.
 
         class MyCog(commands.Cog):
             @op("do_thing", "Does the thing.", PermissionLevel.ADMIN)
@@ -953,13 +954,13 @@ class OpsRegistry:
 
     def __init__(self):
         self._ops: Dict[str, Op] = {}
-        # gid -> label for groups that are NOT in OP_GROUPS (cog/util ops).
+        # gid -> label for groups that are NOT in OP_GROUPS (cog ops).
         # Stamped at registration, pruned when the last op in that group
         # unregisters. Core primitive groups stay in OP_GROUPS.
         self._extra_groups: Dict[str, str] = {}
 
     def label_for(self, gid: str) -> str:
-        """Display label for a group id: core catalog, then live cog/util
+        """Display label for a group id: core catalog, then live cog
         labels, then the raw id."""
         return OP_GROUPS.get(gid) or self._extra_groups.get(gid) or gid
 
@@ -1065,7 +1066,7 @@ class OpsRegistry:
         """Live listing partitioned by group, as (group_id, label, ops).
 
         Ordered by OP_GROUPS (core primitives) then alphabetically for
-        cog/util groups learned at registration. Empty groups are omitted."""
+        cog groups learned at registration. Empty groups are omitted."""
         selected = self.ops(scope=scope, origin=origin)
         order = list(OP_GROUPS)
         seen: List[str] = []
@@ -1127,42 +1128,6 @@ class OpsRegistry:
             ))
         return self._commit_batch(batch)
 
-    def register_module_ops(self, module: Any) -> List[str]:
-        """Register every `@op(...)`-decorated function on a module.
-
-        Same all-or-none batch as register_cog_ops. Origin is still 'cog'
-        (behavioral, not an API primitive); owner is the module object so
-        these outlive any one cog — used by utils.points, whose store
-        exists whether the Points UI cog is loaded.
-        """
-        batch: List[Op] = []
-        claimed: Dict[str, str] = {}
-        for attr in dir(module):
-            member = getattr(module, attr, None)
-            spec = getattr(member, OP_SPEC_ATTR, None)
-            if spec is None or inspect.isclass(member):
-                continue
-            if spec.name in claimed:
-                raise ValueError(
-                    f"Module {getattr(module, '__name__', module)} declares "
-                    f"op '{spec.name}' twice; no ops were registered."
-                )
-            if spec.name in self._ops:
-                raise ValueError(
-                    f"Module {getattr(module, '__name__', module)}.{attr} "
-                    f"declares op '{spec.name}', which is already registered; "
-                    f"no ops were registered."
-                )
-            claimed[spec.name] = attr
-            batch.append(_build_op(
-                name=spec.name, description=spec.description,
-                permission=spec.permission, impl=member,
-                params=list(spec.params), serialize=spec.serialize,
-                agent_guidance=spec.agent_guidance, scope=spec.scope,
-                group=spec.group, group_label=spec.group_label,
-                origin=ORIGIN_COG, owner=module,
-            ))
-        return self._commit_batch(batch)
 
     def _commit_batch(self, batch: List[Op]) -> List[str]:
         for built in batch:
@@ -1407,7 +1372,7 @@ async def edit_message(ctx: OpContext, message, content: str):
 
 @registry.op(
     "delete_message",
-    "Delete a message. Requires admin — mirrors cogs/optional/cleanup.py's "
+    "Delete a message. Requires admin — mirrors cogs/cleanup.py's "
     "bulk-delete gate, which restricts message deletion to superadmin/admin.",
     PermissionLevel.ADMIN,
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to delete.")],
@@ -1794,7 +1759,7 @@ async def read_history(ctx: OpContext, channel, limit: int = 50,
 @registry.op(
     "add_role",
     "Add a role to a member. Requires admin — self-service role assignment "
-    "is the reaction-role system's job (cogs/optional/setrole.py), not this op's.",
+    "is the reaction-role system's job (cogs/setrole.py), not this op's.",
     PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD,
@@ -6875,7 +6840,7 @@ async def delete_invite(ctx: OpContext, guild, code: str):
 # This is a VIEWER, not a test: the registry's invariants live in
 # tests/test_ops_registry.py (run with `python -m pytest tests/`). Keeping
 # assertions out of here is deliberate — the previous version imported
-# cogs.optional.gpt to assert on panel chunking, inverting the dependency
+# cogs.gpt to assert on panel chunking, inverting the dependency
 # so core depended on a cog. That check now lives in the test file, where
 # importing a cog is fine.
 # ---------------------------------------------------------------------------

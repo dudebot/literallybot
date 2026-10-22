@@ -1,5 +1,5 @@
 from discord.ext import commands
-from core.utils import is_superadmin, is_admin, get_superadmins
+from core.permissions import is_superadmin, is_admin, get_superadmins
 import discord
 
 class Admin(commands.Cog):
@@ -47,7 +47,7 @@ class Admin(commands.Cog):
             self.logger.warning(f"claimadmin attempted in DMs by {ctx.author} (ID: {ctx.author.id})")
             return
 
-        # Route membership tests through the shared core.utils gate rather
+        # Route membership tests through the shared core.permissions gate rather
         # than a hand-rolled copy of the superadmin list lookup.
         author_is_superadmin = is_superadmin(self.bot.config, ctx.author.id)
         if not (author_is_superadmin or ctx.author.guild_permissions.administrator or ctx.author == ctx.guild.owner):

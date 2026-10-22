@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from cogs.optional.media import Media, MediaView
+from cogs.media import Media, MediaView
 from core import mcp_server
 from core.ops import OpContext, registry
 
@@ -134,8 +134,8 @@ def test_download_staging_does_not_follow_preexisting_links(library, tmp_path, m
         Path(command[-1]).write_bytes(b'trimmed media')
         return NS(returncode=0)
 
-    monkeypatch.setattr('cogs.optional.media.yt_dlp.YoutubeDL', Downloader)
-    monkeypatch.setattr('cogs.optional.media.subprocess.run', ffmpeg)
+    monkeypatch.setattr('cogs.media.yt_dlp.YoutubeDL', Downloader)
+    monkeypatch.setattr('cogs.media.subprocess.run', ffmpeg)
     result = cog._do_addmedia(guild, 'https://example.test/watch?v=clip', 'clip', 0, 1000)
     assert 'has been added' in result
     assert (directory / 'clip.mp4').read_bytes() == b'trimmed media'

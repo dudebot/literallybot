@@ -10,7 +10,7 @@ Config schema (guild scope):
   enumerable, so agents can manage toggles by editing the guild JSON and
   running /role sync (or a bot restart) to reconcile reactions.
 
-Auth: the /role group requires `core.utils.is_admin`; the raw reaction
+Auth: the /role group requires `core.permissions.is_admin`; the raw reaction
 listeners act only on mappings admins configured.
 
 `whitelist_roles` is a legacy guild-config key from the removed command/panel
@@ -32,7 +32,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
-from core.utils import is_admin
+from core.permissions import is_admin
 
 TOGGLES_KEY = "emoji_role_toggles"
 _PREVIEW_TTL = 300  # seconds a message-content preview stays cached for autocomplete

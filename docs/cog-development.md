@@ -4,23 +4,42 @@ This guide covers creating custom cogs for LiterallyBot, from basic commands to 
 
 ## Cog Architecture Overview
 
-### Cog Categories
+### Feature ownership and recovery
 
-The split is one question: **if this cog is off, can you still turn it — or
-anything else — back on from Discord alone?**
+All feature cogs live directly in `cogs/`. Each owns its prefix/slash commands,
+listeners, background tasks, views, and behavioral `@op` adapters. Shared
+headless implementations and state live in `core/`; a private helper used only
+inside one cog may remain there.
 
-- **Core Cogs (`cogs/core/`)** - The recovery surface. `control.py`
-  (`!enable`/`!disable` over `disabled_cogs`, `!cogs`, `!config`, restart) and
-  `admin.py` (the `claimsuper` bootstrap). Never filtered by
-  `disabled_cogs`, because disabling them leaves shell access as the only
-  way back. Adding a cog here should be rare and needs this justification.
-- **Optional Cogs (`cogs/optional/`)** - Everything else, and the main
-  extension point. "Optional" means the deployment chooses, not that the
-  cog is unimportant — error handling's `/logsettings` surface lives here,
-  since `bot.py` wires error handling from `core/error_handler.py` and
-  does not need the cog loaded.
+`core/cog_discovery.py` owns discovery and recovery protection. Its
+`PROTECTED_COGS` mapping names `control` (configuration, enable/disable and
+restart) and `admin` (ownership recovery and administrator management), with
+explicit reasons. Loader and operator controls consult the same policy. New
+cogs are disableable by default; adding protection needs a recovery reason.
+Protection does not depend on a folder, decorator, or imported cog class.
 
-New cogs go in `cogs/optional/` unless they are part of the recovery path.
+`list_cog_modules(config=None)` discovers public Python modules directly in
+`cogs/`, with protected cogs first. With a Config it filters `disabled_cogs`
+**before importing feature modules**, so disabled optional dependencies and
+import side effects cannot interfere with startup. Without Config it includes
+disabled modules for operator listings. Stable bare IDs survive folder moves;
+`cog_name` also accepts current and historical qualified module names.
+
+The optional `error_handler` cog owns `/logsettings`; mandatory error handling
+is wired independently by `bot.py` through `core/error_handler.py`.
+
+### Enforced ownership boundaries
+
+`tests/test_architecture.py` parses runtime Python with the standard-library AST.
+It rejects core-to-cog and cog-to-cog imports, including aliases and relative
+imports. Cog classes, Discord command/listener/task declarations, and behavioral
+`@op` adapters must live in `cogs/`; behavioral ops must decorate Cog methods.
+Use a shared `core/` service when two features need the same behavior.
+
+This does not ban Discord SDK imports in shared message or panel helpers, raw
+`registry.op` API primitives, or composition-root event wiring in `bot.py`. The
+checks cover static imports and declarations; runtime lookups and dynamically
+constructed imports still need code review.
 
 ### Basic Cog Structure
 ```python
@@ -92,7 +111,7 @@ an atomic transaction across concurrent writers.
 
 ## Permission Management
 
-THE DECORATOR DECIDES. The gate is `core.utils.is_admin` / `is_superadmin` —
+THE DECORATOR DECIDES. The gate is `core.permissions.is_admin` / `is_superadmin` —
 the central predicates, not a separate Discord-only check. `is_admin` includes
 superadmins, configured guild admins, Discord administrators and the guild
 owner, with the bot-account exclusion described in [security.md](security.md).
@@ -102,7 +121,9 @@ third.
 ```python
 import discord
 from discord import app_commands
-from core.utils import is_admin, is_superadmin, panel_slash_pin
+from discord.ext import commands
+from core.permissions import is_admin, is_superadmin
+from core.panels import panel_slash_pin
 
 @commands.command(hidden=True)
 @commands.guild_only()
@@ -214,10 +235,11 @@ disabling any cog safe: `disabled_cogs` can drop any optional cog without
 stranding a caller.
 
 When two cogs need the same capability, the capability belongs to neither cog:
-it lives in a shared headless module (`utils/` for feature helpers, as in
-`utils/points.py`; `core/` for infrastructure), and each cog is a thin Discord
-surface over it — the
-service-function pattern above, one level up.
+it lives in a shared headless module in `core/`, and each cog owns its adapters
+onto it. For example, `core/points.py` owns balance storage and plain get/add/set
+helpers; `cogs/points.py` owns the commands and all three points ops. Keeping
+balances available to other features does not keep Points tools registered when
+Points is disabled. This is the service-function pattern one level up.
 
 The one legitimate `get_cog()` call inside a cog is fetching **its own**
 instance from a detached `View` callback, where discord.py hands the callback
@@ -233,8 +255,9 @@ prefer moving the shared capability into a headless module instead.
 ### Declaring the op
 
 Import the module-level `op` decorator from `core.ops` and decorate an **async**
-method. The decorator only *attaches* a spec to the function — it does not touch
-the registry at import time.
+method on the owning cog. The decorator only *attaches* a spec to the method;
+it does not touch the registry at import time. Shared `core/` services do not
+register behavioral tools themselves.
 
 ```python
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
@@ -310,7 +333,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | **permission** | `PermissionLevel.EVERYONE` / `ADMIN` / `SUPERADMIN`, checked against the **invoking user** on every call, before any Discord id is resolved. Config never overrides this. |
 | **params** | Typed `OpParam`s. The registry generates the JSON schema *and* resolves Discord entities from ids — see the kinds below. |
 | **scope** | `OpScope.GUILD` / `DM` / `GLOBAL`. See below; this is a safety boundary, not a label. |
-| **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog/util ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
+| **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
 | **agent_guidance** | Optional. Extra instruction injected for the agent loop — use it for non-obvious result semantics ("status 'exists' means nothing was written"). |
 | **serialize** | Callable adapting a return value to a JSON-safe dict. Without one, dict results pass through unchanged; other results become `{}`. Use it when objects or IDs need conversion. |
 
@@ -372,8 +395,12 @@ helpers) exactly as your commands do.
 
 ### Config keeps your op's name while its cog is disabled
 
-Every frontend queries the registry **live** — never a snapshot taken at import
-— so your ops appear in the panel as soon as the cog is in the boot set.
+The agent and settings panel query the registry **live**; MCP builds its tool
+surface from the registry at server startup and keeps it until restart. Neither
+uses an import-time snapshot that misses loaded cogs. Registration makes an op
+eligible for exposure; frontend configuration selects exposure, and each call
+still passes the op's authorization gate. MCP's unset allowlist exposes the full
+registered universe; registering a cog must not write exposure settings.
 
 When a cog is not loaded (disabled via `disabled_cogs`), its op names stay in
 the stored `agent_ops_whitelist` / `mcp_tools_enabled` config lists (and the
@@ -395,11 +422,11 @@ config.
 - [ ] The bot restarts cleanly twice in a row with the cog in the boot set
       (no duplicate-name error from the batch registering again)
 
-Live examples: `cogs/optional/setrole.py` (two ops sharing the slash commands'
-services), `cogs/optional/danbooru.py` (one op sharing the prefix command's
-search service), `cogs/optional/auto_response.py` (three ops sharing the admin
+Live examples: `cogs/setrole.py` (four ops sharing the slash commands'
+services), `cogs/danbooru.py` (one op sharing the prefix command's
+search service), `cogs/auto_response.py` (three ops sharing the admin
 panel's services — the modal was carrying the validation until they were
-factored out) and `cogs/optional/media.py` (two ops: `list_media`, and
+factored out) and `cogs/media.py` (two ops: `list_media`, and
 `post_media`, which ACTS rather than returning data, because the `!<name>`
 surface it mirrors is public while a returned host path would be the
 admin-gated attachment surface in disguise).
@@ -477,7 +504,7 @@ Failed downloads and images excluded by `vision: false` also get placeholders.
 Image availability never changes the system prompt. The history cost estimate
 includes a conservative 1,792 input tokens per image.
 
-`utils/ai_images.py` holds an LRU of normalized JPEG/PNG bytes keyed by attachment
+`core/ai_images.py` holds an LRU of normalized JPEG/PNG bytes keyed by attachment
 ID (or URL without query/fragment), bounded at 64 entries and 64 MiB. Failed
 loads are cached for 30 seconds. Up to four downloads/processes run concurrently;
 Pillow processing runs off the event loop. Inputs retain the Discord host
@@ -512,18 +539,18 @@ Config works without a live Context — pass a guild id directly:
 
 ### Panel components
 
-Use `InvokerOnlyView` from `core.utils` before the Discord view base in the
+Use `InvokerOnlyView` from `core.panels` before the Discord view base in the
 inheritance list. It provides invoker checks and timeout cleanup. It does not
 replace `is_admin` / `is_superadmin`: recheck the relevant predicate on control
 callbacks and modal submissions, including after the invoker has been demoted.
 
 For a fixed `discord.ui.View`, `@discord.ui.button(...)` declares a button on an
 async method with `(self, interaction, button)`; see `_ConfirmEditView` in
-[setrole.py](../cogs/optional/setrole.py). A callback decorator does not supply
+[setrole.py](../cogs/setrole.py). A callback decorator does not supply
 permission checks.
 
-For dynamic settings, follow [AiSettingsView](../cogs/optional/gpt.py) or
-[LogSettingsView](../cogs/optional/error_handler.py): build a
+For dynamic settings, follow [AiSettingsView](../cogs/gpt.py) or
+[LogSettingsView](../cogs/error_handler.py): build a
 `discord.ui.LayoutView` from `TextDisplay`, `ActionRow`, buttons, and selectors,
 assign callbacks, and rebuild it from current config after an edit. Use a
 `discord.ui.Modal` for typed input. `on_submit` and `interaction_check` are
@@ -573,6 +600,12 @@ cannot supply a password. `Restart=always` relaunches a killed process.
   until re-enabled.
 - This is how downstream forks of this codebase carry upstream cogs without
   running them — disable, don't delete, so upstream merges stay clean.
-- `cogs/core/` can't be disabled; it is the means of re-enabling everything
-  else. The filter tests `group != CORE_COG_GROUP`, so any future cog group
-  is disableable by default rather than silently inheriting that immunity.
+- Only IDs in `core.cog_discovery.PROTECTED_COGS` are exempt: `control` and
+  `admin`. Operator controls show the protection reason; manually listing these
+  IDs in `disabled_cogs` cannot remove the recovery path.
+- After restart, a disabled feature has no commands, listeners, tasks, setup-time
+  views or behavioral ops. Settings and shared services remain; assigned roles,
+  reactions and posted messages are not undone. Independent raw API primitives
+  retain their own exposure and permission policy.
+- The switch is global and deployment-wide. Live guild settings, such as event
+  report route enabled flags, control their behavior separately.

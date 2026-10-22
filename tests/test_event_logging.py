@@ -6,10 +6,10 @@ import discord
 import pytest
 import pytest_asyncio
 
-from cogs.optional.error_handler import LogSettingsView
-from cogs.optional.logging import Logging
+from cogs.error_handler import LogSettingsView
+from cogs.logging import Logging
 from core import error_handler
-from utils import event_logging as events
+from core import event_logging as events
 
 
 @pytest_asyncio.fixture
@@ -115,7 +115,7 @@ async def test_activity_channel_edit_preserves_settings_and_rechecks_auth(activi
 async def test_bot_lifecycle_clears_registrations_on_failed_injection_and_teardown(isolated_bot_module):
     from discord import app_commands
     from discord.ext import commands
-    from cogs.optional.honeypot import Honeypot
+    from cogs.honeypot import Honeypot
 
     bot = isolated_bot_module.bot
 

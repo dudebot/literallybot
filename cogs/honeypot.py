@@ -10,8 +10,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
-from core.utils import is_admin, panel_slash_pin
-from utils.event_logging import registry as event_registry, report
+from core.permissions import is_admin
+from core.panels import panel_slash_pin
+from core.event_logging import registry as event_registry, report
 
 KEY = "honeypot"
 DEFAULT_MINUTES = 10

@@ -298,7 +298,7 @@ async def log_error_to_discord(
 
 
 def _required_gate(ctx) -> Optional[str]:
-    from core.utils import GATE_ADMIN, GATE_SUPERADMIN, gate_of
+    from core.permissions import GATE_ADMIN, GATE_SUPERADMIN, gate_of
 
     node = getattr(ctx, "command", None)
     gates = set()
@@ -313,7 +313,7 @@ def _required_gate(ctx) -> Optional[str]:
 
 
 def _user_level(ctx) -> str:
-    from core.utils import is_admin, is_superadmin
+    from core.permissions import is_admin, is_superadmin
 
     if is_superadmin(ctx):
         return "superadmin"

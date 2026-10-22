@@ -9,9 +9,9 @@ from discord.ext import commands
 import pytest
 
 from core import error_handler as eh
-from core.utils import is_admin, is_superadmin
-from cogs.optional.rng import RNG
-from cogs.optional.error_handler import LogSettingsView, _RateLimitModal
+from core.permissions import is_admin, is_superadmin
+from cogs.rng import RNG
+from cogs.error_handler import LogSettingsView, _RateLimitModal
 
 
 @pytest.fixture(autouse=True)

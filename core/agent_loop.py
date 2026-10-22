@@ -15,7 +15,7 @@ from core/ops.py; the only policy here is the loop's:
 - send_message always uses allowed_mentions=none.
 - Every executed op is logged at INFO (op, params, actor, ok/error).
 
-Wired up by cogs/optional/gpt.py when a guild's resolved agent universe (the
+Wired up by cogs/gpt.py when a guild's resolved agent universe (the
 super-admin `agent_ops_whitelist` ceiling narrowed by the per-guild
 `agent_ops_gate`, see core/agent_gate) is non-empty. With no exposed bot tools, GPT uses the same agent runner
 without constructing registry tools.

@@ -19,7 +19,7 @@ import discord
 from PIL import Image
 import pytest
 
-from cogs.optional.gpt import Gpt
+from cogs.gpt import Gpt
 
 
 def wire(message):

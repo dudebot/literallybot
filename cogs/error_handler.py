@@ -7,8 +7,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from core.error_handler import ErrorCategory, ErrorSeverity, log_error_to_discord
-from core.utils import InvokerOnlyView, is_admin, is_superadmin, panel_slash_pin
-from utils import event_logging
+from core.panels import InvokerOnlyView, panel_slash_pin
+from core.permissions import is_admin, is_superadmin
+from core import event_logging
 
 
 class ErrorLoggingAdmin(commands.Cog):

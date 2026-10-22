@@ -9,7 +9,7 @@ import openai
 import pytest
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from cogs.optional.gpt import AiSettingsView, Gpt
+from cogs.gpt import AiSettingsView, Gpt
 from core.llm.client import LLMClient, ProviderConfig
 
 
@@ -57,7 +57,7 @@ async def test_successful_calls_roll_anchor_lifetime_forward(config, monkeypatch
                 for i in range(1, 6)]
     clock = 100
     fetch_delay = 0
-    monkeypatch.setattr('cogs.optional.gpt.time', NS(monotonic=lambda: clock))
+    monkeypatch.setattr('cogs.gpt.time', NS(monotonic=lambda: clock))
 
     async def history(limit, before):
         nonlocal clock
@@ -170,7 +170,7 @@ async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, mo
 
 @pytest.mark.asyncio
 async def test_history_controls_and_model_cache_keep_scopes_and_recheck_access(config):
-    from cogs.optional.gpt import _HistorySettingsModal, _CacheSettingsModal
+    from cogs.gpt import _HistorySettingsModal, _CacheSettingsModal
     config.set(1, 'admins', [8])
     config.set_global('superadmins', [7])
     config.set_global('ai_providers', {'xai': {'models': {'grok-4.6': {'max_tokens': 2000}}}})

@@ -12,7 +12,7 @@ from pydantic_ai.models.function import FunctionModel
 from starlette.requests import Request
 from starlette.responses import Response
 
-from cogs.optional.gpt import AiSettingsView, Gpt
+from cogs.gpt import AiSettingsView, Gpt
 from core.agent_gate import agent_universe, call_requires_admin
 from core.agent_loop import build_agent_tools
 from core import mcp_server

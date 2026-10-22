@@ -1,1 +1,1 @@
-# Core bot utilities and configuration
+"""Named reusable bot capabilities; feature entry points belong to cogs."""

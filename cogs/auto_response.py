@@ -37,7 +37,8 @@ import random
 import re
 
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
-from core.utils import InvokerOnlyView, is_admin, panel_slash_pin
+from core.panels import InvokerOnlyView, panel_slash_pin
+from core.permissions import is_admin
 
 MAX_ENTRIES = 25  # Discord select-menu option cap
 

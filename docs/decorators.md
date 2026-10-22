@@ -16,22 +16,22 @@ installed dependency.
 
 | Decorator | Import / owner | Apply to | Purpose and limits | Deep dive |
 |---|---|---|---|---|
-| `@op(name, description, permission, ...)` | `from core.ops import op` | Async cog method or headless module function | Declares a behavioral op. Cog loading registers methods; module functions require `registry.register_module_ops(module)` at startup. Declaration alone does not register or enforce permissions on a direct Python call. | [Declaring an op](cog-development.md#declaring-the-op), [execution and permissions](security.md#agentic--ops-execution-model) |
+| `@op(name, description, permission, ...)` | `from core.ops import op` | Async method on the owning cog | Declares a behavioral op. Cog loading registers instance methods; shared services remain plain functions in `core/`. Declaration alone does not register or enforce permissions on a direct Python call. | [Declaring an op](cog-development.md#declaring-the-op), [execution and permissions](security.md#agentic--ops-execution-model) |
 | `@registry.op(name, description, permission, ...)` | `from core.ops import registry` | Async function in `core/ops.py` | Immediately registers a raw Discord API primitive. Registration stamps `origin='core'`; the behavioral registration paths stamp `origin='cog'`. Neither decorator takes an `origin` argument. | [Ops architecture](cog-development.md#registering-ops-from-a-cog) |
-| `@panel_slash_pin()` | `from core.utils import panel_slash_pin` | Slash command | Sets the Manage Messages default permission for picker visibility. Does **not** enforce bot-admin authorization; pair with a check and `guild_only`. Wraps `app_commands.default_permissions(manage_messages=True)`. | [Permission recipe](cog-development.md#permission-management), [command gates](security.md#command-gates-prefix-and-slash) |
+| `@panel_slash_pin()` | `from core.panels import panel_slash_pin` | Slash command | Sets the Manage Messages default permission for picker visibility. Does **not** enforce bot-admin authorization; pair with a check and `guild_only`. Wraps `app_commands.default_permissions(manage_messages=True)`. | [Permission recipe](cog-development.md#permission-management), [command gates](security.md#command-gates-prefix-and-slash) |
 | `@suppress_command_not_found(*patterns)` | `from core.error_handler import suppress_command_not_found` | Cog **class** | Accepts regex strings or compiled patterns. Full-matches prefix-stripped, trimmed text only for human-authored prefix `CommandNotFound`. Only loaded cogs participate; command/event exceptions and denials remain visible. | [Regex suppression](error-handling.md#suppressing-commandnotfound) |
 
 `@op` supports `params`, `serialize`, `agent_guidance`, `scope`, `group`, and
 `group_label`; `@registry.op` supports the same fields except `group_label`.
 See the [field chart](cog-development.md#the-fields) and
 [scope rules](cog-development.md#choosing-scope). Current examples are
-[reaction-role ops](../cogs/optional/setrole.py), [module ops](../utils/points.py),
-and [RNG suppression](../cogs/optional/rng.py).
+[reaction-role ops](../cogs/setrole.py), [points ops](../cogs/points.py),
+and [RNG suppression](../cogs/rng.py).
 
 ## Authorization and server context
 
 `is_admin` and `is_superadmin` are **predicates**, not decorators. Import them
-from `core.utils` and pass them to the wrapper for the correct command system.
+from `core.permissions` and pass them to the wrapper for the correct command system.
 `gate_of()` reads their attached metadata for help visibility and denial details.
 
 | Decorator | Command system | What it requires | Deep dive |
@@ -60,15 +60,15 @@ and `import discord`.
 | `@commands.group(...)` | Async cog method; `Cleanup.cleanup` | Creates a prefix command group. `invoke_without_command=True` lets its callback handle invocation without a subcommand. | [Command development](cog-development.md#command-development) |
 | `@<prefix_group>.command(...)` | Async method; `@cleanup.command(...)` | Adds a subcommand to an existing prefix group. | [Command development](cog-development.md#command-development) |
 | `@app_commands.command(...)` | Async cog method; `logsettings_slash` | Creates a top-level slash command. | [Permission recipe](cog-development.md#permission-management) |
-| `@<slash_group>.command(...)` | Async method; `@role.command(...)` | Adds a slash subcommand to an `app_commands.Group`. This is a different API from the prefix group's decorator. | [Command development](cog-development.md#command-development), [role example](../cogs/optional/setrole.py) |
+| `@<slash_group>.command(...)` | Async method; `@role.command(...)` | Adds a slash subcommand to an `app_commands.Group`. This is a different API from the prefix group's decorator. | [Command development](cog-development.md#command-development), [role example](../cogs/setrole.py) |
 | `@app_commands.describe(parameter="help", ...)` | Slash callback; `/role add` and `/role delete` | Provides parameter descriptions in Discord. Does not validate input or grant access. | [Command development](cog-development.md#command-development) |
 | `@discord.ui.button(...)` | Async `discord.ui.View` method; `_ConfirmEditView.confirm` | Declares a button and its callback. Authorization belongs in the view/callback; the button decorator supplies none. | [Panel components](cog-development.md#panel-components) |
 
 For library options, see the official [prefix command API](https://discordpy.readthedocs.io/en/stable/ext/commands/api.html#decorators)
 and [application-command API](https://discordpy.readthedocs.io/en/stable/interactions/api.html#decorators).
-The live source examples are [cleanup](../cogs/optional/cleanup.py),
-[role commands/buttons](../cogs/optional/setrole.py), and
-[log settings](../cogs/optional/error_handler.py).
+The live source examples are [cleanup](../cogs/cleanup.py),
+[role commands/buttons](../cogs/setrole.py), and
+[log settings](../cogs/error_handler.py).
 
 ## Events, background tasks, and error entrypoints
 
@@ -82,7 +82,7 @@ Import task decorators with `from discord.ext import tasks`. Names such as
 | `@bot.tree.error` | Async function in `bot.py` | Registers the central slash-command error handler. | [Error flow](error-handling.md#error-flow-overview) |
 | `@tasks.loop(...)` | Async cog method | Creates a scheduled task loop. Current users: reminder polling, status rotation, reaction-role startup sync. The decorator does not start the loop; lifecycle code does. | [Events and tasks](cog-development.md#advanced-features) |
 | `@<loop>.before_loop` | `@change_status.before_loop`, `@check_reminders.before_loop`, `@startup_sync.before_loop` | Registers the preparation coroutine, commonly `wait_until_ready()`. | [Events and tasks](cog-development.md#advanced-features) |
-| `@<loop>.error` | `@change_status.error` | Registers the loop's unhandled-error callback. Forward failures to central logging; this is distinct from a per-command error handler. | [Manual reporting](error-handling.md#logging-errors-manually), [status example](../cogs/optional/status.py) |
+| `@<loop>.error` | `@change_status.error` | Registers the loop's unhandled-error callback. Forward failures to central logging; this is distinct from a per-command error handler. | [Manual reporting](error-handling.md#logging-errors-manually), [status example](../cogs/status.py) |
 
 Loop interval and lifecycle options are documented in the official
 [task API](https://discordpy.readthedocs.io/en/stable/ext/tasks/index.html).
@@ -98,7 +98,7 @@ These are Python features, not additional bot command or permission systems.
 | `@dataclass` / `@dataclass(frozen=True)` | `from dataclasses import dataclass` | Op declarations, LLM request/result/usage records. `frozen=True` prevents normal attribute assignment; it does not deeply freeze nested objects. | [Op fields](cog-development.md#the-fields), [Python dataclasses](https://docs.python.org/3.12/library/dataclasses.html) |
 | `@property` | Built-in | Computes a read attribute, e.g. a settings panel's current superadmin status. | [Panel components](cog-development.md#panel-components), [Python property](https://docs.python.org/3.12/library/functions.html#property) |
 | `@staticmethod` | Built-in | A class-associated helper that receives neither `self` nor `cls`, e.g. media's `_guild_dir`. | [Service functions](cog-development.md#the-service-function-pattern-required), [Python staticmethod](https://docs.python.org/3.12/library/functions.html#staticmethod) |
-| `@classmethod` | Built-in | Receives `cls`; used by the reminder snooze view's factory. | [Reminder source](../cogs/optional/reminders.py), [Python classmethod](https://docs.python.org/3.12/library/functions.html#classmethod) |
+| `@classmethod` | Built-in | Receives `cls`; used by the reminder snooze view's factory. | [Reminder source](../cogs/reminders.py), [Python classmethod](https://docs.python.org/3.12/library/functions.html#classmethod) |
 | `@contextlib.contextmanager` | `import contextlib` | Builds a context manager from a generator. The embedded MCP server uses it to leave signal handling with the bot. | [MCP server](security.md#mcp-ops-server), [Python contextmanager](https://docs.python.org/3.12/library/contextlib.html#contextlib.contextmanager) |
 
 ## Test decorators
@@ -124,7 +124,8 @@ A hidden admin prefix command and its slash twin:
 import discord
 from discord import app_commands
 from discord.ext import commands
-from core.utils import is_admin, panel_slash_pin
+from core.permissions import is_admin
+from core.panels import panel_slash_pin
 
 class Settings(commands.Cog):
     @commands.command(name="settings", hidden=True)
@@ -172,7 +173,7 @@ shared service; do not stack `@op` onto a command or interaction handler.
 | `@commands.has_permissions(administrator=True)` | The shared `is_admin` predicate | Discord Administrator alone is not the complete bot-admin model. [Permission management](cog-development.md#permission-management). |
 | `@app_commands.default_permissions(...)` | `@panel_slash_pin()` for gated panels | The underlying library decorator is available and appears in older doc examples; the wrapper keeps picker permissions consistent. It still needs an authorization check. [Permission recipe](cog-development.md#permission-management). |
 | `@some_command.error` | Validate expected input in the body; let central handlers report unexpected errors | Local command error handlers can coexist with global dispatch and create confusing behavior. This restriction does not prohibit `@bot.tree.error` or `@loop.error`. [Error-handler guidance](error-handling.md#dont-use-local-error-handlers). |
-| `@commands.cooldown(...)` for GPT rate limiting | The existing nested-window ladder in `gpt.py` | The old cooldown decorator was removed; do not add a second limiter. [Rate-limit decision](decision-records.md), [GPT source](../cogs/optional/gpt.py). |
+| `@commands.cooldown(...)` for GPT rate limiting | The existing nested-window ladder in `gpt.py` | The old cooldown decorator was removed; do not add a second limiter. [Rate-limit decision](decision-records.md), [GPT source](../cogs/gpt.py). |
 
 `register_error_whitelist_hook(...)`, `cog_load`, `cog_unload`,
 `interaction_check`, and `InvokerOnlyView` are also useful extension points, but

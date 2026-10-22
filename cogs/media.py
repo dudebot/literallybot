@@ -22,7 +22,8 @@ import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
-from core.utils import InvokerOnlyView, is_admin, panel_slash_pin
+from core.panels import InvokerOnlyView, panel_slash_pin
+from core.permissions import is_admin
 
 
 def _serialize_media_list(result: dict) -> dict:

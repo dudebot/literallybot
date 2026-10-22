@@ -1,8 +1,7 @@
 """literallybot — a general-purpose Discord bot built on discord.py.
 
-Entry point: creates the bot, loads cogs from cogs/core (the recovery
-surface, never disableable) and cogs/optional (everything a deployment can
-switch off via the global `disabled_cogs` config), and wires logging, error
+Entry point: creates the bot, loads feature cogs from cogs/ using explicit
+recovery protection and the global `disabled_cogs` config, and wires logging, error
 handling, and the optional MCP ops server. Runtime configuration lives in
 configs/ as JSON.
 """
@@ -15,7 +14,7 @@ from core.config import Config
 from core import bootstrap
 from core.dm_log import log_dm, row_from_message
 from core.ops import registry as ops_registry
-from utils.event_logging import registry as event_registry
+from core.event_logging import registry as event_registry
 from core.error_handler import (
     handle_command_error, handle_app_command_error, handle_event_error,
     handle_cog_load_failures
@@ -59,11 +58,6 @@ class LiterallyBot(commands.Bot):
                 logger.error("Login succeeded but saving the token failed; "
                              "the bot is running, you will be prompted again "
                              "next start.", exc_info=True)
-        from utils import points as points_mod
-        names = ops_registry.register_module_ops(points_mod)
-        if names:
-            logger.info(f"Registered {len(names)} op(s) from utils.points: "
-                        f"{', '.join(names)}")
         await load_cogs()
 
     async def add_cog(self, cog, **kwargs):
@@ -126,33 +120,24 @@ bot = LiterallyBot(command_prefix='!', intents=discord.Intents.all())
 bot.logger = logger
 bot.config = Config()
 
-# Function to load all cogs from ./cogs/{core,optional}
+# Load feature cogs selected by discovery and explicit recovery protection.
 async def load_cogs():
-    failed_cogs = []  # Track failed cogs for reporting
+    """Load enabled feature cogs, with recovery protection owned by discovery."""
+    from core.cog_discovery import list_cog_modules
 
-    from core.utils import COG_GROUPS, list_cog_modules
-
-    for group in COG_GROUPS:
-        # bot.config filters out globally disabled cogs (never cogs/core/).
-        for cog_name in list_cog_modules(group, bot.config):
-            try:
-                # Skip if already loaded (handles reconnection scenarios)
-                if cog_name in bot.extensions:
-                    logger.debug(f"{cog_name} already loaded, skipping")
-                    continue
-
-                await bot.load_extension(cog_name)
-                logger.info(f"Successfully loaded {cog_name}")
-            except Exception as e:
-                logger.error(f"Failed to load {cog_name}: {e}", exc_info=True)
-                # Store failed cog info for Discord reporting
-                failed_cogs.append({
-                    'name': cog_name,
-                    'error': str(e),
-                    'type': type(e).__name__
-                })
-
-    # Store failed cogs on bot for later reporting
+    failed_cogs = []
+    for cog_name in list_cog_modules(bot.config):
+        try:
+            if cog_name in bot.extensions:
+                logger.debug(f"{cog_name} already loaded, skipping")
+                continue
+            await bot.load_extension(cog_name)
+            logger.info(f"Successfully loaded {cog_name}")
+        except Exception as exc:
+            logger.error(f"Failed to load {cog_name}: {exc}", exc_info=True)
+            failed_cogs.append({
+                'name': cog_name, 'error': str(exc), 'type': type(exc).__name__,
+            })
     bot.failed_cogs = failed_cogs if failed_cogs else []
 
 @bot.event
@@ -160,7 +145,7 @@ async def on_ready():
     """Called on connect (and reconnect): syncs application commands once
     per process. Cogs are loaded in LiterallyBot.setup_hook (before the
     gateway connects) so persistent views are registered before any click
-    arrives; status rotation lives in cogs/optional/status.py."""
+    arrives; status rotation lives in cogs/status.py."""
 
     logger.info(f'{bot.user.name} is online and ready!')
 
@@ -237,7 +222,7 @@ async def on_message(message):
                         f'Processing allowlisted bot-authored command from '
                         f'{message.author} (ID: {message.author.id}): {message.content[:100]}'
                     )
-                    # Escalation guard lives at the root: core.utils.is_admin /
+                    # Escalation guard lives at the root: core.permissions.is_admin /
                     # is_superadmin never grant the bot's own account privileges
                     # (its Discord Administrator role would otherwise pass the
                     # admin gate), so a self-invoked admin command fails closed.

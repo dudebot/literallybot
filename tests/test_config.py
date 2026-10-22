@@ -7,7 +7,7 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from utils.points import add_points, get_points, set_points
+from core.points import add_points, get_points, set_points
 
 
 def disk(config, name='global'):

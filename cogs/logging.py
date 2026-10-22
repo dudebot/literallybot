@@ -1,7 +1,7 @@
 """Membership and activity producers using the shared event delivery service."""
 from discord.ext import commands
 
-from utils.event_logging import registry, report
+from core.event_logging import registry, report
 
 
 class Logging(commands.Cog):

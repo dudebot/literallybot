@@ -6,8 +6,8 @@ import discord
 import pytest
 from discord.ext import commands
 from core.ops import op, PermissionLevel
-from core.utils import get_superadmins, is_superadmin, is_admin
-from cogs.optional.setrole import SetRole, TOGGLES_KEY, _emoji_matches
+from core.permissions import get_superadmins, is_superadmin, is_admin
+from cogs.setrole import SetRole, TOGGLES_KEY, _emoji_matches
 
 
 @pytest.mark.asyncio

@@ -5,8 +5,10 @@ from sys import version_info as sysv
 import sys
 import ast
 from pathlib import Path
-from core.utils import (InvokerOnlyView, is_superadmin, panel_slash_pin,
-                        safe_delete, list_cog_modules)
+from core.panels import InvokerOnlyView, panel_slash_pin
+from core.permissions import is_superadmin
+from core.messages import safe_delete
+from core.cog_discovery import cog_name, list_cog_modules, protection_reason
 
 class Control(commands.Cog):
     """The bot's runtime control plane, superadmin-only: the enable/disable
@@ -19,7 +21,7 @@ class Control(commands.Cog):
     config only; the change binds on the next restart. Same doctrine as the
     MCP tool surface: config edits bind at restart.
 
-    This is why cogs/core/ is never filtered by disabled_cogs. Every
+    The discovery manifest protects this cog from disabling. Every
     in-Discord route to re-enable a cog runs through here, so disabling it
     leaves shell access as the only way back."""
     def __init__(self, bot):
@@ -31,20 +33,18 @@ class Control(commands.Cog):
         self.logger.info(f'Python {sysv.major}.{sysv.minor}.{sysv.micro} - Discord.py {discord.__version__}')
 
     def check_cog(self, cog):
-        """Prefix bare cog names with 'cogs.optional.'; lowercases input."""
-        if cog.lower().startswith('cogs.optional.'):
-            return cog.lower()
-        return f'cogs.optional.{cog.lower()}'
+        """Resolve bare or historically qualified input to the current module."""
+        return f'cogs.{cog_name(cog)}'
 
     def disabled_cogs(self):
         """Bare lowercase names from the global `disabled_cogs` list."""
-        return {str(name).lower()
+        return {cog_name(name)
                 for name in (self.bot.config.get_global("disabled_cogs", []) or [])}
 
     @commands.command(name='list_cogs', hidden=True)
     @commands.check(is_superadmin)
     async def list_cogs(self, ctx):
-        """This command lists all the cogs in the `cogs/optional` directory.
+        """This command lists all the cogs in the `cogs/` directory.
 
         Note:
             This command can be used only from the bot owner.
@@ -57,8 +57,9 @@ class Control(commands.Cog):
             # Display keeps the bare cog names (module path stripped).
             # Unfiltered listing so disabled cogs stay visible, marked.
             disabled = self.disabled_cogs()
-            cogs = [mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional')]
-            names = [f'{c} (disabled)' if c.lower() in disabled else c for c in cogs]
+            cogs = [mod.rsplit('.', 1)[-1] for mod in list_cog_modules()]
+            names = [f'{c} (protected)' if protection_reason(c) else
+                     f'{c} (disabled)' if c in disabled else c for c in cogs]
             await message.edit(content=f'Available cogs: {", ".join(names)}', delete_after=20)
         except Exception as exc:
             self.logger.error("Error listing cogs", exc_info=True)
@@ -84,9 +85,12 @@ class Control(commands.Cog):
         message = await ctx.send('Disabling...')
         await safe_delete(ctx, self.logger)
         bare = self.check_cog(cog).rsplit('.', 1)[-1]
-        known = {mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional')}
+        if reason := protection_reason(bare):
+            await message.edit(content=f'{bare} is protected: {reason}', delete_after=20)
+            return
+        known = {mod.rsplit('.', 1)[-1] for mod in list_cog_modules()}
         if bare not in known:
-            await message.edit(content=f'No optional cog named {bare}.', delete_after=20)
+            await message.edit(content=f'No cog named {bare}.', delete_after=20)
             return
         disabled = sorted(self.disabled_cogs() | {bare})
         self.bot.config.set_global("disabled_cogs", disabled)
@@ -260,11 +264,11 @@ class _CogSelect(discord.ui.Select):
         for name in panel.cog_names():
             state = panel.cog_state(name)
             options.append(discord.SelectOption(
-                label=name, value=name, description=(panel.cog_description(name) or state)[:100],
+                label=name, value=name, description=(('Protected: ' + protection_reason(name)) if state == 'protected' else (panel.cog_description(name) or state))[:100],
                 default=(name == panel.selected)))
         if not options:
             options = [discord.SelectOption(label="(no cogs)", value="_none")]
-        super().__init__(placeholder="Select an optional cog", min_values=0,
+        super().__init__(placeholder="Select a feature cog", min_values=0,
                          max_values=1, options=options[:25], row=0)
 
     async def callback(self, interaction: discord.Interaction):
@@ -294,11 +298,11 @@ class CogsView(InvokerOnlyView, discord.ui.View):
         self._build()
 
     def cog_names(self):
-        return sorted(mod.rsplit('.', 1)[-1] for mod in list_cog_modules('optional'))
+        return sorted(mod.rsplit('.', 1)[-1] for mod in list_cog_modules())
 
     def cog_description(self, name):
         # Read disabled modules without importing their optional dependencies.
-        path = Path(__file__).resolve().parents[1] / "optional" / f"{name}.py"
+        path = Path(__file__).with_name(f"{name}.py")
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"))
             for node in tree.body:
@@ -313,6 +317,8 @@ class CogsView(InvokerOnlyView, discord.ui.View):
 
     def cog_state(self, name):
         """Configured state: what the NEXT boot will do with this cog."""
+        if protection_reason(name):
+            return 'protected'
         if name in self.dev.disabled_cogs():
             return "disabled"
         return "enabled"
@@ -320,8 +326,8 @@ class CogsView(InvokerOnlyView, discord.ui.View):
     def is_pending(self, name):
         """True when the configured state disagrees with what is running, so
         the panel can mark the edits a restart would apply."""
-        running = f"cogs.optional.{name}" in self.bot.extensions
-        return running is (self.cog_state(name) == "disabled")
+        running = f"cogs.{name}" in self.bot.extensions
+        return running != (self.cog_state(name) != "disabled")
 
     def has_pending(self):
         return any(self.is_pending(n) for n in self.cog_names())
@@ -343,7 +349,7 @@ class CogsView(InvokerOnlyView, discord.ui.View):
             label=toggle_label,
             style=(discord.ButtonStyle.success if state == "disabled"
                    else discord.ButtonStyle.danger),
-            row=1, disabled=state is None)
+            row=1, disabled=state in (None, "protected"))
         # Relabelled once there is something to apply, so the operator can see
         # from the panel that their edit is still only config.
         restart_label = ("♻ Restart to apply" if self.has_pending()
@@ -360,6 +366,13 @@ class CogsView(InvokerOnlyView, discord.ui.View):
             name = self.selected
             if name is None:
                 await interaction.response.send_message("Select a cog first.", ephemeral=True)
+                return
+            if reason := protection_reason(name):
+                await interaction.response.send_message(
+                    f'{name} is protected: {reason}', ephemeral=True)
+                return
+            if name not in self.cog_names():
+                await interaction.response.send_message('That cog is no longer available.', ephemeral=True)
                 return
             # Config only. The cog set is fixed at boot (#86): nothing is
             # loaded or unloaded here, by design.
@@ -398,12 +411,12 @@ class CogsView(InvokerOnlyView, discord.ui.View):
         self.add_item(restart_btn)
 
     def render_embed(self):
-        marks = {"enabled": "✅", "disabled": "🚫"}
+        marks = {"enabled": "✅", "disabled": "🚫", "protected": "🔒"}
         e = discord.Embed(
             title="Cogs (bind at restart)",
             description="Editing the global `disabled_cogs` list. 🚫 disabled "
-                        "cogs stay on disk but are skipped by startup. The "
-                        "cog set is fixed at boot — toggles here change "
+                        "cogs stay on disk but are skipped by startup. "
+                        "🔒 Recovery cogs are protected. The cog set is fixed at boot — toggles here change "
                         "config only and take effect on the next restart.",
             color=discord.Color.blurple(),
         )

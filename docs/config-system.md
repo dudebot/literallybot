@@ -153,7 +153,7 @@ illustration; they are not real.)
 | Key | Shape | Written by | Notes |
 |-----|-------|-----------|-------|
 | `discord_token` | `str` | `core.bootstrap` first-run prompt only (no command surface; never a panel field) | The bot's own Discord token. Resolution order is **`DISCORD_TOKEN` env var → this key → interactive prompt → exit with instructions**; the env var is **NEVER persisted here** (a panel-supplied secret belongs only where the operator set it). Written only *after* discord.py confirms the login, so a typo'd token never lands on disk. Plaintext, protected by the store's 0600/0700 modes — see the hardening note below |
-| `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin`, plus the first-run bootstrap in `core.bootstrap` (any key also editable via the `!config` panel, superadmin) | Read through `core.utils.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes". On a first successful login with this list **empty or absent**, the Discord application owner (the team owner for team-owned apps) is added automatically and logged, retiring `!claimsuper` for new installs. Empty-list gate ONLY: an existing deployment is never touched |
+| `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin`, plus the first-run bootstrap in `core.bootstrap` (any key also editable via the `!config` panel, superadmin) | Read through `core.permissions.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes". On a first successful login with this list **empty or absent**, the Discord application owner (the team owner for team-owned apps) is added automatically and logged, retiring `!claimsuper` for new installs. Empty-list gate ONLY: an existing deployment is never touched |
 | `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?, cache_input_ratio?, cache_ttl_seconds?}}}}` | `!aisettings` → Models & Providers (superadmin) | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
 | `<PROVIDER>_API_KEY` | `str` (e.g. `XAI_API_KEY`) | `!aisettings` → Models & Providers key modal | Env var of the same name is the fallback; removed with its provider. Keys are entered ONLY via the panel modal (no slash parameter) |
 | `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
@@ -166,14 +166,14 @@ illustration; they are not real.)
 | `mcp_ops_port` | `int` | *no command surface* — hand-edit | Port for the MCP server (loopback by default; `MCP_OPS_HOST` selects the bind). Config-first, then `MCP_OPS_PORT`, then `8765`. Read at bot startup ⇒ restart-bound |
 | `error_logging` | `{default_channel?: int, category_channels?: {category: channel_id}, severity_channels?: {severity: channel_id}, log_unknown_commands?: bool, rate_limit_minutes?: int}` | `/logsettings` → Global (superadmin) | Global and guild destinations are independent; both receive errors/denials. Unknown prefix commands opt-in (default false). Global duplicate interval is 1–60 minutes (default 5). Category routes take priority; existing `command_error` is a fallback for new `command_denied` / `command_not_found` categories. See [error-handling.md](error-handling.md) |
 | `reminders` | `list[{user_id, timestamp, text, delay}]` | `!remindme` + snooze buttons | Deliberately ONE global list across all guilds/DMs, filtered by `user_id` on read. `delay` (original duration, seconds) scales the snooze options; legacy rows without it get static 10m/1h/1d |
-| `disabled_cogs` | `list[str]` bare lowercase cog names (e.g. `"gpt"`), never paths | `!cogs` panel, `!disable` / `!enable` | Deployment-level off switch: listed cogs stay on disk but are skipped by startup (filtered inside `core.utils.list_cog_modules`). Edits are config-only and bind at the next restart — the cog set is fixed at boot (#86). Applies to every group except `cogs/core/`, which holds the means of re-enabling anything. Bare names mean the list survives cog-folder reorganizations. How downstream forks carry upstream cogs without running them |
+| `disabled_cogs` | `list[str]` bare lowercase cog names (e.g. `"gpt"`), never paths | `!cogs` panel, `!disable` / `!enable` | Deployment-level off switch: listed cogs stay on disk but are skipped by startup (filtered inside `core.cog_discovery.list_cog_modules`). Edits are config-only and bind at the next restart — the cog set is fixed at boot (#86). Only `control` and `admin` are exempt, with recovery reasons in `core.cog_discovery.PROTECTED_COGS`; folders do not grant protection. Filtering happens before feature import. Bare names survive folder moves; historical qualified names are normalized on read. How downstream forks carry upstream cogs without running them |
 | `command_author_allowlist` | `list[int]` | *no command surface* | bot.py bot-authored-command dispatch; hand-edit only |
 
 ### Guild scope (`<guild_id>.json`)
 
 | Key | Shape | Written by | Notes |
 |-----|-------|-----------|-------|
-| `admins` | `list[int]` user ids | `!addadmin` / `!removeadmin` / `!claimadmin` | Read via `core.utils.is_admin` |
+| `admins` | `list[int]` user ids | `!addadmin` / `!removeadmin` / `!claimadmin` | Read via `core.permissions.is_admin` |
 | `current_ai_provider` | `str` provider id | `!aisettings` → Server config | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
 | `current_ai_model` | `str` or absent | `!aisettings` → Server config | Absent ⇒ provider's `default_model` |
 | `ai_history_min_messages` | `int`, default 15 | `/aisettings` → Server config → History Min / Max | Fresh/sliding context size; 1–1000 messages |
@@ -192,7 +192,7 @@ illustration; they are not real.)
 
 | Key | Shape | Written by | Notes |
 |-----|-------|-----------|-------|
-| `points` | `int` | `utils/points.py` (`add_points` / `set_points`) | Per-user balance; absent ⇒ 0. Negative balances are valid; adjustments and assignments use `Config.update_user` for atomic persistence. Other cogs import the helpers; they do not import the Points cog |
+| `points` | `int` | `core/points.py` (`add_points` / `set_points`) | Per-user balance; absent ⇒ 0. Negative balances are valid; adjustments and assignments use `Config.update_user` for atomic persistence. Other cogs import the helpers; they do not import the Points cog |
 
 ### Conventions
 

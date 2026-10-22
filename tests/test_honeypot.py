@@ -8,9 +8,9 @@ import discord
 import pytest
 import pytest_asyncio
 
-from cogs.optional.honeypot import Honeypot, KEY, REASON
+from cogs.honeypot import Honeypot, KEY, REASON
 from core.ops import OpContext, registry
-from utils import event_logging
+from core import event_logging
 
 
 @pytest_asyncio.fixture

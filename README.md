@@ -76,19 +76,33 @@ and the panel shows them as separate sections. Cog ops register when the cog
 loads and unregister when it unloads, all-or-none — a cog never runs with half
 its ops missing.
 
-**The rest of the bot are cogs, leaves of this tree.** `cogs/core/` is the
-recovery surface (the commands that turn things back on) and is never
-disableable; everything else lives in `cogs/optional/` and can be switched off
-per deployment. **The cog set is fixed at boot** — there is no live
-load/unload/reload; a restart binds a code change, a `disabled_cogs` edit, and
-newly registered ops alike.
+**Features live in `cogs/`; reusable implementations live in `core/`.** Each
+cog owns its prefix/slash commands, listeners, tasks, views, and behavioral ops.
+Shared services can be used without activating that feature's entrypoints;
+private helpers may stay in a cog, and cogs do not depend on other cogs.
+`core/cog_discovery.py` declares the only protected IDs, `control` and `admin`,
+with recovery reasons. Discovery and operator controls use that same policy;
+folders confer no immunity. Disabled modules are filtered before import.
+
+**The cog set is fixed at boot.** `!cogs`, `!disable` and `!enable` edit the global
+`disabled_cogs` list; a restart applies those choices. A disabled feature loses
+its commands, listeners, tasks, views and behavioral tools on the next boot.
+Saved settings, shared implementations and existing Discord effects remain.
+Independent raw API primitives keep their own policy. For example, disabling
+Points removes its commands and three points tools while preserving balances
+and the reusable store in `core/points.py`.
 
 ```mermaid
 flowchart TB
     subgraph SRC["Where ops come from"]
         CORE["core/ops.py<br/><i>API primitives</i><br/>@registry.op(...) · origin=core"]
-        COG["Any cog — behavioral primitives<br/><i>e.g. setrole, danbooru</i><br/>@op(...) · origin=cog"]
+        COG["Any cog — behavioral primitives<br/><i>e.g. setrole, danbooru, points</i><br/>@op(...) · origin=cog"]
     end
+
+    SERVICE["core/ headless services<br/>reusable logic and state<br/>e.g. points, event_logging"]
+    COMMAND["Cog commands / listeners / tasks / views"]
+    COMMAND -->|"call"| SERVICE
+    COG -->|"call"| SERVICE
 
     REG{{"<b>Ops Registry</b> — core/ops.py<br/>name · description · PermissionLevel<br/>typed params · scope · group · origin<br/><br/>generates JSON schema · resolves ids<br/>· enforces permissions · serializes results"}}
 
@@ -101,7 +115,7 @@ flowchart TB
     end
 
     REG -->|"scope == GUILD, live"| AGENT
-    REG -->|"whole registry, live"| MCP
+    REG -->|"registry at server startup"| MCP
 
     subgraph CFG["Exposure filters — admin config"]
         WL["<b>Agent, two-tier</b><br/><code>agent_ops_whitelist</code> (owner, global)<br/>× <code>agent_ops_gate</code> (admin, per-guild:<br/>off / admin / everyone)<br/>both in the <code>/aisettings</code> panel"]
@@ -266,7 +280,7 @@ Normalized images are held in an **in-memory LRU cache** (64 images / 64 MB,
 nothing written to disk), and history image selection favors keeping the same
 images across turns to support provider prompt-cache reuse.
 
-**Safety limits** (`utils/ai_images.py`):
+**Safety limits** (`core/ai_images.py`):
 - **Discord-hosted images only** — `https` URLs on `cdn.discordapp.com`,
   `media.discordapp.net`, `images-ext-1.discordapp.net`, or `images-ext-2.discordapp.net`; anything else is ignored.
 - **Max 8 images per request.**
@@ -468,15 +482,15 @@ restart.
 
 `actor_id` is the Discord user id the call is made on behalf of — the
 registry runs the same permission check it would for an in-bot command,
-against live bot config via `core.utils.is_admin`/`is_superadmin`.
+against live bot config via `core.permissions.is_admin`/`is_superadmin`.
 
 ## 🏗️ Development & Extension
 
 ### Creating Custom Cogs
-Add new features by creating cogs in `cogs/optional/`:
+Add new features by creating cogs in `cogs/`:
 
 ```python
-# cogs/optional/my_feature.py
+# cogs/my_feature.py
 from discord.ext import commands
 
 class MyFeature(commands.Cog):
@@ -493,19 +507,24 @@ async def setup(bot):
     await bot.add_cog(MyFeature(bot))
 ```
 
-Restart the bot and it loads automatically (anything in `cogs/optional/` not
-listed in `disabled_cogs`), showing up in `/help` grouped under its cog.
+Restart the bot and public `.py` modules directly in `cogs/` load automatically
+unless disabled. Underscore-prefixed helpers and subfolders are not discovered.
+Commands appear in `/help` grouped under their cog.
 
 ### Giving a Cog an Op
 
 Any cog can contribute to the ops registry, which makes its capability
-available to the in-chat agent, the MCP server, and the admin panel at once.
+eligible for the in-chat agent, MCP server and settings panel. Registration,
+frontend exposure and per-call authorization are separate: the agent uses its
+configured whitelist/guild gates, while an unset MCP allowlist selects the full
+registered universe. A cog must not change its own exposure settings.
 Factor the logic into a plain service method, then let both the command and the
 op call it:
 
 ```python
+from discord.ext import commands
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
-from core.utils import is_admin
+from core.permissions import is_admin
 
 class MyFeature(commands.Cog):
     async def _do_thing(self, guild, target: str) -> dict:
@@ -542,7 +561,7 @@ The ops register when the cog loads and unregister when it unloads. A batch is
 all-or-none, so a malformed op means zero ops registered rather than half — and
 the cog is ejected rather than running with its ops silently missing. See
 `docs/cog-development.md` →
-"Registering ops from a cog" for the full contract, and `cogs/optional/setrole.py`
+"Registering ops from a cog" for the full contract, and `cogs/setrole.py`
 for a live example.
 
 ### Config Quick Reference

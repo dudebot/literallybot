@@ -4,7 +4,7 @@ import platform
 import discord
 from discord.ext import commands
 
-from core.utils import is_admin
+from core.permissions import is_admin
 
 
 class Tools(commands.Cog):

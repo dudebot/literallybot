@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from core.ops import OpContext, registry
-from core.utils import sanitize_outbound_text
+from core.messages import sanitize_outbound_text
 
 
 def test_sanitize_strips_hidden_payloads_and_odd_spaces():

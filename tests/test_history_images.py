@@ -9,9 +9,9 @@ import discord
 import pytest
 from pydantic_ai.messages import BinaryContent, ModelRequest, ModelResponse
 
-from cogs.optional.gpt import Gpt
+from cogs.gpt import Gpt
 from core.llm.client import _to_pai_messages
-from utils.ai_images import ImageCache, message_images, normalize_image
+from core.ai_images import ImageCache, message_images, normalize_image
 from test_vision import JPEG
 
 
@@ -50,7 +50,7 @@ async def test_embed_bot_and_reference_images_keep_their_source_turn(config, mon
     cog, ctx = setup(config, [posted, trigger])
     ctx.channel.fetch_message.return_value = target
     fetch = AsyncMock(return_value=(200, normalize_image(JPEG)))
-    monkeypatch.setattr('utils.ai_images.fetch_image', fetch)
+    monkeypatch.setattr('core.ai_images.fetch_image', fetch)
     history, _ = await cog._build_history(ctx, messages=[posted, trigger])
     assert len(history[0]['images']) == 2
     assert history[-1]['role'] == 'assistant' and len(history[-1]['images']) == 1
@@ -72,7 +72,7 @@ async def test_embed_bot_and_reference_images_keep_their_source_turn(config, mon
 async def test_ninth_trigger_image_evicts_oldest_but_reply_target_is_required(config, monkeypatch):
     messages = [message(i, images=[attachment(i)]) for i in range(1, 9)]
     cog, ctx = setup(config, messages)
-    monkeypatch.setattr('utils.ai_images.fetch_image', AsyncMock(return_value=(200, normalize_image(JPEG))))
+    monkeypatch.setattr('core.ai_images.fetch_image', AsyncMock(return_value=(200, normalize_image(JPEG))))
     first, _ = await cog._build_history(ctx, messages=messages)
     retained = [key for turn in first for key in turn.get('_selected_images', [])]
     trigger = message(9, images=[attachment(9)])
@@ -95,7 +95,7 @@ async def test_expired_urls_refresh_message_once(config, monkeypatch):
     cog, ctx = setup(config, [old])
     ctx.channel.fetch_message.return_value = fresh
     fetch = AsyncMock(side_effect=lambda url: (200, normalize_image(JPEG)) if 'ex=new' in url else (403, None))
-    monkeypatch.setattr('utils.ai_images.fetch_image', fetch)
+    monkeypatch.setattr('core.ai_images.fetch_image', fetch)
     history, _ = await cog._build_history(ctx, messages=[old])
     assert len(history[0]['images']) == 2
     ctx.channel.fetch_message.assert_awaited_once_with(1)
@@ -108,7 +108,7 @@ async def test_failed_refresh_is_negative_cached(config, monkeypatch):
     cog, ctx = setup(config, [old])
     ctx.channel.fetch_message.side_effect = RuntimeError('deleted')
     fetch = AsyncMock(return_value=(403, None))
-    monkeypatch.setattr('utils.ai_images.fetch_image', fetch)
+    monkeypatch.setattr('core.ai_images.fetch_image', fetch)
     for _ in range(2):
         history, _ = await cog._build_history(ctx, messages=[old])
         assert '[image: 1.jpg]' in history[0]['content']
@@ -128,7 +128,7 @@ async def test_lru_bounds_identity_negative_expiry_and_coalescing(monkeypatch):
     cache.put('d', image(b'789'))
     assert list(cache.entries) == ['c', 'd'] and cache.bytes == 5  # Byte eviction.
     fetch_evicted = AsyncMock(return_value=(200, image(b'34')))
-    monkeypatch.setattr('utils.ai_images.fetch_image', fetch_evicted)
+    monkeypatch.setattr('core.ai_images.fetch_image', fetch_evicted)
     assert await cache.get(('b', 'b.jpg', 'https://cdn.discordapp.com/b.jpg'), None, None, {}) == image(b'34')
     fetch_evicted.assert_awaited_once()
     assert cache.bytes <= 5
@@ -136,9 +136,9 @@ async def test_lru_bounds_identity_negative_expiry_and_coalescing(monkeypatch):
     old, fresh = message(1, images=[attachment(1)]), message(1, images=[attachment(1, 'fresh')])
     assert message_images(old)[0][0] == message_images(fresh)[0][0]
     clock = 0
-    monkeypatch.setattr('utils.ai_images.time', NS(monotonic=lambda: clock))
+    monkeypatch.setattr('core.ai_images.time', NS(monotonic=lambda: clock))
     fetch = AsyncMock(return_value=(0, None))
-    monkeypatch.setattr('utils.ai_images.fetch_image', fetch)
+    monkeypatch.setattr('core.ai_images.fetch_image', fetch)
     item = message_images(old)[0]
     await asyncio.gather(*(cache.get(item, old, None, {}) for _ in range(5)))
     await cache.get(item, fresh, None, {})
@@ -156,7 +156,7 @@ async def test_explicit_inputs_obey_hard_cap_and_priority(config, monkeypatch, t
                       reference=NS(message_id=1))
     cog, ctx = setup(config, [target, trigger])
     fetch = AsyncMock(return_value=(200, normalize_image(JPEG)))
-    monkeypatch.setattr('utils.ai_images.fetch_image', fetch)
+    monkeypatch.setattr('core.ai_images.fetch_image', fetch)
     history, _ = await cog._build_history(ctx, messages=[target, trigger])
     chosen = {key for turn in history for key in turn.get('_selected_images', [])}
     expected = ([(2, ('attachment', i)) for i in range(101, 101 + trigger_count)]
@@ -175,7 +175,7 @@ async def test_reply_pins_persist_through_text_followup_and_fill_vacancies(confi
     reply = message(10, reference=NS(message_id=1))
     messages.append(reply)
     cog, ctx = setup(config, messages)
-    monkeypatch.setattr('utils.ai_images.fetch_image', AsyncMock(return_value=(200, normalize_image(JPEG))))
+    monkeypatch.setattr('core.ai_images.fetch_image', AsyncMock(return_value=(200, normalize_image(JPEG))))
     first, _ = await cog._build_history(ctx, messages=messages)
     retained = [key for turn in first for key in turn.get('_selected_images', [])]
     assert {key[0] for key in retained} == {1, 3, 4, 5, 6, 7, 8, 9}
@@ -189,7 +189,7 @@ async def test_reply_pins_persist_through_text_followup_and_fill_vacancies(confi
 
 
 def test_history_snapshots_release_pixels_preserve_comparisons_and_prune_expiry():
-    from utils.ai_history import HistoryWindows, estimate_message_tokens, prefix_tokens
+    from core.ai_history import HistoryWindows, estimate_message_tokens, prefix_tokens
     windows = HistoryWindows()
     image = {'data': b'pixel payload', 'media_type': 'image/jpeg'}
     messages = [{'role': 'user', 'content': 'look', 'images': [image]}]
@@ -212,14 +212,14 @@ def test_history_snapshots_release_pixels_preserve_comparisons_and_prune_expiry(
 async def test_image_400_retry_commits_only_the_request_sent(config, monkeypatch):
     from contextlib import asynccontextmanager
     from pydantic_ai.exceptions import ModelHTTPError
-    from utils.ai_history import prefix_tokens, estimate_message_tokens
+    from core.ai_history import prefix_tokens, estimate_message_tokens
     trigger = message(1, images=[attachment(1)])
     cog, ctx = setup(config, [trigger])
     @asynccontextmanager
     async def typing():
         yield
     ctx.typing, ctx.send = typing, AsyncMock()
-    monkeypatch.setattr('utils.ai_images.fetch_image', AsyncMock(return_value=(200, normalize_image(JPEG))))
+    monkeypatch.setattr('core.ai_images.fetch_image', AsyncMock(return_value=(200, normalize_image(JPEG))))
     run = AsyncMock(side_effect=[ModelHTTPError(400, 'test'), 'hello'])
     monkeypatch.setattr(cog, '_run_agentic', run)
     await cog.process_askgpt(ctx, 'look')
@@ -236,7 +236,7 @@ async def test_image_400_retry_commits_only_the_request_sent(config, monkeypatch
 async def test_failed_image_logs_warning_without_signed_query(config, monkeypatch, caplog):
     trigger = message(1, images=[attachment(1, 'secret-signature')])
     cog, ctx = setup(config, [trigger])
-    monkeypatch.setattr('utils.ai_images.fetch_image', AsyncMock(return_value=(200, None)))
+    monkeypatch.setattr('core.ai_images.fetch_image', AsyncMock(return_value=(200, None)))
     with caplog.at_level(logging.WARNING, logger='test'):
         await cog._build_history(ctx, messages=[trigger])
     assert 'https://cdn.discordapp.com/attachments/1/1/1.jpg' in caplog.text

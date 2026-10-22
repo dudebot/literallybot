@@ -10,9 +10,9 @@ import time
 from collections import deque, OrderedDict
 from typing import Dict, List, Optional, Any
 
-from core.utils import (InvokerOnlyView, is_admin, is_superadmin,
-                        panel_slash_pin, recursive_split,
-                        sanitize_outbound_text)
+from core.panels import InvokerOnlyView, panel_slash_pin
+from core.permissions import is_admin, is_superadmin
+from core.messages import recursive_split, sanitize_outbound_text
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
 from core.agent_gate import agent_universe
@@ -27,8 +27,8 @@ from core.agent_gate import (
 )
 from core.mcp_server import ENABLE_CONFIG_KEY, exposed_ops, resolve_mcp_tools
 
-from utils.ai_history import HistoryWindows, history_bounds, cache_policy
-from utils.ai_images import ImageCache, MAX_IMAGES, message_images
+from core.ai_history import HistoryWindows, history_bounds, cache_policy
+from core.ai_images import ImageCache, MAX_IMAGES, message_images
 
 PANEL_TIMEOUT = 180
 TOOL_BUDGET_VALUES = (4, 8, 12, 16)
@@ -283,7 +283,7 @@ class Gpt(commands.Cog):
         """
         if not getattr(ctx, "guild", None):
             return []
-        from core.utils import is_superadmin
+        from core.permissions import is_superadmin
         wl = self.bot.config.get_global("agent_ops_whitelist")
         gate = self.bot.config.get(ctx, "agent_ops_gate")
         return agent_universe(wl, gate,
@@ -801,7 +801,7 @@ class Gpt(commands.Cog):
         # themselves — see core/agent_loop.py. The pydantic-ai limit below is
         # set to 2x as a runaway backstop only; in the normal exhaustion path
         # the model authors its own final reply and no exception fires.
-        from core.utils import is_admin, is_superadmin
+        from core.permissions import is_admin, is_superadmin
         from core.agent_gate import call_requires_admin
         from core.ops import registry as _registry
 

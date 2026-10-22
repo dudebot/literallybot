@@ -1,10 +1,13 @@
 # Registered event logging
 
-Guild event reports use `utils/event_logging.py`, a headless registration and
+Guild event reports use `core/event_logging.py`, a headless registration and
 delivery service. Membership joins/departures, nickname changes, voice activity,
 and honeypot incidents are producers. Their listeners remain in their own cogs.
 Reports work without the optional `logging` cog whenever another producer is
 loaded. The optional `error_handler` cog supplies the shared settings UI.
+Both cogs live in `cogs/`; the shared delivery service remains in `core/`.
+Disabling the settings cog removes its UI on the next boot without stopping
+reports from loaded producers.
 
 ## Operator controls
 
@@ -61,7 +64,7 @@ must not leave stale categories. The bot lifecycle also clears registrations aft
 removal finalizer, including when a consumer teardown fails.
 
 ```python
-from utils.event_logging import registry, report
+from core.event_logging import registry, report
 
 async def cog_load(self):
     registry.register(self, "my_feature", "My feature", {"incident": "Incidents"})

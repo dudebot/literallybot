@@ -6,7 +6,7 @@ MCP ops server, and secret handling. Read alongside `docs/config-system.md`
 
 ## Permission Model
 
-Three tiers, checked by `core/utils.py`. Both prefix commands (`commands.Context`)
+Three tiers, checked by `core/permissions.py`. Both prefix commands (`commands.Context`)
 and slash commands (`discord.Interaction`) route through the same `is_admin` /
 `is_superadmin` helpers — there is one auth gate, not two.
 

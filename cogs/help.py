@@ -17,7 +17,7 @@ goes stale silently). Both surfaces apply the same rule:
   /help), the checks are EXECUTED and answer exactly;
 - without it — !help cannot run an Interaction-typed predicate, /help
   cannot run a Context-typed one — the fallback reads the tier the check
-  declares via the `__gate__` stamp on core.utils' is_admin /
+  declares via the `__gate__` stamp on core.permissions' is_admin /
   is_superadmin (the same functions `@commands.check` and
   `@app_commands.check` both wrap). A gate of unknown tier fails
   closed (admin-or-better), never open.
@@ -33,8 +33,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core.utils import (GATE_ADMIN, GATE_SUPERADMIN, gate_of, is_admin,
-                        is_superadmin)
+from core.permissions import GATE_ADMIN, GATE_SUPERADMIN, gate_of, is_admin, is_superadmin
 
 MEDIA_NOTE = "Any file in this server's media library can be posted with !<name> — admins manage it via /media"
 
@@ -100,7 +99,7 @@ def _is_gated(cmd, cog=None):
 def _gate_tier(cmd):
     """The strictest tier any of this command's checks declares, or None.
 
-    Reads the __gate__ stamp that core.utils' is_admin/is_superadmin check
+    Reads the __gate__ stamp that core.permissions' is_admin/is_superadmin check
     factories leave on their predicates. This is what lets a surface that
     cannot EXECUTE a check still know who it was meant for."""
     tiers = set()

@@ -10,7 +10,7 @@ import re
 
 import discord
 
-from core.utils import recursive_split
+from core.messages import recursive_split
 
 KEY = "event_logging"
 
