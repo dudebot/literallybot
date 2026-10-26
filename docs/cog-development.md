@@ -332,7 +332,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | **description** | Written *for a model*, not a changelog. State what it does, what it returns, and what it does **not** do — and when the excluded action is another op's job, name that op instead of asserting nonexistence (descriptions claiming a sibling "is not an op" go stale the day it ships). |
 | **permission** | `PermissionLevel.EVERYONE` / `ADMIN` / `SUPERADMIN`, checked against the **invoking user** on every call, before any Discord id is resolved. Config never overrides this. |
 | **params** | Typed `OpParam`s. The registry generates the JSON schema *and* resolves Discord entities from ids — see the kinds below. |
-| **scope** | `OpScope.GUILD` / `DM` / `GLOBAL`. See below; this is a safety boundary, not a label. |
+| **scope** | `OpScope.GUILD` / `DM` / `GLOBAL` / `SELF`. See below; this is a safety boundary, not a label. |
 | **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
 | **agent_guidance** | Optional. Extra instruction injected for the agent loop — use it for non-obvious result semantics ("status 'exists' means nothing was written"). |
 | **serialize** | Callable adapting a return value to a JSON-safe dict. Without one, dict results pass through unchanged; other results become `{}`. Use it when objects or IDs need conversion. |
@@ -350,6 +350,12 @@ universe derivable instead of hand-listed:
   emojis). The in-guild agent universe is selected from this set, queried live,
   then narrowed by the configured exposure gates.
   This is what almost every cog op should be.
+- **`OpScope.SELF`** — acts only for `ctx.author`, the non-bot invoker.
+  Declare payloads only (STRING, INTEGER, BOOLEAN, STRING_LIST); never a user,
+  actor, owner, subject, target, entity, snowflake or INTERNAL parameter.
+  Both dispatch paths reject missing/bot actors and unexpected arguments.
+  MCP excludes/refuses this scope. Exposure requires the shared whitelist
+  and SELF switches, plus the guild gate for public use.
 - **`OpScope.DM`** — acts on a one-to-one DM conversation, no guild involved.
   Never offered to the guild-confined agent loop.
 - **`OpScope.GLOBAL`** — acts on the bot itself across guilds (`list_guilds`).
@@ -399,7 +405,7 @@ The agent and settings panel query the registry **live**; MCP builds its tool
 surface from the registry at server startup and keeps it until restart. Neither
 uses an import-time snapshot that misses loaded cogs. Registration makes an op
 eligible for exposure; frontend configuration selects exposure, and each call
-still passes the op's authorization gate. MCP's unset allowlist exposes the full
+still passes the op's authorization gate. MCP's unset allowlist exposes the non-SELF
 registered universe; registering a cog must not write exposure settings.
 
 When a cog is not loaded (disabled via `disabled_cogs`), its op names stay in
@@ -609,3 +615,24 @@ cannot supply a password. `Restart=always` relaunches a killed process.
   retain their own exposure and permission policy.
 - The switch is global and deployment-wide. Live guild settings, such as event
   report route enabled flags, control their behavior separately.
+
+### Shared agent execution
+
+`core.agent_loop.run_agent_turn` owns tool construction, terminal quiet,
+narration nudge, usage logging and hard-limit fallback. GPT delegates to it;
+other trusted callers supply their assembled messages, context, resolved tool
+names, closing request, metadata and optional dispatch-validity hook. Persona,
+history scraping, lifecycle checks and delivery remain with the caller.
+Use `resolve_agent_tools(ctx, scopes)` before assembling history/guidance, and
+include that same policy in the cache key. `build_agentic_guidance(names)`
+supports ID-free guidance; guild callers retain the existing public guidance
+by supplying guild/channel IDs.
+
+Set `sequential=True` on an op whose writes must execute sequentially in the
+provider loop; this metadata is carried by both registration paths into Tool.
+This does not replace storage transactions or cancellation checks. The
+synchronous `validity_check` hook runs immediately before dispatch; services
+with stronger atomic lifecycle requirements must enforce them at mutation.
+`LLMClient.run_agent(max_retries=0)` optionally disables SDK transport retries.
+Omitting the override preserves SDK defaults; it does not change Agent
+validation retries. The shared runner forwards it to main/nudge/fallback.

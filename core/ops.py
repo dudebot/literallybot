@@ -111,6 +111,7 @@ class OpScope(str, Enum):
     GUILD = "guild"
     DM = "dm"
     GLOBAL = "global"
+    SELF = "self"  # invoker-only data; never exposed through MCP
 
 
 # Op groups: a stable kebab-case id -> human display label. The id is what
@@ -520,6 +521,7 @@ class Op:
     # and can't drift out of sync with the enabled-tool set. Distinct from
     # `description`, which rides inside the function schema itself.
     agent_guidance: Optional[str] = None
+    sequential: bool = False
 
     def default_gate(self) -> str:
         """The Off/Admin/Everyone default for this op's agent exposure.
@@ -533,6 +535,10 @@ class Op:
         return "off"
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
+        if self.scope == OpScope.SELF:
+            reason = self.self_call_error(ctx, kwargs)
+            if reason:
+                return OpResult(ok=False, error=reason)
         allowed, reason = _check_permission(ctx, self.permission)
         if not allowed:
             return OpResult(ok=False, error=reason)
@@ -544,6 +550,15 @@ class Op:
         except Exception as exc:  # noqa: BLE001 - ops surface failure, not raise
             return OpResult(ok=False, error=f"{type(exc).__name__}: {exc}")
         return OpResult(ok=True, value=value)
+
+    def self_call_error(self, ctx, arguments):
+        actor = getattr(ctx, "author", None)
+        actor_id = getattr(actor, "id", None)
+        if not isinstance(actor_id, int) or isinstance(actor_id, bool) or actor_id <= 0 or getattr(actor, "bot", False):
+            return "SELF requires a valid non-bot invoking actor."
+        if set(arguments) - {p.name for p in self.params}:
+            return "Unexpected SELF parameters."
+        return None
 
     # -- schema generation ------------------------------------------------
 
@@ -851,6 +866,7 @@ class OpSpec:
     params: Tuple[OpParam, ...] = ()
     serialize: Optional[Callable[[Any], Dict[str, Any]]] = None
     agent_guidance: Optional[str] = None
+    sequential: bool = False
     scope: OpScope = OpScope.GUILD
     group: str = "messaging"
     group_label: Optional[str] = None
@@ -868,7 +884,8 @@ def op(name: str, description: str, permission: PermissionLevel,
        agent_guidance: Optional[str] = None,
        scope: OpScope = OpScope.GUILD,
        group: str = "messaging",
-       group_label: Optional[str] = None):
+       group_label: Optional[str] = None,
+       sequential: bool = False):
     """Declare a function as an op, WITHOUT registering it.
 
     Used only on owning cog methods, registered in add_cog. Shared service
@@ -893,7 +910,7 @@ def op(name: str, description: str, permission: PermissionLevel,
             name=name, description=description, permission=permission,
             params=tuple(params or []), serialize=serialize,
             agent_guidance=agent_guidance, scope=scope, group=group,
-            group_label=group_label,
+            group_label=group_label, sequential=sequential,
         ))
         return func
     return decorator
@@ -904,13 +921,15 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
               serialize: Optional[Callable[[Any], Dict[str, Any]]],
               agent_guidance: Optional[str], scope: OpScope, group: str,
               origin: str, owner: Any,
-              group_label: Optional[str] = None) -> Op:
+              group_label: Optional[str] = None, sequential: bool = False) -> Op:
     """Validate and construct an Op. Shared by both registration paths so a
     cog op and a core op are held to exactly the same rules."""
     if not inspect.iscoroutinefunction(impl):
         raise TypeError(f"Op '{name}' implementation must be an async function.")
     if not isinstance(scope, OpScope):
         raise TypeError(f"Op '{name}' scope must be an OpScope, got {scope!r}.")
+    if not isinstance(sequential, bool):
+        raise TypeError("sequential must be a bool.")
     if not group or not isinstance(group, str):
         raise ValueError(f"Op '{name}' must declare a non-empty group id.")
     # Wire names collapse per kind (MEMBER and USER both user_id). Two
@@ -927,6 +946,16 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
             return (_ENTITY_WIRE_NAMES[kind],)
         return ()
 
+    if scope == OpScope.SELF:
+        safe_kinds = {ParamKind.STRING, ParamKind.INTEGER, ParamKind.BOOLEAN, ParamKind.STRING_LIST}
+        for p in params or []:
+            tokens = set(re.sub(r"([a-z])([A-Z])", r"\1_\2", p.name).lower().replace("-", "_").split("_"))
+            if p.kind not in safe_kinds or tokens & {"owner", "actor", "author", "user", "subject", "member", "target", "recipient", "uid"}:
+                raise ValueError(f"SELF op '{name}' cannot declare identity/target parameters.")
+        declared = {p.name for p in params or []}
+        actual = list(inspect.signature(impl).parameters.values())[1:]
+        if any(p.name not in declared or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in actual):
+            raise ValueError(f"SELF op '{name}' implementation parameters must match declarations.")
     seen_wire = set()
     for p in (params or []):
         for wn in _wire_names_for(p.kind):
@@ -943,7 +972,7 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
         name=name, description=description, permission=permission,
         impl=impl, params=list(params or []), serialize=serialize,
         agent_guidance=agent_guidance, scope=scope, group=group,
-        group_label=group_label, origin=origin, owner=owner,
+        group_label=group_label, origin=origin, owner=owner, sequential=sequential,
     )
 
 
@@ -982,7 +1011,7 @@ class OpsRegistry:
            serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
            agent_guidance: Optional[str] = None,
            scope: OpScope = OpScope.GUILD,
-           group: str = "messaging"):
+           group: str = "messaging", sequential: bool = False):
         """Decorator: `@registry.op("name", "...", PermissionLevel.ADMIN)`
         registers an `async def impl(ctx, **kwargs)` under `name`.
 
@@ -996,7 +1025,7 @@ class OpsRegistry:
                 name=name, description=description, permission=permission,
                 impl=func, params=params, serialize=serialize,
                 agent_guidance=agent_guidance, scope=scope, group=group,
-                origin=ORIGIN_CORE, owner=None,
+                origin=ORIGIN_CORE, owner=None, sequential=sequential,
             ))
             return func
         return decorator
@@ -1124,7 +1153,7 @@ class OpsRegistry:
                 params=list(spec.params), serialize=spec.serialize,
                 agent_guidance=spec.agent_guidance, scope=spec.scope,
                 group=spec.group, group_label=spec.group_label,
-                origin=ORIGIN_COG, owner=cog,
+                origin=ORIGIN_COG, owner=cog, sequential=spec.sequential,
             ))
         return self._commit_batch(batch)
 
@@ -1179,6 +1208,10 @@ class OpsRegistry:
         # trigger Discord fetches (channel/message/member lookups) as a side
         # effect of a call it was never allowed to make. Op.__call__ checks
         # again for the object-based `call()` path — cheap belt-and-suspenders.
+        if op.scope == OpScope.SELF:
+            reason = op.self_call_error(ctx, raw)
+            if reason:
+                return OpResult(ok=False, error=reason)
         allowed, reason = _check_permission(ctx, op.permission)
         if not allowed:
             return OpResult(ok=False, error=reason)

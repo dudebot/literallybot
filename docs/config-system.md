@@ -159,7 +159,7 @@ illustration; they are not real.)
 | `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
 | `cooldown_tier_bases` | `{tier: seconds}` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS`; the model modal's tier dropdown covers the common case |
 | `cooldown_windows` | `list[[count, period_mult]]` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
-| `agent_ops_whitelist` | `{op_name: bool}` | `!aisettings` → 🛠 Agent Ops (superadmin) | The GLOBAL ceiling for the in-chat AGENT tier (`core/agent_gate`). Only ops set `true` here can EVER reach the agent — in any guild or DM — and only whitelisted guild-scoped ops render on a server's ⚙ tab. Absent/empty ⇒ nothing enabled (fail closed, the owner opts ops in). A whitelisted name whose op is currently unregistered (cog unloaded) is KEPT and just dropped from the effective set (same live-registry doctrine as `mcp_tools_enabled`). Governs the agent path ONLY; MCP/direct calls still answer to each op's hardcoded `PermissionLevel` floor |
+| `agent_ops_whitelist` | `{op_name: bool}` | `!aisettings` → 🛠 Agent Ops (superadmin) | The GLOBAL ceiling for the in-chat AGENT tier (`core/agent_gate`). Only ops set `true` here can EVER reach the agent — in any guild or DM — and only whitelisted GUILD/SELF ops render on a server's ⚙ tab. Absent/empty ⇒ nothing enabled (fail closed, the owner opts ops in). A whitelisted name whose op is currently unregistered (cog unloaded) is KEPT and just dropped from the effective set (same live-registry doctrine as `mcp_tools_enabled`). Governs the agent path ONLY; MCP/direct calls still answer to each op's hardcoded `PermissionLevel` floor |
 | `mcp_tools_enabled` | `list[str]` op names | `!aisettings` → MCP (superadmin) | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
 | `mcp_ops_enabled` | `bool` | `!aisettings` → MCP (🔌 toggle, superadmin) | The MCP server's on/off switch (was the `MCP_OPS_ENABLED` env var until 2026-08). Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
 | `mcp_ops_token` | `str` | *no command surface* — hand-edit, or auto-generated | Bearer token for the MCP server. Config-first with an `MCP_OPS_TOKEN` env fallback; if the server is enabled with neither set, the bot generates one (`secrets.token_urlsafe(32)`) and writes it here. Never logged — read it out of `global.json` to connect a client |
@@ -180,7 +180,7 @@ illustration; they are not real.)
 | `ai_history_max_messages` | `int`, default 30 | `/aisettings` → Server config → History Min / Max | Cache-reuse ceiling, at least the minimum and at most 1000. Equal bounds give fixed history; references may add supplemental messages. Previous anchor retained only inside the assumed TTL when estimated input cost decreases |
 | `gpt_personality_data` | `{prompt: str}` | `!aisettings` → Personality modal | Guild persona for `!gpt` |
 | `ai_enabled` | `bool` | `!aisettings` → Server config (💬 toggle) | Per-guild AI kill switch. Absent ⇒ ON. Gates the mention/reply chat path only — the panel stays reachable to turn it back on. Chat is guild-only: DMs never answer |
-| `agent_ops_gate` | `{op_name: "off"\|"admin"\|"everyone"}` | `!aisettings` → ⚙ Server config, per-op tri-state select (**guild admin**) | The per-guild agent gate (`core/agent_gate`), the second tier under the global `agent_ops_whitelist` ceiling. For each WHITELISTED guild-scoped op a server admin picks Off / Admin only / Everyone; a missing entry falls back to the op's `default_gate()` (always `"off"`). `off` hides the op from that guild's agent, `admin` limits agent invocation to bot admins, `everyone` opens it to any member (still subject to the op's own hardcoded `PermissionLevel` floor). Guild-admin-savable is not an escalation path: the surface is guild-scoped ops only, capped by the super-admin whitelist, and each op re-checks its floor at call time. Superseded `bot_tools_enabled` (the old single on/off allowlist) when the two-tier model landed |
+| `agent_ops_gate` | `{op_name: "off"\|"admin"\|"everyone"}` | `!aisettings` → ⚙ Server config, per-op tri-state select (**guild admin**) | The per-guild agent gate (`core/agent_gate`), the second tier under the global `agent_ops_whitelist` ceiling. For each WHITELISTED GUILD/SELF op a server admin picks Off / Admin only / Everyone; a missing entry falls back to the op's `default_gate()` (always `"off"`). `off` hides the op from that guild's agent, `admin` limits agent invocation to bot admins, `everyone` opens it to any member (still subject to the op's own hardcoded `PermissionLevel` floor). Guild-admin-savable is not an escalation path: the surface is eligible GUILD/SELF ops only, capped by the super-admin whitelist, and each op re-checks its floor at call time. Superseded `bot_tools_enabled` (the old single on/off allowlist) when the two-tier model landed |
 | `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
 | `emoji_role_toggles` | `list[{channel_id, message_id, emoji, role_id}]` | `/role add\|delete\|sync` (setrole.py) | emoji is canonical str form (unicode char or `<:name:id>`); channel_id None = legacy-migrated entry pending `/role sync`; legacy nested-dict shape auto-migrates on first read |
 | `error_logging` | as global, except `rate_limit_minutes` is global-only | `/logsettings` → Server (admin) | Independent destination/routes and `log_unknown_commands` toggle; cannot disable global reporting |
@@ -411,3 +411,25 @@ existing deferred-save API. This uses the existing temporary-file rename; it
 is not an fsync-backed power-loss durability guarantee.
 
 MCP binding is configured at startup with `MCP_OPS_HOST` (default `127.0.0.1`). Wildcard binds also require `MCP_OPS_TRUSTED_HOSTS`, a comma-separated list of client-facing IPs or hostnames. See [security](security.md#mcp-ops-server).
+
+### SELF tool policy contracts
+
+`ai_self_tools_enabled` has two explicit scopes, read by
+`core.agent_gate.self_tools_enabled` / `resolve_agent_tools`:
+
+| Scope | Default when absent | Meaning |
+| --- | --- | --- |
+| Global | `true` | Master ceiling for SELF tools, including DMs |
+| Guild | `false` | Additional opt-in for public guild SELF tools |
+
+The global `agent_ops_whitelist` still requires each tool name to be explicitly
+true. Guild SELF also requires a non-off `agent_ops_gate` entry; Admin/Everyone
+and the op's hard permission floor still apply. No superadmin bypass applies
+to SELF policy. DM callers request SELF only and never substitute another
+guild's context. Readers do not persist defaults or automatically grant tools.
+Visible switches are deferred to the downstream R3 settings work.
+
+Public guild `ai_tool_budget` keeps its default 8 and existing 1–16 clamp.
+DM turns use 8. All GUILD/SELF action tools share one counter per turn,
+including the narration nudge. Terminal `stay_quiet` remains outside the
+action counter, matching existing public behavior.

@@ -473,6 +473,7 @@ class LLMClient:
         max_tool_calls: int = 8,
         *,
         output_type: OutputSpec[str] = str,
+        max_retries: Optional[int] = None,
     ) -> LLMResponse:
         """Run a multi-turn tool-calling agent loop via `pydantic_ai.Agent`.
 
@@ -496,6 +497,12 @@ class LLMClient:
         api_key = self._resolve_api_key(provider, provider_info)
 
         pai_model = self._build_model(provider, model, provider_info, api_key)
+        if max_retries is not None:
+            if isinstance(max_retries, bool) or not isinstance(max_retries, int) or max_retries < 0:
+                raise ValueError("max_retries must be a nonnegative integer.")
+            # This model owns a fresh SDK client. Leave its default untouched
+            # unless the caller explicitly chooses a transport retry policy.
+            pai_model.client.max_retries = max_retries
         settings = self._build_settings(provider_info, model, metadata)
         if any(message.get("images") for message in messages):
             settings["openai_store"] = False

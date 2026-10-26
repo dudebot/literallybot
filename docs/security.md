@@ -90,19 +90,20 @@ Security properties enforced centrally, so no frontend can skip them:
   the model finishes with a final reply or intentional silence. pydantic-ai's
   hard cap sits at 2x the guild budget (default 16) as a runaway backstop; even that path degrades to a
   model-authored plain-chat answer, never a canned failure string.
-- **Intentional silence is agent-local.** When at least one registry tool is
-  enabled for the run, `gpt.py` also offers `stay_quiet()` as a Pydantic output
+- **Intentional silence is agent-local.** The shared
+  `core.agent_loop.run_agent_turn` always offers `stay_quiet()` as a Pydantic output
   function. It ends the run successfully without another model request or an
   automatic final Discord reply; previously executed actions/messages remain.
   The decision is local to that invocation, including its narration-nudge retry.
   This terminal control does not consume the configured action budget and is never
   registered as an op, exposed over MCP, or listed in op settings. Empty model
   output remains an error, not an implicit silence signal. With no enabled
-  registry tools, GPT uses one direct `model_request` through `LLMClient.chat`:
-  no `Agent`, output tools, or agent retries.
+  registry tools, GPT still uses the same Agent with terminal quiet output.
+  The narration nudge reuses the same tools and action counter; quiet remains
+  outside that action budget.
 - **Scope is a structural boundary.** Every op declares an `OpScope`, and the
-  in-guild agent's tool universe is *derived* as exactly the `GUILD`-scoped ops
-  (`registry.guild_agent_names()`), queried live. DM-scoped ops (`send_dm`,
+  in-guild agent's tool universe includes configured `GUILD` ops and eligible
+  `SELF` ops, queried live through `resolve_agent_tools`. DM-scoped ops (`send_dm`,
   `read_dms`, `fetch_dms`, `delete_dm`, `edit_dm`, `list_dm_conversations`,
   `add_dm_reaction`, `remove_dm_reaction`, `list_dm_pins`) and global ops
   (`list_guilds`, `get_user`) are
@@ -484,3 +485,31 @@ Models & Providers tab.
 `delete_message` is exposed to the agent loop and MCP — it remains ADMIN-gated
 per-call, and `call_ids` now checks permissions *before* resolving any Discord
 targets.
+
+### Invoker-only tools
+
+`OpScope.SELF` binds ownership to the trusted invocation's `ctx.author`.
+Registration rejects identity/target selectors, Discord entity and snowflake
+parameters, INTERNAL parameters and undeclared implementation arguments.
+Both object and ID dispatch require a positive non-bot actor ID and reject
+unexpected arguments. Payload parameters such as `text` remain model-fillable;
+trusted session/revision tokens belong in runtime services, outside tool schemas.
+
+SELF is excluded from MCP catalogs, schema-only builds and effective allowlists.
+MCP wrapper creation and dispatch both refuse SELF before any actor/context
+lookup, including stale wrappers and forged actor IDs. Bearer-to-user MCP
+identity remains deferred; other scopes retain their existing MCP policy.
+
+The shared agent policy requires a global whitelist entry and global
+`ai_self_tools_enabled` (absent means true). Public guild SELF additionally
+requires the guild's same-named setting (absent means false) and a non-off
+per-op gate. All SELF switches, whitelist entries and applicable gates are
+rechecked on each dispatch for every actor, including superadmins. Existing
+GUILD admin bypass behavior is preserved.
+
+SELF logs omit arguments, result bodies and error strings. They retain safe
+operation, actor, surface, status and budget metadata. Provider exceptions from
+a turn exposing SELF are replaced with a plain redacted error without the
+original exception chain, since provider errors may contain tool exchanges.
+The tool-name policy is included in history-window and retained-image keys;
+cache separation supplements live authorization rather than replacing it.

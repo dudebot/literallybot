@@ -215,6 +215,7 @@ async def test_image_400_retry_commits_only_the_request_sent(config, monkeypatch
     from core.ai_history import prefix_tokens, estimate_message_tokens
     trigger = message(1, images=[attachment(1)])
     cog, ctx = setup(config, [trigger])
+    ctx.bot = cog.bot
     @asynccontextmanager
     async def typing():
         yield
@@ -236,6 +237,7 @@ async def test_image_400_retry_commits_only_the_request_sent(config, monkeypatch
 async def test_failed_image_logs_warning_without_signed_query(config, monkeypatch, caplog):
     trigger = message(1, images=[attachment(1, 'secret-signature')])
     cog, ctx = setup(config, [trigger])
+    ctx.bot = cog.bot
     monkeypatch.setattr('core.ai_images.fetch_image', AsyncMock(return_value=(200, None)))
     with caplog.at_level(logging.WARNING, logger='test'):
         await cog._build_history(ctx, messages=[trigger])
@@ -256,6 +258,7 @@ async def test_media_only_invocation_requires_activation_and_enabled_ai(
         config, activation, payload, enabled, expected):
     trigger = message(2, images=[attachment(2)] if payload == 'image' else [])
     cog, ctx = setup(config, [trigger])
+    ctx.bot = cog.bot
     trigger.guild = ctx.guild
     trigger.content = '<@99>' if activation == 'mention' else ''
     trigger.mentions = [cog.bot.user] if activation == 'mention' else []

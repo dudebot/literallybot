@@ -86,11 +86,14 @@ def test_disabled_cogs_cannot_remove_the_recovery_surface(config, tmp_path, monk
 
 
 @pytest.mark.asyncio
-async def test_cog_registration_is_atomic_and_binds_the_live_instance():
-    from core.ops import OpContext, PermissionLevel, op
+async def test_cog_registration_is_atomic_and_binds_the_live_instance(config, isolated_bot_module, tmp_path):
+    from core.ops import OpContext, OpScope, PermissionLevel, op
 
-    class Working:
-        @op('probe', 'Return instance state.', PermissionLevel.EVERYONE, group='test')
+    from discord.ext import commands
+
+    class Working(commands.Cog):
+        @op('probe', 'Return instance state.', PermissionLevel.EVERYONE,
+            scope=OpScope.SELF, sequential=True, group='test')
         async def probe(self, ctx):
             return {'value': self.value}
 
@@ -103,17 +106,27 @@ async def test_cog_registration_is_atomic_and_binds_the_live_instance():
         async def z(self, ctx):
             pass
 
-    registry = OpsRegistry()
+    bot, registry = isolated_bot_module.bot, isolated_bot_module.ops_registry
     cog = Working()
     cog.value = 42
-    registry.register_cog_ops(cog)
+    await bot.add_cog(cog)
     with pytest.raises(ValueError, match='already registered'):
         registry.register_cog_ops(Collision())
     assert registry.get('new_probe') is None
-    result = await registry.call('probe', OpContext(bot=None, author=None, guild=None))
+    result = await registry.call('probe', OpContext(bot=None, author=NS(id=1, bot=False), guild=None))
     assert registry.require('probe').result_payload(result) == {'ok': True, 'value': 42}
-    registry.unregister_owner(cog)
+    # Disabling changes the next boot selection without deleting saved policy.
+    directory = tmp_path / 'cogs'
+    directory.mkdir()
+    (directory / 'synthetic.py').write_text('raise AssertionError("Disabled feature imported")')
+    config.set_global('disabled_cogs', ['synthetic'])
+    config.set_global('agent_ops_whitelist', {'probe': True})
+    assert list_cog_modules(config) == []
+    assert registry.get('probe') is not None
+    await bot.remove_cog(cog.qualified_name)
+    assert config.get_global('agent_ops_whitelist') == {'probe': True}
     assert registry.names() == []
+    assert not (await registry.call('probe', OpContext(bot=None, author=NS(id=1)))).ok
 
 
 @pytest.mark.asyncio

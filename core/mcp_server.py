@@ -73,6 +73,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from core.ops import (
+    OpScope,
     Op,
     OpContext,
     ResolutionError,
@@ -116,7 +117,7 @@ def exposed_ops() -> List[str]:
 
     The WHOLE ops registry, queried LIVE (never an import-time snapshot, so
     cog-registered ops are visible the moment their cog is loaded). Ops of
-    every scope are exposed: an MCP caller is a host-side operator, not a
+    every scope except SELF are exposed: an MCP caller is a host-side operator, not a
     guild member. ADMIN-tier ops (delete_message) are safe to expose because
     registry.call_ids checks the permission gate BEFORE resolving any ids,
     so permission failures never trigger target lookups.
@@ -130,7 +131,7 @@ def exposed_ops() -> List[str]:
 
     Gate what a deployment actually serves via the `mcp_tools_enabled`
     allowlist, not by editing this."""
-    return registry.names()
+    return [op.name for op in registry.ops() if op.scope != OpScope.SELF]
 
 
 def resolve_mcp_tools(config) -> List[str]:
@@ -196,7 +197,13 @@ def _make_mcp_tool(bot: Any, op: Op):
     the same JSON schema the registry declares.
     """
 
+    if op.scope == OpScope.SELF:
+        raise ValueError("SELF tools are unavailable through MCP.")
+
     async def tool_fn(**raw) -> dict:
+        current = registry.get(op.name)
+        if op.scope == OpScope.SELF or (current is not None and current.scope == OpScope.SELF):
+            raise BotUnavailableError("SELF tools are unavailable through MCP.")
         # Identity belt: dispatch resolves by NAME but this tool's schema was
         # built from `op` at server start; inert while the cog set is fixed
         # at boot (#86).

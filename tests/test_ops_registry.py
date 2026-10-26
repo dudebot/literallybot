@@ -368,3 +368,37 @@ def test_history_cursors_preserve_chronology_without_new_api():
                                       before_message_id=20, after_message_id=9))
     assert result.ok and [m['id'] for m in result.value['messages']] == [10, 12, 15]
     assert tuple(c.id for c in channel.seen_cursors) == (20, 9)
+
+
+@pytest.mark.asyncio
+async def test_self_dispatch_binds_invoker_and_rejects_identity_in_both_paths():
+    from types import SimpleNamespace as NS
+    from core.ops import OpsRegistry, OpScope, PermissionLevel, OpParam, ParamKind
+
+    reg = OpsRegistry()
+    saved = {}
+
+    @reg.op('save_value', 'Save own value.', PermissionLevel.EVERYONE,
+            scope=OpScope.SELF, params=[OpParam('text', ParamKind.STRING)])
+    async def save(ctx, text):
+        saved[ctx.author.id] = text
+        return text
+
+    for call in (reg.call, reg.call_ids):
+        for uid in (1, 2):
+            ctx = OpContext(bot=None, author=NS(id=uid, bot=False))
+            assert (await call('save_value', ctx, text=str(uid))).ok
+            for key in ('user_id', 'actor_id', 'target_user', 'owner', 'undeclared'):
+                assert not (await call('save_value', ctx, text='overwrite', **{key: 2})).ok
+        for actor in (None, NS(id=0), NS(id=1, bot=True)):
+            assert not (await call('save_value', OpContext(bot=None, author=actor), text='bad')).ok
+    assert saved == {1: '1', 2: '2'}
+
+    for param in (OpParam('user_id', ParamKind.INTEGER),
+                  OpParam('actor', ParamKind.STRING),
+                  OpParam('subject_id', ParamKind.STRING),
+                  OpParam('recipient', ParamKind.USER),
+                  OpParam('token', ParamKind.INTERNAL)):
+        with pytest.raises(ValueError, match='SELF'):
+            reg.op('bad', 'Bad selector.', PermissionLevel.EVERYONE,
+                   scope=OpScope.SELF, params=[param])(save)

@@ -32,12 +32,17 @@ async def test_channel_window_reuses_prefix_until_message_edit(config):
     bot = NS(config=config, logger=logging.getLogger('test'), user=NS(id=99, display_name='Bot'))
     gpt = Gpt(bot)
     pc = gpt.get_provider_config(1)
-    ctx = NS(guild=NS(id=1), channel=channel, message=messages[2], author=author)
+    ctx = NS(bot=bot, guild=NS(id=1), channel=channel, message=messages[2], author=author)
     first, key, anchor, when = await gpt._prepare_cached_history(ctx, pc, [], now=100)
     gpt._history_windows.commit(key, anchor, first, when)
     ctx.message = messages[3]
     second, _, anchor, _ = await gpt._prepare_cached_history(ctx, pc, [], now=101)
     assert anchor == 1
+    # A changed policy cannot borrow a retained window, even when all
+    # dialogue is unchanged. SELF names use the same fingerprint.
+    _, changed_key, changed_anchor, _ = await gpt._prepare_cached_history(
+        ctx, pc, ['synthetic_self_tool'], now=101)
+    assert changed_key != key and changed_anchor == 2
     assert second[:4] == first[:4]  # static system + all three old messages
     # Editing the oldest message breaks the shared history: extending now
     # costs more than the fresh three-message baseline.
@@ -78,7 +83,7 @@ async def test_successful_calls_roll_anchor_lifetime_forward(config, monkeypatch
     bot = NS(config=config, logger=logging.getLogger('test'), user=NS(id=99, display_name='Bot'))
     gpt = Gpt(bot)
     gpt.llm.run_agent = chat
-    ctx = NS(guild=NS(id=1), channel=NS(id=2, history=history),
+    ctx = NS(bot=bot, guild=NS(id=1), channel=NS(id=2, history=history),
              author=author, typing=typing, send=send)
     for clock, trigger in [(100, 2), (350, 3), (600, 4)]:
         ctx.message = messages[trigger]
@@ -126,7 +131,7 @@ async def test_candidate_references_share_fetches_but_refresh_next_invocation(co
 
     bot = NS(config=config, logger=logging.getLogger('test'), user=NS(id=99, display_name='Bot'))
     gpt = Gpt(bot)
-    ctx = NS(guild=NS(id=1), channel=NS(id=2, history=history, fetch_message=fetch_message),
+    ctx = NS(bot=bot, guild=NS(id=1), channel=NS(id=2, history=history, fetch_message=fetch_message),
              author=author, message=messages[2])
     pc = gpt.get_provider_config(1)
     first, key, anchor, when = await gpt._prepare_cached_history(ctx, pc, [], now=100)
@@ -216,3 +221,31 @@ async def test_history_controls_and_model_cache_keep_scopes_and_recheck_access(c
     cache.ratio._value = '5'
     await cache.on_submit(interaction)
     assert gpt.llm.get_all_providers()['xai']['models']['grok-4.6']['cache_input_ratio'] == .25
+
+
+@pytest.mark.asyncio
+async def test_agent_transport_retry_override_preserves_default(config, monkeypatch):
+    """DM callers can disable transport retries without changing public defaults."""
+    from pydantic_ai.exceptions import ModelHTTPError
+    from pydantic_ai.models.openai import OpenAIChatModel
+    config.set_global('XAI_API_KEY', 'test-only')
+    client = LLMClient(config)
+    pc = client.get_provider_config(None)
+    attempts = []
+
+    def fail(request):
+        attempts.append(request)
+        return httpx.Response(500, json={'error': {'message': 'unavailable'}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as http:
+        def model(*args):
+            sdk = openai.AsyncOpenAI(api_key='test', http_client=http, max_retries=1)
+            return OpenAIChatModel('test', provider=OpenAIProvider(openai_client=sdk))
+        monkeypatch.setattr(client, '_build_model', model)
+        with pytest.raises(ModelHTTPError):
+            await client.run_agent(pc, [], tools=[], user_prompt='request', max_retries=0)
+        assert len(attempts) == 1
+        attempts.clear()
+        with pytest.raises(ModelHTTPError):
+            await client.run_agent(pc, [], tools=[], user_prompt='request')
+        assert len(attempts) == 2

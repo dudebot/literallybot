@@ -111,11 +111,13 @@ async def test_budget_fallback_uses_agent_without_bot_tools(config, gpt_run, mon
     gpt, ctx, _ = gpt_run
     config.set_global('agent_ops_whitelist', {'send_message': True})
     config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
+    config.set(7, 'ai_tool_budget', 12)
     run = AsyncMock(side_effect=[UsageLimitExceeded('test budget'), NS(text='Best effort', usage=None)])
     monkeypatch.setattr(gpt.llm, 'run_agent', run)
     await gpt.process_askgpt(ctx, 'hello')
     first, fallback = run.await_args_list
     assert first.kwargs['tools']
+    assert first.kwargs['max_tool_calls'] == 24
     assert fallback.kwargs['tools'] == []
     assert '[SYSTEM] The tool budget ran out' in fallback.args[1][-1]['content']
     assert fallback.kwargs['output_type'][1].name == 'stay_quiet'
@@ -286,3 +288,156 @@ async def test_mcp_bearer_auth_refuses_missing_or_wrong_credentials():
     request = Request({'type': 'http', 'headers': [(b'authorization', b'Bearer test-token')]})
     assert (await middleware.dispatch(request, downstream)).status_code == 204
     downstream.assert_awaited_once()
+
+
+@pytest.fixture
+def self_surface(config, monkeypatch):
+    from core import agent_gate, agent_loop
+    from core.ops import OpsRegistry, OpScope, PermissionLevel, OpParam, ParamKind
+    reg = OpsRegistry()
+    writes = []
+
+    @reg.op('save_value', 'Save own text.', PermissionLevel.EVERYONE,
+            scope=OpScope.SELF, sequential=True,
+            params=[OpParam('text', ParamKind.STRING)], serialize=lambda value: value)
+    async def save(ctx, text):
+        if text == 'sensitive-failure':
+            raise ValueError(text)
+        writes.append((ctx.author.id, text))
+        return {'text': text}
+
+    @reg.op('guild_probe', 'Probe guild.', PermissionLevel.EVERYONE)
+    async def probe(ctx):
+        writes.append(('guild', ctx.guild.id))
+        return {}
+
+    for module in (agent_gate, agent_loop, mcp_server):
+        monkeypatch.setattr(module, 'registry', reg)
+    config.set_global('agent_ops_whitelist', {name: True for name in reg.names()})
+    ctx = NS(bot=NS(config=config, logger=logging.getLogger('test.self')),
+             author=NS(id=1, bot=False), guild=None, channel=NS(id=10))
+    return reg, ctx, writes
+
+
+@pytest.mark.asyncio
+async def test_self_policy_revocation_privileged_invokers_and_log_redaction(config, self_surface, caplog):
+    from core.agent_gate import resolve_agent_tools
+    reg, ctx, writes = self_surface
+    config.set_global('superadmins', [1])
+    assert resolve_agent_tools(ctx) == ['save_value']  # global absent => on; DM SELF only
+    with pytest.raises(ValueError, match='Unsupported'):
+        build_agent_tools(ctx, ctx.bot.logger, ['guild_probe'])
+    caplog.set_level(logging.INFO)
+    tool = build_agent_tools(ctx, ctx.bot.logger, ['save_value'])[0]
+    assert tool.sequential
+    assert (await tool.function(text='sensitive-success'))['text'] == 'sensitive-success'
+    assert 'sensitive-failure' in (await tool.function(text='sensitive-failure'))['error']
+    assert 'sensitive-' not in caplog.text
+    config.set_global('ai_self_tools_enabled', False)
+    with pytest.raises(ValueError, match='SELF'):
+        build_agent_tools(ctx, ctx.bot.logger, ['save_value'])
+    assert not (await tool.function(text='must-not-write'))['ok']
+    config.set_global('ai_self_tools_enabled', True)
+    config.set_global('agent_ops_whitelist', {})
+    assert not (await tool.function(text='must-not-write'))['ok']
+    config.set_global('agent_ops_whitelist', {'save_value': True, 'guild_probe': True})
+    ctx.guild = NS(id=7, owner=None)
+    assert 'save_value' not in resolve_agent_tools(ctx)  # public absent => off even for owner
+    config.set(7, 'ai_self_tools_enabled', True)
+    assert 'save_value' not in resolve_agent_tools(ctx)  # default per-op off
+    config.set(7, 'agent_ops_gate', {'save_value': 'everyone'})
+    tool = build_agent_tools(ctx, ctx.bot.logger, ['save_value'])[0]
+    config.set(7, 'ai_self_tools_enabled', False)
+    assert not (await tool.function(text='must-not-write'))['ok']
+    config.set(7, 'ai_self_tools_enabled', True)
+    config.set(7, 'agent_ops_gate', {'save_value': 'off'})
+    assert not (await tool.function(text='must-not-write'))['ok']
+    assert writes == [(1, 'sensitive-success')]
+
+
+@pytest.mark.asyncio
+async def test_mcp_self_exclusion_and_stale_dispatch_before_identity_lookup(config, self_surface):
+    from core.ops import OpScope
+    reg, ctx, writes = self_surface
+    for stored in (None, ['save_value'], ['save_value', 'guild_probe'], []):
+        if stored is not None:
+            config.set_global('mcp_tools_enabled', stored)
+        assert 'save_value' not in mcp_server.resolve_mcp_tools(config)
+    assert 'save_value' not in mcp_server.resolve_mcp_tools(None)
+    server = mcp_server.build_server()
+    assert 'save_value' not in {t.name for t in await server.list_tools()}
+    with pytest.raises(ValueError, match='SELF'):
+        mcp_server._make_mcp_tool(None, reg.require('save_value'))
+    # Existing wrapper and mutable/stale captured declaration must both fail
+    # before resolving forged actor/guild ids, even in a schema-only build.
+    op = reg.require('guild_probe')
+    wrapper = mcp_server._make_mcp_tool(None, op)
+    from dataclasses import replace
+    reg._ops[op.name] = replace(op, scope=OpScope.SELF)
+    with pytest.raises(mcp_server.BotUnavailableError, match='SELF'):
+        await wrapper(actor_id='999', guild_id='987')
+    reg._ops[op.name] = op
+    op.scope = OpScope.SELF
+    with pytest.raises(mcp_server.BotUnavailableError, match='SELF'):
+        await wrapper(actor_id='999', guild_id='987')
+    assert not writes
+
+
+@pytest.mark.asyncio
+async def test_shared_runner_mixed_budget_survives_nudge(config, self_surface, gpt_run):
+    from core.agent_loop import run_agent_turn
+    reg, ctx, writes = self_surface
+    gpt, _, responses = gpt_run
+    ctx.guild = NS(id=7, owner=None)
+    config.set(7, 'ai_self_tools_enabled', True)
+    config.set(7, 'agent_ops_gate', {'save_value': 'everyone', 'guild_probe': 'everyone'})
+    requests = responses([
+        [TextPart('run tool guild_probe')],
+        [ToolCallPart('save_value', {'text': 'one'}, 'save'),
+         ToolCallPart('guild_probe', {}, 'guild')],
+        [ToolCallPart('save_value', {'text': 'over-budget'}, 'extra')],
+        [TextPart('finished')],
+    ])
+    result = await run_agent_turn(gpt.llm, gpt.get_provider_config(ctx), [], ctx,
+                                  ['save_value', 'guild_probe'], 'request', tool_budget=2)
+    assert result == 'finished'
+    assert set(writes) == {(1, 'one'), ('guild', 7)}
+    assert len(requests) == 4
+
+
+@pytest.mark.asyncio
+async def test_self_provider_failures_cannot_escape_as_sensitive_tracebacks(config, self_surface, caplog):
+    import traceback
+    from core.agent_loop import run_agent_turn
+    reg, ctx, _ = self_surface
+
+    async def fail(*args, **kwargs):
+        reg._ops.clear()  # prior exchanges remain private after withdrawal
+        raise ValueError('sensitive-tool-exchange')
+
+    with pytest.raises(RuntimeError) as caught:
+        await run_agent_turn(NS(run_agent=fail), NS(provider='test', model='test'),
+                             [], ctx, ['save_value'], 'request')
+    rendered = ''.join(traceback.format_exception(caught.value))
+    assert 'sensitive-tool-exchange' not in rendered
+    assert 'sensitive-tool-exchange' not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_dm_default_budget_and_live_turn_validity(config, self_surface, gpt_run):
+    from core.agent_loop import run_agent_turn
+    reg, ctx, writes = self_surface
+    gpt, _, responses = gpt_run
+    responses([
+        [ToolCallPart('save_value', {'text': str(i)}, str(i)) for i in range(9)],
+        [ToolCallPart('stay_quiet', {}, 'quiet')],
+    ])
+    assert await run_agent_turn(gpt.llm, gpt.get_provider_config(ctx), [], ctx,
+                                ['save_value'], 'request') is None
+    assert writes == [(1, str(i)) for i in range(8)]
+    valid = True
+    tools = build_agent_tools(ctx, ctx.bot.logger, ['save_value'],
+                              validity_check=lambda: valid)
+    valid = False
+    assert not (await tools[0].function(text='cancelled'))['ok']
+    assert len(writes) == 8

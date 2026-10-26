@@ -14,8 +14,11 @@ from core.panels import InvokerOnlyView, panel_slash_pin
 from core.permissions import is_admin, is_superadmin
 from core.messages import recursive_split, sanitize_outbound_text
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
-from core.ops import ORIGIN_COG, ORIGIN_CORE, OpScope, registry
-from core.agent_gate import agent_universe
+from core.ops import ORIGIN_COG, ORIGIN_CORE, OpContext, OpScope, registry
+from core.agent_gate import agent_universe, resolve_agent_tools, guild_call_requires_admin
+from core.agent_loop import (run_agent_turn, log_agentic_usage, looks_like_narrated_call,
+                             is_nudge_false_alarm, NUDGE_PROMPT, NUDGE_FALSE_ALARM_SENTINEL,
+                             build_agentic_guidance, MESSAGE_ID_GUIDANCE)
 from core.agent_gate import (
     GATE_ADMIN,
     GATE_EVERYONE,
@@ -107,145 +110,6 @@ def cooldown_tier_for_cost(cost_per_mtok_output, tier_bases=None):
     return ("pricy", base_for("pricy", _UNSET_COST_SECONDS))
 
 
-# Single-token sentinel a nudged model uses to say "false alarm, my reply
-# was fine" — the original reply is then posted unchanged, so a false flag
-# costs one silent API call and the channel never sees a second message.
-NUDGE_FALSE_ALARM_SENTINEL = "OK"
-
-# Corrective user turn for a run whose reply NAMES a tool but executed zero
-# tool calls (the narrated-call signature). Option 2 is what keeps false
-# positives invisible: the model self-clears with the sentinel instead of
-# restating (or arguing with) its own reply in public.
-NUDGE_PROMPT = (
-    "[SYSTEM CHECK — automated, not from a user] Your reply above names a "
-    "tool, but ZERO tool calls were made, so nothing was executed and your "
-    "reply has NOT been posted yet. Choose one:\n"
-    "1. If you meant to perform an action: emit the real function call(s) "
-    "through the native tool-call channel NOW, then finish with the final "
-    "reply text for the channel, or call stay_quiet if no reply is needed. "
-    "Do not describe the calls in text.\n"
-    "2. If your reply was already a complete answer that needed no tool: "
-    f"respond with exactly {NUDGE_FALSE_ALARM_SENTINEL} (nothing else) and "
-    "your original reply will be posted unchanged."
-)
-
-
-def looks_like_narrated_call(text, tool_names):
-    """True when a zero-tool-call reply reads as a verbalized tool invocation.
-
-    Deliberately narrow: fires only on an ENABLED tool's snake_case name
-    appearing verbatim, or explicit "run tool" phrasing — strings that don't
-    occur in genuine chat prose. (The 2026-07-05 attempt matched everyday
-    words like "search"/"done"/"I'll" and flagged normal answers constantly;
-    that regex is the cautionary tale, not the template.) False positives
-    that remain (e.g. the user asks "what tools do you have?" and the reply
-    honestly lists them) are absorbed by the sentinel path in _run_agentic.
-    """
-    if not text:
-        return False
-    lowered = text.lower()
-    if "run tool" in lowered or "run the tool" in lowered:
-        return True
-    return any(name in lowered for name in tool_names)
-
-
-def is_nudge_false_alarm(text):
-    """Did the nudged re-run answer with the bare false-alarm sentinel?"""
-    return (text or "").strip().strip(".!").upper() == NUDGE_FALSE_ALARM_SENTINEL
-
-
-MESSAGE_ID_GUIDANCE = (
-    "Message IDs are harness-supplied metadata identifying existing Discord "
-    "messages, not part of anyone's message text or a format to continue. "
-    "Use them only in structured tool arguments, taking visible IDs directly "
-    "rather than guessing or searching. Your final reply is just the "
-    "message body, posted in the channel answering the trigger; Discord assigns "
-    "its ID after posting."
-)
-
-
-def build_agentic_guidance(tool_names, guild_id, channel_id):
-    """System-prompt lines for agentic runs: available tools, target ids,
-    and — critically — the MECHANICS of tool invocation.
-
-    The mechanics block exists because models (observed live: grok narrating
-    "run tool search_history with channel_id is ..." as plain text) sometimes
-    verbalize an intended call instead of emitting it. The loop is a
-    pydantic-ai Agent over the OpenAI-compatible function-calling API: a real
-    call rides the structured tool_calls channel of the response; a text-only
-    response ends the run and is posted to Discord verbatim. The guidance
-    states that contract explicitly instead of hoping the model infers it.
-
-    Module-level (not a cog method) so a test harness can import and
-    exercise the exact shipped text without constructing a bot.
-    """
-    lines = [
-        "",
-        "You have REAL Discord tools available: " + ", ".join(tool_names) + ".",
-        f"- Current guild id: {guild_id}. Current channel id: {channel_id}.",
-        "- The invoking user and trigger message IDs are in the closing request context.",
-        "- " + MESSAGE_ID_GUIDANCE,
-        *([
-            "- For an explicit Discord reply to a specific message, call "
-            "send_message with reference_message_id, then stay_quiet.",
-        ] if "send_message" in tool_names else []),
-        "",
-        "HOW TOOL CALLS WORK (mechanics — this part is exact, not stylistic):",
-        "- You are in an agent loop over the chat-completions API with function "
-        "calling enabled. The ONLY way to run a tool is to emit a native "
-        "function call — the tool's name plus a JSON arguments object — through "
-        "the API's structured tool-call channel. A tool call is NOT text; "
-        "nothing you write in your visible reply can execute anything.",
-        "- Every response you produce is one of three things: (a) one or "
-        "more function calls — they execute for real and their results come "
-        "back for you to continue with; (b) plain text — the run ENDS "
-        "immediately and that text is posted to the channel as your reply; "
-        "or (c) the terminal stay_quiet call — the run ends WITHOUT a final "
-        "channel reply. Decide which one BEFORE responding.",
-        "- Call stay_quiet with no arguments when no final reply is needed "
-        "(for example, the user requested only a reaction or asked you not "
-        "to reply). Finish any requested actions and inspect their results "
-        "BEFORE calling it. Do not hide failed actions that need explanation. "
-        "It only suppresses the automatic final reply; messages already sent "
-        "by tools remain. Never use an empty text response to signal silence.",
-        "- Because of (b), writing out an intended call as words — e.g. "
-        "\"run tool search_history with channel_id is 1234 contains is pizza\" "
-        "— executes nothing: the run just ends and that sentence gets posted "
-        "to the channel verbatim, where everyone sees a malfunction. If you "
-        "intend a tool call, EMIT the function call instead of describing it.",
-        *([
-            "- Worked example: someone asks \"do i play factorio\" and the answer "
-            "isn't in the visible history. Correct: emit the function call "
-            "search_history with arguments {\"channel_ids\": [" + str(channel_id) +
-            "], \"author_id\": <invoking_user_id>, \"contains\": \"factorio\", "
-            "\"limit\": 100}, wait for the results, then answer in plain text. "
-            "Wrong: any reply that merely talks about searching.",
-        ] if "search_history" in tool_names else []),
-        "",
-        "- When an action would genuinely help (react, reply elsewhere, edit, "
-        "search, list), use the matching tool. Prefer doing over describing.",
-        "- If no tool fits the request, just reply normally in text — a plain "
-        "conversational answer is a perfectly good response, and most messages "
-        "only need one. Don't reach for a tool when the user just wants an answer.",
-        "- Only claim you did something if you ACTUALLY called the tool for it in "
-        "this turn and saw its result. Never say a reaction was added, a message "
-        "sent/edited/deleted, or history searched unless that tool ran — don't "
-        "pretend or role-play a tool result. If you couldn't do it, say so plainly.",
-    ]
-    # Per-tool behavioral notes ride on the op declarations themselves
-    # (core/ops.py `agent_guidance`), so guidance stays in lockstep with
-    # whatever set of tools a guild has enabled — no hand-maintained
-    # if-ladder here to drift out of sync with the registry.
-    per_tool = []
-    for name in tool_names:
-        op = registry.get(name)
-        if op is not None and op.agent_guidance:
-            per_tool.append(f"- {op.agent_guidance}")
-    if per_tool:
-        lines.append("")
-        lines.append("Per-tool notes:")
-        lines.extend(per_tool)
-    return lines
 
 
 class Gpt(commands.Cog):
@@ -281,13 +145,7 @@ class Gpt(commands.Cog):
         Empty (the default) runs the same agent with no bot tools. Stale op
         names are dropped by intersecting with the current universe.
         """
-        if not getattr(ctx, "guild", None):
-            return []
-        from core.permissions import is_superadmin
-        wl = self.bot.config.get_global("agent_ops_whitelist")
-        gate = self.bot.config.get(ctx, "agent_ops_gate")
-        return agent_universe(wl, gate,
-                              is_superadmin_actor=is_superadmin(ctx))
+        return resolve_agent_tools(ctx)
 
     def cooldown_config(self):
         """(tier_bases, windows) — operator overrides merged over defaults.
@@ -782,147 +640,16 @@ class Gpt(commands.Cog):
 
     async def _run_agentic(self, ctx, provider_config, api_messages, metadata, question, tool_names,
                          *, on_tool_call=None) -> Optional[str]:
-        """Run the request through the in-bot agent loop (ops-registry tools).
-
-        The actor for every tool call is the INVOKING USER's Member (ctx
-        passes through as the OpContext), targets are confined to ctx.guild,
-        and the loop uses the guild-configured tool budget (default 8). `tool_names` is the guild's
-        resolved bot-tool allowlist. The model's final text comes back to the
-        caller and flows through the normal compliance/split/send path,
-        exactly like a plain chat response. None means the model explicitly
-        chose stay_quiet; an empty string still means an invalid response.
-        """
-        from pydantic_ai import ToolOutput
-        from pydantic_ai.exceptions import UsageLimitExceeded
-        from core.agent_loop import build_agent_tools
-        tool_budget = guild_tool_budget(self.bot.config, ctx)
-
-        # Soft tool budget (countdown + refusals) lives inside the tools
-        # themselves — see core/agent_loop.py. The pydantic-ai limit below is
-        # set to 2x as a runaway backstop only; in the normal exhaustion path
-        # the model authors its own final reply and no exception fires.
-        from core.permissions import is_admin, is_superadmin
-        from core.agent_gate import call_requires_admin
-        from core.ops import registry as _registry
-
-        def _live_gate_check(op_name):
-            # Re-read policy at each dispatch (codex review 2026-08-20): an
-            # admin tightening an op to "admin only" mid-run binds on the next
-            # call. Admins/superadmins are never gated; for everyone else the
-            # gate is resolved live from the current whitelist + guild config.
-            if is_admin(ctx) or is_superadmin(ctx):
-                return False
-            op = _registry.get(op_name)
-            if op is None:
-                return True  # unknown op → fail closed
-            wl = self.bot.config.get_global("agent_ops_whitelist")
-            gate = self.bot.config.get(ctx, "agent_ops_gate")
-            return call_requires_admin(op, wl, gate)
-
-        tools = build_agent_tools(
-            ctx, self.logger, tool_names,
-            gate_check=_live_gate_check, tool_budget=tool_budget, on_tool_call=on_tool_call,
-        ) if tool_names and ctx.guild else []
-        # Local to this invocation: no registry entry, MCP exposure, or state
-        # shared with other runs. An output function terminates the Agent;
-        # an ordinary function tool would require another model response.
-        quiet = False
-
-        async def stay_quiet() -> str:
-            """End this turn without an automatic final Discord reply.
-
-            Use when no reply is needed. Complete actions and inspect their
-            results first; do not hide failures that need explanation.
-            Previously sent messages remain. Takes no arguments.
-            """
-            nonlocal quiet
-            quiet = True
-            return ""
-
-        output_type = [str, ToolOutput(stay_quiet, name="stay_quiet")]
-        available_names = [t.name for t in tools] + ["stay_quiet"]
-        self.logger.info(
-            f"agentic gpt run: guild={getattr(ctx.guild, 'id', 'DM')} channel={ctx.channel.id} "
-            f"actor={ctx.author.id} provider={provider_config.provider} "
-            f"model={provider_config.model} tools={available_names}"
+        return await run_agent_turn(
+            self.llm, provider_config, api_messages, ctx, tool_names,
+            f"[COMMAND from user {ctx.author.id}] {question}", metadata,
+            guild_tool_budget(self.bot.config, ctx) if ctx.guild else 8,
+            logger=self.logger, gate_check=lambda name: guild_call_requires_admin(ctx, name),
+            on_tool_call=on_tool_call, log_usage=self._log_agentic_usage,
         )
-        command_turn = f"[COMMAND from user {ctx.author.id}] {question}"
-        try:
-            response = await self.llm.run_agent(
-                provider_config,
-                api_messages,
-                tools=tools,
-                output_type=output_type,
-                metadata=metadata,
-                # The command text is repeated as the closing user turn so the
-                # actionable instruction is unambiguous even when the channel
-                # scrape attributed the invoking message oddly (e.g. a
-                # bot-authored mention landing in history as an assistant turn).
-                user_prompt=command_turn,
-                max_tool_calls=tool_budget * 2,
-            )
-            self._log_agentic_usage(response)
-
-            # Narrated-call backstop: the reply names an enabled tool but zero
-            # tools ran — almost certainly a verbalized invocation (observed
-            # live 2026-07-21: "run tool search_history with channel_id is
-            # ..."). One corrective re-run; the sentinel path keeps false
-            # positives invisible (original reply posts unchanged), so the
-            # channel sees exactly one message either way.
-            tool_calls = response.usage.tool_calls if response.usage else 0
-            if not quiet and tool_calls == 0 and looks_like_narrated_call(response.text, available_names):
-                self.logger.info(
-                    "agentic reply names a tool but made no tool calls — nudging once")
-                retry = await self.llm.run_agent(
-                    provider_config,
-                    api_messages + [
-                        {"role": "user", "content": command_turn},
-                        {"role": "assistant", "content": response.text},
-                    ],
-                    tools=tools,
-                    output_type=output_type,
-                    metadata=metadata,
-                    user_prompt=NUDGE_PROMPT,
-                    max_tool_calls=tool_budget * 2,
-                )
-                self._log_agentic_usage(retry)
-                if is_nudge_false_alarm(retry.text):
-                    self.logger.info("nudge was a false alarm — keeping the original reply")
-                else:
-                    response = retry
-        except UsageLimitExceeded as e:
-            # Only reachable if the model ignores 2x the soft budget worth of
-            # refusals (pathological). Even then: a model-authored best-effort
-            # answer, never a canned failure string.
-            self.logger.warning(f"agentic gpt run blew the hard tool cap: {e}")
-            quiet = False
-            fallback = await self.llm.run_agent(provider_config, api_messages + [
-                {"role": "user", "content": command_turn},
-                {"role": "user", "content": (
-                    "[SYSTEM] The tool budget ran out before this request "
-                    "finished. Answer in plain text with your best effort "
-                    "from what you know, and say briefly what you could not "
-                    "verify.")},
-            ], tools=[], metadata=metadata, output_type=output_type)
-            self._log_agentic_usage(fallback)
-            return None if quiet else fallback.text
-
-        if quiet:
-            self.logger.info(
-                "agentic stay_quiet: guild=%s channel=%s actor=%s",
-                getattr(ctx.guild, "id", "DM"), ctx.channel.id, ctx.author.id,
-            )
-            return None
-        return response.text
 
     def _log_agentic_usage(self, response):
-        if response.usage:
-            self.logger.info(
-                f"agentic usage: provider={response.usage.provider} model={response.usage.model} "
-                f"prompt={response.usage.prompt_tokens} completion={response.usage.completion_tokens} "
-                f"total={response.usage.total_tokens} est_cost_usd={response.usage.estimated_cost_usd} "
-                f"tool_calls={response.usage.tool_calls}"
-            )
+        log_agentic_usage(self.logger, response)
 
     def check_message_compliance(self, ctx, message):
         """
@@ -1424,8 +1151,13 @@ def tool_tab_sections(scope=None):
     (in-chat agent whitelist vs host-side MCP) but the catalog they edit
     is one shape.
     """
-    api = registry.grouped(scope=scope, origin=ORIGIN_CORE)
-    cog_ops = registry.ops(scope=scope, origin=ORIGIN_COG)
+    scopes = set(scope) if isinstance(scope, (set, frozenset, tuple)) else ({scope} if scope else None)
+    allowed = set(exposed_ops()) if scopes is None else {
+        o.name for o in registry.ops() if o.scope in scopes}
+    api = [(gid, label, [o for o in ops if o.name in allowed])
+           for gid, label, ops in registry.grouped(origin=ORIGIN_CORE)]
+    api = [(gid, label, ops) for gid, label, ops in api if ops]
+    cog_ops = [o for o in registry.ops(origin=ORIGIN_COG) if o.name in allowed]
     behavioral = ([(BEHAVIORAL_GROUP_ID, "Behavioral", cog_ops)]
                   if cog_ops else [])
     return [
@@ -1966,6 +1698,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         self.gpt = gpt_cog
         self.bot = gpt_cog.bot
         self.invoker_id = user.id
+        self.author = user
         self.guild = guild
         self.page = "server"
         self.message = None
@@ -2023,18 +1756,19 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         # Same resolver the agent loop uses — the panel's summary line must
         # show exactly the effective set (whitelist + per-guild gate), never
         # a private re-derivation of it.
-        return agent_universe(self._whitelist(), self._gate_cfg())
+        return (agent_universe(self._whitelist(), self._gate_cfg())
+                + resolve_agent_tools(self, {OpScope.SELF}))
 
     def _server_gate_ops(self):
         """The (group_label, [Op, ...]) sections the Server tab renders: only
-        WHITELISTED guild-scoped ops, grouped in OP_GROUPS order. A
+        WHITELISTED GUILD/SELF ops, grouped in OP_GROUPS order. A
         non-whitelisted op is disabled globally, so it must NOT appear here
         (both a context/clarity win and a correctness one — a guild admin
         cannot enable what the super-admin has withheld)."""
         wl = self._whitelist()
         sections = []
-        for gid, label, ops in registry.grouped(scope=OpScope.GUILD):
-            live = [o for o in ops if is_whitelisted(o.name, wl)]
+        for gid, label, ops in registry.grouped():
+            live = [o for o in ops if o.scope in {OpScope.GUILD, OpScope.SELF} and is_whitelisted(o.name, wl)]
             if live:
                 sections.append((label, live))
         return sections
@@ -2139,7 +1873,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 "you want to configure fits here.*"), reserve=reserve)
 
     def _whitelist_names(self):
-        """Guild-scoped (plus unregistered) names the whitelist has set true.
+        """GUILD/SELF (plus unregistered) names the whitelist has set true.
 
         Unregistered names are kept so an unloaded cog's choice survives a
         save. Registered DM/GLOBAL names are omitted: this tab cannot speak
@@ -2151,7 +1885,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             if not on:
                 continue
             op = registry.get(name)
-            if op is None or op.scope == OpScope.GUILD:
+            if op is None or op.scope in {OpScope.GUILD, OpScope.SELF}:
                 names.append(name)
         return names
 
@@ -2209,7 +1943,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
             # GUILD-scoped op. DM/GLOBAL ops are MCP-only; the in-chat
             # agent is confined to the invoking guild.
             self._add_tool_sections(
-                self._sections(scope=OpScope.GUILD), self._whitelist_names(),
+                self._sections(scope={OpScope.GUILD, OpScope.SELF}), self._whitelist_names(),
                 self._save_whitelist)
             self.add_item(self._row(
                 self._preset_button("Clear all", self._clear_whitelist, []),
@@ -2298,8 +2032,9 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 f"cogs and stay enabled: {', '.join(offline)}*") if offline else ""
         return (
             f"## AI settings — {TAB_AGENTOPS}\n"
-            "What the in-chat agent may consume inside a server. Guild-scoped "
-            "ops only — DMs and bot-wide lookups live on the MCP tab. An op "
+            "Which GUILD and invoker-only SELF tools the agent may use. "
+            "SELF also requires its surface switches; DM and GLOBAL ops "
+            "remain on the MCP tab. An op "
             "left off here is disabled everywhere and never appears on any "
             "server's ⚙ tab. Each server admin then sets Off/Admin/Everyone "
             "per op for their own guild.\n"
@@ -2595,7 +2330,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 "Requires admin.", ephemeral=True)
             return
         op = registry.get(op_name)
-        if op is None or not is_whitelisted(op_name, self._whitelist()):
+        if op is None or op.scope not in {OpScope.GUILD, OpScope.SELF} or not is_whitelisted(op_name, self._whitelist()):
             # Whitelist changed out from under this stale panel, or a bogus
             # value — never write a gate for an op the guild can't see.
             self.flash(f"'{op_name}' is not an enabled agent op here.")
@@ -2632,7 +2367,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         gate_cfg = dict(self._gate_cfg())
         for name in live:
             op = registry.get(name)
-            if op is None or not is_whitelisted(name, wl):
+            if op is None or op.scope not in {OpScope.GUILD, OpScope.SELF} or not is_whitelisted(name, wl):
                 continue
             if name in selected_set:
                 gate_cfg[name] = bucket
@@ -2644,7 +2379,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
     async def _save_whitelist(self, interaction: discord.Interaction, selected,
                               universe=None):
         """Super-admin In-chat ops tab: the GLOBAL {op_name: bool} whitelist
-        of GUILD-scoped ops — the ceiling for every guild's in-chat agent.
+        of GUILD/SELF ops — the ceiling for every in-chat agent.
         Reuses the offline-preserving merge so an op whose cog is unloaded
         stays whitelisted across a save. Registered DM/GLOBAL names are
         dropped: they are not in-chat tools."""
@@ -2654,12 +2389,12 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 ephemeral=True)
             return
         stored = self._whitelist_names()
-        live_guild = registry.op_names(scope=OpScope.GUILD)
+        live_guild = [o.name for o in registry.ops() if o.scope in {OpScope.GUILD, OpScope.SELF}]
         merged = self._merge_stored(
             stored, selected,
             live_guild if universe is None else universe)
         merged = [n for n in merged
-                  if (op := registry.get(n)) is None or op.scope == OpScope.GUILD]
+                  if (op := registry.get(n)) is None or op.scope in {OpScope.GUILD, OpScope.SELF}]
         # Store as an explicit {name: True} map: absent/false both read as
         # disabled, so an off op simply drops out of the map.
         self.bot.config.set_global(WHITELIST_KEY, {n: True for n in merged})

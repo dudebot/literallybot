@@ -49,6 +49,7 @@ async def test_eos_reply_is_silent_without_empty_apology(config, monkeypatch):
     ctx = NS(guild=NS(id=7), channel=NS(id=8), author=author,
              message=NS(id=9), typing=typing, send=AsyncMock())
     cog = Gpt(NS(config=config, logger=logging.getLogger('test'), user=NS(id=11)))
+    ctx.bot = cog.bot
     monkeypatch.setattr(cog, '_check_cooldown', lambda ctx: None)
     monkeypatch.setattr(cog, '_prepare_cached_history',
                         AsyncMock(return_value=([], ('key',), 9, 0)))

@@ -18,7 +18,8 @@ top of each op's hardcoded `permission` floor:
 Resolution order for a guild + op: not whitelisted → OFF; else guild override if
 present; else the op's default. A super-admin invoking the agent bypasses the
 per-guild gate, but the universe is still GUILD-scoped — DM and GLOBAL ops
-are MCP-only.
+are MCP-only. SELF has a separate invoker-only policy below; its switches
+and gates never have a privileged bypass.
 
 This module is the SINGLE authority: gpt.py's tool builder, the /aisettings
 panels, and the call-time check all resolve through here so the panel shows
@@ -118,3 +119,58 @@ def call_requires_admin(op: Any, whitelist: Optional[Dict[str, bool]],
     """
     gate = effective_gate(op, whitelist, gate_cfg)
     return gate != GATE_EVERYONE
+
+SELF_TOOLS_KEY = "ai_self_tools_enabled"
+
+
+def self_tools_enabled(ctx) -> bool:
+    """Global master defaults on; public guild participation defaults off."""
+    config = ctx.bot.config
+    if not config.get_global(SELF_TOOLS_KEY, True):
+        return False
+    guild = getattr(ctx, "guild", None)
+    return guild is None or bool(config.get(guild.id, SELF_TOOLS_KEY, False))
+
+
+def resolve_agent_tools(ctx, scopes=None) -> List[str]:
+    """Resolve one trusted surface's tool policy, also used as its cache key."""
+    from core.permissions import is_superadmin
+
+    guild = getattr(ctx, "guild", None)
+    scopes = set(scopes if scopes is not None else
+                 ({OpScope.GUILD, OpScope.SELF} if guild else {OpScope.SELF}))
+    config = ctx.bot.config
+    wl = config.get_global(WHITELIST_KEY)
+    gates = config.get(guild.id, GATE_KEY) if guild else None
+    names = (agent_universe(wl, gates, is_superadmin_actor=is_superadmin(ctx))
+             if guild and OpScope.GUILD in scopes else [])
+    if OpScope.SELF in scopes and self_tools_enabled(ctx):
+        for op in registry.ops(scope=OpScope.SELF):
+            if op.self_call_error(ctx, {}) or not is_whitelisted(op.name, wl):
+                continue
+            if guild and guild_gate(op, gates) == GATE_OFF:
+                continue
+            names.append(op.name)
+    return names
+
+
+def self_call_allowed(ctx, op) -> bool:
+    """No privileged bypass: SELF policy is always re-read at dispatch."""
+    from core.permissions import is_admin
+    if op.name not in resolve_agent_tools(ctx, {OpScope.SELF}):
+        return False
+    if getattr(ctx, "guild", None):
+        gate = guild_gate(op, ctx.bot.config.get(ctx.guild.id, GATE_KEY))
+        return gate == GATE_EVERYONE or (gate == GATE_ADMIN and is_admin(ctx))
+    return True
+
+
+def guild_call_requires_admin(ctx, name) -> bool:
+    """Preserve the existing GUILD admin bypass for already-built tools."""
+    from core.permissions import is_admin, is_superadmin
+    if is_admin(ctx) or is_superadmin(ctx):
+        return False
+    op = registry.get(name)
+    return op is None or call_requires_admin(
+        op, ctx.bot.config.get_global(WHITELIST_KEY),
+        ctx.bot.config.get(ctx, GATE_KEY))
