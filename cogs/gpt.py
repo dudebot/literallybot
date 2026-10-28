@@ -284,10 +284,16 @@ class Gpt(commands.Cog):
         all_messages_for_history = list(messages)
         
         all_messages_for_history.extend(referenced_msgs.values())
-        # In a private conversation the final dialogue turn must remain the
-        # trigger, even when it replies to a message outside the history window.
-        all_messages_for_history.sort(
-            key=lambda msg: (msg.id in referenced_msgs if include_ids else False, msg.id))
+        # References belong at their original chronological position.
+        all_messages_for_history.sort(key=lambda msg: msg.id)
+        if not include_ids:
+            # Private conversations must end with the triggering user turn,
+            # even if selected context contains newer messages.
+            trigger = next((msg for msg in all_messages_for_history
+                            if msg.id == ctx.message.id), None)
+            if trigger is not None:
+                all_messages_for_history.remove(trigger)
+                all_messages_for_history.append(trigger)
         candidates = [(msg, item) for msg in sorted(all_messages_for_history, key=lambda m: m.id)
                       for item in message_images(msg)]
         identities = [(msg.id, item[0]) for msg, item in candidates]
@@ -317,7 +323,7 @@ class Gpt(commands.Cog):
         # Construct history with bot messages unchanged and non-bot with user ID prefix
         for msg in all_messages_for_history:
             full_content = getattr(msg, 'content', '')
-            if msg.id in referenced_msgs:
+            if msg.id in referenced_msgs and not msg.author.bot:
                 full_content = '[REFERENCED MESSAGE] ' + full_content
             
             if hasattr(msg, 'embeds') and msg.embeds:
@@ -374,11 +380,15 @@ class Gpt(commands.Cog):
             if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
                 # Keep IDs out of assistant examples while preserving a stable
                 # per-message rendering and the following image attachment target.
-                if include_ids:
-                    history.append({"role": "user", "content": (
-                        "[history metadata, not a request] The next assistant message "
-                        f"is Discord message_id={msg.id}."
-                    )})
+                if include_ids or msg.id in referenced_msgs:
+                    metadata = "[history metadata, not a request] The next assistant message"
+                    if include_ids:
+                        metadata += f" is Discord message_id={msg.id}."
+                    else:
+                        metadata += "."
+                    if msg.id in referenced_msgs:
+                        metadata += " It was referenced by a reply in this history."
+                    history.append({"role": "user", "content": metadata})
                 history.append({"role": "assistant", "content": full_content})
             else:
                 # For user messages, add context about whether it's a reply

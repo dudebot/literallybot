@@ -40,32 +40,70 @@ def setup(config, messages):
 
 
 @pytest.mark.asyncio
-async def test_embed_bot_and_reference_images_keep_their_source_turn(config, monkeypatch):
+@pytest.mark.parametrize('bot_target', [True, False])
+@pytest.mark.parametrize('include_ids', [True, False])
+async def test_embed_bot_and_reference_images_keep_their_source_turn(
+        config, monkeypatch, bot_target, include_ids):
     embed = discord.Embed(title='Preview')
     embed.set_image(url='https://media.discordapp.net/image.png')
     embed.set_thumbnail(url='https://media.discordapp.net/thumb.png')
-    target = message(1, images=[attachment(1)], bot=True)
+    target = message(1, images=[attachment(1)], bot=bot_target)
     posted = message(2, embeds=[embed])
     trigger = message(3, reference=NS(message_id=1))
     cog, ctx = setup(config, [posted, trigger])
     ctx.channel.fetch_message.return_value = target
     fetch = AsyncMock(return_value=(200, normalize_image(JPEG)))
     monkeypatch.setattr('core.ai_images.fetch_image', fetch)
-    history, _ = await cog._build_history(ctx, messages=[posted, trigger])
-    assert len(history[0]['images']) == 2
-    assert history[-1]['role'] == 'assistant' and len(history[-1]['images']) == 1
-    assert history[-1]['content'] == '[REFERENCED MESSAGE] ' + target.content
-    assert history[-1]['_selected_images'] == [(1, ('attachment', 1))]
-    assert history[-2] == {
-        'role': 'user', 'content': '[history metadata, not a request] '
-        'The next assistant message is Discord message_id=1.'}
+    history, _ = await cog._build_history(
+        ctx, messages=[trigger, posted], include_ids=include_ids)
+    if bot_target:
+        assert history[0]['role'] == 'user'
+        assert history[0]['content'].startswith('[history metadata, not a request]')
+        assert 'referenced by a reply' in history[0]['content']
+        assert ('message_id=1' in history[0]['content']) == include_ids
+        source = history[1]
+        assert source['role'] == 'assistant'
+        assert source['content'] == target.content
+    else:
+        source = history[0]
+        assert source['role'] == 'user'
+        assert '[REFERENCED MESSAGE] ' + target.content in source['content']
+    assert len(source['images']) == 1
+    assert source['_selected_images'] == [(1, ('attachment', 1))]
+    assert posted.content in history[-2]['content']
+    assert len(history[-2]['images']) == 2
+    assert trigger.content in history[-1]['content']
+    assert history[-1]['role'] == 'user'
     converted = _to_pai_messages(history)
-    bot_index = next(i for i, m in enumerate(converted) if isinstance(m, ModelResponse))
-    assert isinstance(converted[bot_index + 1], ModelRequest)
-    part = converted[bot_index + 1].parts[0].content
-    assert part[0] == '[Images from the preceding bot message]'
-    assert isinstance(part[1], BinaryContent)
+    if bot_target:
+        bot_index = next(i for i, m in enumerate(converted) if isinstance(m, ModelResponse))
+        assert converted[bot_index].parts[0].content == target.content
+        assert isinstance(converted[bot_index + 1], ModelRequest)
+        part = converted[bot_index + 1].parts[0].content
+        assert part[0] == '[Images from the preceding bot message]'
+        assert isinstance(part[1], BinaryContent)
     assert fetch.await_count == 3
+
+
+@pytest.mark.asyncio
+async def test_private_trigger_stays_last_with_newer_context(config, monkeypatch):
+    previous = message(1, bot=True)
+    trigger = message(2, images=[attachment(2)], reference=NS(message_id=1))
+    newer = message(3, images=[attachment(3)], bot=True)
+    cog, ctx = setup(config, [newer, trigger])
+    ctx.guild = None
+    ctx.channel.fetch_message.return_value = previous
+    monkeypatch.setattr('core.ai_images.fetch_image',
+                        AsyncMock(return_value=(200, normalize_image(JPEG))))
+    history, _ = await cog._build_history(
+        ctx, messages=[trigger, newer], include_ids=False)
+    assert [(turn['role'], turn['content']) for turn in history[1:]] == [
+        ('assistant', previous.content), ('assistant', newer.content),
+        ('user', trigger.content)]
+    assert 'referenced by a reply' in history[0]['content']
+    assert history[-2]['_selected_images'] == [(3, ('attachment', 3))]
+    assert history[-1]['_selected_images'] == [(2, ('attachment', 2))]
+    assert history[-2]['images'] and history[-1]['images']
 
 
 @pytest.mark.asyncio
