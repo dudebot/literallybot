@@ -360,14 +360,9 @@ async def test_self_policy_revocation_privileged_invokers_and_log_redaction(conf
     assert not (await tool.function(text='must-not-write'))['ok']
     config.set_global('agent_ops_whitelist', {'save_value': True, 'guild_probe': True})
     ctx.guild = NS(id=7, owner=None)
-    assert 'save_value' not in resolve_agent_tools(ctx)  # public absent => off even for owner
-    config.set(7, 'ai_self_tools_enabled', True)
-    assert 'save_value' not in resolve_agent_tools(ctx)  # default per-op off
+    assert 'save_value' not in resolve_agent_tools(ctx)  # per-op gate defaults off, even for owner
     config.set(7, 'agent_ops_gate', {'save_value': 'everyone'})
     tool = build_agent_tools(ctx, ctx.bot.logger, ['save_value'])[0]
-    config.set(7, 'ai_self_tools_enabled', False)
-    assert not (await tool.function(text='must-not-write'))['ok']
-    config.set(7, 'ai_self_tools_enabled', True)
     config.set(7, 'agent_ops_gate', {'save_value': 'off'})
     assert not (await tool.function(text='must-not-write'))['ok']
     assert writes == [(1, 'sensitive-success')]
@@ -407,7 +402,6 @@ async def test_shared_runner_mixed_budget_survives_nudge(config, self_surface, g
     reg, ctx, writes = self_surface
     gpt, _, responses = gpt_run
     ctx.guild = NS(id=7, owner=None)
-    config.set(7, 'ai_self_tools_enabled', True)
     config.set(7, 'agent_ops_gate', {'save_value': 'everyone', 'guild_probe': 'everyone'})
     requests = responses([
         [TextPart('run tool guild_probe')],

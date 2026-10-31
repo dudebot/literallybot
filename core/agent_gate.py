@@ -124,12 +124,9 @@ SELF_TOOLS_KEY = "ai_self_tools_enabled"
 
 
 def self_tools_enabled(ctx) -> bool:
-    """Global master defaults on; public guild participation defaults off."""
-    config = ctx.bot.config
-    if not config.get_global(SELF_TOOLS_KEY, True):
-        return False
-    guild = getattr(ctx, "guild", None)
-    return guild is None or bool(config.get(guild.id, SELF_TOOLS_KEY, False))
+    """Bot-wide master switch for SELF tools; absent means on. In a guild each
+    SELF op still needs its per-op gate, which defaults off."""
+    return bool(ctx.bot.config.get_global(SELF_TOOLS_KEY, True))
 
 
 def resolve_agent_tools(ctx, scopes=None) -> List[str]:

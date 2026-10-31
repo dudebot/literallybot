@@ -514,8 +514,7 @@ identity remains deferred; other scopes retain their existing MCP policy.
 
 The shared agent policy requires a global whitelist entry and global
 `ai_self_tools_enabled` (absent means true). Public guild SELF additionally
-requires the guild's same-named setting (absent means false) and a non-off
-per-op gate. All SELF switches, whitelist entries and applicable gates are
+requires a non-off per-op gate (absent means off). All SELF switches, whitelist entries and applicable gates are
 rechecked on each dispatch for every actor, including superadmins. Existing
 GUILD admin bypass behavior is preserved.
 

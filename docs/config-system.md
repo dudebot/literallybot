@@ -418,16 +418,13 @@ MCP binding is configured at startup with `MCP_OPS_HOST` (default `127.0.0.1`). 
 
 ### SELF tool policy contracts
 
-`ai_self_tools_enabled` has two explicit scopes, read by
-`core.agent_gate.self_tools_enabled` / `resolve_agent_tools`:
-
-| Scope | Default when absent | Meaning |
-| --- | --- | --- |
-| Global | `true` | Master ceiling for SELF tools, including DMs |
-| Guild | `false` | Additional opt-in for public guild SELF tools |
+`ai_self_tools_enabled` is a global master switch for SELF tools, including
+DMs (absent means `true`), read by `core.agent_gate.self_tools_enabled` /
+`resolve_agent_tools`. There is no per-guild copy.
 
 The global `agent_ops_whitelist` still requires each tool name to be explicitly
-true. Guild SELF also requires a non-off `agent_ops_gate` entry; Admin/Everyone
+true. Guild SELF also requires a non-off `agent_ops_gate` entry, which defaults
+off, so a new guild starts with no tools; Admin/Everyone
 and the op's hard permission floor still apply. No superadmin bypass applies
 to SELF policy. DM callers request SELF only and never substitute another
 guild's context. Readers do not persist defaults or automatically grant tools.
