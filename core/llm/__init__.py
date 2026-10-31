@@ -12,6 +12,7 @@ from .client import (
     LLMClient,
     ProviderConfig,
     LLMResponse,
+    AgentRunLimitExceeded,
     PROVIDER_ALIASES,
     DEFAULT_PROVIDER,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "LLMClient",
     "ProviderConfig",
     "LLMResponse",
+    "AgentRunLimitExceeded",
     "UsageRecord",
     "PROVIDER_ALIASES",
     "DEFAULT_PROVIDER",

@@ -44,7 +44,8 @@ Management.
 
 ### Escalation guards (intentional)
 
-- **The bot's own account is never admin.** `is_admin` explicitly returns false
+- **The bot's own account is never admin.** Context-based `is_admin` and
+  `is_superadmin` explicitly return false
   when the actor id equals the bot user id. Without this, the bot's own Discord
   Administrator role would pass the `guild_permissions.administrator` check, and a
   self-authored command (driven through the agent loop or MCP server) could
@@ -81,6 +82,13 @@ Security properties enforced centrally, so no frontend can skip them:
   channel the actor cannot read (`permissions_for(actor).read_messages`) are
   refused — the bot sees more channels than any one user, and this stops it from
   leaking history/members from channels the caller can't see, or posting into them.
+  Channel enumeration applies the same visibility filter. Private threads
+  additionally require Manage Threads or current membership, verified using
+  the thread-member REST endpoint rather than the potentially incomplete member
+  cache. Membership lookup failures deny access. This applies to direct op
+  targets, forwarding destinations and thread enumeration; it adds a lookup
+  only for private threads when the actor lacks Manage Threads. Message reads
+  also require Read Message History.
 - **Mentions suppressed.** Both frontends force `allowed_mentions=none` on
   `send_message`, so tool-driven sends never ping.
 - **Tool budget.** The agentic `!gpt` loop has a SOFT budget of 8 tool calls by default per

@@ -545,7 +545,20 @@ class Op:
         vis_ok, vis_reason = _check_channel_visibility(ctx, kwargs)
         if not vis_ok:
             return OpResult(ok=False, error=vis_reason)
+        for value in kwargs.values():
+            for item in (value if isinstance(value, (list, tuple)) else [value]):
+                channel = item if _is_guild_channel(item) else getattr(item, "channel", None)
+                if not await _actor_can_access_private_thread(ctx, channel):
+                    return OpResult(ok=False, error="Actor cannot access this private thread.")
         try:
+            # MESSAGE params are resolved using the bot's credentials; every
+            # read or action derived from that message requires actor history
+            # access, including reactions, polls and forwarding.
+            for param in self.params:
+                if param.kind == ParamKind.MESSAGE:
+                    message = kwargs.get(param.name)
+                    if message is not None:
+                        _require_actor_history_perm(ctx, message.channel)
             value = await self.impl(ctx, **kwargs)
         except Exception as exc:  # noqa: BLE001 - ops surface failure, not raise
             return OpResult(ok=False, error=f"{type(exc).__name__}: {exc}")
@@ -814,11 +827,33 @@ def _check_channel_visibility(ctx: OpContext, kwargs: Dict[str, Any]) -> "tuple[
                 continue
             try:
                 perms = channel.permissions_for(actor)
-            except Exception:  # noqa: BLE001 - be permissive on odd channel types
-                continue
+            except Exception:  # noqa: BLE001 - unverifiable visibility fails closed
+                return False, f"Could not verify actor access to channel {getattr(channel, 'id', '?')}."
             if not getattr(perms, "read_messages", True):
                 return False, f"Actor cannot access channel {getattr(channel, 'id', '?')}."
     return True, None
+
+
+async def _actor_can_access_private_thread(ctx: OpContext, channel: Any) -> bool:
+    """Thread permissions inherit the parent; private membership is separate.
+
+    Do not trust the thread member cache: it may be incomplete or stale.
+    Bare MCP actors retain the frontend's documented operator policy.
+    """
+    actor = getattr(ctx, "author", None)
+    if (actor is None or not hasattr(actor, "guild_permissions")
+            or not isinstance(channel, discord.Thread) or not channel.is_private()):
+        return True
+    try:
+        permissions = channel.permissions_for(actor)
+        if not permissions.read_messages:
+            return False
+        if permissions.manage_threads:
+            return True
+        await channel.fetch_member(actor.id)
+        return True
+    except Exception:
+        return False
 
 
 def _is_guild_channel(value: Any) -> bool:
@@ -1519,7 +1554,7 @@ async def _index_search(bot, guild_id, channel_ids, limit, author_id, contains):
     return hits[:limit], total
 
 
-def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
+async def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
     """Guild-wide search can surface channels the invoking user can't read;
     apply the actor-visibility policy of _check_channel_visibility plus the
     history-specific Read Message History requirement — this is a HISTORY
@@ -1532,8 +1567,15 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
     if actor is None or not hasattr(actor, "guild_permissions"):
         return hits
     visible = []
+    access_by_channel = {}
     for hit in hits:
-        channel = guild.get_channel(hit["channel_id"]) if guild else None
+        channel_id = hit["channel_id"]
+        if channel_id in access_by_channel:
+            if access_by_channel[channel_id]:
+                visible.append(hit)
+            continue
+        channel = guild.get_channel_or_thread(channel_id) if guild else None
+        access_by_channel[channel_id] = False
         if channel is None or not hasattr(channel, "permissions_for"):
             continue
         try:
@@ -1543,7 +1585,9 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
             # ticket channels commonly grant the first and deny the second),
             # and search_history runs on the BOT's perms, so the actor's own
             # history permission must be enforced here.
-            if p.read_messages and p.read_message_history:
+            if (p.read_messages and p.read_message_history
+                    and await _actor_can_access_private_thread(ctx, channel)):
+                access_by_channel[channel_id] = True
                 visible.append(hit)
         except Exception:  # noqa: BLE001 - odd channel types err to hidden
             continue
@@ -1551,7 +1595,7 @@ def _drop_hits_actor_cannot_see(ctx: OpContext, guild, hits):
 
 
 def _require_actor_history_perm(ctx: OpContext, channel: Any) -> None:
-    """History-class reads (chronological scans, pin listings) need Read
+    """History-class reads and message-targeted operations need Read
     Message History, which the generic visibility gate deliberately does NOT
     check (it stays read_messages-only because it also guards non-history
     ops like send_message). Same policy as search_history's fallback branch
@@ -1638,7 +1682,7 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
             ctx.bot, guild.id, [c.id for c in scoped],
             limit, author_id, contains)
         pre = len(hits)
-        hits = _drop_hits_actor_cannot_see(ctx, guild, hits)
+        hits = await _drop_hits_actor_cannot_see(ctx, guild, hits)
         payload = {"messages": hits, "count": len(hits)}
         if len(hits) < pre:
             # Some matches sit in channels the invoking user cannot read.
@@ -1729,9 +1773,7 @@ def _serialize_full_message(message: Any) -> Dict[str, Any]:
     group="messaging",
 )
 async def get_message(ctx: OpContext, message):
-    # The MESSAGE resolver already fetched the message and the generic
-    # channel-visibility gate already ran; this impl is a bare pass-through
-    # to the serializer.
+    # The shared MESSAGE gate already enforces actor history access.
     return message
 
 
@@ -2037,6 +2079,8 @@ async def forward_message(ctx: OpContext, message, destination_channel_id: int):
         ctx, {"destination": destination})
     if not vis_ok:
         raise ValueError(vis_reason)
+    if not await _actor_can_access_private_thread(ctx, destination):
+        raise ValueError("Actor cannot access this private thread.")
     return await message.forward(destination)
 
 
@@ -2298,6 +2342,7 @@ async def list_channels(ctx: OpContext, guild):
     return [
         {"id": c.id, "name": c.name, "type": str(c.type)}
         for c in guild.channels
+        if _check_channel_visibility(ctx, {"channel": c})[0]
     ]
 
 
@@ -3607,7 +3652,7 @@ async def get_channel_info(ctx: OpContext, channel):
     return payload
 
 
-def _drop_threads_actor_cannot_see(ctx: OpContext, guild, threads):
+async def _drop_threads_actor_cannot_see(ctx: OpContext, guild, threads, limit=500):
     """Guild-wide thread enumeration can surface threads whose PARENT channel
     the invoking user cannot read — same actor-visibility policy as
     _drop_hits_actor_cannot_see (real Members filtered; bare id-holder
@@ -3618,14 +3663,19 @@ def _drop_threads_actor_cannot_see(ctx: OpContext, guild, threads):
     if actor is None or not hasattr(actor, "guild_permissions"):
         return threads
     visible = []
-    for t in threads:
+    # Bound REST membership lookups as well as returned rows. Large active
+    # thread sets must not cause unbounded per-call authorization work.
+    for t in threads[:500]:
         parent = (guild.get_channel(getattr(t, "parent_id", None))
                   if guild else None)
         if parent is None or not hasattr(parent, "permissions_for"):
             continue
         try:
-            if parent.permissions_for(actor).read_messages:
+            if (parent.permissions_for(actor).read_messages
+                    and await _actor_can_access_private_thread(ctx, t)):
                 visible.append(t)
+                if len(visible) >= limit:
+                    break
         except Exception:  # noqa: BLE001 - odd channel types err to hidden
             continue
     return visible
@@ -3681,9 +3731,13 @@ async def list_threads(ctx: OpContext, guild, channel=None,
                 threads.append(t)
     else:
         threads = list(await guild.active_threads())
-    threads = _drop_threads_actor_cannot_see(ctx, guild, threads)
+    truncated = len(threads) > 500
+    threads = await _drop_threads_actor_cannot_see(ctx, guild, threads, limit)
     rows = [serialize_thread(t) for t in threads[:limit]]
-    return {"threads": rows, "count": len(rows)}
+    result = {"threads": rows, "count": len(rows)}
+    if truncated:
+        result["note"] = "Only the first 500 thread candidates were checked; restrict channel_id for narrower results."
+    return result
 
 
 @registry.op(

@@ -107,12 +107,12 @@ async def test_unintentional_blank_is_not_silence_and_uses_agent(gpt_run):
 
 @pytest.mark.asyncio
 async def test_budget_fallback_uses_agent_without_bot_tools(config, gpt_run, monkeypatch):
-    from pydantic_ai.exceptions import UsageLimitExceeded
+    from core.llm import AgentRunLimitExceeded
     gpt, ctx, _ = gpt_run
     config.set_global('agent_ops_whitelist', {'send_message': True})
     config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
     config.set(7, 'ai_tool_budget', 12)
-    run = AsyncMock(side_effect=[UsageLimitExceeded('test budget'), NS(text='Best effort', usage=None)])
+    run = AsyncMock(side_effect=[AgentRunLimitExceeded([]), NS(text='Best effort', usage=None)])
     monkeypatch.setattr(gpt.llm, 'run_agent', run)
     await gpt.process_askgpt(ctx, 'hello')
     first, fallback = run.await_args_list

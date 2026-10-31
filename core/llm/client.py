@@ -41,7 +41,8 @@ from typing import Any, Dict, List, Optional
 
 import openai
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, capture_run_messages
+from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.direct import model_request
 from pydantic_ai.messages import (
     ModelMessage,
@@ -52,6 +53,7 @@ from pydantic_ai.messages import (
     UserPromptPart,
     BinaryContent,
     ImageUrl,
+    ToolReturnPart,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
@@ -223,6 +225,18 @@ class LLMResponse:
     model: str
     usage: Optional[UsageRecord] = None
     raw: Any = None
+
+
+class AgentRunLimitExceeded(UsageLimitExceeded):
+    """A capped run's completed results, for explanation without replay.
+
+    Results remain private request data: never include them in exception text
+    or logs. Keeping SDK messages here would couple callers to provider state.
+    """
+
+    def __init__(self, completed_results):
+        super().__init__("Agent run exceeded its usage limit.")
+        self.completed_results = completed_results
 
 
 class LLMClient:
@@ -486,9 +500,9 @@ class LLMClient:
         belongs to the caller, not this provider-agnostic client.
 
         The loop is bounded: at most `max_tool_calls` tool executions
-        (pydantic-ai raises `UsageLimitExceeded` beyond that — callers
-        should catch it and degrade gracefully). Usage aggregates across
-        every request in the run, so cost tracking covers the whole loop.
+        (`AgentRunLimitExceeded` carries completed result text beyond that,
+        so callers can explain partial work without replaying actions).
+        Per-request usage is logged even when a later request fails.
         """
         provider = provider_config.provider
         model = provider_config.model
@@ -509,28 +523,38 @@ class LLMClient:
 
         agent = Agent(model=pai_model, tools=tools, model_settings=settings,
                       output_type=output_type)
-        result = await agent.run(
-            user_prompt,
-            message_history=_to_pai_messages(messages),
-            usage_limits=UsageLimits(
-                tool_calls_limit=max_tool_calls,
-                # Belt-and-suspenders: also cap total model requests so a
-                # model that loops without tool calls can't spin either.
-                request_limit=max_tool_calls + 2,
-            ),
-        )
+        costs = []
+        with capture_run_messages() as transcript:
+            try:
+                result = await agent.run(
+                    user_prompt,
+                    message_history=_to_pai_messages(messages),
+                    usage_limits=UsageLimits(
+                        tool_calls_limit=max_tool_calls,
+                        request_limit=max_tool_calls + 2,
+                    ),
+                )
+            except UsageLimitExceeded:
+                completed = [
+                    {"tool": part.tool_name, "result": part.model_response_str()}
+                    for message in transcript if isinstance(message, PaiModelRequest)
+                    for part in message.parts if isinstance(part, ToolReturnPart)
+                ]
+                raise AgentRunLimitExceeded(completed) from None
+            finally:
+                # Input history is synthesized without run IDs. SDK responses
+                # belong to this run and must be accounted even on failure.
+                for message in transcript:
+                    if isinstance(message, PaiModelResponse) and message.run_id is not None:
+                        request_usage = _usage_from_pai(message.usage, provider=provider, model=model)
+                        self._log_usage(request_usage, metadata)
+                        if request_usage:
+                            costs.append(request_usage.estimated_cost_usd)
 
         # RunUsage aggregates across every request in the loop; it is an
         # attribute in pydantic-ai 2.x (not the v1 `.usage()` method) and
         # duck-types RequestUsage's input/output token fields.
         usage = _usage_from_pai(result.usage, provider=provider, model=model)
-        costs = []
-        for message in result.new_messages():
-            if isinstance(message, PaiModelResponse):
-                request_usage = _usage_from_pai(message.usage, provider=provider, model=model)
-                self._log_usage(request_usage, metadata)
-                if request_usage:
-                    costs.append(request_usage.estimated_cost_usd)
         if usage and costs:
             # Long-context tiers apply per request, never to an aggregate run.
             usage.estimated_cost_usd = (round(sum(costs), 6)

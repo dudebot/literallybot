@@ -65,6 +65,9 @@ def is_superadmin(config_or_ctx: Any, user_id: Union[int, None] = None) -> bool:
         actor = _actor(ctx)
         if actor is None:
             return False
+        bot_user = getattr(bot, "user", None)
+        if bot_user is not None and actor.id == bot_user.id:
+            return False
         return actor.id in get_superadmins(config)
     else:
         # First arg is config, second is user id

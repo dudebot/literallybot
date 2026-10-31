@@ -26,6 +26,9 @@ class _FakeGuild:
     def get_channel(self, cid):
         return self._channels.get(cid)
 
+    def get_channel_or_thread(self, cid):
+        return self._channels.get(cid)
+
 
 class _FakeChannel:
     def __init__(self, cid, perms, messages=(), guild=None):
@@ -276,6 +279,7 @@ async def test_admin_gate_runs_before_resolution_and_rechecks_revocation(config)
     guild = NS(id=7, owner=None)
     message = NS(id=22, delete=AsyncMock())
     channel = NS(id=10, guild=guild, fetch_message=AsyncMock(return_value=message))
+    message.channel = channel
     bot = NS(config=config, user=NS(id=999), get_channel=Mock(return_value=channel))
     ctx = OpContext(bot=bot, author=NS(id=1), guild=guild)
     denied = await registry.call_ids('delete_message', ctx, channel_id='10', message_id='22')
