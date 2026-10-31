@@ -239,7 +239,7 @@ async def test_agent_transport_retry_override_preserves_default(config, monkeypa
 
     async with httpx.AsyncClient(transport=httpx.MockTransport(fail)) as http:
         def model(*args):
-            sdk = openai.AsyncOpenAI(api_key='test', http_client=http, max_retries=1)
+            sdk = openai.AsyncOpenAI(api_key='test-key', http_client=http, max_retries=1)
             return OpenAIChatModel('test', provider=OpenAIProvider(openai_client=sdk))
         monkeypatch.setattr(client, '_build_model', model)
         with pytest.raises(ModelHTTPError):
