@@ -352,7 +352,8 @@ universe derivable instead of hand-listed:
   This is what almost every cog op should be.
 - **`OpScope.SELF`** — acts only for `ctx.author`, the non-bot invoker.
   Declare payloads only (STRING, INTEGER, BOOLEAN, STRING_LIST); never a user,
-  actor, owner, subject, target, entity, snowflake or INTERNAL parameter.
+  actor, owner, subject, target, entity, snowflake or INTERNAL parameter. The
+  one exception is a single optional `SELF_USER` parameter (see below).
   Both dispatch paths reject missing/bot actors and unexpected arguments.
   MCP excludes/refuses this scope. Exposure requires the shared whitelist
   and SELF switches, plus the guild gate for public use.
@@ -380,6 +381,7 @@ decimal *strings* (they exceed 2**53 and would round as JSON numbers).
 | `STRING`, `INTEGER`, `BOOLEAN` | same name | the scalar |
 | `SNOWFLAKE` | same name (string) | an id you handle yourself — *not* resolved |
 | `INTERNAL` | never on the wire | only object-based callers pass it |
+| `SELF_USER` | `user_id`, optional | the invoker when omitted; another `Member` only when an admin names someone in this guild. In a DM, always the invoker. Checked on both dispatch paths. SELF ops only; such an op is a **User** tool in /aisettings (Extra → User). |
 
 ### Lifecycle
 

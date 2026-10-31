@@ -406,3 +406,71 @@ async def test_self_dispatch_binds_invoker_and_rejects_identity_in_both_paths():
         with pytest.raises(ValueError, match='SELF'):
             reg.op('bad', 'Bad selector.', PermissionLevel.EVERYONE,
                    scope=OpScope.SELF, params=[param])(save)
+
+
+
+@pytest.mark.asyncio
+async def test_self_user_is_the_invoker_unless_an_admin_names_a_member(config):
+    from types import SimpleNamespace as NS
+    from unittest.mock import AsyncMock
+    from core.ops import OpsRegistry, OpScope, PermissionLevel, OpParam, ParamKind
+
+    reg = OpsRegistry()
+
+    async def read(ctx, user):
+        return user.id
+
+    for scope, required in ((OpScope.GUILD, False), (OpScope.SELF, True)):
+        with pytest.raises(ValueError, match='SELF_USER'):
+            reg.op('bad', 'Bad.', PermissionLevel.EVERYONE, scope=scope,
+                   params=[OpParam('user', ParamKind.SELF_USER, required=required)])(read)
+    reg.op('read_record', 'Read a record.', PermissionLevel.EVERYONE, scope=OpScope.SELF,
+           params=[OpParam('user', ParamKind.SELF_USER, required=False)])(read)
+
+    member = NS(id=2, bot=False)
+    guild = NS(id=7, owner=None, get_member=lambda uid: member if uid == 2 else None,
+               fetch_member=AsyncMock(side_effect=LookupError('not a member')))
+
+    async def run(guild, other):
+        ctx = OpContext(bot=NS(config=config), author=NS(id=1, bot=False), guild=guild)
+        by_ids = await reg.call_ids('read_record', ctx, **({'user_id': str(other)} if other else {}))
+        by_obj = await reg.call('read_record', ctx, **({'user': NS(id=other)} if other else {}))
+        assert (by_ids.ok, by_ids.value) == (by_obj.ok, by_obj.value)
+        return by_ids
+
+    assert (await run(None, None)).value == 1  # omitted: the invoker
+    assert (await run(None, 1)).value == 1
+    assert not (await run(None, 2)).ok  # a DM never targets someone else
+    assert not (await run(guild, 2)).ok  # not an admin
+    config.set(7, 'admins', [1])
+    assert (await run(guild, 2)).value == 2
+    assert not (await run(guild, 3)).ok  # admin, but not a member of this guild
+
+
+def test_self_user_ops_are_listed_as_user_tools():
+    from core.ops import OpScope, PermissionLevel, OpParam, ParamKind, op
+    from core.agent_loop import build_agentic_guidance
+    from cogs.gpt import tool_tab_sections
+
+    class Records:
+        @op('record_test_read', 'Read a record.', PermissionLevel.EVERYONE, scope=OpScope.SELF,
+            group='records-test', params=[OpParam('user', ParamKind.SELF_USER, required=False)])
+        async def read(self, ctx, user):
+            return None
+
+        @op('record_test_feature', 'A feature.', PermissionLevel.EVERYONE,
+            scope=OpScope.SELF, group='records-test')
+        async def feature(self, ctx):
+            return None
+
+    cog = Records()
+    registry.register_cog_ops(cog)
+    try:
+        extra = dict(tool_tab_sections({OpScope.SELF}))['Extra']
+        buckets = {label: [o.name for o in ops] for _gid, label, ops in extra}
+        assert 'record_test_read' in buckets['User']
+        assert 'record_test_feature' in buckets['Guild']
+        guidance = '\n'.join(build_agentic_guidance(['record_test_read', 'record_test_feature']))
+        assert 'User tools (record_test_read)' in guidance
+    finally:
+        registry.unregister_owner(cog)

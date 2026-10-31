@@ -201,18 +201,36 @@ def panel(config):
 @pytest.mark.parametrize('page', ['server', 'agentops', 'mcp'])
 async def test_full_settings_page_fits_discord_limits(config, page):
     # Build the actual view: helper-only checks missed the 40-component outage.
-    config.set_global('superadmins', [1])
-    config.set_global('agent_ops_whitelist', {name: True for name in registry.names()})
-    view, _ = panel(config)
-    view.page = page
-    view._build()
-    assert view.page == page
-    assert view.total_children_count <= 40
-    assert view.to_components()
-    selects = [child for child in view.walk_children() if isinstance(child, discord.ui.Select)]
-    assert selects
-    assert all(1 <= len(select.options) <= 25 for select in selects)
-    view.stop()
+    # A cog op of each Extra kind renders the Guild and User rows too.
+    from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+
+    class Extra:
+        @op('extra_guild_probe', 'Guild.', PermissionLevel.EVERYONE, group='extra-probe')
+        async def guild(self, ctx):
+            return None
+
+        @op('extra_user_probe', 'User.', PermissionLevel.EVERYONE, scope=OpScope.SELF,
+            group='extra-probe', params=[OpParam('user', ParamKind.SELF_USER, required=False)])
+        async def user(self, ctx, user):
+            return None
+
+    cog = Extra()
+    registry.register_cog_ops(cog)
+    try:
+        config.set_global('superadmins', [1])
+        config.set_global('agent_ops_whitelist', {name: True for name in registry.names()})
+        view, _ = panel(config)
+        view.page = page
+        view._build()
+        assert view.page == page
+        assert view.total_children_count <= 40
+        assert view.to_components()
+        selects = [child for child in view.walk_children() if isinstance(child, discord.ui.Select)]
+        assert selects
+        assert all(1 <= len(select.options) <= 25 for select in selects)
+        view.stop()
+    finally:
+        registry.unregister_owner(cog)
 
 
 @pytest.mark.asyncio

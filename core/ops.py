@@ -196,6 +196,9 @@ class ParamKind(str, Enum):
                              # for the same 2**53 reason as entity ids.
     BOOLEAN = "boolean"
     INTERNAL = "internal"  # never on the wire; frontends may pass a live object
+    SELF_USER = "self_user"  # wire: user_id (str, optional) -> the invoker when
+                             # omitted; another member only for an admin in
+                             # the same guild, never in a DM. SELF ops only.
 
 
 # Discord snowflakes are 64-bit and routinely exceed 2**53, the largest
@@ -224,6 +227,7 @@ _ENTITY_WIRE_NAMES = {
     ParamKind.USER: "user_id",
     ParamKind.ROLE: "role_id",
     ParamKind.GUILD: "guild_id",
+    ParamKind.SELF_USER: "user_id",
 }
 
 
@@ -365,6 +369,24 @@ async def resolve_member(guild: Any, user_id: int) -> Any:
                 f"Could not resolve member {user_id} in guild {guild.id}: {exc}"
             ) from exc
     return member
+
+
+async def resolve_self_user(ctx: Any, value: Any) -> Any:
+    """SELF_USER target: the invoker when omitted. Naming someone else needs
+    an admin invoker and a member of the current guild; in a DM it is always
+    the invoker."""
+    author = ctx.author
+    if value is None:
+        return author
+    user_id = _as_int(getattr(value, "id", value), "user_id")
+    if user_id == author.id:
+        return author
+    guild = getattr(ctx, "guild", None)
+    if guild is None:
+        raise ResolutionError("In a DM this tool only acts on the person talking to you; leave user_id out.")
+    if not is_admin(ctx):
+        raise ResolutionError("Only an admin can name someone else; leave user_id out.")
+    return await resolve_member(guild, user_id)
 
 
 def resolve_role(guild: Any, role_id: int) -> Any:
@@ -523,6 +545,12 @@ class Op:
     agent_guidance: Optional[str] = None
     sequential: bool = False
 
+    @property
+    def user_tool(self) -> bool:
+        """Acts on one person's stored record (declares a SELF_USER param).
+        Frontends list these as User tools, apart from Guild tools."""
+        return any(p.kind == ParamKind.SELF_USER for p in self.params)
+
     def default_gate(self) -> str:
         """The Off/Admin/Everyone default for this op's agent exposure.
 
@@ -542,6 +570,12 @@ class Op:
         allowed, reason = _check_permission(ctx, self.permission)
         if not allowed:
             return OpResult(ok=False, error=reason)
+        for p in self.params:
+            if p.kind == ParamKind.SELF_USER:
+                try:
+                    kwargs[p.name] = await resolve_self_user(ctx, kwargs.get(p.name))
+                except ResolutionError as exc:
+                    return OpResult(ok=False, error=str(exc))
         vis_ok, vis_reason = _check_channel_visibility(ctx, kwargs)
         if not vis_ok:
             return OpResult(ok=False, error=vis_reason)
@@ -569,7 +603,7 @@ class Op:
         actor_id = getattr(actor, "id", None)
         if not isinstance(actor_id, int) or isinstance(actor_id, bool) or actor_id <= 0 or getattr(actor, "bot", False):
             return "SELF requires a valid non-bot invoking actor."
-        if set(arguments) - {p.name for p in self.params}:
+        if set(arguments) - {p.name for p in self.params} - {w.name for w in self.wire_params()}:
             return "Unexpected SELF parameters."
         return None
 
@@ -723,6 +757,11 @@ class Op:
                 if guild is None:
                     raise ResolutionError(f"Op '{self.name}' requires a guild context to resolve members.")
                 kwargs[p.name] = await resolve_member(guild, _as_int(user_id, "user_id"))
+
+            elif p.kind == ParamKind.SELF_USER:
+                # Op.__call__ applies the invoker/admin rule on both paths.
+                user_id = raw.pop("user_id", None)
+                kwargs[p.name] = None if user_id is None else _as_int(user_id, "user_id")
 
             elif p.kind == ParamKind.USER:
                 user_id = raw.pop("user_id", None)
@@ -965,6 +1004,11 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
         raise TypeError(f"Op '{name}' scope must be an OpScope, got {scope!r}.")
     if not isinstance(sequential, bool):
         raise TypeError("sequential must be a bool.")
+    self_users = [p for p in params or [] if p.kind == ParamKind.SELF_USER]
+    if self_users and (scope != OpScope.SELF or len(self_users) > 1
+                       or any(p.required for p in self_users)):
+        raise ValueError(f"Op '{name}' may declare one optional SELF_USER "
+                         f"parameter, and only on a SELF op.")
     if not group or not isinstance(group, str):
         raise ValueError(f"Op '{name}' must declare a non-empty group id.")
     # Wire names collapse per kind (MEMBER and USER both user_id). Two
@@ -984,6 +1028,8 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
     if scope == OpScope.SELF:
         safe_kinds = {ParamKind.STRING, ParamKind.INTEGER, ParamKind.BOOLEAN, ParamKind.STRING_LIST}
         for p in params or []:
+            if p.kind == ParamKind.SELF_USER:
+                continue
             tokens = set(re.sub(r"([a-z])([A-Z])", r"\1_\2", p.name).lower().replace("-", "_").split("_"))
             if p.kind not in safe_kinds or tokens & {"owner", "actor", "author", "user", "subject", "member", "target", "recipient", "uid"}:
                 raise ValueError(f"SELF op '{name}' cannot declare identity/target parameters.")

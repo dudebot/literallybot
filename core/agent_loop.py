@@ -381,6 +381,8 @@ def build_agentic_guidance(tool_names, guild_id=None, channel_id=None):
     Module-level (not a cog method) so a test harness can import and
     exercise the exact shipped text without constructing a bot.
     """
+    user_tools = [n for n in tool_names
+                  if getattr(registry.get(n), "user_tool", False)]
     lines = [
         "",
         *([
@@ -392,6 +394,12 @@ def build_agentic_guidance(tool_names, guild_id=None, channel_id=None):
             "You have tools available: " + ", ".join(tool_names) + ".",
             "- SELF tools act only for the invoking user; never supply a user identity.",
         ]),
+        *([
+            "- User tools (" + ", ".join(user_tools) + ") act on one person's "
+            "stored record. Leave user_id out to act on the person who invoked "
+            "you" + ("; pass one only when an admin asks about another member here."
+                     if guild_id is not None else "; in a DM it is always them."),
+        ] if user_tools else []),
         *([
             "- For an explicit Discord reply to a specific message, call "
             "send_message with reference_message_id, then stay_quiet.",

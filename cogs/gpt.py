@@ -1122,15 +1122,17 @@ class Gpt(commands.Cog):
 # CHUNKED across as many selects as it takes.
 SELECT_MAX_OPTIONS = 25
 
-# Shared by the In-chat ops and MCP ops tabs. API primitives keep OP_GROUPS
-# (Discord-domain slices) conceptually bundled below. Behavioral
-# (cog-registered) ops are one flat bucket — they are not a Discord domain
-# and should not mint a select row per cog. The two tabs pass this into the
-# same renderer; only `current` and the saver differ (in-chat agent
-# whitelist vs MCP expose-list).
-API_SECTION = "**API primitives**"
-BEHAVIORAL_SECTION = "**Behavioral**"
+# Shared by the In-chat ops and MCP ops tabs. API primitives ("Integrated")
+# keep OP_GROUPS (Discord-domain slices) conceptually bundled below.
+# Behavioral (cog-registered) ops ("Extra") are two flat buckets, Guild and
+# User (`Op.user_tool`) — they are not a Discord domain and should not mint
+# a select row per cog. The two tabs pass this into the same renderer; only
+# `current` and the saver differ (in-chat agent whitelist vs MCP
+# expose-list).
+API_SECTION = "Integrated"
+BEHAVIORAL_SECTION = "Extra"
 BEHAVIORAL_GROUP_ID = "_behavioral"
+USER_GROUP_ID = "_user"
 
 # Tab labels: glanceable consume-vs-provide, kept under 16 characters.
 TAB_AGENTOPS = "In-chat ops"
@@ -1168,8 +1170,10 @@ def tool_tab_sections(scope=None):
            for gid, label, ops in registry.grouped(origin=ORIGIN_CORE)]
     api = [(gid, label, ops) for gid, label, ops in api if ops]
     cog_ops = [o for o in registry.ops(origin=ORIGIN_COG) if o.name in allowed]
-    behavioral = ([(BEHAVIORAL_GROUP_ID, "Behavioral", cog_ops)]
-                  if cog_ops else [])
+    guild_ops = [o for o in cog_ops if not o.user_tool]
+    user_ops = [o for o in cog_ops if o.user_tool]
+    behavioral = ([(BEHAVIORAL_GROUP_ID, "Guild", guild_ops)] if guild_ops else []) \
+        + ([(USER_GROUP_ID, "User", user_ops)] if user_ops else [])
     return [
         (API_SECTION, api),
         (BEHAVIORAL_SECTION, behavioral),
@@ -1200,9 +1204,10 @@ def _grouped_tool_sections(sections, current, on_save):
     """Render tool-tab sections as titled heading + select per bundle.
 
     `sections` is tool_tab_sections() output. API groups are composed
-    into API_BUNDLES (conceptual, ≤25); behavioral is already one bucket
-    and still chunks if a cog dump exceeds the cap. Yields ("heading",
-    markdown) and ("select", _ToolSelect).
+    into API_BUNDLES (conceptual, ≤25); behavioral is already two buckets
+    (Guild, User) and still chunks if a cog dump exceeds the cap. The
+    section title rides on its first heading, so it costs no extra v2
+    child. Yields ("heading", markdown) and ("select", _ToolSelect).
 
     Every select is handed the full universe so a save carries through
     names enabled in other selects. Unregistered stored names are
@@ -1211,11 +1216,11 @@ def _grouped_tool_sections(sections, current, on_save):
     universe = [op.name for _label, groups in sections
                 for _gid, _glabel, ops in groups for op in ops]
     by_gid = {}
-    behavioral_ops = []
+    behavioral = []
     for _section_label, groups in sections:
         for gid, group_label, ops in groups:
-            if gid == BEHAVIORAL_GROUP_ID:
-                behavioral_ops.extend(ops)
+            if gid in (BEHAVIORAL_GROUP_ID, USER_GROUP_ID):
+                behavioral.append((group_label, ops))
             else:
                 by_gid[gid] = (group_label, ops)
 
@@ -1225,7 +1230,10 @@ def _grouped_tool_sections(sections, current, on_save):
     if leftover:
         bundles.append(("Other", leftover))
 
-    def emit(title, items):
+    section = None
+
+    def emit(title, items, section_title):
+        nonlocal section
         if not items:
             return
         chunks = [items[i:i + SELECT_MAX_OPTIONS]
@@ -1234,7 +1242,9 @@ def _grouped_tool_sections(sections, current, on_save):
             names = [n for n, _d in chunk]
             descs = {n: d for n, d in chunk if d}
             heading = title if len(chunks) == 1 else f"{title} ({i + 1}/{len(chunks)})"
-            yield "heading", f"**{heading}**"
+            prefix = f"### {section_title}\n" if section != section_title else ""
+            section = section_title
+            yield "heading", f"{prefix}**{heading}**"
             yield "select", _ToolSelect(
                 names, current, on_save, universe,
                 label=heading, descriptions=descs or None)
@@ -1248,10 +1258,10 @@ def _grouped_tool_sections(sections, current, on_save):
             group_label, ops = by_gid[gid]
             for op in ops:
                 items.append((op.name, group_label if multi else None))
-        yield from emit(title, items)
+        yield from emit(title, items, API_SECTION)
 
-    if behavioral_ops:
-        yield from emit("Behavioral", [(op.name, None) for op in behavioral_ops])
+    for label, ops in behavioral:
+        yield from emit(label, [(op.name, None) for op in ops], BEHAVIORAL_SECTION)
 
 
 class _ToolSelect(discord.ui.Select):
@@ -1841,7 +1851,7 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         for label, ops in sections:
             for op in ops:
                 names.append(op.name)
-                descs[op.name] = label
+                descs[op.name] = f"User · {label}" if op.user_tool else label
         reserve = self._SERVER_TRAILING_COST
 
         def add_bucket(title, bucket):
@@ -2020,12 +2030,11 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                 f"cogs and stay enabled: {', '.join(offline)}*") if offline else ""
         return (
             f"## AI settings — {TAB_AGENTOPS}\n"
-            "Which GUILD and invoker-only SELF tools the agent may use. "
-            "SELF also requires its surface switches; DM and GLOBAL ops "
-            "remain on the MCP tab. An op "
-            "left off here is disabled everywhere and never appears on any "
-            "server's ⚙ tab. Each server admin then sets Off/Admin/Everyone "
-            "per op for their own guild.\n"
+            "Which tools the in-chat agent may use. **Integrated** are "
+            "Discord actions; **Extra** come from bot features, either on the "
+            "server (**Guild**) or on the invoking person's own data "
+            "(**User**). A tool left off here is disabled everywhere. Each "
+            "server admin then sets Off/Admin/Everyone for their own guild.\n"
             f"**Enabled ops:** {len(live)} live"
             + (f" (+{len(offline)} offline)" if offline else "")
             + note

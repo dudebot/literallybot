@@ -496,7 +496,11 @@ targets.
 
 ### Invoker-only tools
 
-`OpScope.SELF` binds ownership to the trusted invocation's `ctx.author`.
+`OpScope.SELF` binds ownership to the trusted invocation's `ctx.author`. A SELF op
+may declare one optional `SELF_USER` parameter (wire `user_id`): omitted, it is the
+invoker; naming someone else requires an admin invoker and a member of the current
+guild; in a DM it is always the invoker. `Op.__call__` enforces this on both dispatch
+paths before the op runs, so a model-chosen id cannot widen it.
 Registration rejects identity/target selectors, Discord entity and snowflake
 parameters, INTERNAL parameters and undeclared implementation arguments.
 Both object and ID dispatch require a positive non-bot actor ID and reject
