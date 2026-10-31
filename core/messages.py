@@ -131,8 +131,7 @@ def recursive_split(text, max_size=2000):
 
             return recursive_split(left, max_size) + recursive_split(right, max_size)
 
-    left = text[:max_size].rstrip()
-    right = text[max_size:].lstrip()
+    split_index = max_size
     inside_code_block = False
     code_delimiter = None
     code_lang = ""
@@ -145,13 +144,22 @@ def recursive_split(text, max_size=2000):
     inside_inline_code = any(code.start() < max_size < code.end() for code in inline_codes)
     if inside_code_block and code_delimiter:
         header = code_delimiter + code_lang
-        if not left.endswith(header):
-            left = left + "\n" + header
-        if not right.startswith(header):
-            right = header + "\n" + right
+        closing = "\n" + code_delimiter
+        split_index -= len(closing)
+        # Very long delimiters/language labels can leave no room for content.
+        # Fall back to a literal bounded cut rather than recurse without progress.
+        if split_index > len(header) + 1:
+            left = text[:split_index].rstrip() + closing
+            right = header + "\n" + text[split_index:].lstrip()
+            return [left] + recursive_split(right, max_size)
     elif inside_inline_code:
-        if not left.endswith("`"):
-            left = left.rstrip("`") + "`"
-        if not right.startswith("`"):
-            right = "`" + right.lstrip("`")
+        delimiter = next(code.group(1) for code in inline_codes
+                         if code.start() < max_size < code.end())
+        split_index -= len(delimiter)
+        if split_index > len(delimiter):
+            left = text[:split_index].rstrip() + delimiter
+            right = delimiter + text[split_index:].lstrip()
+            return [left] + recursive_split(right, max_size)
+    left = text[:max_size].rstrip()
+    right = text[max_size:].lstrip()
     return [left] + recursive_split(right, max_size)

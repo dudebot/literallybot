@@ -146,9 +146,13 @@ class Config:
 
     def _flush_all(self):
         """Write all dirty configs to disk - assumes lock is already held"""
-        for config_id in list(self._dirty_configs):  # Copy to avoid modification during iteration
-            self._immediate_save(config_id)
-        self._dirty_configs.clear()
+        # Keep mutations and dirty tracking together while serializing. A
+        # writer can otherwise add a scope after the snapshot and have its
+        # pending write erased by clear(), without ever reaching disk.
+        with self._data_lock:
+            for config_id in list(self._dirty_configs):
+                self._immediate_save(config_id)
+                self._dirty_configs.discard(config_id)
         self._save_timer = None
 
     def flush(self):
@@ -186,7 +190,7 @@ class Config:
         with self._data_lock:
             cfg = self._configs.setdefault(config_id, {})
             cfg[key] = value
-        self._dirty_configs.add(config_id)
+            self._dirty_configs.add(config_id)
         self._schedule_save()
 
     def rem(self, ctx, key, scope='guild'):
@@ -287,6 +291,7 @@ class Config:
         """Take the on-disk file wholesale; file wins over in-memory state."""
         with self._data_lock:
             self._configs[config_id] = external_data.copy()
+            self._dirty_configs.discard(config_id)
     
     def _check_external_changes(self):
         """Check for external file modifications and reload if needed"""
@@ -317,10 +322,6 @@ class Config:
                     
                     # Update modification time
                     self._file_mtimes[config_id] = current_mtime
-                    
-                    # If this config was dirty, it's not anymore (external changes win)
-                    if config_id in self._dirty_configs:
-                        self._dirty_configs.remove(config_id)
                     
                     action = "Loaded new" if is_new else "Reloaded"
                     print(f"[Config] {action} {config_id}.json due to external changes")

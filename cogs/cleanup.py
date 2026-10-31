@@ -157,15 +157,9 @@ class Cleanup(commands.Cog):
                                 reason = "reply to gone user"
                                 discovered_gone_ids.add(ref.author.id)
 
-                    # Check 4: message replies to a deleted message (reference unresolved)
-                    if not should_delete and reply_to_gone and message.reference and not message.reference.resolved:
-                        # If the referenced message is gone, it was likely from a departed user
-                        # whose messages were already deleted — include these too
-                        if message.reference.resolved is None and message.reference.message_id:
-                            # Try to determine if the original author is gone
-                            # resolved=None means discord couldn't fetch it (deleted)
-                            should_delete = True
-                            reason = "reply to deleted message"
+                    # An unresolved/deleted reference gives no author evidence.
+                    # Leave it alone: a missing original does not imply that its
+                    # author left, and may belong to a current member.
 
                     if should_delete:
                         ch_found += 1
