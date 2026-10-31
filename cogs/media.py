@@ -23,6 +23,7 @@ from discord import File, app_commands
 import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
+from core.media_library import guild_media_dir, guild_media_files, safe_media_directory
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 from core.panels import InvokerOnlyView, panel_slash_pin
 from core.permissions import is_admin
@@ -81,55 +82,27 @@ class Media(commands.Cog):
                              "path separators, wildcards, percent signs or control characters.")
         return name
 
-    @staticmethod
-    def _safe_directory(directory):
-        """Reject symlinked library directories, including the media root."""
-        root = Path('media').absolute()
-        directory = Path(directory).absolute()
-        try:
-            relative = directory.relative_to(root)
-        except ValueError:
-            raise ValueError("Media directory is outside the library.") from None
-        current = root
-        if current.is_symlink():
-            raise ValueError("Media directories cannot be symbolic links.")
-        for part in relative.parts:
-            if part == '..':
-                raise ValueError("Media directory is outside the library.")
-            current = current / part
-            if current.is_symlink():
-                raise ValueError("Media directories cannot be symbolic links.")
-        return directory
-
     @classmethod
     def _guild_dir(cls, guild):
-        return str(cls._safe_directory(Path('media') / str(int(guild.id))))
+        return str(guild_media_dir(guild.id))
 
     @classmethod
     def _media_path(cls, directory, name):
         cls._validate_name(name)
-        path = cls._safe_directory(directory) / name
+        path = safe_media_directory(directory) / name
         if path.is_symlink():
             raise ValueError("Media files cannot be symbolic links.")
         return str(path)
 
     def _guild_files(self, guild):
-        """Filenames in the guild's media dir; [] when absent (a guild that
-        never ran !addmedia has no library, which must read as empty, not
-        as an error)."""
-        try:
-            directory = self._guild_dir(guild)
-            files = []
-            for name in os.listdir(directory):
-                try:
-                    path = self._media_path(directory, name)
-                except ValueError:
-                    continue
-                if os.path.isfile(path):
-                    files.append(name)
-            return files
-        except (OSError, ValueError):
-            return []
+        """Filenames in the guild's media dir that are valid library names."""
+        files = []
+        for path in guild_media_files(guild.id):
+            try:
+                files.append(self._validate_name(path.name))
+            except ValueError:
+                continue
+        return files
 
     def _is_media_command(self, ctx, error):
         """Return True if the failed command matches a media file in the
@@ -200,7 +173,7 @@ class Media(commands.Cog):
     def _cleanup_media_files(self, media_dir, file_name):
         """Remove only literal basename matches inside a safe library directory."""
         self._validate_name(file_name)
-        directory = self._safe_directory(media_dir)
+        directory = safe_media_directory(media_dir)
         for name in os.listdir(directory):
             if not name.startswith((f'{file_name}.', f'{file_name}_tmp.')):
                 continue
