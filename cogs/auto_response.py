@@ -9,11 +9,12 @@ Guild config key `auto_responses` — list of entries:
      "match": "full",                 # full | contains | regex
      "auto_delete": false}            # true = delete the triggering message
 
-`match` replaces the older boolean `full_match`, which is still read for
-entries written before the third mode existed (true -> "full", false ->
-"contains"). "regex" treats each trigger as a Python pattern, which is how
-you get word boundaries: `\bthink\b` fires on "think" but not "rethinking".
-An invalid pattern never matches and never raises.
+"regex" uses a fixed RE2 syntax: words, word boundaries, character classes,
+groups, alternatives and repetition. Lookarounds and backreferences are
+rejected when saving. Matching uses the same bounded compiler, including
+for directly edited config; unsupported patterns never execute.
+RE2 word boundaries and word classes are ASCII-only, so a whole-word
+pattern for `café` never matches: the accented edge letter counts as a boundary.
 
 Absent/empty key = inert in that guild (default OFF everywhere; manage with
 !autoresponse). First matching entry wins, in config
@@ -34,13 +35,19 @@ from discord.ext import commands
 import discord
 from discord import app_commands
 import random
-import re
+from functools import lru_cache
+
+import re2
 
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 from core.panels import InvokerOnlyView, panel_slash_pin
 from core.permissions import is_admin
 
 MAX_ENTRIES = 25  # Discord select-menu option cap
+MAX_REGEX_LENGTH = 200
+MAX_REGEX_TRIGGERS = 25
+REGEX_HELP = (r"Use words, \bword\b, [classes], groups, | and repetition; "
+              "lookarounds and backreferences are unsupported.")
 
 MATCH_FULL = "full"
 MATCH_CONTAINS = "contains"
@@ -48,23 +55,31 @@ MATCH_REGEX = "regex"
 
 
 def _response_texts(responses):
-    """Plain response strings; tolerates the short-lived [text, weight]
-    shape by taking the text and ignoring the weight."""
-    out = []
-    for r in responses or []:
-        if isinstance(r, (list, tuple)) and r:
-            out.append(str(r[0]))
-        elif r is not None and str(r).strip():
-            out.append(str(r))
-    return out
+    """Return configured, nonempty response strings."""
+    return [text for text in responses or [] if isinstance(text, str) and text.strip()]
 
 
 def entry_match_mode(entry):
-    """Match mode for an entry, honouring the legacy `full_match` bool."""
-    mode = entry.get("match")
-    if mode in (MATCH_FULL, MATCH_CONTAINS, MATCH_REGEX):
-        return mode
-    return MATCH_FULL if entry.get("full_match", True) else MATCH_CONTAINS
+    """Return the configured match mode; absent mode means full-message match."""
+    return entry.get("match", MATCH_FULL)
+
+
+@lru_cache(maxsize=256)
+def _compile_pattern(pattern):
+    """One static syntax and resource policy for saves and message handling."""
+    if len(pattern) > MAX_REGEX_LENGTH:
+        return None, f"Patterns are limited to {MAX_REGEX_LENGTH} characters."
+    options = re2.Options()
+    options.case_sensitive = False
+    options.log_errors = False
+    options.max_mem = 1024 * 1024
+    try:
+        return re2.compile(pattern, options=options), None
+    except re2.error as exc:
+        reason = exc.args[0]
+        if isinstance(reason, bytes):
+            reason = reason.decode("utf-8", errors="replace")
+        return None, str(reason)
 
 
 def find_response(entries, content):
@@ -85,14 +100,11 @@ def find_response(entries, content):
             continue
         mode = entry_match_mode(entry)
         if mode == MATCH_REGEX:
-            hit = False
-            for pattern in triggers:
-                try:
-                    if re.search(pattern, content, re.IGNORECASE):
-                        hit = True
-                        break
-                except re.error:
-                    continue
+            if len(triggers) > MAX_REGEX_TRIGGERS:
+                continue
+            hit = any(compiled.search(content) is not None
+                      for pattern in triggers
+                      if (compiled := _compile_pattern(pattern)[0]) is not None)
         elif mode == MATCH_CONTAINS:
             hit = any(t.lower() in text for t in triggers)
         else:
@@ -114,25 +126,13 @@ def normalize_triggers(triggers, mode):
 
 
 def invalid_patterns(triggers):
-    """['`pat` (reason)', ...] for triggers that aren't compilable regexes.
-
-    Validation, not matching: `find_response` skips a bad pattern at runtime
-    rather than raising, so without this an invalid regex would be stored and
-    silently never fire."""
-    bad = []
-    for pattern in triggers:
-        try:
-            re.compile(pattern)
-        except re.error as exc:
-            bad.append(f"`{pattern}` ({exc.msg})")
-    return bad
+    """Present static regex validation failures to the operator."""
+    return [f"`{pattern}` ({reason})" for pattern in triggers
+            if (reason := _compile_pattern(pattern)[1]) is not None]
 
 
 def _serialize_entry_list(result: dict) -> dict:
-    """Wire payload for `list_autoresponses`. Without a serializer every
-    frontend would see a bare {"ok": true} (Op.serialize_result), so the
-    entries have to be copied out explicitly. `index` is positional, not an
-    id, and stays an int — it is not a snowflake."""
+    """Expose ordered entries with positional indexes and the table count."""
     entries = list(result.get("entries") or [])
     return {"entries": entries, "count": len(entries)}
 
@@ -200,9 +200,11 @@ class AutoResponse(commands.Cog):
         if not trigger_list or not response_list:
             raise ValueError("Need at least one trigger and one response.")
         if mode == MATCH_REGEX:
+            if len(trigger_list) > MAX_REGEX_TRIGGERS:
+                raise ValueError(f"Use at most {MAX_REGEX_TRIGGERS} regex triggers per entry.")
             bad = invalid_patterns(trigger_list)
             if bad:
-                raise ValueError("Invalid regex: " + ", ".join(bad))
+                raise ValueError("Invalid regex: " + ", ".join(bad[:3]) + ". " + REGEX_HELP)
         return {
             "triggers": trigger_list,
             "responses": response_list,
@@ -343,7 +345,7 @@ class AutoResponse(commands.Cog):
             OpParam("match", ParamKind.STRING,
                     "Match mode: 'full' (whole message equals a trigger), "
                     "'contains' (trigger appears anywhere), or 'regex' "
-                    "(trigger is a case-insensitive Python pattern, e.g. "
+                    "(trigger is a case-insensitive RE2 pattern, e.g. "
                     r"'\bthink\b' for whole words).",
                     required=False, default=MATCH_FULL),
             OpParam("auto_delete", ParamKind.BOOLEAN,
@@ -356,7 +358,8 @@ class AutoResponse(commands.Cog):
             "short trigger becomes very noisy — prefer 'full', or 'regex' "
             r"with \bword\b, unless the user asked for substring "
             "matching. An invalid regex is rejected outright, nothing is "
-            "stored."),
+            "stored. Lookarounds and backreferences are unsupported; "
+            "use word boundaries, character classes, groups and alternatives."),
         scope=OpScope.GUILD,
         group="auto-response",
         group_label="Auto-responses",
@@ -443,7 +446,7 @@ class _EntryModal(discord.ui.Modal):
                 default=mode == self._MATCH_CONTAINS),
             discord.SelectOption(
                 label="Regex", value=self._MATCH_REGEX,
-                description="Trigger is a pattern; \\bword\\b matches whole words only",
+                description="Words, \\b boundaries, groups, | and repetition; no lookarounds/backreferences",
                 default=mode == self._MATCH_REGEX),
         ])
         delete = bool(entry.get("auto_delete", False))

@@ -186,7 +186,7 @@ illustration; they are not real.)
 | `error_logging` | as global, except `rate_limit_minutes` is global-only | `/logsettings` → Server (admin) | Independent destination/routes and `log_unknown_commands` toggle; cannot disable global reporting |
 | `honeypot` | `{enabled: bool, channel_id: int, role_id: int, minutes: int, strip_all_other_roles: bool}` | `/honeypot`, `!honeypot`, `configure_honeypot` (admin) | Absent ⇒ disabled. One trap per guild; existing role/channel only. Minutes 0–10080 (default 10), stripping defaults false on each enable. Disable preserves saved settings and assigned roles. See [honeypot](honeypot.md) |
 | `event_logging` | `{enabled?: bool, default_channel?: int, features?: {feature_id: {enabled?: bool, channel_id?: int}}, categories?: {category_id: {enabled?: bool, channel_id?: int}}}` | `/logsettings` → Activity (admin) | Guild event reports only; absent ⇒ enabled with #log destination. Category → feature → default channel → #log. All parent/child toggles must be on. Registered features drive controls; unloaded-feature config is retained. Independent of mandatory `error_logging` routes. See [event logging](event-logging.md) |
-| `auto_responses` | `list[{triggers: list[str], responses: list[str], match?: "full"\|"contains"\|"regex", full_match?: bool, auto_delete?: bool}]` | `!autoresponse` panel, `add_autoresponse` / `edit_autoresponse` ops | Per-guild canned replies. `match` (default `full`) = whole message equals a trigger; `contains` = substring hit anywhere (keyword automod); `regex` = trigger is a case-insensitive Python pattern (`\bword\b` for whole words), and an uncompilable one is rejected at write time. Legacy `full_match` bool is still read for entries written before `match` existed (true ⇒ full, false ⇒ contains). Regex triggers keep their case; all others are stored lowercased. `auto_delete` deletes the triggering message. Uniform-random response pick; capped at 25 entries (panel dropdown limit). Absent/empty ⇒ cog inert. First match wins — list order IS precedence, which is why `list_autoresponses` reports a positional index. Bot-authored messages are always ignored (two-bot loop guard) |
+| `auto_responses` | `list[{triggers: list[str], responses: list[str], match?: "full"\|"contains"\|"regex", auto_delete?: bool}]` | `!autoresponse` panel, `add_autoresponse` / `edit_autoresponse` ops | Per-guild canned replies. `match` (default `full`) = whole-message equality; `contains` = substring; `regex` = case-insensitive RE2 pattern, with at most 200 characters per pattern and 25 triggers per entry. RE2 matches in linear time and rejects lookarounds and backreferences. Save and runtime use shared validation; malformed entries are rejected or skipped. Responses are strings and picked uniformly. Regex triggers keep their case; other triggers are stored lowercased. `auto_delete` deletes the triggering message. Capped at 25 entries (panel dropdown limit). Absent/empty ⇒ cog inert. First match wins; `list_autoresponses` reports the positional index. Bot-authored messages are ignored |
 
 ### User scope (`user_<id>.json`)
 
@@ -384,21 +384,23 @@ No op may change this setting.
 
 ### Image input capability
 
-A model entry in `ai_providers.<provider>.models.<model>` may explicitly set
-`vision: true` after the operator verifies that exact provider/model supports
-image input. Missing/false stays text-only; model names are not guessed.
-Only the trigger contributes up to four unique Discord-hosted attachments or
-embed images. Other history and files remain text metadata. Provider usage
-accounting includes the resulting input tokens. Existing catalogs are not
-automatically migrated. Current xAI documentation demonstrates image input
-for grok-4.7, not the repository's older default model names:
-https://docs.x.ai/developers/model-capabilities/images/understanding .
-A live image-content answer is still required before declaring a model verified.
+Image input is enabled unless the selected model entry explicitly sets
+`vision: false` in `ai_providers.<provider>.models.<model>`. A render can send up
+to eight images from message attachments and embed images/thumbnails, including
+referenced messages and bot posts. Trigger images have first priority, then the
+reply target; remaining slots retain earlier selections and fill from recent
+history. Images stay attached to their source turn. Images beyond the limit,
+failed loads and images disabled by `vision: false` remain text placeholders.
+Normalized image bytes and retained selections use bounded in-memory caches;
+provider usage accounts for the resulting input tokens. Verify image capability
+for the exact configured provider/model and explicitly opt text-only models out.
+An actual image-content answer is required before declaring a model verified.
 
 Verified vision seed: `ollama/qwen3.5:4b` supports image input per
 https://ollama.com/library/qwen3.5:4b . A bounded local inference with installed
 `qwen3.5:4b-gpu` and a synthetic image answered “Blue square” correctly through
-LLMClient on 2026-10-03. Other catalog entries remain opt-in until verified.
+LLMClient on 2026-10-03. Verify other entries against the exact configured
+provider/model and set `vision: false` for text-only models.
 
 ### Atomic user-document updates
 
