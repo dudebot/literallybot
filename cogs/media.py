@@ -15,6 +15,8 @@ import os
 import tempfile
 from pathlib import Path
 import subprocess
+import threading
+import time
 import discord
 from discord.ext import commands
 from discord import File, app_commands
@@ -24,6 +26,10 @@ from core.error_handler import register_error_whitelist_hook, unregister_error_w
 from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
 from core.panels import InvokerOnlyView, panel_slash_pin
 from core.permissions import is_admin
+
+_DOWNLOAD_TIMEOUT = (10, 15)  # connect/read inactivity, in seconds
+_DOWNLOAD_SECONDS = 120
+_MAX_LIBRARY_FILE_BYTES = 100 * 1024 * 1024
 
 
 def _serialize_media_list(result: dict) -> dict:
@@ -57,6 +63,8 @@ class Media(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+        self._download_lock = threading.Lock()
+        self._downloading_guilds = set()
         register_error_whitelist_hook(self._is_media_command)
 
     def cog_unload(self):
@@ -223,7 +231,7 @@ class Media(commands.Cog):
         cmd.extend(['-i', file_path, '-t', str(duration_ms / 1000),
                     '-c:v', 'libx264', '-c:a', 'aac', temp_path])
 
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True, timeout=60)
         if result.returncode != 0:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -233,6 +241,21 @@ class Media(commands.Cog):
         return True
 
     def _do_addmedia(self, guild, link, file_name, start_ms, end_ms):
+        # Called in worker threads: reject excess work instead of occupying
+        # executor workers waiting for another download to finish.
+        with self._download_lock:
+            if guild.id in self._downloading_guilds:
+                return 'A media download is already running for this server.'
+            if len(self._downloading_guilds) >= 2:
+                return 'Media downloads are busy. Try again after one finishes.'
+            self._downloading_guilds.add(guild.id)
+        try:
+            return self._download_media(guild, link, file_name, start_ms, end_ms)
+        finally:
+            with self._download_lock:
+                self._downloading_guilds.discard(guild.id)
+
+    def _download_media(self, guild, link, file_name, start_ms, end_ms):
         """Download (and optionally trim) a file into the guild's library.
 
         Synchronous — the panel runs it via asyncio.to_thread so a slow
@@ -275,6 +298,21 @@ class Media(commands.Cog):
         # from following pre-existing symlinks in the library.
         staging = tempfile.TemporaryDirectory(prefix='download-', dir=media_dir)
         download_dir = staging.name
+        upload_limit = min(getattr(guild, 'filesize_limit', 10 * 1024 * 1024),
+                           _MAX_LIBRARY_FILE_BYTES)
+        # Allow room for separate audio/video streams and trimming a larger
+        # source; the published file must still fit the guild upload limit.
+        source_limit = upload_limit * 2
+        deadline = time.monotonic() + _DOWNLOAD_SECONDS
+
+        def check_download(progress=None):
+            if time.monotonic() >= deadline:
+                raise ValueError('Media download exceeded the two-minute time limit.')
+            if progress and (progress.get('downloaded_bytes') or 0) > source_limit:
+                raise ValueError('Media download exceeds the source size limit.')
+            if sum(path.stat().st_size for path in Path(download_dir).rglob('*')
+                   if path.is_file()) > source_limit:
+                raise ValueError('Media download exceeds the source size limit.')
 
         try:
             if clean_url.lower().endswith(direct_extensions):
@@ -282,10 +320,15 @@ class Media(commands.Cog):
                 file_extension = clean_url.split('.')[-1].lower()
                 file_path = self._media_path(download_dir, f'{file_name}.{file_extension}')
 
-                with requests.get(link, stream=True) as response:
+                with requests.get(link, stream=True, timeout=_DOWNLOAD_TIMEOUT) as response:
                     response.raise_for_status()
+                    if int(response.headers.get('Content-Length', 0)) > source_limit:
+                        raise ValueError('Media download exceeds the source size limit.')
+                    downloaded = 0
                     with open(file_path, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=8192):
+                            downloaded += len(chunk)
+                            check_download({'downloaded_bytes': downloaded})
                             f.write(chunk)
             else:
                 # yt-dlp download - let it determine extension
@@ -293,10 +336,25 @@ class Media(commands.Cog):
                     'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                     'outtmpl': os.path.join(download_dir, f'{file_name}.%(ext)s'),
                     'merge_output_format': 'mp4',
+                    'socket_timeout': _DOWNLOAD_TIMEOUT[1],
+                    'retries': 1,
+                    'fragment_retries': 1,
+                    'extractor_retries': 1,
+                    'noplaylist': True,
+                    'playlistend': 1,
+                    'max_downloads': 1,
+                    'max_filesize': source_limit,
+                    'progress_hooks': [check_download],
                 }
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([link])
+                    try:
+                        ydl.download([link])
+                    except yt_dlp.utils.MaxDownloadsReached:
+                        # yt-dlp raises this after successfully completing the
+                        # one item allowed by max_downloads.
+                        pass
+                check_download()
 
                 # Find what yt-dlp created (exclude temp files)
                 matches = [self._media_path(download_dir, name)
@@ -320,6 +378,8 @@ class Media(commands.Cog):
                     return 'Failed to trim media file.'
 
             final_name = os.path.basename(file_path)
+            if os.path.getsize(file_path) > upload_limit:
+                return f'Media file exceeds this server\'s upload limit ({upload_limit} bytes).'
             os.replace(file_path, self._media_path(media_dir, final_name))
             return f'Media file {final_name} has been added — post it with `!{file_name}`.'
 
@@ -329,6 +389,9 @@ class Media(commands.Cog):
         except yt_dlp.utils.DownloadError as e:
             self._cleanup_media_files(download_dir, file_name)
             return f'Failed to download the video: {e}'
+        except ValueError as e:
+            self._cleanup_media_files(download_dir, file_name)
+            return str(e)
         except Exception as e:
             self._cleanup_media_files(download_dir, file_name)
             return f'Unexpected error: {e}'

@@ -456,6 +456,16 @@ If exposed later, both should have ADMIN floors and share panel services;
 deletion should take an exact filename, and download failures must produce
 tool errors rather than successful human-readable error strings.
 
+Media additions allow one download per guild and two across the bot. Direct
+HTTP transfers use finite connect/read timeouts; streamed downloads and yt-dlp
+staging enforce a source budget of twice the guild upload limit, with a 200 MiB
+ceiling. Published files must fit the guild upload limit and a 100 MiB ceiling.
+yt-dlp downloads one item with finite socket timeouts and retries; progress
+checks enforce a two-minute deadline. This deadline is cooperative during
+progress callbacks, not a hard process timeout across extraction and merging.
+ffmpeg trimming has a 60-second process timeout. Failed downloads remove staging
+files and release admission slots.
+
 Activation uses the [global and guild gates](config-system.md#enabling-cog-tools).
 The stable `@op` description becomes the Pydantic tool schema description
 (`core/agent_loop.py`, `Tool.from_schema`). `agent_guidance` is separate
