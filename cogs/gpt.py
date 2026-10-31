@@ -1762,13 +1762,6 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         # Per-GUILD server-admin overrides: {op_name: "off"|"admin"|"everyone"}.
         return self.bot.config.get(self._cfg_ctx(), GATE_KEY) or {}
 
-    def _bot_tools(self):
-        # Same resolver the agent loop uses — the panel's summary line must
-        # show exactly the effective set (whitelist + per-guild gate), never
-        # a private re-derivation of it.
-        return (agent_universe(self._whitelist(), self._gate_cfg())
-                + resolve_agent_tools(self, {OpScope.SELF}))
-
     def _server_gate_ops(self):
         """The (group_label, [Op, ...]) sections the Server tab renders: only
         WHITELISTED GUILD/SELF ops, grouped in OP_GROUPS order. A
@@ -2010,28 +2003,13 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         return body[:3900]
 
     def _server_text(self):
-        model_info = self.gpt._current_model_info(self._cfg_ctx())
-        bases, windows = self.gpt.cooldown_config()
-        tier, base = cooldown_tier_for_cost(
-            model_info.get("cost_per_mtok_output"), bases)
-        bot_tools = self._bot_tools()
-        rate = " · ".join(f"{c}/{_fmt_secs(m * base)}" for c, m in windows)
         minimum, maximum = history_bounds(self.bot.config, self._cfg_ctx())
-        ratio, ttl = cache_policy(model_info)
         return (
             f"## AI settings — {self.guild.name}\n"
-            f"**AI replies:** {'ON — mention or reply to the bot' if self._ai_enabled() else 'OFF'}\n"
-            f"**Provider / model:** {self.provider} / **{self.model}** ({tier}: {rate})\n"
-            f"**History:** {minimum}–{maximum} messages\n"
-            "Min is the usual context size (when available). Recent calls may keep older "
-            "context up to Max when cache reuse is estimated to lower input cost.\n"
-            "Start with Max = 2× Min. Higher caps allow longer reuse; they do not "
-            "guarantee more context or savings. Reply references may add messages.\n"
-            f"**Cache assumptions:** {ratio:.0%} of regular input price · {ttl:g}s lifetime\n"
-            "Tick **Admin only** or **Everyone** below. Unticked is Off. "
-            "Only ops a bot super-admin has enabled appear here.\n"
-            f"**Agent tools here:** "
-            + (", ".join(bot_tools) if bot_tools else "*none — plain chat*")
+            f"**AI replies:** {'ON' if self._ai_enabled() else 'OFF'}\n"
+            f"**Provider / model:** {self.provider} / **{self.model}**\n"
+            f"**History:** {minimum}–{maximum} messages "
+            f"(grows toward {maximum} while cached, then drops to {minimum})"
         )
 
     def _agentops_text(self):
@@ -2143,8 +2121,9 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
     def _tool_budget_select(self):
         current = guild_tool_budget(self.bot.config, self._cfg_ctx())
         select = discord.ui.Select(
-            placeholder=f"Tool calls per run: {current}",
-            options=[discord.SelectOption(label=str(n), value=str(n), default=n == current)
+            placeholder=f"Tool calls per reply: {current}",
+            options=[discord.SelectOption(label=f"Tool calls per reply: {n}", value=str(n),
+                                          default=n == current)
                      for n in TOOL_BUDGET_VALUES])
 
         async def cb(interaction):
