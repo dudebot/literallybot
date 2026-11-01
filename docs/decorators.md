@@ -27,6 +27,8 @@ See the [field chart](cog-development.md#the-fields) and
 [scope rules](cog-development.md#choosing-scope). Current examples are
 [reaction-role ops](../cogs/setrole.py), [points ops](../cogs/points.py),
 and [RNG suppression](../cogs/rng.py).
+For a SELF op with a `SELF_USER` parameter, see the
+[note tools example](cog-development.md#example-a-self-user-tool).
 
 ## Authorization and server context
 

@@ -16,8 +16,7 @@ from core.messages import recursive_split, sanitize_outbound_text
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import ORIGIN_COG, ORIGIN_CORE, OpContext, OpScope, registry
 from core.agent_gate import agent_universe, resolve_agent_tools, guild_call_requires_admin
-from core.agent_loop import (run_agent_turn, log_agentic_usage, looks_like_narrated_call,
-                             is_nudge_false_alarm, NUDGE_PROMPT, NUDGE_FALSE_ALARM_SENTINEL,
+from core.agent_loop import (run_agent_turn, log_agentic_usage,
                              build_agentic_guidance, MESSAGE_ID_GUIDANCE)
 from core.agent_gate import (
     GATE_ADMIN,
@@ -439,7 +438,8 @@ class Gpt(commands.Cog):
         # Construct the overall prompt with detailed instructions
         prompt_parts = [
             # 1) System identity and high-level role
-            "You are a helpful assistant built for engaging Discord conversations.",
+            "You are an agent running inside Discord, talking with the people here and "
+            "acting through the tools you are given.",
             # 2) Persona
             f"Your persona: {current_personality_prompt}",
         ]

@@ -92,8 +92,8 @@ Security properties enforced centrally, so no frontend can skip them:
 - **Mentions suppressed.** Both frontends force `allowed_mentions=none` on
   `send_message`, so tool-driven sends never ping.
 - **Tool budget.** The agentic `!gpt` loop has a SOFT budget of 8 tool calls by default per
-  run (`ai_tool_budget`, clamped to 1–16; default `core/agent_loop.AGENT_TOOL_BUDGET`), shared across the run and any
-  narration-nudge retry: the last 3 results carry a `tool_calls_remaining`
+  run (`ai_tool_budget`, clamped to 1–16; default `core/agent_loop.AGENT_TOOL_BUDGET`), shared across the run
+  and its hard-limit fallback: the last 3 results carry a `tool_calls_remaining`
   countdown, and calls past the budget are refused with an answer-now error so
   the model finishes with a final reply or intentional silence. pydantic-ai's
   hard cap sits at 2x the guild budget (default 16) as a runaway backstop; even that path degrades to a
@@ -102,13 +102,12 @@ Security properties enforced centrally, so no frontend can skip them:
   `core.agent_loop.run_agent_turn` always offers `stay_quiet()` as a Pydantic output
   function. It ends the run successfully without another model request or an
   automatic final Discord reply; previously executed actions/messages remain.
-  The decision is local to that invocation, including its narration-nudge retry.
+  The decision is local to that invocation.
   This terminal control does not consume the configured action budget and is never
   registered as an op, exposed over MCP, or listed in op settings. Empty model
   output remains an error, not an implicit silence signal. With no enabled
   registry tools, GPT still uses the same Agent with terminal quiet output.
-  The narration nudge reuses the same tools and action counter; quiet remains
-  outside that action budget.
+  Quiet remains outside the action budget.
 - **Scope is a structural boundary.** Every op declares an `OpScope`, and the
   in-guild agent's tool universe includes configured `GUILD` ops and eligible
   `SELF` ops, queried live through `resolve_agent_tools`. DM-scoped ops (`send_dm`,

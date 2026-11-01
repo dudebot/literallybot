@@ -537,11 +537,10 @@ class Op:
     # The cog instance that owns a 'cog'-origin op, so unregister_owner can
     # remove exactly that cog's batch on unload. None for core ops.
     owner: Any = None
-    # Behavioral guidance injected into the agent system prompt when this op
-    # is on a guild's enabled-tool list (see gpt.py build_agentic_guidance).
-    # Lives here, not in the prompt builder, so guidance travels with the op
-    # and can't drift out of sync with the enabled-tool set. Distinct from
-    # `description`, which rides inside the function schema itself.
+    # Usage guidance for the in-bot agent loop, appended to `description` in
+    # the tool definition it sends (core/agent_loop.py), so it travels with
+    # the tool and only reaches the model when the tool is offered. MCP
+    # clients get `description` alone: guidance speaks to the chat agent.
     agent_guidance: Optional[str] = None
     sequential: bool = False
 
@@ -637,6 +636,11 @@ class Op:
                               p.required, p.default))
             elif p.kind == ParamKind.STRING_LIST:
                 add(WireParam(p.name, "array", p.description,
+                              p.required, p.default))
+            elif p.kind == ParamKind.SELF_USER:
+                add(WireParam("user_id", _SNOWFLAKE_JSON_TYPE,
+                              p.description or ("Leave out to act on the person talking to you. "
+                                                "Only an admin may name another member of this server."),
                               p.required, p.default))
             elif p.kind in _ENTITY_WIRE_NAMES:
                 add(WireParam(_ENTITY_WIRE_NAMES[p.kind], _SNOWFLAKE_JSON_TYPE,
@@ -1411,8 +1415,9 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
     serialize=_serialize_sent_message,
     agent_guidance=(
         "send_message returns the new message's message_id; reuse it for "
-        "follow-up edits or reactions, and use reference_message_id to reply "
-        "to a message. Your final text reply is posted to the current channel "
+        "follow-up edits or reactions. For an explicit Discord reply to a "
+        "specific message, call send_message with reference_message_id, then "
+        "stay_quiet. Your final text reply is posted to the current channel "
         "automatically — never duplicate it with send_message."),
     scope=OpScope.GUILD,
     group="messaging",
@@ -1708,7 +1713,11 @@ def _require_actor_history_perm(ctx: OpContext, channel: Any) -> None:
         "answer in plain text — never paste "
         "them raw. If the result carries a `note` about a fallback scan, "
         "only the most recent messages were checked — say so instead of "
-        "claiming 'never'."),
+        "claiming 'never'. Example: asked \"do i play factorio\" with no "
+        "answer in the visible history, call search_history with "
+        "{\"channel_ids\": [<current channel id>], \"author_id\": "
+        "<their user id>, \"contains\": \"factorio\"}, then answer from "
+        "the results."),
     scope=OpScope.GUILD,
     group="messaging",
 )

@@ -431,6 +431,6 @@ guild's context. Readers do not persist defaults or automatically grant tools.
 Visible switches are deferred to the downstream R3 settings work.
 
 Public guild `ai_tool_budget` keeps its default 8 and existing 1–16 clamp.
-DM turns use 8. All GUILD/SELF action tools share one counter per turn,
-including the narration nudge. Terminal `stay_quiet` remains outside the
+DM turns use 8. All GUILD/SELF action tools share one counter per turn.
+Terminal `stay_quiet` remains outside the
 action counter, matching existing public behavior.

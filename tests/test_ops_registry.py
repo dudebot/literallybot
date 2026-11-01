@@ -449,7 +449,6 @@ async def test_self_user_is_the_invoker_unless_an_admin_names_a_member(config):
 
 def test_self_user_ops_are_listed_as_user_tools():
     from core.ops import OpScope, PermissionLevel, OpParam, ParamKind, op
-    from core.agent_loop import build_agentic_guidance
     from cogs.gpt import tool_tab_sections
 
     class Records:
@@ -470,7 +469,7 @@ def test_self_user_ops_are_listed_as_user_tools():
         buckets = {label: [o.name for o in ops] for _gid, label, ops in extra}
         assert 'record_test_read' in buckets['User']
         assert 'record_test_feature' in buckets['Guild']
-        guidance = '\n'.join(build_agentic_guidance(['record_test_read', 'record_test_feature']))
-        assert 'User tools (record_test_read)' in guidance
+        schema = registry.require('record_test_read').to_json_schema()
+        assert 'Leave out' in schema['properties']['user_id']['description']
     finally:
         registry.unregister_owner(cog)

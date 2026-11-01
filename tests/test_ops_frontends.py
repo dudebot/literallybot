@@ -59,7 +59,7 @@ def gpt_run(config, monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('route', ['direct', 'after_action', 'parallel', 'nudge'])
+@pytest.mark.parametrize('route', ['direct', 'after_action', 'parallel'])
 async def test_explicit_quiet_ends_run_without_posting_or_leaking_to_next_turn(config, gpt_run, route):
     gpt, ctx, responses = gpt_run
     config.set_global('agent_ops_whitelist', {'send_message': True})
@@ -67,8 +67,6 @@ async def test_explicit_quiet_ends_run_without_posting_or_leaking_to_next_turn(c
     actions = int(route in ('after_action', 'parallel'))
     script = [[ToolCallPart('send_message', {'channel_id': '10', 'content': 'Done'})]
               for _ in range(actions)]
-    if route == 'nudge':
-        script.append([TextPart('I will call stay_quiet')])
     script.append([ToolCallPart('stay_quiet', {})])
     if route == 'parallel':
         # Even if the model batches an action with the terminal output, the
@@ -316,7 +314,7 @@ def self_surface(config, monkeypatch):
     writes = []
 
     @reg.op('save_value', 'Save own text.', PermissionLevel.EVERYONE,
-            scope=OpScope.SELF, sequential=True,
+            agent_guidance='Use when asked to save.', scope=OpScope.SELF, sequential=True,
             params=[OpParam('text', ParamKind.STRING)], serialize=lambda value: value)
     async def save(ctx, text):
         if text == 'sensitive-failure':
@@ -348,6 +346,8 @@ async def test_self_policy_revocation_privileged_invokers_and_log_redaction(conf
     caplog.set_level(logging.INFO)
     tool = build_agent_tools(ctx, ctx.bot.logger, ['save_value'])[0]
     assert tool.sequential
+    # Guidance rides in the tool definition, so every caller's model sees it.
+    assert tool.description == 'Save own text.\n\nUse when asked to save.'
     assert (await tool.function(text='sensitive-success'))['text'] == 'sensitive-success'
     assert 'sensitive-failure' in (await tool.function(text='sensitive-failure'))['error']
     assert 'sensitive-' not in caplog.text
@@ -397,14 +397,13 @@ async def test_mcp_self_exclusion_and_stale_dispatch_before_identity_lookup(conf
 
 
 @pytest.mark.asyncio
-async def test_shared_runner_mixed_budget_survives_nudge(config, self_surface, gpt_run):
+async def test_shared_runner_mixed_budget(config, self_surface, gpt_run):
     from core.agent_loop import run_agent_turn
     reg, ctx, writes = self_surface
     gpt, _, responses = gpt_run
     ctx.guild = NS(id=7, owner=None)
     config.set(7, 'agent_ops_gate', {'save_value': 'everyone', 'guild_probe': 'everyone'})
     requests = responses([
-        [TextPart('run tool guild_probe')],
         [ToolCallPart('save_value', {'text': 'one'}, 'save'),
          ToolCallPart('guild_probe', {}, 'guild')],
         [ToolCallPart('save_value', {'text': 'over-budget'}, 'extra')],
@@ -414,7 +413,7 @@ async def test_shared_runner_mixed_budget_survives_nudge(config, self_surface, g
                                   ['save_value', 'guild_probe'], 'request', tool_budget=2)
     assert result == 'finished'
     assert set(writes) == {(1, 'one'), ('guild', 7)}
-    assert len(requests) == 4
+    assert len(requests) == 3
 
 
 @pytest.mark.asyncio

@@ -334,7 +334,7 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | **params** | Typed `OpParam`s. The registry generates the JSON schema *and* resolves Discord entities from ids — see the kinds below. |
 | **scope** | `OpScope.GUILD` / `DM` / `GLOBAL` / `SELF`. See below; this is a safety boundary, not a label. |
 | **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
-| **agent_guidance** | Optional. Extra instruction injected for the agent loop — use it for non-obvious result semantics ("status 'exists' means nothing was written"). |
+| **agent_guidance** | Optional. When and how the in-chat agent should use the tool, and non-obvious result semantics ("status 'exists' means nothing was written"). Appended to `description` in the agent's tool definition; a short worked example belongs here when the arguments are not obvious. MCP clients get `description` only. |
 | **serialize** | Callable adapting a return value to a JSON-safe dict. Without one, dict results pass through unchanged; other results become `{}`. Use it when objects or IDs need conversion. |
 
 There is deliberately **no `origin` parameter**. Origin is stamped by the
@@ -382,6 +382,55 @@ decimal *strings* (they exceed 2**53 and would round as JSON numbers).
 | `SNOWFLAKE` | same name (string) | an id you handle yourself — *not* resolved |
 | `INTERNAL` | never on the wire | only object-based callers pass it |
 | `SELF_USER` | `user_id`, optional | the invoker when omitted; another `Member` only when an admin names someone in this guild. In a DM, always the invoker. Checked on both dispatch paths. SELF ops only; such an op is a **User** tool in /aisettings (Extra → User). |
+
+#### Example: a SELF user tool
+
+A pair of note tools on a cog, the shape a downstream copy uses to let the
+agent remember things about the person it talks to. Both are SELF ops with one
+optional `SELF_USER` parameter, so each acts on the invoker unless an admin
+names another member of the same guild. In a DM it is always the invoker.
+
+```python
+from datetime import datetime, timezone
+
+from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+
+
+class Notes(commands.Cog):
+    @op('read_notes',
+        'Read the notes kept about a person, oldest first. Each note has a date.',
+        PermissionLevel.EVERYONE,
+        params=[OpParam('user', ParamKind.SELF_USER, required=False)],
+        scope=OpScope.SELF, group='notes', group_label='Notes')
+    async def op_read_notes(self, ctx, user):
+        return {'notes': self.bot.config.get_user(user, 'notes', [])}
+
+    @op('write_note',
+        'Save one short note about a person, in your own words. They can read '
+        'and delete every note.',
+        PermissionLevel.EVERYONE,
+        params=[OpParam('text', ParamKind.STRING, 'The note, at most 200 characters.'),
+                OpParam('user', ParamKind.SELF_USER, required=False)],
+        agent_guidance=(
+            'Call it when they ask you to remember something. Saying you noted '
+            'it saves nothing; only this call does.'),
+        scope=OpScope.SELF, group='notes', group_label='Notes', sequential=True)
+    async def op_write_note(self, ctx, text, user):
+        notes = self.bot.config.get_user(user, 'notes', [])
+        stamp = datetime.now(timezone.utc).date().isoformat()
+        self.bot.config.set_user(user, 'notes', [*notes, {'at': stamp, 'text': text[:200]}])
+        return {'saved': True}
+```
+
+- The model sees each tool as `name`, then `description` followed by
+  `agent_guidance`, then the argument schema. Put when to call it in
+  `agent_guidance`, with a short example when the arguments are not obvious.
+- `SELF_USER` without a description gets a default telling the model to leave
+  `user_id` out for the person talking to it.
+- `sequential=True` keeps two writes in one turn from racing.
+- The tools stay off until a super-admin whitelists them, `ai_self_tools_enabled`
+  is on, and a guild admin opens them in /aisettings (DMs skip the guild gate).
+  They then show under Extra → User.
 
 ### Lifecycle
 
@@ -469,10 +518,9 @@ ffmpeg trimming has a 60-second process timeout. Failed downloads remove staging
 files and release admission slots.
 
 Activation uses the [global and guild gates](config-system.md#enabling-cog-tools).
-The stable `@op` description becomes the Pydantic tool schema description
-(`core/agent_loop.py`, `Tool.from_schema`). `agent_guidance` is separate
-code-authored text appended by `build_agentic_guidance` only for enabled
-tools. Neither field currently has a runtime config editor or catalog callback.
+The stable `@op` description, followed by its `agent_guidance`, becomes the
+Pydantic tool description (`core/agent_loop.py`, `Tool.from_schema`), so it
+reaches the model only for enabled tools. Neither field currently has a runtime config editor or catalog callback.
 There is no lazy schema discovery in the in-chat loop: enabled schemas are
 sent with the run; `list_media` discovers library data on demand.
 
@@ -631,14 +679,15 @@ cannot supply a password. `Restart=always` relaunches a killed process.
 ### Shared agent execution
 
 `core.agent_loop.run_agent_turn` owns tool construction, terminal quiet,
-narration nudge, usage logging and hard-limit fallback. GPT delegates to it;
+usage logging and hard-limit fallback. GPT delegates to it;
 other trusted callers supply their assembled messages, context, resolved tool
 names, closing request, metadata and optional dispatch-validity hook. Persona,
 history scraping, lifecycle checks and delivery remain with the caller.
 Use `resolve_agent_tools(ctx, scopes)` before assembling history/guidance, and
-include that same policy in the cache key. `build_agentic_guidance(names)`
-supports ID-free guidance; guild callers retain the existing public guidance
-by supplying guild/channel IDs.
+include that same policy in the cache key. Descriptions and per-tool guidance
+reach the model through the tool definitions. `build_agentic_guidance(names)`
+names the enabled tools from that resolved list and states the loop contract;
+it supports ID-free guidance, and guild callers add guild/channel IDs.
 
 Set `sequential=True` on an op whose writes must execute sequentially in the
 provider loop; this metadata is carried by both registration paths into Tool.
@@ -647,4 +696,4 @@ synchronous `validity_check` hook runs immediately before dispatch; services
 with stronger atomic lifecycle requirements must enforce them at mutation.
 `LLMClient.run_agent(max_retries=0)` optionally disables SDK transport retries.
 Omitting the override preserves SDK defaults; it does not change Agent
-validation retries. The shared runner forwards it to main/nudge/fallback.
+validation retries. The shared runner forwards it to the main run and the fallback.

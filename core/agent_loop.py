@@ -160,65 +160,17 @@ def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
     return Tool.from_schema(
         tool_fn,
         name=op.name,
-        description=op.description,
+        description="\n\n".join(filter(None, [op.description, op.agent_guidance])),
         json_schema=op.to_json_schema(),
         sequential=op.sequential,
     )
-
-
-# Single-token sentinel a nudged model uses to say "false alarm, my reply
-# was fine" — the original reply is then posted unchanged, so a false flag
-# costs one silent API call and the channel never sees a second message.
-NUDGE_FALSE_ALARM_SENTINEL = "OK"
-
-# Corrective user turn for a run whose reply NAMES a tool but executed zero
-# tool calls (the narrated-call signature). Option 2 is what keeps false
-# positives invisible: the model self-clears with the sentinel instead of
-# restating (or arguing with) its own reply in public.
-NUDGE_PROMPT = (
-    "[SYSTEM CHECK — automated, not from a user] Your reply above names a "
-    "tool, but ZERO tool calls were made, so nothing was executed and your "
-    "reply has NOT been posted yet. Choose one:\n"
-    "1. If you meant to perform an action: emit the real function call(s) "
-    "through the native tool-call channel NOW, then finish with the final "
-    "reply text for the channel, or call stay_quiet if no reply is needed. "
-    "Do not describe the calls in text.\n"
-    "2. If your reply was already a complete answer that needed no tool: "
-    f"respond with exactly {NUDGE_FALSE_ALARM_SENTINEL} (nothing else) and "
-    "your original reply will be posted unchanged."
-)
-
-
-def looks_like_narrated_call(text, tool_names):
-    """True when a zero-tool-call reply reads as a verbalized tool invocation.
-
-    Deliberately narrow: fires only on an ENABLED tool's snake_case name
-    appearing verbatim, or explicit "run tool" phrasing — strings that don't
-    occur in genuine chat prose. (The 2026-07-05 attempt matched everyday
-    words like "search"/"done"/"I'll" and flagged normal answers constantly;
-    that regex is the cautionary tale, not the template.) False positives
-    that remain (e.g. the user asks "what tools do you have?" and the reply
-    honestly lists them) are absorbed by the sentinel path in _run_agentic.
-    """
-    if not text:
-        return False
-    lowered = text.lower()
-    if "run tool" in lowered or "run the tool" in lowered:
-        return True
-    return any(name in lowered for name in tool_names)
-
-
-def is_nudge_false_alarm(text):
-    """Did the nudged re-run answer with the bare false-alarm sentinel?"""
-    return (text or "").strip().strip(".!").upper() == NUDGE_FALSE_ALARM_SENTINEL
-
 
 
 async def run_agent_turn(llm, provider_config, api_messages, ctx, tool_names,
                          closing_request, metadata=None, tool_budget=AGENT_TOOL_BUDGET,
                          *, logger=None, gate_check=None, on_tool_call=None,
                          validity_check=None, max_retries=None, log_usage=None):
-    """Execute one turn with one tool set/counter across nudge and fallback."""
+    """Execute one turn with one tool set/counter across the run and fallback."""
     logger = logger or ctx.bot.logger
     log_usage = log_usage or (lambda response: log_agentic_usage(logger, response))
     retry_options = {} if max_retries is None else {"max_retries": max_retries}
@@ -286,34 +238,6 @@ async def _run_agent_turn(llm, provider_config, api_messages, ctx, tool_names,
             max_tool_calls=tool_budget * 2,
         )
         log_usage(response)
-
-        # Narrated-call backstop: the reply names an enabled tool but zero
-        # tools ran — almost certainly a verbalized invocation (observed
-        # live 2026-07-21: "run tool search_history with channel_id is
-        # ..."). One corrective re-run; the sentinel path keeps false
-        # positives invisible (original reply posts unchanged), so the
-        # channel sees exactly one message either way.
-        tool_calls = response.usage.tool_calls if response.usage else 0
-        if not quiet and tool_calls == 0 and looks_like_narrated_call(response.text, available_names):
-            logger.info(
-                "agentic reply names a tool but made no tool calls — nudging once")
-            retry = await llm.run_agent(
-                provider_config,
-                api_messages + [
-                    {"role": "user", "content": command_turn},
-                    {"role": "assistant", "content": response.text},
-                ],
-                tools=tools,
-                output_type=output_type,
-                metadata=metadata, **retry_options,
-                user_prompt=NUDGE_PROMPT,
-                max_tool_calls=tool_budget * 2,
-            )
-            log_usage(retry)
-            if is_nudge_false_alarm(retry.text):
-                logger.info("nudge was a false alarm — keeping the original reply")
-            else:
-                response = retry
     except AgentRunLimitExceeded as error:
         # Only reachable if the model ignores 2x the soft budget worth of
         # refusals (pathological). Even then: a model-authored best-effort
@@ -367,97 +291,41 @@ MESSAGE_ID_GUIDANCE = (
 
 
 def build_agentic_guidance(tool_names, guild_id=None, channel_id=None):
-    """System-prompt lines for agentic runs: available tools, target ids,
-    and — critically — the MECHANICS of tool invocation.
+    """System-prompt lines for agentic runs: target ids and how to use tools.
 
-    The mechanics block exists because models (observed live: grok narrating
-    "run tool search_history with channel_id is ..." as plain text) sometimes
-    verbalize an intended call instead of emitting it. The loop is a
-    pydantic-ai Agent over the OpenAI-compatible function-calling API: a real
-    call rides the structured tool_calls channel of the response; a text-only
-    response ends the run and is posted to Discord verbatim. The guidance
-    states that contract explicitly instead of hoping the model infers it.
+    The tools themselves (descriptions with their usage guidance, argument
+    schemas) reach the model as pydantic-ai tool definitions; this names the
+    enabled set from `tool_names` and states the loop contract: a call rides
+    the structured tool-call channel; a text-only response ends the run and
+    is posted verbatim. Models (observed live: grok narrating "run tool
+    search_history with channel_id is ...", or saying a note was saved
+    without calling write_note) skip the call unless told so plainly.
 
     Module-level (not a cog method) so a test harness can import and
     exercise the exact shipped text without constructing a bot.
     """
-    user_tools = [n for n in tool_names
-                  if getattr(registry.get(n), "user_tool", False)]
-    lines = [
+    return [
         "",
         *([
-            "You have REAL Discord tools available: " + ", ".join(tool_names) + ".",
             f"- Current guild id: {guild_id}. Current channel id: {channel_id}.",
             "- The invoking user and trigger message IDs are in the closing request context.",
             "- " + MESSAGE_ID_GUIDANCE,
         ] if guild_id is not None else [
-            "You have tools available: " + ", ".join(tool_names) + ".",
             "- SELF tools act only for the invoking user; never supply a user identity.",
         ]),
-        *([
-            "- User tools (" + ", ".join(user_tools) + ") act on one person's "
-            "stored record. Leave user_id out to act on the person who invoked "
-            "you" + ("; pass one only when an admin asks about another member here."
-                     if guild_id is not None else "; in a DM it is always them."),
-        ] if user_tools else []),
-        *([
-            "- For an explicit Discord reply to a specific message, call "
-            "send_message with reference_message_id, then stay_quiet.",
-        ] if "send_message" in tool_names else []),
         "",
-        "HOW TOOL CALLS WORK (mechanics — this part is exact, not stylistic):",
-        "- You are in an agent loop over the chat-completions API with function "
-        "calling enabled. The ONLY way to run a tool is to emit a native "
-        "function call — the tool's name plus a JSON arguments object — through "
-        "the API's structured tool-call channel. A tool call is NOT text; "
-        "nothing you write in your visible reply can execute anything.",
-        "- Every response you produce is one of three things: (a) one or "
-        "more function calls — they execute for real and their results come "
-        "back for you to continue with; (b) plain text — the run ENDS "
-        "immediately and that text is posted to the channel as your reply; "
-        "or (c) the terminal stay_quiet call — the run ends WITHOUT a final "
-        "channel reply. Decide which one BEFORE responding.",
-        "- Call stay_quiet with no arguments when no final reply is needed "
-        "(for example, the user requested only a reaction or asked you not "
-        "to reply). Finish any requested actions and inspect their results "
-        "BEFORE calling it. Do not hide failed actions that need explanation. "
-        "It only suppresses the automatic final reply; messages already sent "
-        "by tools remain. Never use an empty text response to signal silence.",
-        "- Because of (b), writing out an intended call as words — e.g. "
-        "\"run tool search_history with channel_id is 1234 contains is pizza\" "
-        "— executes nothing: the run just ends and that sentence gets posted "
-        "to the channel verbatim, where everyone sees a malfunction. If you "
-        "intend a tool call, EMIT the function call instead of describing it.",
-        *([
-            "- Worked example: someone asks \"do i play factorio\" and the answer "
-            "isn't in the visible history. Correct: emit the function call "
-            "search_history with arguments {\"channel_ids\": [" + str(channel_id) +
-            "], \"author_id\": <invoking_user_id>, \"contains\": \"factorio\", "
-            "\"limit\": 100}, wait for the results, then answer in plain text. "
-            "Wrong: any reply that merely talks about searching.",
-        ] if "search_history" in tool_names else []),
-        "",
-        "- When an action would genuinely help (react, reply elsewhere, edit, "
-        "search, list), use the matching tool. Prefer doing over describing.",
-        "- If no tool fits the request, just reply normally in text — a plain "
-        "conversational answer is a perfectly good response, and most messages "
-        "only need one. Don't reach for a tool when the user just wants an answer.",
-        "- Only claim you did something if you ACTUALLY called the tool for it in "
-        "this turn and saw its result. Never say a reaction was added, a message "
-        "sent/edited/deleted, or history searched unless that tool ran — don't "
-        "pretend or role-play a tool result. If you couldn't do it, say so plainly.",
+        "HOW TOOLS WORK:",
+        "- Tools enabled for this turn: " + ", ".join([*tool_names, "stay_quiet"]) + ".",
+        "- Each tool's definition says what it does and when to use it. When a "
+        "request matches a tool's description, call that tool before you reply. "
+        "Most messages need only a conversational answer; don't reach for a "
+        "tool when none fits.",
+        "- The only way to act is a native function call. Text never executes "
+        "anything: a text response ends the turn and is posted as your reply.",
+        "- Say an action happened only after its tool returned success in this "
+        "turn. Earlier messages in the chat, including your own, are not proof "
+        "anything was done. If you couldn't do it, say so plainly.",
+        "- Call stay_quiet with no arguments when no final reply is needed, "
+        "after finishing and checking any requested actions. Messages already "
+        "sent by tools remain. Never send empty text to mean silence.",
     ]
-    # Per-tool behavioral notes ride on the op declarations themselves
-    # (core/ops.py `agent_guidance`), so guidance stays in lockstep with
-    # whatever set of tools a guild has enabled — no hand-maintained
-    # if-ladder here to drift out of sync with the registry.
-    per_tool = []
-    for name in tool_names:
-        op = registry.get(name)
-        if op is not None and op.agent_guidance:
-            per_tool.append(f"- {op.agent_guidance}")
-    if per_tool:
-        lines.append("")
-        lines.append("Per-tool notes:")
-        lines.extend(per_tool)
-    return lines

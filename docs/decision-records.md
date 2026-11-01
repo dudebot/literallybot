@@ -518,3 +518,23 @@ makes an op eligible, configured exposure chooses a frontend's tools, and
 per-call permissions authorize execution. MCP's unset allowlist still selects
 the full registered universe. No new exposure default or hot-unload contract
 is introduced by this refactor.
+
+## Tool guidance rides in the tool definitions; narrated-call nudge removed (2026-10-31)
+
+Supersedes the 2026-07-21 narrated-call backstop. Its detector looked for an
+enabled tool's name in a zero-call reply, so it missed the failure seen live:
+the model said "noted", "done" and "saved" three times without calling the
+`write_note` SELF tool, and no tool name appeared. Matching reply text cannot tell what
+the model meant to do. The detector, `NUDGE_PROMPT` and the `OK` sentinel are
+gone, and nothing replaces them with another text check.
+
+Tools reach the model as pydantic-ai tool definitions. Each definition's
+description is the op's `description` followed by its `agent_guidance`, so every
+caller of `run_agent_turn` sends the same per-tool guidance. The prompt from
+`build_agentic_guidance` names the turn's enabled tools, built from the resolved
+list rather than written by hand, and carries no per-tool notes: the `user_id`
+note is that parameter's schema description and the reply note is in
+`send_message`'s guidance. It keeps target IDs and a short contract: call a tool
+whose description matches the request, text never executes anything, claim an
+action only after its tool succeeded, and earlier chat is not proof of action.
+GPT's identity line now says it is an agent running inside Discord.
