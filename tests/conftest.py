@@ -17,6 +17,13 @@ class ManualTimer:
         self.cancelled = True
 
 
+@pytest.fixture(autouse=True)
+def tool_telemetry_dir(tmp_path, monkeypatch):
+    """Agent runs append telemetry rows; keep them out of the checkout."""
+    monkeypatch.setattr('core.tool_telemetry.TOOL_LOG_DIR', tmp_path / 'agent_tools')
+    return tmp_path / 'agent_tools'
+
+
 @pytest.fixture
 def config_factory(tmp_path, monkeypatch):
     monkeypatch.setattr('core.config.Timer', ManualTimer)

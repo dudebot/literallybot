@@ -312,6 +312,13 @@ panel. Nothing is on by default, so plain chat stays plain chat until someone
 opts ops in. Every call still passes the op's own `PermissionLevel` floor
 against the real user. See `docs/security.md` for the full model.
 
+Every agent run appends one row to `logs/agent_tools/YYYY-MM-DD.jsonl`: the
+ordered tool calls with status (`ok`, `error`, `refused_*`) and timing, the
+enabled set and the outcome — never arguments or results.
+`venv/bin/python scripts/tool_usage.py --days 7` summarizes per-tool counts,
+calls per run, an hourly histogram, transitions and repeats — the evidence for
+a prompt fix or a bundled tool.
+
 ## 🎬 Media Libraries
 
 New media names must be at least two characters, cannot start with a dot,

@@ -1,4 +1,5 @@
 """Agent and settings boundaries: live permissions, budgets, and stored choices."""
+import json
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -414,6 +415,12 @@ async def test_shared_runner_mixed_budget(config, self_surface, gpt_run):
     assert result == 'finished'
     assert set(writes) == {(1, 'one'), ('guild', 7)}
     assert len(requests) == 3
+    # One telemetry row per run, calls in issue order, arguments never stored.
+    from core.tool_telemetry import iter_runs
+    [row] = iter_runs()
+    assert [(c['tool'], c['status']) for c in row['calls']] == [
+        ('save_value', 'ok'), ('guild_probe', 'ok'), ('save_value', 'refused_budget')]
+    assert row['outcome'] == 'reply' and 'over-budget' not in json.dumps(row)
 
 
 @pytest.mark.asyncio
