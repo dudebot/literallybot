@@ -77,6 +77,9 @@ from core.dm_log import list_dm_users, load_dms, log_dm, row_from_message
 from core.permissions import is_admin, is_superadmin
 from core.messages import sanitize_outbound_text
 
+# Most keywords one search_history call runs (one index query each).
+SEARCH_TERMS_MAX = 8
+
 # Shared history-scan cap: search_history never scans more than this many
 # messages regardless of the requested limit (silently clamped, matching
 # the original MCP frontend's behavior).
@@ -1696,6 +1699,12 @@ def _require_actor_history_perm(ctx: OpContext, channel: Any) -> None:
                 "fallback approximates this with a whole-word match on "
                 "message text only.",
                 required=False),
+        OpParam("contains_any", ParamKind.STRING_LIST,
+                f"Optional — up to {SEARCH_TERMS_MAX} keywords searched "
+                "separately in this one call (same matching as `contains`, "
+                "which it replaces); results come back per term under "
+                "`terms`, each with its own count. `limit` applies per term.",
+                required=False),
     ],
     serialize=lambda payload: payload,
     agent_guidance=(
@@ -1717,14 +1726,16 @@ def _require_actor_history_perm(ctx: OpContext, channel: Any) -> None:
         "answer in the visible history, call search_history with "
         "{\"channel_ids\": [<current channel id>], \"author_id\": "
         "<their user id>, \"contains\": \"factorio\"}, then answer from "
-        "the results."),
+        "the results. Several keywords (\"did X ever say bounce, gawk or "
+        "snooze\") go in ONE call as `contains_any`, not one call per word."),
     scope=OpScope.GUILD,
     group="messaging",
 )
 async def search_history(ctx: OpContext, guild=None, channels=None,
                           limit: int = 100,
                           author_id: Optional[int] = None,
-                          contains: Optional[str] = None):
+                          contains: Optional[str] = None,
+                          contains_any: Optional[List[str]] = None):
     scoped = list(channels or [])
     guild = scoped[0].guild if scoped else (guild or ctx.guild)
     if guild is None:
@@ -1732,6 +1743,22 @@ async def search_history(ctx: OpContext, guild=None, channels=None,
     # Snowflake scalars arrive as strings on the wire; compare as ints.
     if author_id is not None:
         author_id = _as_int(author_id, "author_id")
+    if contains_any is None:
+        return await _search_history_one(ctx, guild, scoped, limit, author_id, contains)
+    if contains is not None:
+        raise ValueError("Pass either contains or contains_any, not both.")
+    terms = list(dict.fromkeys(t.strip() for t in contains_any if t.strip()))
+    if not terms or len(terms) > SEARCH_TERMS_MAX:
+        raise ValueError(f"contains_any needs 1-{SEARCH_TERMS_MAX} non-empty keywords.")
+    # Sequential: the search endpoint is tightly rate-limited per guild.
+    return {"terms": [
+        {"contains": term,
+         **await _search_history_one(ctx, guild, scoped, limit, author_id, term)}
+        for term in terms]}
+
+
+async def _search_history_one(ctx, guild, scoped, limit, author_id, contains):
+    """One keyword (or none) of search_history: index first, then fallback."""
     try:
         hits, total = await _index_search(
             ctx.bot, guild.id, [c.id for c in scoped],

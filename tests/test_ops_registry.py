@@ -87,6 +87,34 @@ def test_search_history_drops_hits_where_actor_lacks_history_perm(monkeypatch):
     assert "total_matches" not in res.value
 
 
+def test_search_history_contains_any_is_one_call_per_term(monkeypatch):
+    """Telemetry showed one search_history call per keyword; contains_any
+    batches them but must keep per-term counts and the visibility drop."""
+    import core.ops as ops_module
+    guild = _FakeGuild(1, [])
+    visible = _FakeChannel(10, _Perms(True, True), guild=guild)
+    denied = _FakeChannel(20, _Perms(True, False), guild=guild)
+    guild._channels = {10: visible, 20: denied}
+    queried = []
+
+    async def fake_index(bot, gid, cids, limit, author_id, contains):
+        queried.append(contains)
+        if contains == "gawk":
+            return [{"id": 2, "channel_id": 20, "content": "gawk"}], 1
+        return [{"id": 1, "channel_id": 10, "content": contains}], 3
+    monkeypatch.setattr(ops_module, "_index_search", fake_index)
+
+    res = asyncio.run(registry.call("search_history", _search_ctx(guild),
+                                    contains_any=["bounce", "gawk", "bounce", " "]))
+    assert res.ok and queried == ["bounce", "gawk"]
+    bounce, gawk = res.value["terms"]
+    assert (bounce["contains"], bounce["count"], bounce["total_matches"]) == ("bounce", 1, 3)
+    assert gawk["count"] == 0 and "total_matches" not in gawk
+    both = asyncio.run(registry.call("search_history", _search_ctx(guild),
+                                     contains="x", contains_any=["y"]))
+    assert not both.ok
+
+
 def test_search_history_fallback_refuses_history_denied_actor(monkeypatch):
     """Fallback path: the recent-window scan reads with the bot's perms and
     bypasses per-hit filtering, so a history-denied member must be refused
