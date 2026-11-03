@@ -13,9 +13,9 @@ from core.llm.usage import UsageRecord, estimate_cost, known_output_price
 
 
 def test_openrouter_free_models_cost_nothing_and_paid_stay_unknown():
-    assert known_output_price("openrouter", "google/gemma-4-31b-it:free") == 0.0
-    assert known_output_price("openrouter", "google/gemma-4-31b-it") is None
-    record = UsageRecord(provider="openrouter", model="google/gemma-4-31b-it:free",
+    assert known_output_price("openrouter", "fake/model:free") == 0.0
+    assert known_output_price("openrouter", "fake/model") is None
+    record = UsageRecord(provider="openrouter", model="fake/model:free",
                          prompt_tokens=10, completion_tokens=10, total_tokens=20)
     assert estimate_cost(record) == 0.0
 
@@ -76,7 +76,7 @@ async def test_openrouter_discovery_keeps_only_free_models(config, monkeypatch):
 
     monkeypatch.setattr("core.llm.client.openai.OpenAI", FakeOpenAI)
     # A panel-added provider's default model starts unpriced.
-    info = {"name": "OpenRouter", "base_url": "https://openrouter.ai/api/v1",
+    info = {"name": "OpenRouter", "base_url": "https://llm.example.test/v1",
             "models": {"a/unpriced:free": {}}}
     llm = LLMClient(config)
     found = await llm.discover_models("openrouter", "sk-or-test", info)

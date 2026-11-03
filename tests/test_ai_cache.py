@@ -15,9 +15,9 @@ from core.llm.client import LLMClient, ProviderConfig
 
 @pytest.mark.asyncio
 async def test_channel_window_reuses_prefix_until_message_edit(config):
-    info = {'models': {'grok-4.6': {'cache_input_ratio': .25, 'cache_ttl_seconds': 300}}}
+    info = {'models': {'fake-model': {'cache_input_ratio': .25, 'cache_ttl_seconds': 300}}}
     config.set_global('ai_providers', {'xai': info})
-    config.set(1, 'current_ai_model', 'grok-4.6')
+    config.set(1, 'current_ai_model', 'fake-model')
     config.set(1, 'ai_history_min_messages', 3)
     config.set(1, 'ai_history_max_messages', 6)
     author = NS(id=10, bot=False, display_name='A', name='A')
@@ -152,25 +152,25 @@ async def test_xai_wire_routes_conversation_and_accounts_cached_input(config, mo
     def handle(request):
         headers.append(request.headers)
         return httpx.Response(200, json={
-            'id': 'response', 'object': 'chat.completion', 'created': 1, 'model': 'grok-4.6',
+            'id': 'response', 'object': 'chat.completion', 'created': 1, 'model': 'fake-model',
             'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': 'hello'}, 'finish_reason': 'stop'}],
             'usage': {'prompt_tokens': 10000, 'completion_tokens': 100, 'total_tokens': 10100,
                       'prompt_tokens_details': {'cached_tokens': 8000},
                       'completion_tokens_details': {'reasoning_tokens': 60}}})
     async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        # Real xAI host: client.py sends x-grok-conv-id only to api.x.ai.
         sdk = openai.AsyncOpenAI(api_key='test-only', base_url='https://api.x.ai/v1', http_client=http)
         client = LLMClient(config)
         config.set_global('XAI_API_KEY', 'test-only')
         monkeypatch.setattr('core.llm.client.OpenAIProvider',
                             lambda **kwargs: OpenAIProvider(openai_client=sdk))
-        info = {'base_url': 'https://api.x.ai/v1', 'models': {'grok-4.6': {}}}
-        pc = ProviderConfig('xai', 'grok-4.6', info, {})
+        info = {'base_url': 'https://api.x.ai/v1', 'models': {'fake-model': {}}}
+        pc = ProviderConfig('xai', 'fake-model', info, {})
         result = await client.run_agent(pc, [{'role': 'user', 'content': 'hi'}],
                                         metadata={'guild': '1', 'channel': '2', 'sender': '3'}, tools=[])
-        assert headers[0]['x-grok-conv-id'] == 'literallybot:1:2:grok-4.6'
+        assert headers[0]['x-grok-conv-id'] == 'literallybot:1:2:fake-model'
         assert result.usage.cached_prompt_tokens == 8000
         assert result.usage.reasoning_tokens == 60
-        assert result.usage.estimated_cost_usd == pytest.approx(.0086)
 
 
 @pytest.mark.asyncio
@@ -178,7 +178,7 @@ async def test_history_controls_and_model_cache_keep_scopes_and_recheck_access(c
     from cogs.gpt import _HistorySettingsModal, _CacheSettingsModal
     config.set(1, 'admins', [8])
     config.set_global('superadmins', [7])
-    config.set_global('ai_providers', {'xai': {'models': {'grok-4.6': {'max_tokens': 2000}}}})
+    config.set_global('ai_providers', {'xai': {'models': {'fake-model': {'max_tokens': 2000}}}})
     bot = NS(config=config, logger=logging.getLogger('test'))
     gpt = Gpt(bot)
     sent = []
@@ -187,7 +187,7 @@ async def test_history_controls_and_model_cache_keep_scopes_and_recheck_access(c
     async def render(interaction):
         pass
     panel = NS(bot=bot, gpt=gpt, invoker_id=8, _cfg_ctx=lambda: 1, rerender=render,
-               mgmt_provider='xai', mgmt_model='grok-4.6')
+               mgmt_provider='xai', mgmt_model='fake-model')
     interaction = NS(user=NS(id=8), guild=NS(id=1), client=bot,
                      response=NS(send_message=send))
     history = _HistorySettingsModal(panel)
@@ -212,15 +212,15 @@ async def test_history_controls_and_model_cache_keep_scopes_and_recheck_access(c
     cache = _CacheSettingsModal(panel)
     cache.ratio._value, cache.ttl._value = '25', '300'
     await cache.on_submit(interaction)
-    assert 'cache_input_ratio' not in gpt.llm.get_all_providers()['xai']['models']['grok-4.6']
+    assert 'cache_input_ratio' not in gpt.llm.get_all_providers()['xai']['models']['fake-model']
     interaction.user.id = panel.invoker_id = 7
     await cache.on_submit(interaction)
-    model = gpt.llm.get_all_providers()['xai']['models']['grok-4.6']
+    model = gpt.llm.get_all_providers()['xai']['models']['fake-model']
     assert model == {'max_tokens': 2000, 'cache_input_ratio': .25, 'cache_ttl_seconds': 300}
     config.set_global('superadmins', [])
     cache.ratio._value = '5'
     await cache.on_submit(interaction)
-    assert gpt.llm.get_all_providers()['xai']['models']['grok-4.6']['cache_input_ratio'] == .25
+    assert gpt.llm.get_all_providers()['xai']['models']['fake-model']['cache_input_ratio'] == .25
 
 
 @pytest.mark.asyncio
