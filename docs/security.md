@@ -61,199 +61,54 @@ Management.
 
 ## Agentic / Ops Execution Model
 
-The ops registry (`core/ops.py`) is the single place every atomic Discord action
-is defined, each with a declared `PermissionLevel` (EVERYONE / ADMIN / SUPERADMIN).
-Two frontends call into it: the in-bot agent loop (`core/agent_loop.py`, used by
-`!gpt` when agentic mode is on) and the MCP server (`core/mcp_server.py`).
+The registry (`core/ops.py`) describes atomic actions, typed parameters,
+scopes and results. Neither `@op` nor `@registry.op` declares an ACL tier.
+Descriptions and agent guidance explain behavior, not assumed authorization.
 
-Security properties enforced centrally, so no frontend can skip them:
+### Configured authorization
 
-- **Actor = the invoking user.** In the agent loop the live `commands.Context`
-  passes straight through as the `OpContext`, so every op's permission gate
-  evaluates the *invoking user's* real Member in their real guild — never the
-  bot, never `guild.me`. An op the user can't authorize fails closed and the
-  denial is returned into the loop as a tool error.
-- **In-guild confinement.** `allowed_guild_ids` for the agent loop is exactly
-  `{ctx.guild.id}`. Every id-resolved target (channel/message/member/role/guild)
-  is checked to belong to an allowed guild (`check_guild_allowed`); a target in
-  another guild the bot happens to be in, or in a DM, is refused
-  (`GuildNotAllowedError`).
-- **Channel-visibility gate.** When the actor is a real Member, ops whose target
-  channel the actor cannot read (`permissions_for(actor).read_messages`) are
-  refused — the bot sees more channels than any one user, and this stops it from
-  leaking history/members from channels the caller can't see, or posting into them.
-  Channel enumeration applies the same visibility filter. Private threads
-  additionally require Manage Threads or current membership, verified using
-  the thread-member REST endpoint rather than the potentially incomplete member
-  cache. Membership lookup failures deny access. This applies to direct op
-  targets, forwarding destinations and thread enumeration; it adds a lookup
-  only for private threads when the actor lacks Manage Threads. Message reads
-  also require Read Message History.
-- **Mentions suppressed.** Both frontends force `allowed_mentions=none` on
-  `send_message`, so tool-driven sends never ping.
-- **Tool budget.** The agentic `!gpt` loop has a SOFT budget of 8 tool calls by default per
-  run (`ai_tool_budget`, clamped to 1–16; default `core/agent_loop.AGENT_TOOL_BUDGET`), shared across the run
-  and its hard-limit fallback: the last 3 results carry a `tool_calls_remaining`
-  countdown, and calls past the budget are refused with an answer-now error so
-  the model finishes with a final reply or intentional silence. pydantic-ai's
-  hard cap sits at 2x the guild budget (default 16) as a runaway backstop; even that path degrades to a
-  model-authored plain-chat answer, never a canned failure string.
-- **Intentional silence is agent-local.** The shared
-  `core.agent_loop.run_agent_turn` always offers `stay_quiet()` as a Pydantic output
-  function. It ends the run successfully without another model request or an
-  automatic final Discord reply; previously executed actions/messages remain.
-  The decision is local to that invocation.
-  This terminal control does not consume the configured action budget and is never
-  registered as an op, exposed over MCP, or listed in op settings. Empty model
-  output remains an error, not an implicit silence signal. With no enabled
-  registry tools, GPT still uses the same Agent with terminal quiet output.
-  Quiet remains outside the action budget.
-- **Scope is a structural boundary.** Every op declares an `OpScope`, and the
-  in-guild agent's tool universe includes configured `GUILD` ops and eligible
-  `SELF` ops, queried live through `resolve_agent_tools`. DM-scoped ops (`send_dm`,
-  `read_dms`, `fetch_dms`, `delete_dm`, `edit_dm`, `list_dm_conversations`,
-  `add_dm_reaction`, `remove_dm_reaction`, `list_dm_pins`) and global ops
-  (`list_guilds`, `get_user`) are
-  therefore never offerable to a guild's agent surface at all — not by config, not by mistake.
-  There is no hand-maintained "agent tools" list to drift (the former
-  `agent=True` flag was removed in the 2026-08 refactor).
-- **Member moderation includes admin-gated state changes and destructive actions.**
-  The 2026-08 guild-domain pass
-  added ADMIN-gated member-state writes (`set_nickname`, `timeout_member`,
-  `remove_timeout` — every one undoable, and timeouts auto-expire at
-  Discord's 28-day cap) and ADMIN-gated moderation/admin-view reads
-  (`list_bans`, `fetch_audit_logs`, `estimate_prune`, `list_integrations`,
-  `list_invites`). Irreversible ejection (kick / ban / unban / prune) and
-  guild-settings writes were initially withheld; they shipped in the
-  owner-tier pass below at ADMIN/SUPERADMIN floors. Profile reads any
-  member can see in the
-  client (`get_member`, `get_guild_info`, `search_members`) are EVERYONE,
-  like the other guild-info reads.
-- **Expressive assets follow the emoji precedent; webhook actions are admin-gated.**
-  The 2026-08 expressive-domain pass added the sticker siblings of the
-  emoji ops (`list_stickers` EVERYONE; `create_sticker`/`edit_sticker`/
-  `delete_sticker` ADMIN, with the same managed/standard-asset refusals),
-  `download_emoji` (ADMIN — it writes the server filesystem, the same
-  class as the attachment gate), poll reads any channel member gets in the
-  client (`get_poll_voters` EVERYONE — Discord polls are non-anonymous),
-  and the ADMIN invite lifecycle (`create_invite` defaults to a 24h
-  expiry; `revoke_invite` only deletes codes verified against the guild's
-  own invite list). `list_webhooks` (ADMIN) deliberately NEVER serializes
-  a webhook's url or token — either is a persistent unauthenticated
-  posting credential. Webhook create/edit/execute/delete were initially
-  withheld; they shipped in the owner-tier pass below (ADMIN, URL/token
-  still never serialized). `send_message`'s optional `sticker_id` and
-  `edit_emoji`'s `role_ids` resolve strictly in-guild, preserving guild
-  confinement.
-- **Voice moderation is reversible; event creation, editing and deletion are admin-gated.**
-  The 2026-08 voice-domain pass added voice-state reads
-  (`get_voice_state`, `list_voice_states` — EVERYONE, filtered by the
-  invoking user's channel visibility exactly like the voice sidebar: a
-  member you can't see reads as not-in-voice, a channel you can't see is
-  omitted), reversible ADMIN voice writes (`move_member`,
-  `disconnect_member`, `set_voice_mute`, `set_voice_deafen`,
-  `set_stage_suppress` — each a no-confirmation client action, instantly
-  undoable, and a 400 when the target isn't in voice surfaces as the op
-  error), stage/event reads (`get_stage_instance`, `list_scheduled_events`,
-  `get_scheduled_event`, `list_scheduled_event_users` — EVERYONE, same
-  visibility any member has), and ADMIN event writes
-  (`create_scheduled_event`, `edit_scheduled_event` — cancellation
-  irreversibly destroys the accrued RSVP list, so `edit_scheduled_event`
-  refuses status='canceled' and delete/cancel is `delete_scheduled_event`'s
-  job in the owner-tier pass below). `list_automod_rules` is an ADMIN read
-  on purpose — keyword rules expose the guild's filtered-word lists, which
-  must not leak to members through a guild agent; automod create/edit/delete
-  shipped in the owner-tier pass below (guild-wide enforcement-policy CRUD).
-  Bot voice PRESENCE (connect / play audio / its own request-to-speak) is
-  structurally out of scope: a stateful gateway session, not an atomic
-  request/response op.
-- **The NEEDS_OWNER destructive/privileged tier is admin-defaulted, three
-  ops superadmin.** The 2026-08 owner-tier pass added the 36 destructive or
-  privileged primitives that every domain above deliberately withheld:
-  channel CRUD + overwrite writes (`create_channel`, `delete_channel`,
-  `clone_channel`, `move_channel`, `set_channel_overwrite`,
-  `delete_channel_overwrite`); thread destruction & membership
-  (`delete_thread`, `add_thread_member`, `remove_thread_member`,
-  `list_private_archived_threads`); member ejection & role batch edits
-  (`kick_member`, `ban_member`, `unban_member`, `prune_members`,
-  `edit_member_roles`); message moderation (`bulk_delete_messages`,
-  `publish_message`, `send_tts`, `send_sticker`, `remove_reaction_other`,
-  `clear_reactions`); webhook CRUD + execute (`create_webhook`,
-  `edit_webhook`, `delete_webhook`, `execute_webhook` — the URL/token is
-  still never serialized); AutoMod CRUD (`create_automod_rule`,
-  `edit_automod_rule`, `delete_automod_rule`); the scheduled-event delete
-  (`delete_scheduled_event`) and stage lifecycle (`create_stage`,
-  `edit_stage`, `end_stage`); and the invite delete (`delete_invite`). Every
-  one is at least `PermissionLevel.ADMIN`. `default_gate()` is always off, so
-  a whitelist tick does not expose the op to members until a guild admin
-  opts it in. Three carry
-  server-wide blast radius and are `PermissionLevel.SUPERADMIN`:
-  `edit_guild_settings` (guild identity/verification posture), `bulk_ban`
-  (up to 200 members in one call), and `purge_messages` (unbounded mass
-  delete). Webhooks resolve against the guild's own webhook list and
-  overwrite/ban/bulk targets are guild-confined, so a destructive op can
-  never reach an entity outside the confined guild.
-- **Agentic mode is opt-in, two-tier, and per-tool** (`core/agent_gate.py`).
-  The bot owner whitelists which ops the agent may ever see
-  (`agent_ops_whitelist`, global, default empty ⇒ `!gpt` is plain chat with
-  no tools), and each guild's admins set every whitelisted op to
-  off/admin/everyone for their guild (`agent_ops_gate`) — both from the
-  `!aisettings` panel. The MCP server consumes its own global
-  `mcp_tools_enabled` allowlist at build time.
-- **Every executed op is logged** at INFO (op name, params, actor id, ok/error).
+`/aisettings` is the authority for in-chat tool access:
 
-### Allowlists are exposure filters, not authorization
+| Setting | Effect | Default |
+|---------|--------|---------|
+| Global `agent_ops_whitelist` | Selects capabilities available for guild configuration | Empty |
+| Guild `agent_ops_gate` | Off disables the tool; Admin authorizes bot admins; Everyone authorizes members | Off |
+| Global `ai_self_tools_enabled` | Master switch for SELF tools | On |
 
-This distinction is the whole security model of the ops layer, and it explains
-why the defaults look permissive:
+Tool selection and dispatch use `core.agent_gate`. Dispatch re-reads the
+whitelist and guild choice before resolving Discord IDs or spending action
+budget. Off and whitelist revocation apply to all actors, including
+superadmins. Everyone has no additional per-op admin floor. Existing stored
+choices are retained; registration never grants access or persists defaults.
+Settings editors and ordinary prefix/slash commands keep their central
+`is_admin` / `is_superadmin` checks.
 
-| | Decides | Set by | Default |
-|---|---------|--------|---------|
-| **`PermissionLevel`** (per op, in code) | **Whether a given actor may run it** | The op's declaration; not configurable at runtime | enforced always |
-| **`agent_ops_whitelist`** (global) | Whether the agent may *ever* see it | superadmin | empty ⇒ plain chat |
-| **`agent_ops_gate`** (per guild) | off / admin / everyone for that guild's agent | any bot admin of that guild | `off` (`default_gate()`) |
-| **`mcp_tools_enabled`** (global) | Whether the MCP server *serves* it | superadmin | absent ⇒ **whole registry** |
+MCP is a separate authenticated operator surface, controlled by
+`mcp_tools_enabled` and its bearer/host/origin checks. It has no additional
+per-op actor tier. Direct registry callers are trusted application code and
+must authorize their entrypoint before dispatch.
 
-Enabling an op grants **exposure**, never **authorization**. Every call still
-passes the op's own `PermissionLevel` gate against the invoking actor, before any
-Discord id is resolved. So an admin who enables `delete_message` for their guild
-has not granted anyone the ability to delete messages — non-admin users who try
-get the same permission error they would have gotten anyway.
+### Execution boundaries
 
-That is why **`mcp_tools_enabled` fails open to the full registry** rather than
-closed to nothing. It is a deliberate owner decision, not an oversight: the MCP
-surface's actual security boundary is the set of gates that are *not*
-configurable — default loopback bind (explicit `MCP_OPS_HOST` opt-in), the
-Host/Origin allowlist for that bind, mandatory bearer token, and the per-call
-permission checks. A config list that an operator must populate before the
-server is useful would add friction without adding a boundary. The guild-side
-default is the opposite (empty ⇒ no tools) because there the exposure decision
-is also a *behavioral* one: a guild that hasn't opted in should get plain chat.
-
-**`agent_ops_gate` is guild-admin-savable.** Not an escalation path, for the
-structural reason above plus scope: the universe a guild admin picks from is
-whitelisted guild-scoped ops only, so there is nothing in it that reaches
-outside the guild they already administer, and the super-admin whitelist
-stays the ceiling.
-
-**Cog-registered ops** enter these universes the moment their cog loads and
-leave when it unloads, carrying the same declared `PermissionLevel` as any core
-op — the registration path stamps `origin='cog'`, which a cog cannot forge, but
-origin affects only how the panel renders it, never what it may do. A stored
-allowlist name whose op is currently unregistered is retained in config and
-dropped only from the effective set, so an unloaded cog cannot cause a silent
-permission change on the next panel save.
-
-### Ordering (exposed-op selection)
-
-`registry.call_ids` checks the permission gate **before** resolving any ids to
-live Discord objects, so a caller who fails the gate learns nothing about
-whether a guessed id exists — no id-probing oracle. That is what makes
-ADMIN-tier ops (e.g. `delete_message`, `timeout_member`, `list_bans`) safely
-exposable on both frontends: a
-non-admin gets the same permission error regardless of target validity.
-`Op.__call__`'s own permission check is belt-and-suspenders for object-based
-callers that bypass `call_ids` and resolved nothing through the registry.
+- The actor is the invoking user. In-chat calls are confined to the invoking
+  guild; DM and GLOBAL ops cannot enter a guild agent's tool universe.
+- Guild-channel visibility and message-history checks still apply. Private
+  thread reads require membership or Manage Threads, verified against Discord.
+- SELF ownership and target-resolution rules still apply; see Invoker-only
+  tools below. SELF tools are unavailable through MCP.
+- Discord itself enforces the bot's permissions, hierarchy and API limits.
+  A configured-access refusal is local and does not mean Discord rejected it.
+- Sends suppress mentions. Host attachment access follows the selected op's
+  configured access, with file type, size and path validation retained.
+- The action budget defaults to 8, configurable from 1–16 per guild. The
+  final three results carry a countdown; calls after exhaustion are refused.
+  A hard cap at twice the budget falls back to a model-authored final answer.
+- `stay_quiet()` is local terminal output, outside the action budget and
+  registry. It ends the run without an automatic final reply; prior actions
+  remain. Empty model output is an error.
+- Op calls are logged with status and timings. SELF exchanges omit arguments
+  and results from logs. Cog ops join and leave the registry with their owning
+  cog; stored configuration for unloaded ops is preserved.
 
 ## MCP Ops Server
 
@@ -302,10 +157,8 @@ and the Host/Origin allowlist for the bind.
   user_id, never a channel id, matching the DM API; Discord refuses bot DMs
   to strangers; `delete_dm` retracts and `edit_dm` edits only bot-authored
   messages, and `remove_dm_reaction` can only remove the bot's own
-  reactions). The whole DM family — including the `list_dm_conversations`/
-  `list_dm_pins`/`fetch_dms` reads — is ADMIN-gated, as is `get_user`
-  (global public-profile read: keeps arbitrary-id lookups off the EVERYONE
-  surface). The one
+  reactions). DM and global tools follow the authenticated MCP operator
+  surface's enabled-tool list. The one
   guild-confined surface in the system is the in-bot `!gpt` agent loop,
   which passes exactly `{ctx.guild.id}` to the registry.
 
@@ -474,8 +327,7 @@ does not change it. Do not publish the port or front it with a public proxy.
   configuration state now lives inside the admin-gated `!aisettings` / `!media`
   panels, which answer ephemerally in their slash form. The public media
   inventory is also available through the cog's `list_media` op when exposed;
-  `post_media` mirrors the public `!<name>` shortcut. Both have EVERYONE floors
-  and remain subject to the agent's global/guild exposure settings or the
+  `post_media` mirrors the public `!<name>` shortcut. Both follow the agent's global/guild access settings or the
   separate MCP allowlist. They never return host filesystem paths.
 
 Fixed in the 2026-07-05 consistency sweep (see git history for details):
@@ -489,9 +341,8 @@ because they alter configuration shared by every guild — their prefix variants
 have since been removed entirely in favor of the `!aisettings` panel (and its
 ephemeral `/aisettings` slash twin), which keeps the superadmin gate on the
 Models & Providers tab.
-`delete_message` is exposed to the agent loop and MCP — it remains ADMIN-gated
-per-call, and `call_ids` now checks permissions *before* resolving any Discord
-targets.
+`delete_message` follows configured tool access, like every other op. The
+agent checks that access before resolving any Discord targets.
 
 ### Invoker-only tools
 

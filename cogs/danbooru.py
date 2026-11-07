@@ -19,7 +19,7 @@ import bs4
 import requests
 from discord.ext import commands
 
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 
 # Danbooru's Cloudflare rejects the default python-requests User-Agent (and
 # spoofed browser UAs) with an HTML challenge page; an honest bot UA passes.
@@ -168,7 +168,6 @@ class Danbooru(commands.Cog):
         "Search Danbooru for an image matching space-separated tags and return "
         "its URL, tags, score, and favs. Outside NSFW-marked channels the "
         "search is forced to rating:general. Does not post anything.",
-        PermissionLevel.EVERYONE,
         params=[
             OpParam("channel", ParamKind.CHANNEL,
                     "Channel the result is intended for; its NSFW flag decides "

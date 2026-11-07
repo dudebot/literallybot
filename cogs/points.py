@@ -1,7 +1,7 @@
 from discord.ext import commands
 import discord
 from core.permissions import is_admin
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 from core.points import get_points, add_points, set_points
 
 
@@ -101,7 +101,6 @@ class Points(commands.Cog):
     @op(
         "get_user_points",
         "Read a user's point balance. Does not change anything.",
-        PermissionLevel.EVERYONE,
         params=[
             OpParam("user", ParamKind.MEMBER, "Member whose balance to read."),
         ],
@@ -117,7 +116,6 @@ class Points(commands.Cog):
     @op(
         "add_user_points",
         "Add points to a user (negative amount subtracts). Negative balances are allowed.",
-        PermissionLevel.ADMIN,
         params=[
             OpParam("user", ParamKind.MEMBER, "Member to credit or debit."),
             OpParam("amount", ParamKind.INTEGER, "Points to add; negative subtracts."),
@@ -134,7 +132,6 @@ class Points(commands.Cog):
     @op(
         "set_user_points",
         "Set a user's point balance to an exact signed amount.",
-        PermissionLevel.ADMIN,
         params=[
             OpParam("user", ParamKind.MEMBER, "Member whose balance to set."),
             OpParam("amount", ParamKind.INTEGER, "New balance (negative balances allowed)."),

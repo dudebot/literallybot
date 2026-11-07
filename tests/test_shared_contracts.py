@@ -5,7 +5,7 @@ from types import SimpleNamespace as NS
 import discord
 import pytest
 from discord.ext import commands
-from core.ops import op, PermissionLevel
+from core.ops import op
 from core.permissions import get_superadmins, is_superadmin, is_admin
 from cogs.setrole import SetRole, TOGGLES_KEY, _emoji_matches
 
@@ -13,7 +13,7 @@ from cogs.setrole import SetRole, TOGGLES_KEY, _emoji_matches
 @pytest.mark.asyncio
 async def test_bot_cog_lifecycle_registers_and_removes_operations(isolated_bot_module):
     class Example(commands.Cog):
-        @op('test_example_action', 'Example action.', PermissionLevel.EVERYONE,
+        @op('test_example_action', 'Example action.',
             params=[], serialize=lambda result: result)
         async def action(self, ctx):
             return {'value': 1}

@@ -164,7 +164,7 @@ in [security.md](security.md).
 ## Registering ops from a cog
 
 An **op** is one atomic Discord-affecting capability, declared once in the ops
-registry (`core/ops.py`) with its permission requirement and typed parameters.
+registry (`core/ops.py`) with its typed parameters and behavior.
 Every frontend — the in-chat agent loop, the MCP server, the `!aisettings`
 panel — is *generated* from those declarations. Registering an op makes it
 available for selection without frontend code; the configured exposure gates
@@ -260,7 +260,7 @@ it does not touch the registry at import time. Shared `core/` services do not
 register behavioral tools themselves.
 
 ```python
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 
 
 def _serialize_toggle(result: dict) -> dict:
@@ -283,7 +283,6 @@ class SetRole(commands.Cog):
         "given emoji grants or removes the role. If that emoji on that "
         "message already toggles a different role, nothing is written unless "
         "replace_existing is true.",
-        PermissionLevel.ADMIN,
         params=[
             OpParam("channel", ParamKind.CHANNEL,
                     "Channel containing the target message."),
@@ -330,7 +329,6 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 |-------|--------------|
 | **name** | Unique registry-wide (core ops included). A collision fails the whole cog's batch — pick something specific. This is the literal tool name a model sees. |
 | **description** | Written *for a model*, not a changelog. State what it does, what it returns, and what it does **not** do — and when the excluded action is another op's job, name that op instead of asserting nonexistence (descriptions claiming a sibling "is not an op" go stale the day it ships). |
-| **permission** | `PermissionLevel.EVERYONE` / `ADMIN` / `SUPERADMIN`, checked against the **invoking user** on every call, before any Discord id is resolved. Config never overrides this. |
 | **params** | Typed `OpParam`s. The registry generates the JSON schema *and* resolves Discord entities from ids — see the kinds below. |
 | **scope** | `OpScope.GUILD` / `DM` / `GLOBAL` / `SELF`. See below; this is a safety boundary, not a label. |
 | **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
@@ -393,13 +391,12 @@ names another member of the same guild. In a DM it is always the invoker.
 ```python
 from datetime import datetime, timezone
 
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 
 
 class Notes(commands.Cog):
     @op('read_notes',
         'Read the notes kept about a person, oldest first. Each note has a date.',
-        PermissionLevel.EVERYONE,
         params=[OpParam('user', ParamKind.SELF_USER, required=False)],
         scope=OpScope.SELF, group='notes', group_label='Notes')
     async def op_read_notes(self, ctx, user):
@@ -408,7 +405,6 @@ class Notes(commands.Cog):
     @op('write_note',
         'Save one short note about a person, in your own words. They can read '
         'and delete every note.',
-        PermissionLevel.EVERYONE,
         params=[OpParam('text', ParamKind.STRING, 'The note, at most 200 characters.'),
                 OpParam('user', ParamKind.SELF_USER, required=False)],
         agent_guidance=(
@@ -456,7 +452,7 @@ The agent and settings panel query the registry **live**; MCP builds its tool
 surface from the registry at server startup and keeps it until restart. Neither
 uses an import-time snapshot that misses loaded cogs. Registration makes an op
 eligible for exposure; frontend configuration selects exposure, and each call
-still passes the op's authorization gate. MCP's unset allowlist exposes the non-SELF
+is authorized by its frontend's configured access policy. MCP's unset allowlist exposes the non-SELF
 registered universe; registering a cog must not write exposure settings.
 
 When a cog is not loaded (disabled via `disabled_cogs`), its op names stay in
@@ -473,7 +469,7 @@ config.
       its frontend; declared send actions report what was sent
 - [ ] Name is unique registry-wide and reads as a tool name
 - [ ] Description written for a model, including what it does *not* do
-- [ ] `permission` is the tier you'd require of a human running it
+- [ ] Descriptions explain behavior without fixed ACL claims; configure access in `/aisettings`
 - [ ] `scope=OpScope.GUILD` only if it genuinely cannot act outside the guild
 - [ ] `group` is a kebab-case id; new cog groups use `group_label=` on `@op`, not a line in `OP_GROUPS`
 - [ ] The bot restarts cleanly twice in a row with the cog in the boot set
@@ -485,17 +481,16 @@ search service), `cogs/auto_response.py` (three ops sharing the admin
 panel's services — the modal was carrying the validation until they were
 factored out) and `cogs/media.py` (two ops: `list_media`, and
 `post_media`, which ACTS rather than returning data, because the `!<name>`
-surface it mirrors is public while a returned host path would be the
-admin-gated attachment surface in disguise).
+surface it mirrors uses library names rather than host filesystem paths).
 
 ### Media tools and discovery
 
 The media cog already supplies two behavioral primitives:
 
-| Tool | Action | Permission floor |
+| Tool | Action | Access |
 |------|--------|------------------|
-| `list_media(guild_id?)` | Return sorted filenames; MCP must select a guild, chat defaults to the invoking guild | Everyone |
-| `post_media(channel_id, name)` | Send the matching library file to a visible guild channel | Everyone |
+| `list_media(guild_id?)` | Return sorted filenames; MCP must select a guild, chat defaults to the invoking guild | Configured in `/aisettings` |
+| `post_media(channel_id, name)` | Send the matching library file to a visible guild channel | Configured in `/aisettings` |
 
 `post_media` accepts a filename or prefix of at least two characters, like
 `!<name>`. Prefer a full filename returned by `list_media` when discovering
@@ -503,7 +498,7 @@ an item. A successful result contains `status`, the matched `name`, and
 `message_id`; the attachment has already been sent. Use `stay_quiet` when
 the in-chat request needs only the clip and no final reply. Paths are never
 returned. Addition and deletion remain admin-panel actions (`/media`).
-If exposed later, both should have ADMIN floors and share panel services;
+If exposed later, both should share panel services and use configured tool access;
 deletion should take an exact filename, and download failures must produce
 tool errors rather than successful human-readable error strings.
 

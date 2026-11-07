@@ -87,22 +87,22 @@ def test_disabled_cogs_cannot_remove_the_recovery_surface(config, tmp_path, monk
 
 @pytest.mark.asyncio
 async def test_cog_registration_is_atomic_and_binds_the_live_instance(config, isolated_bot_module, tmp_path):
-    from core.ops import OpContext, OpScope, PermissionLevel, op
+    from core.ops import OpContext, OpScope, op
 
     from discord.ext import commands
 
     class Working(commands.Cog):
-        @op('probe', 'Return instance state.', PermissionLevel.EVERYONE,
+        @op('probe', 'Return instance state.',
             scope=OpScope.SELF, sequential=True, group='test')
         async def probe(self, ctx):
             return {'value': self.value}
 
     class Collision:
-        @op('new_probe', 'Would register before the collision.', PermissionLevel.EVERYONE)
+        @op('new_probe', 'Would register before the collision.')
         async def a(self, ctx):
             pass
 
-        @op('probe', 'Collides with the loaded cog.', PermissionLevel.EVERYONE)
+        @op('probe', 'Collides with the loaded cog.')
         async def z(self, ctx):
             pass
 

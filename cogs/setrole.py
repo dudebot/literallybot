@@ -31,7 +31,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 from core.permissions import is_admin
 
 TOGGLES_KEY = "emoji_role_toggles"
@@ -509,7 +509,6 @@ class SetRole(commands.Cog):
         "given emoji grants or removes the role. If that emoji on that "
         "message already toggles a different role, nothing is written unless "
         "replace_existing is true.",
-        PermissionLevel.ADMIN,
         params=[
             OpParam("channel", ParamKind.CHANNEL,
                     "Channel containing the target message."),
@@ -546,7 +545,6 @@ class SetRole(commands.Cog):
         "Reconcile this guild's configured emoji role toggles: re-add missing "
         "bot reactions, fill in channel ids for legacy entries, and report "
         "broken ones. Never deletes a configured toggle.",
-        PermissionLevel.ADMIN,
         serialize=_serialize_sync,
         agent_guidance=(
             "Entries reported with a status other than 'ok' are broken "
@@ -575,8 +573,7 @@ class SetRole(commands.Cog):
             ],
         }
 
-    @op("list_emoji_role_toggles", "List stored role toggles and observable health; does not repair.",
-        PermissionLevel.ADMIN, serialize=lambda result: result,
+    @op("list_emoji_role_toggles", "List stored role toggles and observable health; does not repair.", serialize=lambda result: result,
         scope=OpScope.GUILD, group="role-automation", group_label="Role automation")
     async def op_list_emoji_role_toggles(self, ctx):
         if ctx.guild is None:
@@ -603,7 +600,6 @@ class SetRole(commands.Cog):
         return {"entries": rows, "count": len(rows)}
 
     @op("remove_emoji_role_toggle", "Remove a stored message/emoji binding and its bot reaction.",
-        PermissionLevel.ADMIN,
         params=[OpParam("message_id", ParamKind.SNOWFLAKE, "Message ID from list."),
                 OpParam("emoji", ParamKind.STRING, "Emoji from list.")],
         serialize=lambda result: result,

@@ -15,7 +15,7 @@ from core.permissions import is_admin, is_superadmin
 from core.messages import recursive_split, sanitize_outbound_text
 from core.llm import LLMClient, PROVIDER_ALIASES, DEFAULT_PROVIDER
 from core.ops import ORIGIN_COG, ORIGIN_CORE, OpContext, OpScope, registry
-from core.agent_gate import agent_universe, resolve_agent_tools, guild_call_requires_admin
+from core.agent_gate import agent_universe, resolve_agent_tools, guild_call_denied
 from core.agent_loop import (run_agent_turn, log_agentic_usage,
                              build_agentic_guidance, MESSAGE_ID_GUIDANCE)
 from core.agent_gate import (
@@ -654,7 +654,7 @@ class Gpt(commands.Cog):
             self.llm, provider_config, api_messages, ctx, tool_names,
             f"[COMMAND from user {ctx.author.id}] {question}", metadata,
             guild_tool_budget(self.bot.config, ctx) if ctx.guild else 8,
-            logger=self.logger, gate_check=lambda name: guild_call_requires_admin(ctx, name),
+            logger=self.logger, gate_check=lambda name: guild_call_denied(ctx, name),
             on_tool_call=on_tool_call, log_usage=self._log_agentic_usage,
         )
 
@@ -2315,9 +2315,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
                             op_name: str, state: str):
         """Server tab: set one whitelisted op's per-guild agent gate to
         off/admin/everyone. Guild admins configure their OWN guild's agent
-        surface — this is not an escalation path: the op still enforces its
-        own PermissionLevel against the invoking user at call time, and the
-        super-admin whitelist is the ceiling this cannot exceed.
+        surface. These settings authorize agent calls; the super-admin whitelist
+        is the ceiling this cannot exceed.
 
         Storage is sparse: a choice EQUAL to the op's default is stored as an
         explicit override anyway (so the admin's intent survives a later

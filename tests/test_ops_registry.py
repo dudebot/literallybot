@@ -300,46 +300,6 @@ def test_purge_messages_filters_by_author():
 
 
 @pytest.mark.asyncio
-async def test_admin_gate_runs_before_resolution_and_rechecks_revocation(config):
-    from types import SimpleNamespace as NS
-    from unittest.mock import AsyncMock, Mock
-
-    guild = NS(id=7, owner=None)
-    message = NS(id=22, delete=AsyncMock())
-    channel = NS(id=10, guild=guild, fetch_message=AsyncMock(return_value=message))
-    message.channel = channel
-    bot = NS(config=config, user=NS(id=999), get_channel=Mock(return_value=channel))
-    ctx = OpContext(bot=bot, author=NS(id=1), guild=guild)
-    denied = await registry.call_ids('delete_message', ctx, channel_id='10', message_id='22')
-    assert not denied.ok and 'admin' in denied.error
-    bot.get_channel.assert_not_called()
-    config.set(7, 'admins', [1])
-    assert (await registry.call_ids('delete_message', ctx, channel_id='10', message_id='22')).ok
-    message.delete.assert_awaited_once()
-    config.set(7, 'admins', [])
-    assert not (await registry.call('delete_message', ctx, message=message)).ok
-    message.delete.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-async def test_guild_admin_cannot_run_superadmin_destruction(config):
-    from types import SimpleNamespace as NS
-    from unittest.mock import AsyncMock
-
-    guild = NS(id=7, owner=None)
-    bot = NS(config=config, user=NS(id=999))
-    ctx = OpContext(bot=bot, author=NS(id=1), guild=guild)
-    channel = NS(id=10, purge=AsyncMock(return_value=[]))
-    config.set(7, 'admins', [1])
-    denied = await registry.call('purge_messages', ctx, channel=channel, limit=10)
-    assert not denied.ok and 'superadmin' in denied.error
-    channel.purge.assert_not_called()
-    config.set_global('superadmins', [1])
-    assert (await registry.call('purge_messages', ctx, channel=channel, limit=10)).ok
-    channel.purge.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_channel_resolution_cannot_escape_the_invoking_guild():
     from types import SimpleNamespace as NS
     from unittest.mock import AsyncMock
@@ -374,7 +334,7 @@ async def test_snowflake_wire_values_preserve_precision_and_hide_internal_contro
 
 
 @pytest.mark.asyncio
-async def test_public_send_cannot_ping_or_read_host_attachments(config, tmp_path):
+async def test_send_suppresses_mentions_and_supports_attachments_after_frontend_authorization(config, tmp_path):
     from types import SimpleNamespace as NS
     from unittest.mock import AsyncMock
 
@@ -386,9 +346,11 @@ async def test_public_send_cannot_ping_or_read_host_attachments(config, tmp_path
     assert not mentions.everyone and not mentions.users and not mentions.roles
     attachment = tmp_path / 'private.png'
     attachment.write_bytes(b'private data')
-    denied = await registry.call('send_message', ctx, channel=channel, file_paths=[str(attachment)])
-    assert not denied.ok and 'admin' in denied.error.lower()
-    channel.send.assert_awaited_once()
+    result = await registry.call('send_message', ctx, channel=channel, file_paths=[str(attachment)])
+    assert result.ok
+    assert channel.send.await_count == 2
+    assert channel.send.await_args.kwargs['files'][0].filename == 'private.png'
+    channel.send.await_args.kwargs['files'][0].close()
 
 
 def test_history_cursors_preserve_chronology_without_new_api():
@@ -405,12 +367,12 @@ def test_history_cursors_preserve_chronology_without_new_api():
 @pytest.mark.asyncio
 async def test_self_dispatch_binds_invoker_and_rejects_identity_in_both_paths():
     from types import SimpleNamespace as NS
-    from core.ops import OpsRegistry, OpScope, PermissionLevel, OpParam, ParamKind
+    from core.ops import OpsRegistry, OpScope, OpParam, ParamKind
 
     reg = OpsRegistry()
     saved = {}
 
-    @reg.op('save_value', 'Save own value.', PermissionLevel.EVERYONE,
+    @reg.op('save_value', 'Save own value.',
             scope=OpScope.SELF, params=[OpParam('text', ParamKind.STRING)])
     async def save(ctx, text):
         saved[ctx.author.id] = text
@@ -432,7 +394,7 @@ async def test_self_dispatch_binds_invoker_and_rejects_identity_in_both_paths():
                   OpParam('recipient', ParamKind.USER),
                   OpParam('token', ParamKind.INTERNAL)):
         with pytest.raises(ValueError, match='SELF'):
-            reg.op('bad', 'Bad selector.', PermissionLevel.EVERYONE,
+            reg.op('bad', 'Bad selector.',
                    scope=OpScope.SELF, params=[param])(save)
 
 
@@ -441,7 +403,7 @@ async def test_self_dispatch_binds_invoker_and_rejects_identity_in_both_paths():
 async def test_self_user_is_the_invoker_unless_an_admin_names_a_member(config):
     from types import SimpleNamespace as NS
     from unittest.mock import AsyncMock
-    from core.ops import OpsRegistry, OpScope, PermissionLevel, OpParam, ParamKind
+    from core.ops import OpsRegistry, OpScope, OpParam, ParamKind
 
     reg = OpsRegistry()
 
@@ -450,9 +412,9 @@ async def test_self_user_is_the_invoker_unless_an_admin_names_a_member(config):
 
     for scope, required in ((OpScope.GUILD, False), (OpScope.SELF, True)):
         with pytest.raises(ValueError, match='SELF_USER'):
-            reg.op('bad', 'Bad.', PermissionLevel.EVERYONE, scope=scope,
+            reg.op('bad', 'Bad.', scope=scope,
                    params=[OpParam('user', ParamKind.SELF_USER, required=required)])(read)
-    reg.op('read_record', 'Read a record.', PermissionLevel.EVERYONE, scope=OpScope.SELF,
+    reg.op('read_record', 'Read a record.', scope=OpScope.SELF,
            params=[OpParam('user', ParamKind.SELF_USER, required=False)])(read)
 
     member = NS(id=2, bot=False)
@@ -476,16 +438,16 @@ async def test_self_user_is_the_invoker_unless_an_admin_names_a_member(config):
 
 
 def test_self_user_ops_are_listed_as_user_tools():
-    from core.ops import OpScope, PermissionLevel, OpParam, ParamKind, op
+    from core.ops import OpScope, OpParam, ParamKind, op
     from cogs.gpt import tool_tab_sections
 
     class Records:
-        @op('record_test_read', 'Read a record.', PermissionLevel.EVERYONE, scope=OpScope.SELF,
+        @op('record_test_read', 'Read a record.', scope=OpScope.SELF,
             group='records-test', params=[OpParam('user', ParamKind.SELF_USER, required=False)])
         async def read(self, ctx, user):
             return None
 
-        @op('record_test_feature', 'A feature.', PermissionLevel.EVERYONE,
+        @op('record_test_feature', 'A feature.',
             scope=OpScope.SELF, group='records-test')
         async def feature(self, ctx):
             return None

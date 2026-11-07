@@ -31,7 +31,7 @@ from typing import Any, List
 from pydantic_ai import Tool
 
 from core.ops import Op, OpScope, registry
-from core.agent_gate import self_call_allowed, resolve_agent_tools, guild_call_requires_admin
+from core.agent_gate import self_call_allowed, resolve_agent_tools, guild_call_denied
 from core.llm import AgentRunLimitExceeded
 from core.tool_telemetry import record_run
 
@@ -123,24 +123,21 @@ def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
             logger.warning("agent-op %s actor=%s refused: turn invalid", op.name, ctx.author.id)
             entry["status"] = "refused_invalid"
             return {"ok": False, "error": "Turn is no longer valid."}
-        # Per-guild admin gate, re-evaluated LIVE at dispatch (not a snapshot):
-        # a server admin set this op to "admin only" for agent use and the
-        # invoking user is not an admin. Refuse before spending budget or
-        # touching Discord. (Admins and "everyone"-gated ops pass; the op's own
-        # hardcoded floor is still enforced by registry.call_ids below.)
+        # Re-read configured access before spending budget or resolving IDs.
         denied = (not self_call_allowed(ctx, op) if op.scope == OpScope.SELF else
-                  (gate_check or (lambda name: guild_call_requires_admin(ctx, name)))(op.name))
+                  (gate_check or (lambda name: guild_call_denied(ctx, name)))(op.name))
         if denied:
             logger.warning(
-                "agent-op %s actor=%s REFUSED (guild gate: admin only)",
+                "agent-op %s actor=%s REFUSED (configured tool access)",
                 op.name, ctx.author.id,
             )
             entry["status"] = "refused_gate"
             return {"ok": False,
                     "error": ("SELF tool is not permitted for this invoker."
                               if op.scope == OpScope.SELF else
-                              f"'{op.name}' is set to admin-only for the agent in "
-                              "this server; a server admin must ask for it.")}
+                              f"Configured access denied for '{op.name}' for the invoking "
+                              "user. Check /aisettings for this server. This was "
+                              "blocked locally; no Discord action was attempted.")}
         budget["used"] += 1
         remaining = budget["cap"] - budget["used"]
         if remaining < 0:

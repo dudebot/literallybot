@@ -39,7 +39,7 @@ from functools import lru_cache
 
 import re2
 
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 from core.panels import InvokerOnlyView, panel_slash_pin
 from core.permissions import is_admin
 
@@ -314,7 +314,6 @@ class AutoResponse(commands.Cog):
         "List this guild's configured auto-responses in config order. The "
         "index of each entry is what edit_autoresponse takes, and the order "
         "is the precedence: the FIRST matching entry wins.",
-        PermissionLevel.ADMIN,
         serialize=_serialize_entry_list,
         agent_guidance=(
             "Indexes shift when an entry is deleted — list again before a "
@@ -336,7 +335,6 @@ class AutoResponse(commands.Cog):
         "the triggers, the bot replies with one of the responses picked at "
         "random. Appends a new entry; it never edits or replaces an existing "
         "one. Capped at 25 entries per guild.",
-        PermissionLevel.ADMIN,
         params=[
             OpParam("triggers", ParamKind.STRING_LIST,
                     "Trigger strings (case-insensitive except in regex mode)."),
@@ -375,7 +373,6 @@ class AutoResponse(commands.Cog):
 
     @op(
         "edit_autoresponse", "Edit an entry in place, or delete it. Re-list after deletion.",
-        PermissionLevel.ADMIN,
         params=[
             OpParam("index", ParamKind.INTEGER, "Index from list_autoresponses.", minimum=0),
             OpParam("triggers", ParamKind.STRING_LIST, "Replacement triggers.", required=False),

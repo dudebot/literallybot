@@ -15,7 +15,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 from core.permissions import is_admin
 from core.panels import panel_slash_pin
 
@@ -135,7 +135,6 @@ class Counter(commands.Cog):
         "Strict (deletes non-counts) when the bot has Manage Messages, otherwise "
         "non-strict (reacts to wrong numbers). Uses existing channel history; "
         "does not clear messages or award rewards.",
-        PermissionLevel.ADMIN,
         params=[OpParam("channel", ParamKind.CHANNEL, "Server text channel."),
                 OpParam("action", ParamKind.STRING, "enable or disable")],
         scope=OpScope.GUILD, group="counting", group_label="Counting")

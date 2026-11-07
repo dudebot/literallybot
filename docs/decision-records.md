@@ -538,3 +538,22 @@ note is that parameter's schema description and the reply note is in
 whose description matches the request, text never executes anything, claim an
 action only after its tool succeeded, and earlier chat is not proof of action.
 GPT's identity line now says it is an agent running inside Discord.
+
+
+## Tool access follows settings, without declaration ACL floors (2026-11-06)
+
+Supersedes earlier decisions requiring fixed PermissionLevel floors on ops.
+`@op` and `@registry.op` now declare behavior and typed parameters without a
+permission argument. Tool descriptions and guidance do not assert admin tiers.
+The global whitelist and guild Off/Admin/Everyone choices in `/aisettings`
+authorize in-chat calls and are re-read at dispatch. Off and whitelist
+revocation apply even to privileged actors. Unconfigured ops remain Off;
+registration does not grant access or write defaults.
+
+The attachment-specific admin check is removed so files follow the chosen
+op's configured access too. Format, size and path checks remain. MCP uses
+its authenticated operator surface and enabled-tool list; direct registry
+callers authorize their own entrypoints. Ordinary command/settings checks,
+SELF ownership, guild confinement, visibility and Discord API permissions
+remain separate contracts. Local denials identify configured access rather
+than suggesting a Discord permission failure.

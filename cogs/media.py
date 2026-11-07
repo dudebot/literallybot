@@ -8,8 +8,7 @@ identical prefix rule.
 
 `post_media` deliberately SENDS rather than returning a host path: the
 library is public (any member can post any item with `!<name>`), whereas
-handing back a filesystem path would be the admin-gated attachment surface
-in disguise (`_require_admin_for_attachments` in core/ops.py).
+the library interface resolves names without returning host filesystem paths.
 """
 import os
 import tempfile
@@ -24,7 +23,7 @@ import yt_dlp
 import requests
 from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
 from core.media_library import guild_media_dir, guild_media_files, safe_media_directory
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 from core.panels import InvokerOnlyView, panel_slash_pin
 from core.permissions import is_admin
 
@@ -403,15 +402,14 @@ class Media(commands.Cog):
     # --- ops --------------------------------------------------------------
     #
     # Registered against the live cog instance by LiterallyBot.add_cog and
-    # dropped on unload. EVERYONE, matching `!<name>`: the library is a
-    # public surface, and adding/deleting items stays behind the admin panel.
+    # dropped on unload. Access follows tool settings. Adding/deleting
+    # library items stays behind the admin panel.
 
     @op(
         "list_media",
         "List the names of the media files in this guild's library. Any of "
         "them can be posted with post_media (or by a user typing !<name>). "
         "Returns names only, not file paths, and does not post anything.",
-        PermissionLevel.EVERYONE,
         params=[
             OpParam("guild", ParamKind.GUILD,
                     "Server whose library to list. Required over MCP; "
@@ -437,7 +435,6 @@ class Media(commands.Cog):
         "Post a file from this guild's media library into a channel. The name "
         "matches by prefix, the same way !<name> does, and must be at least 2 "
         "characters. This SENDS the file — do not also send_message with it.",
-        PermissionLevel.EVERYONE,
         params=[
             OpParam("channel", ParamKind.CHANNEL, "Channel to post the file in."),
             OpParam("name", ParamKind.STRING,

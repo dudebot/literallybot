@@ -2,11 +2,10 @@
 
 The "world pattern": one ops layer, many frontends. Every atomic Discord
 action (send a message, add a role, ...) is registered here exactly once,
-with its permission requirement declared alongside it. Any frontend — an
-in-bot agent loop, a slash-command cog, an MCP server — calls into the same
-`registry.call(op_name, ctx, **kwargs)` and gets the same permission
-enforcement and the same error shape back. No frontend re-implements
-Discord call plumbing or permission checks.
+with typed parameters and behavioral descriptions. Frontends authorize
+access before calling the shared registry: the in-chat agent uses live
+/aisettings policy, while MCP uses its authenticated operator surface.
+The registry shares Discord resolution, confinement and result handling.
 
 Ops are self-describing: each op declares its parameters as typed
 `OpParam`s (Discord entities are ids on the wire — channel_id, message_id,
@@ -47,11 +46,8 @@ module-level `op(...)` decorator, and `bot.py` calls
 discord.py cog lifecycle. It only knows how to run an op against an
 `OpContext`.
 
-Permission gates route through `core.permissions.is_admin` / `is_superadmin`,
-the same helpers `cogs/cleanup.py` and `cogs/setrole.py`
-already use via `@commands.check(...)`. Those helpers expect a duck-typed
-ctx with `.author`, `.guild`, and `.bot.config` — `OpContext` below mirrors
-that shape so the existing helpers work unmodified.
+OpContext mirrors the invoking actor and guild. Tool access is configured
+by the frontend rather than declared as a fixed permission floor.
 
 Frontends: core/mcp_server.py (MCP) and core/agent_loop.py (in-bot agent
 loop) both generate their tool surfaces from this registry.
@@ -67,14 +63,14 @@ import inspect
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from enum import Enum, IntEnum
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import discord
 
 from core.dm_log import list_dm_users, load_dms, log_dm, row_from_message
-from core.permissions import is_admin, is_superadmin
+from core.permissions import is_admin
 from core.messages import sanitize_outbound_text
 
 # Most keywords one search_history call runs (one index query each).
@@ -92,14 +88,6 @@ ATTACHMENT_EXTENSIONS = frozenset({
     ".gif", ".png", ".jpg", ".jpeg", ".webp", ".mp4", ".webm",
     ".mov", ".pdf", ".txt", ".opus", ".ogg", ".mp3", ".wav",
 })
-
-
-class PermissionLevel(IntEnum):
-    """Ordered so a numeric comparison also makes sense, but permission
-    checks below dispatch by exact level rather than relying on ordering."""
-    EVERYONE = 0
-    ADMIN = 1
-    SUPERADMIN = 2
 
 
 class OpScope(str, Enum):
@@ -136,21 +124,21 @@ OP_GROUPS: Dict[str, str] = {
     "guild-info": "Guild info",
     # Member-state writes (nickname, timeout) live apart from "roles" and
     # "guild-info": the reads stay browsable in guild-info, while this group
-    # collects the ADMIN member-moderation write surface.
+    # collects the member-moderation write surface.
     "members": "Members",
     # Moderation reads (ban list, automod rules). The ban/kick/prune WRITES
-    # live in the NEEDS_OWNER-tier "members" surface below (ADMIN+ floors).
+    # live in the destructive "members" surface below.
     "moderation": "Moderation",
     # Voice-state reads and the reversible client-parity voice writes
     # (move/disconnect/server-mute/deafen/stage suppress) from the 2026-08
     # voice-domain pass. Bot voice PRESENCE (connect/play audio) is out of
     # scope — a stateful gateway session, not an atomic op.
     "voice": "Voice",
-    # Guild scheduled events (2026-08 voice-domain pass): reads for everyone,
-    # create/edit for admins. Delete/cancel lives in the NEEDS_OWNER tier
+    # Guild scheduled events (2026-08 voice-domain pass). Delete/cancel lives
+    # in the destructive surface
     # (delete_scheduled_event) — it destroys the accrued RSVP list.
     "events": "Scheduled events",
-    # Invite lifecycle (2026-08 expressive-domain pass): admin list/create/
+    # Invite lifecycle (2026-08 expressive-domain pass): list/create/
     # revoke. Webhook CRUD + execute live in the NEEDS_OWNER-tier "webhooks"
     # group below — a webhook URL is a persistent unauthenticated posting
     # credential.
@@ -295,8 +283,8 @@ class OpContext:
 @dataclass
 class OpResult:
     """Uniform result shape every op returns — frontends branch on `.ok`
-    rather than catching exceptions, so a failed permission check and a
-    failed Discord API call look the same to a caller."""
+    rather than catching exceptions. Target validation and Discord API
+    failures use the same result shape."""
     ok: bool
     value: Any = None
     error: Optional[str] = None
@@ -519,7 +507,6 @@ def _message_search_text(message: Any) -> str:
 class Op:
     name: str
     description: str
-    permission: PermissionLevel
     impl: Callable[..., Any]
     params: List[OpParam] = field(default_factory=list)
     serialize: Optional[Callable[[Any], Dict[str, Any]]] = None
@@ -558,10 +545,7 @@ class Op:
 
         Always off: an op the super-admin has whitelisted still does not
         reach a guild's members until a guild admin picks Admin or Everyone
-        in /aisettings. PermissionLevel is the invoke floor, not the agent
-        default — mapping EVERYONE-floor ops to gate "everyone" would make
-        a single whitelist tick expose send_message (and friends) to every
-        member."""
+        in /aisettings. Declarations do not grant access."""
         return "off"
 
     async def __call__(self, ctx: OpContext, **kwargs) -> OpResult:
@@ -569,9 +553,6 @@ class Op:
             reason = self.self_call_error(ctx, kwargs)
             if reason:
                 return OpResult(ok=False, error=reason)
-        allowed, reason = _check_permission(ctx, self.permission)
-        if not allowed:
-            return OpResult(ok=False, error=reason)
         for p in self.params:
             if p.kind == ParamKind.SELF_USER:
                 try:
@@ -912,25 +893,6 @@ def _is_guild_channel(value: Any) -> bool:
     )
 
 
-def _check_permission(ctx: OpContext, level: PermissionLevel) -> "tuple[bool, Optional[str]]":
-    """Route to core.permissions.is_admin / is_superadmin, the same gates the
-    existing cogs use via @commands.check(...). Those helpers read
-    ctx.bot.config, ctx.author, and ctx.guild — see OpContext's docstring."""
-    if level == PermissionLevel.EVERYONE:
-        return True, None
-    if ctx is None or ctx.author is None:
-        return False, "No actor on context; cannot check permissions."
-    if level == PermissionLevel.SUPERADMIN:
-        if is_superadmin(ctx):
-            return True, None
-        return False, "Requires superadmin."
-    if level == PermissionLevel.ADMIN:
-        if is_admin(ctx):
-            return True, None
-        return False, "Requires admin."
-    return False, f"Unknown permission level: {level!r}"
-
-
 @dataclass(frozen=True)
 class OpSpec:
     """An op declaration attached to a cog method by the module-level
@@ -943,7 +905,6 @@ class OpSpec:
     """
     name: str
     description: str
-    permission: PermissionLevel
     params: Tuple[OpParam, ...] = ()
     serialize: Optional[Callable[[Any], Dict[str, Any]]] = None
     agent_guidance: Optional[str] = None
@@ -959,7 +920,7 @@ class OpSpec:
 OP_SPEC_ATTR = "__op_spec__"
 
 
-def op(name: str, description: str, permission: PermissionLevel,
+def op(name: str, description: str, *,
        params: Optional[List[OpParam]] = None,
        serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
        agent_guidance: Optional[str] = None,
@@ -973,7 +934,7 @@ def op(name: str, description: str, permission: PermissionLevel,
     functions remain ordinary Python functions. The spec is inert at import.
 
         class MyCog(commands.Cog):
-            @op("do_thing", "Does the thing.", PermissionLevel.ADMIN)
+            @op("do_thing", "Does the thing.")
             async def do_thing(self, ctx, ...): ...
 
     The spec is attached to the function; `registry.register_cog_ops(cog)`
@@ -988,7 +949,7 @@ def op(name: str, description: str, permission: PermissionLevel,
             raise TypeError(f"Function already declares op "
                             f"'{getattr(func, OP_SPEC_ATTR).name}'; one op per function.")
         setattr(func, OP_SPEC_ATTR, OpSpec(
-            name=name, description=description, permission=permission,
+            name=name, description=description,
             params=tuple(params or []), serialize=serialize,
             agent_guidance=agent_guidance, scope=scope, group=group,
             group_label=group_label, sequential=sequential,
@@ -997,7 +958,7 @@ def op(name: str, description: str, permission: PermissionLevel,
     return decorator
 
 
-def _build_op(*, name: str, description: str, permission: PermissionLevel,
+def _build_op(*, name: str, description: str,
               impl: Callable[..., Any], params: Optional[List[OpParam]],
               serialize: Optional[Callable[[Any], Dict[str, Any]]],
               agent_guidance: Optional[str], scope: OpScope, group: str,
@@ -1057,7 +1018,7 @@ def _build_op(*, name: str, description: str, permission: PermissionLevel,
                 )
             seen_wire.add(wn)
     return Op(
-        name=name, description=description, permission=permission,
+        name=name, description=description,
         impl=impl, params=list(params or []), serialize=serialize,
         agent_guidance=agent_guidance, scope=scope, group=group,
         group_label=group_label, origin=origin, owner=owner, sequential=sequential,
@@ -1094,13 +1055,13 @@ class OpsRegistry:
         self._extra_groups = {g: lab for g, lab in self._extra_groups.items()
                               if g in used}
 
-    def op(self, name: str, description: str, permission: PermissionLevel,
+    def op(self, name: str, description: str, *,
            params: Optional[List[OpParam]] = None,
            serialize: Optional[Callable[[Any], Dict[str, Any]]] = None,
            agent_guidance: Optional[str] = None,
            scope: OpScope = OpScope.GUILD,
            group: str = "messaging", sequential: bool = False):
-        """Decorator: `@registry.op("name", "...", PermissionLevel.ADMIN)`
+        """Decorator: `@registry.op("name", "...")`
         registers an `async def impl(ctx, **kwargs)` under `name`.
 
         This is the CORE registration path — ops registered through it are
@@ -1110,7 +1071,7 @@ class OpsRegistry:
         """
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
             self._insert(_build_op(
-                name=name, description=description, permission=permission,
+                name=name, description=description,
                 impl=func, params=params, serialize=serialize,
                 agent_guidance=agent_guidance, scope=scope, group=group,
                 origin=ORIGIN_CORE, owner=None, sequential=sequential,
@@ -1237,7 +1198,7 @@ class OpsRegistry:
             claimed[spec.name] = attr
             batch.append(_build_op(
                 name=spec.name, description=spec.description,
-                permission=spec.permission, impl=bound,
+                impl=bound,
                 params=list(spec.params), serialize=spec.serialize,
                 agent_guidance=spec.agent_guidance, scope=spec.scope,
                 group=spec.group, group_label=spec.group_label,
@@ -1278,7 +1239,7 @@ class OpsRegistry:
                        **raw) -> OpResult:
         """Id-based invocation: resolve wire params (channel_id, message_id,
         user_id, role_id, guild_id + scalars) to live objects, then run the
-        op with the same permission gates as `call()`.
+        op with the same scope and visibility boundaries as `call()`.
 
         Guild confinement is CALLER policy: pass `allowed_guild_ids` to
         confine id-resolved targets to those guilds (the in-bot agent loop
@@ -1292,17 +1253,12 @@ class OpsRegistry:
             return OpResult(ok=False, error=f"Unknown op: {op_name}")
         if allowed_guild_ids is not None:
             allowed_guild_ids = frozenset(allowed_guild_ids)
-        # Gate BEFORE resolution: an unauthorized caller must not be able to
-        # trigger Discord fetches (channel/message/member lookups) as a side
-        # effect of a call it was never allowed to make. Op.__call__ checks
-        # again for the object-based `call()` path — cheap belt-and-suspenders.
+        # Validate SELF ownership before resolution; object-based calls
+        # repeat the same structural check in Op.__call__.
         if op.scope == OpScope.SELF:
             reason = op.self_call_error(ctx, raw)
             if reason:
                 return OpResult(ok=False, error=reason)
-        allowed, reason = _check_permission(ctx, op.permission)
-        if not allowed:
-            return OpResult(ok=False, error=reason)
         try:
             kwargs = await op.resolve_kwargs(ctx.bot, getattr(ctx, "guild", None),
                                              raw, allowed_guild_ids)
@@ -1367,17 +1323,6 @@ def load_discord_attachments(
     return [discord.File(path, filename=path.name) for path in resolved]
 
 
-def _require_admin_for_attachments(ctx: OpContext, file_paths) -> None:
-    """Attachments read the HOST filesystem, so they are admin-gated even on
-    ops whose text path is open to everyone — otherwise any user with the
-    agentic chat tools could exfiltrate server files into a channel."""
-    if not file_paths:
-        return
-    allowed, reason = _check_permission(ctx, PermissionLevel.ADMIN)
-    if not allowed:
-        raise ValueError(f"file attachments require admin: {reason}")
-
-
 def _serialize_sent_message(m) -> Dict[str, Any]:
     return {
         "message_id": m.id,
@@ -1390,11 +1335,10 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
 
 @registry.op(
     "send_message",
-    "Send a text message to a channel, optionally as a reply to an existing "
-    "message in that channel. Optional local file attachment(s) via "
-    "file_paths (server filesystem paths the bot can read; admin-only), and "
-    "an optional custom sticker from this guild via sticker_id.",
-    PermissionLevel.EVERYONE,
+    'Send a text message to a channel, optionally as a reply to an existing '
+    'message in that channel. Optional local file attachment(s) via '
+    'file_paths (server filesystem paths the bot can read), and an optional '
+    'custom sticker from this guild via sticker_id.',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to send into."),
@@ -1406,8 +1350,7 @@ def _serialize_sent_message(m) -> Dict[str, Any]:
                 "Optional message id in the same channel to reply to.",
                 required=False),
         OpParam("file_paths", ParamKind.STRING_LIST,
-                "Optional attachments: absolute server-side file paths "
-                "(gif/png/jpg/webp/mp4/…), max 10. Requires admin.",
+                'Optional attachments: absolute server-side file paths (gif/png/jpg/webp/mp4/…), max 10.',
                 required=False),
         OpParam("sticker_id", ParamKind.SNOWFLAKE,
                 "Optional custom sticker id to attach — must belong to "
@@ -1434,7 +1377,6 @@ async def send_message(ctx: OpContext, channel, content: str = "",
     # to ping anyone. An object-based caller that WANTS pings must pass an
     # explicit allowed_mentions. (Policy hoisted here from the agent-loop
     # and MCP frontends so no frontend can forget it.)
-    _require_admin_for_attachments(ctx, file_paths)
     text = sanitize_outbound_text(content if content is not None else "")
     if not str(text).strip() and not file_paths and sticker_id is None:
         raise ValueError("send_message requires non-empty content, a file "
@@ -1478,7 +1420,6 @@ async def send_message(ctx: OpContext, channel, content: str = "",
 @registry.op(
     "edit_message",
     "Edit the content of a message the bot previously sent.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Discord message id to edit (must be authored by the bot)."),
@@ -1494,13 +1435,11 @@ async def edit_message(ctx: OpContext, message, content: str):
 
 @registry.op(
     "delete_message",
-    "Delete a message. Requires admin — mirrors cogs/cleanup.py's "
-    "bulk-delete gate, which restricts message deletion to superadmin/admin.",
-    PermissionLevel.ADMIN,
+    "Delete a message. py's bulk-delete gate, which restricts message "
+    'deletion to superadmin/admin.',
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to delete.")],
     agent_guidance=(
-        "delete_message requires the invoking user to be a bot admin; if the "
-        "tool returns a permission error, relay that plainly."),
+        'If the tool returns an error, relay it plainly.'),
     scope=OpScope.GUILD,
     group="messaging",
 )
@@ -1512,7 +1451,6 @@ async def delete_message(ctx: OpContext, message):
 @registry.op(
     "add_reaction",
     "Add an emoji reaction to a message.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE, "Discord message id to react to."),
         OpParam("emoji", ParamKind.STRING,
@@ -1535,7 +1473,6 @@ async def add_reaction(ctx: OpContext, message, emoji: str):
     "Remove the bot's own emoji reaction from a message. Only reactions "
     "the bot itself added can be removed — other users' reactions are "
     "untouchable by design.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Discord message id to remove the bot's reaction from."),
@@ -1672,7 +1609,6 @@ def _require_actor_history_perm(ctx: OpContext, channel: Any) -> None:
     "Search FULL message history via Discord's search index (keyword "
     "matching like the Discord search bar) — the whole server at once, or "
     "one channel — optionally filtered by author id and/or a content keyword.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to search server-wide. Optional when the "
@@ -1844,7 +1780,6 @@ def _serialize_full_message(message: Any) -> Dict[str, Any]:
     "Read a single message by id: content, author, attachments (filename "
     "and url), embeds (title/description/fields), pinned flag, and jump_url. "
     "Pure read.",
-    PermissionLevel.EVERYONE,
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to read.")],
     serialize=_serialize_full_message,
     agent_guidance=(
@@ -1866,7 +1801,6 @@ async def get_message(ctx: OpContext, message):
     "with before_message_id, or forwards from a known point with "
     "after_message_id. For keyword or author-filtered search use "
     "search_history instead.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Channel to read."),
         OpParam("limit", ParamKind.INTEGER,
@@ -1915,9 +1849,7 @@ async def read_history(ctx: OpContext, channel, limit: int = 50,
 
 @registry.op(
     "add_role",
-    "Add a role to a member. Requires admin — self-service role assignment "
-    "is the reaction-role system's job (cogs/setrole.py), not this op's.",
-    PermissionLevel.ADMIN,
+    "Add a role to a member. py), not this op's.",
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member and role belong to (the API "
@@ -1938,8 +1870,7 @@ async def add_role(ctx: OpContext, member, role, guild=None):
 
 @registry.op(
     "remove_role",
-    "Remove a role from a member. Requires admin, mirroring add_role.",
-    PermissionLevel.ADMIN,
+    'Remove a role from a member.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member and role belong to (the API "
@@ -1960,9 +1891,7 @@ async def remove_role(ctx: OpContext, member, role, guild=None):
 
 @registry.op(
     "pin_message",
-    "Pin a message in its channel. Requires admin (pins are surfaced to "
-    "the whole channel and Discord itself caps pins at 50 per channel).",
-    PermissionLevel.ADMIN,
+    'Pin a message in its channel.',
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to pin.")],
     scope=OpScope.GUILD,
     group="messaging",
@@ -1974,9 +1903,7 @@ async def pin_message(ctx: OpContext, message):
 
 @registry.op(
     "unpin_message",
-    "Unpin a message in its channel. Requires admin (mirror of pin_message; "
-    "also the only way to manage Discord's 50-pin-per-channel cap).",
-    PermissionLevel.ADMIN,
+    'Unpin a message in its channel.',
     params=[OpParam("message", ParamKind.MESSAGE, "Discord message id to unpin.")],
     scope=OpScope.GUILD,
     group="messaging",
@@ -1991,7 +1918,6 @@ async def unpin_message(ctx: OpContext, message):
     "List a channel's pinned messages (newest pin first), each with its "
     "pinned_at timestamp. Read-only — use it before pin_message/"
     "unpin_message to manage the 50-pin cap.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Channel whose pins to list."),
         OpParam("limit", ParamKind.INTEGER,
@@ -2021,7 +1947,6 @@ async def list_pins(ctx: OpContext, channel, limit: int = 50):
     "create_thread",
     "Create a thread, either attached to an existing message or standalone "
     "on a channel.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to create the thread in."),
@@ -2057,7 +1982,6 @@ def _reaction_matches(reaction: Any, emoji: str) -> bool:
     "List the reactions on a message (emoji, count, whether the bot "
     "reacted). Pass emoji to also get the user ids who reacted with that "
     "emoji. Read-only.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Message whose reactions to list."),
@@ -2105,7 +2029,6 @@ async def list_reactions(ctx: OpContext, message, emoji: Optional[str] = None,
     "trigger_typing",
     "Show the bot's typing indicator in a channel for ~10 seconds (it "
     "self-expires; sending a message also clears it). Cosmetic only.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Channel to show the typing indicator in."),
@@ -2124,7 +2047,6 @@ async def trigger_typing(ctx: OpContext, channel):
     "Forward a message to another channel in the SAME guild (Discord's "
     "forward feature; the forward arrives as a new bot-owned message, "
     "deletable via delete_message). Cross-guild destinations are refused.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE, "Message to forward."),
         # A SNOWFLAKE scalar on purpose, NOT a second ParamKind.CHANNEL: the
@@ -2168,10 +2090,8 @@ async def forward_message(ctx: OpContext, message, destination_channel_id: int):
 
 @registry.op(
     "suppress_embeds",
-    "Hide (or restore) the embeds on a message — the link-preview boxes. "
-    "Requires admin: unlike edit_message it works on ANY message, not just "
-    "the bot's own. Fully reversible with suppress=false.",
-    PermissionLevel.ADMIN,
+    'Hide (or restore) the embeds on a message — the link-preview boxes. '
+    'Fully reversible with suppress=false.',
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Message whose embeds to hide/show."),
@@ -2192,7 +2112,6 @@ async def suppress_embeds(ctx: OpContext, message, suppress: bool = True):
     "Send a rich embed to a channel: title, description, link url, color, "
     "image, footer — all optional, but at least one of title/description/"
     "image_url is required. Never pings. Reversible via delete_message.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Channel to send into."),
         OpParam("title", ParamKind.STRING,
@@ -2245,7 +2164,6 @@ async def send_embed(ctx: OpContext, channel, title: Optional[str] = None,
     "Post a native Discord poll to a channel: a question and 2-10 answer "
     "options, open for duration_hours. The poll rides an ordinary message, "
     "so delete_message removes it.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Channel to post the poll in."),
@@ -2297,7 +2215,6 @@ def _require_message_poll(message: Any):
     "get_poll_results",
     "Read a poll's current tallies from its message: question, per-answer "
     "vote counts, expiry time, and whether it has finalized. Read-only.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Message carrying the poll to read."),
@@ -2326,7 +2243,6 @@ async def get_poll_results(ctx: OpContext, message):
     "End one of the BOT's own polls immediately, finalizing the results. "
     "Refuses polls on messages the bot did not author — mirroring "
     "edit_message's own-message discipline.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Bot-authored message carrying the poll to end."),
@@ -2348,7 +2264,6 @@ async def end_poll(ctx: OpContext, message):
     "List who voted for one poll answer (Discord polls are non-anonymous — "
     "the client shows this list to every channel member on click). Get the "
     "answer_id from get_poll_results. Read-only.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Message carrying the poll."),
@@ -2397,7 +2312,6 @@ async def get_poll_voters(ctx: OpContext, message, answer_id: int,
 @registry.op(
     "list_guilds",
     "List the guilds the bot is a member of (id and name).",
-    PermissionLevel.EVERYONE,
     params=[],
     serialize=lambda gs: {"guilds": gs, "count": len(gs)},
     scope=OpScope.GLOBAL,
@@ -2410,7 +2324,6 @@ async def list_guilds(ctx: OpContext):
 @registry.op(
     "list_channels",
     "List a guild's channels the bot can see (id, name, type).",
-    PermissionLevel.EVERYONE,
     params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
     serialize=lambda cs: {"channels": cs, "count": len(cs)},
     agent_guidance=(
@@ -2433,7 +2346,6 @@ async def list_channels(ctx: OpContext, guild):
     "List members who can see a channel and their online status "
     "(online/idle/dnd/offline). Same visibility as the Discord member "
     "sidebar for that channel.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id whose members to list."),
@@ -2483,9 +2395,6 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
 #
 # DM ops take a user id and nothing else — no membership check is needed,
 # because Discord itself refuses bot DMs to users who share no guild.
-# Consequence for the ADMIN gate: over guild-less frontends (MCP) there is
-# no guild admin list to consult, so DM ops are effectively superadmin-only
-# there; in-bot, ambient ctx.guild keeps the per-guild admin check.
 #
 # CONSENT IS DELIBERATELY NOT ENFORCED HERE. Whether a given user has opted in
 # is a per-deployment convention (one guild's opt-in role id is meaningless in
@@ -2501,7 +2410,6 @@ async def list_members(ctx: OpContext, channel, status: Optional[str] = None,
     "attachment(s) via file_paths. Discord only delivers bot DMs to users "
     "sharing at least one guild with the bot. NOTE: this op does not check "
     "whether the user consented to DMs — the caller owns that decision.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER, "Discord user id to DM."),
         OpParam("content", ParamKind.STRING,
@@ -2559,7 +2467,6 @@ async def send_dm(ctx: OpContext, user, content: str = "",
     "Read the stored DM transcript with a user, oldest first. Covers DMs "
     "exchanged since transcript storage was enabled — use fetch_dms for "
     "older history straight from Discord.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER, "Discord user id whose DMs to read."),
         OpParam("since", ParamKind.STRING,
@@ -2602,7 +2509,6 @@ async def read_dms(ctx: OpContext, user, since: Optional[str] = None,
     "Unlike read_dms this covers the full conversation history, including "
     "messages that predate transcript storage. Paginate backwards with "
     "before_message_id.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER,
                 "Discord user id whose DM history to fetch."),
@@ -2644,7 +2550,6 @@ async def fetch_dms(ctx: OpContext, user, limit: int = 50,
     "button for a mistaken send_dm. Refuses messages the bot did not "
     "author: Discord allows no way to delete the other participant's "
     "side of a DM.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER,
                 "Discord user id whose DM conversation holds the message."),
@@ -2680,7 +2585,6 @@ async def delete_dm(ctx: OpContext, user, message_id: int):
     "Edit a DM message the bot itself sent to a user — the fix-the-typo "
     "sibling of delete_dm. Refuses messages the bot did not author: "
     "Discord allows no way to edit the other participant's side of a DM.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER,
                 "Discord user id whose DM conversation holds the message."),
@@ -2746,7 +2650,6 @@ def _dm_conversation_rows(limit: int) -> List[Dict[str, Any]]:
     "user_name (null when the user is not in the bot's cache), and the "
     "timestamp of the newest stored row. Reads local transcript storage "
     "only — same privacy class as read_dms.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("limit", ParamKind.INTEGER,
                 "Max conversations to return (default 100, clamped to 1000).",
@@ -2777,7 +2680,6 @@ async def list_dm_conversations(ctx: OpContext, limit: int = 100):
     "lightweight acknowledgement of a user's DM without sending text. The "
     "DM mirror of add_reaction (whose MESSAGE param structurally cannot "
     "reach DM channels). Fully reversible via remove_dm_reaction.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER,
                 "Discord user id whose DM conversation holds the message."),
@@ -2809,7 +2711,6 @@ async def add_dm_reaction(ctx: OpContext, user, message_id: int, emoji: str):
     "conversation. Only reactions the bot itself added can be removed — "
     "the other participant's reactions are untouchable by design, "
     "mirroring the guild remove_reaction guarantee.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER,
                 "Discord user id whose DM conversation holds the message."),
@@ -2839,7 +2740,6 @@ async def remove_dm_reaction(ctx: OpContext, user, message_id: int,
     "List the pinned messages in a DM conversation, same row shape as "
     "read_dms/fetch_dms (direction in/out, attachments with filename+url). "
     "Read-only.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER,
                 "Discord user id whose DM conversation to read pins from."),
@@ -2890,7 +2790,6 @@ def _serialize_user_profile(u: Any) -> Dict[str, Any]:
     "— exactly what any Discord client renders for any user id. Guild-"
     "independent: works for DM correspondents who share no channel with "
     "the caller (use get_member for guild-specific facts like roles).",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("user", ParamKind.USER, "Discord user id to look up."),
     ],
@@ -2949,7 +2848,6 @@ def _guard_editable(role: Any):
     "list_roles",
     "List a guild's roles (id, name, color, position, member count), "
     "top of the hierarchy first.",
-    PermissionLevel.EVERYONE,
     params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
     serialize=lambda rs: {"roles": rs, "count": len(rs)},
     scope=OpScope.GUILD,
@@ -2964,7 +2862,6 @@ async def list_roles(ctx: OpContext, guild):
     "list_role_members",
     "List the members who hold a given role. Use list_roles first to find "
     "the role id. Bots are excluded unless include_bots is set.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id the role belongs to."),
         OpParam("role", ParamKind.ROLE, "Discord role id whose holders to list."),
@@ -3010,9 +2907,8 @@ async def list_role_members(ctx: OpContext, guild, role,
 
 @registry.op(
     "create_role",
-    "Create a new role in a guild. Requires admin. The role is created "
-    "unassigned; use add_role to grant it to members.",
-    PermissionLevel.ADMIN,
+    'Create a new role in a guild. The role is created unassigned; use '
+    'add_role to grant it to members.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to create the role in."),
         OpParam("name", ParamKind.STRING, "Role name."),
@@ -3044,8 +2940,7 @@ async def create_role(ctx: OpContext, guild, name: str, color: Optional[str] = N
 @registry.op(
     "edit_role",
     "Edit a role's name, color, hoist/mentionable flags, or hierarchy "
-    "position. Requires admin. Managed roles and @everyone are refused.",
-    PermissionLevel.ADMIN,
+    'position. Managed roles and @everyone are refused.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id the role belongs to."),
         OpParam("role", ParamKind.ROLE, "Discord role id to edit."),
@@ -3094,9 +2989,7 @@ async def edit_role(ctx: OpContext, guild, role, name: Optional[str] = None,
 
 @registry.op(
     "delete_role",
-    "Delete a role from a guild. Requires admin. Managed roles and "
-    "@everyone are refused.",
-    PermissionLevel.ADMIN,
+    'Delete a role from a guild. Managed roles and @everyone are refused.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id the role belongs to."),
         OpParam("role", ParamKind.ROLE, "Discord role id to delete."),
@@ -3197,7 +3090,6 @@ def load_emoji_image(file_path: str) -> bytes:
     "list_emojis",
     "List a guild's custom emoji (id, name, animated, and the exact string "
     "to use in a message or reaction).",
-    PermissionLevel.EVERYONE,
     params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
     serialize=lambda es: {"emojis": es, "count": len(es)},
     agent_guidance=(
@@ -3214,9 +3106,8 @@ async def list_emojis(ctx: OpContext, guild):
 
 @registry.op(
     "create_emoji",
-    "Upload a new custom emoji to a guild from a local image file. Requires "
-    "admin. Image must be png/jpg/gif/webp and under 256KB.",
-    PermissionLevel.ADMIN,
+    'Upload a new custom emoji to a guild from a local image file. Image must '
+    'be png/jpg/gif/webp and under 256KB.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to add the emoji to."),
         OpParam("name", ParamKind.STRING,
@@ -3239,7 +3130,6 @@ async def create_emoji(ctx: OpContext, guild, name: str, file_path: str):
     # Reads the HOST filesystem, so it carries the same admin gate as
     # send_message attachments even though the op is already ADMIN — keeping
     # the check explicit means the rule survives a future tier change.
-    _require_admin_for_attachments(ctx, [file_path])
     image = load_emoji_image(file_path)
     return await guild.create_custom_emoji(
         name=name, image=image,
@@ -3249,10 +3139,9 @@ async def create_emoji(ctx: OpContext, guild, name: str, file_path: str):
 
 @registry.op(
     "edit_emoji",
-    "Rename an existing custom emoji, and/or restrict it to specific roles "
-    "(role_ids; an empty list clears the restriction). Requires admin. "
-    "Managed (integration-owned) emoji are refused.",
-    PermissionLevel.ADMIN,
+    'Rename an existing custom emoji, and/or restrict it to specific roles '
+    '(role_ids; an empty list clears the restriction). Managed '
+    '(integration-owned) emoji are refused.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id the emoji belongs to."),
         OpParam("emoji_id", ParamKind.SNOWFLAKE,
@@ -3290,9 +3179,8 @@ async def edit_emoji(ctx: OpContext, guild, emoji_id: int, name: str,
 
 @registry.op(
     "delete_emoji",
-    "Delete a custom emoji from a guild. Requires admin. Managed "
-    "(integration-owned) emoji are refused.",
-    PermissionLevel.ADMIN,
+    'Delete a custom emoji from a guild. Managed (integration-owned) emoji '
+    'are refused.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id the emoji belongs to."),
         OpParam("emoji_id", ParamKind.SNOWFLAKE,
@@ -3402,7 +3290,6 @@ def load_sticker_file(file_path: str) -> Path:
     "List a guild's custom stickers (id, name, description, related emoji, "
     "format, image url). Use the id with send_message's sticker_id to send "
     "one.",
-    PermissionLevel.EVERYONE,
     params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to enumerate.")],
     serialize=lambda ss: {"stickers": ss, "count": len(ss)},
     agent_guidance=(
@@ -3418,10 +3305,9 @@ async def list_stickers(ctx: OpContext, guild):
 
 @registry.op(
     "create_sticker",
-    "Upload a new custom sticker to a guild from a local file. Requires "
-    "admin. File must be png/apng/gif/json(lottie) and under 512KB; Discord "
-    "also requires a description and a related unicode emoji.",
-    PermissionLevel.ADMIN,
+    'Upload a new custom sticker to a guild from a local file. File must be '
+    'png/apng/gif/json(lottie) and under 512KB; Discord also requires a '
+    'description and a related unicode emoji.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to add the sticker to."),
@@ -3445,12 +3331,11 @@ async def list_stickers(ctx: OpContext, guild):
     scope=OpScope.GUILD,
     group="emojis",
 )
-async def create_sticker(ctx: OpContext, guild, name: str, description: str,
+async def create_sticker(ctx: OpContext, guild, name: str, description: str, *,
                          emoji: str, file_path: str):
     # Reads the HOST filesystem — same explicit admin gate as create_emoji,
     # kept even though the op is already ADMIN so the rule survives a
     # future tier change.
-    _require_admin_for_attachments(ctx, [file_path])
     if not 2 <= len(str(name)) <= 30:
         raise ValueError(
             f"Sticker names must be 2-30 characters, got {len(str(name))}.")
@@ -3469,10 +3354,8 @@ async def create_sticker(ctx: OpContext, guild, name: str, description: str,
 
 @registry.op(
     "edit_sticker",
-    "Edit a custom sticker's name, description, or related emoji. Requires "
-    "admin. Reversible metadata edit; standard (Discord-pack) stickers are "
-    "refused.",
-    PermissionLevel.ADMIN,
+    "Edit a custom sticker's name, description, or related emoji. Reversible "
+    'metadata edit; standard (Discord-pack) stickers are refused.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the sticker belongs to."),
@@ -3514,9 +3397,8 @@ async def edit_sticker(ctx: OpContext, guild, sticker_id: int,
 
 @registry.op(
     "delete_sticker",
-    "Delete a custom sticker from a guild. Requires admin. Standard "
-    "(Discord-pack) stickers are refused.",
-    PermissionLevel.ADMIN,
+    'Delete a custom sticker from a guild. Standard (Discord-pack) stickers '
+    'are refused.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the sticker belongs to."),
@@ -3544,10 +3426,8 @@ async def delete_sticker(ctx: OpContext, guild, sticker_id: int):
     "download_emoji",
     "Download a custom emoji's (or, with sticker=true, a custom sticker's) "
     "image from Discord's CDN to a server-side file under media/tmp — the "
-    "read half of cloning an asset between guilds (pair with "
-    "create_emoji/create_sticker's file_path). Requires admin: it writes "
-    "to the server filesystem, mirroring the attachment gate.",
-    PermissionLevel.ADMIN,
+    'read half of cloning an asset between guilds (pair with '
+    "create_emoji/create_sticker's file_path).",
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the asset belongs to."),
@@ -3592,10 +3472,8 @@ async def download_emoji(ctx: OpContext, guild, emoji_id: int,
 
 @registry.op(
     "list_channel_overwrites",
-    "List permission overwrites (channel ACLs): which roles/members are "
-    "explicitly allowed or denied what, per channel. Requires admin — this "
-    "enumerates ACLs of channels hidden from ordinary members.",
-    PermissionLevel.ADMIN,
+    'List permission overwrites (channel ACLs): which roles/members are '
+    'explicitly allowed or denied what, per channel.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to inspect."),
         OpParam("channel", ParamKind.CHANNEL,
@@ -3692,7 +3570,6 @@ def serialize_thread(t: Any) -> Dict[str, Any]:
     "tags (available_tags), and the parent id for threads, where they apply. "
     "Pure read; same detail every member sees in the client's channel "
     "settings.",
-    PermissionLevel.EVERYONE,
     params=[OpParam("channel", ParamKind.CHANNEL,
                     "Discord channel id to inspect.")],
     serialize=lambda payload: payload,
@@ -3768,7 +3645,6 @@ async def _drop_threads_actor_cannot_see(ctx: OpContext, guild, threads, limit=5
     "List threads: active guild-wide by default, or one parent channel's "
     "threads (optionally including its archived PUBLIC threads). Read-only. "
     "Archived private threads are never listed.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to enumerate (active threads guild-wide)."),
@@ -3826,7 +3702,6 @@ async def list_threads(ctx: OpContext, guild, channel=None,
     "list_thread_members",
     "List a thread's members (threads have explicit membership, unlike "
     "channels). Read-only; same list the client shows in the thread header.",
-    PermissionLevel.EVERYONE,
     params=[OpParam("channel", ParamKind.CHANNEL,
                     "Discord thread id whose members to list (threads are "
                     "channels; a non-thread channel id is refused).")],
@@ -3857,10 +3732,8 @@ async def list_thread_members(ctx: OpContext, channel):
 
 @registry.op(
     "join_thread",
-    "Join the BOT to a thread, so it follows the conversation there. "
-    "Requires admin. Only changes the bot's own membership; reversible via "
-    "leave_thread.",
-    PermissionLevel.ADMIN,
+    'Join the BOT to a thread, so it follows the conversation there. Only '
+    "changes the bot's own membership; reversible via leave_thread.",
     params=[OpParam("channel", ParamKind.CHANNEL,
                     "Discord thread id to join.")],
     scope=OpScope.GUILD,
@@ -3874,9 +3747,8 @@ async def join_thread(ctx: OpContext, channel):
 
 @registry.op(
     "leave_thread",
-    "Remove the BOT from a thread. Requires admin. Inverse of join_thread; "
-    "only changes the bot's own membership.",
-    PermissionLevel.ADMIN,
+    'Remove the BOT from a thread. Inverse of join_thread; only changes the '
+    "bot's own membership.",
     params=[OpParam("channel", ParamKind.CHANNEL,
                     "Discord thread id to leave.")],
     scope=OpScope.GUILD,
@@ -3890,10 +3762,9 @@ async def leave_thread(ctx: OpContext, channel):
 
 @registry.op(
     "edit_thread",
-    "Edit a thread: rename, archive/unarchive, lock/unlock, slowmode, or "
-    "auto-archive duration. Requires admin. Every flag is reversible "
-    "(unarchive/unlock/rename back).",
-    PermissionLevel.ADMIN,
+    'Edit a thread: rename, archive/unarchive, lock/unlock, slowmode, or '
+    'auto-archive duration. Every flag is reversible (unarchive/unlock/rename '
+    'back).',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Discord thread id to edit."),
         OpParam("name", ParamKind.STRING, "New thread name.", required=False),
@@ -3962,10 +3833,8 @@ async def edit_thread(ctx: OpContext, channel, name: Optional[str] = None,
 @registry.op(
     "set_slowmode",
     "Set a channel's slowmode (seconds between messages per user; 0 "
-    "disables). Requires admin. Reversible; a deliberately atomic op — "
-    "channel name/topic edits are edit_channel's job, thread slowmode is "
-    "edit_thread's.",
-    PermissionLevel.ADMIN,
+    'disables). Reversible; a deliberately atomic op — channel name/topic '
+    "edits are edit_channel's job, thread slowmode is edit_thread's.",
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to set slowmode on."),
@@ -3995,11 +3864,10 @@ async def set_slowmode(ctx: OpContext, channel, seconds: int):
 
 @registry.op(
     "edit_channel",
-    "Edit a channel's name, topic, or nsfw flag. Requires admin. Reversible "
-    "in-place edits only — position/category moves are move_channel's job, "
-    "permission overwrites are set_channel_overwrite's. Threads are refused "
-    "(edit_thread owns those).",
-    PermissionLevel.ADMIN,
+    "Edit a channel's name, topic, or nsfw flag. Reversible in-place edits "
+    "only — position/category moves are move_channel's job, permission "
+    "overwrites are set_channel_overwrite's. Threads are refused (edit_thread "
+    'owns those).',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Discord channel id to edit."),
         OpParam("name", ParamKind.STRING, "New channel name.",
@@ -4049,11 +3917,8 @@ async def edit_channel(ctx: OpContext, channel, name: Optional[str] = None,
 
 @registry.op(
     "get_member_permissions",
-    "Compute one member's EFFECTIVE permissions in one channel — guild "
-    "roles plus channel overwrites, fully resolved. Requires admin, same "
-    "gate as list_channel_overwrites (this resolves ACLs of channels "
-    "hidden from ordinary members).",
-    PermissionLevel.ADMIN,
+    "Compute one member's EFFECTIVE permissions in one channel — guild roles "
+    'plus channel overwrites, fully resolved.',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to evaluate in."),
@@ -4082,7 +3947,6 @@ async def get_member_permissions(ctx: OpContext, channel, member):
     "Create a forum post: a thread with its required starter message in a "
     "forum channel (create_thread cannot serve forums — they refuse "
     "threads without content). Never pings. Optional forum tags.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord forum channel id to post in."),
@@ -4224,7 +4088,6 @@ def serialize_member_profile(m: Any) -> Dict[str, Any]:
     "Read one member's full profile: nick, roles, join/creation dates, "
     "timeout state, booster status, presence, avatar url. Pure read — the "
     "detail view to list_members' index.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -4250,7 +4113,6 @@ async def get_member(ctx: OpContext, member, guild=None):
 
 @registry.op(
     "list_guild_members", "Page through current guild membership. Requires Members intent; not an activity history.",
-    PermissionLevel.ADMIN,
     params=[OpParam("guild", ParamKind.GUILD, "Guild to enumerate."),
             OpParam("limit", ParamKind.INTEGER, "Page size (maximum 1000).", required=False, default=100, minimum=1, maximum=1000),
             OpParam("after_user_id", ParamKind.SNOWFLAKE, "Exclusive member cursor from prior page.", required=False)],
@@ -4276,7 +4138,6 @@ async def list_guild_members(ctx: OpContext, guild, limit: int = 100, after_user
     "tier, features, verification level, locale, vanity code, icon/banner "
     "urls. Pure cache read — the same facts any member sees on the server "
     "banner.",
-    PermissionLevel.EVERYONE,
     params=[OpParam("guild", ParamKind.GUILD, "Discord guild id to read.")],
     serialize=lambda payload: payload,
     agent_guidance=(
@@ -4315,7 +4176,6 @@ async def get_guild_info(ctx: OpContext, guild):
     "Search a guild's members by name/nick prefix (gateway member search). "
     "Read-only — the path from a name to a user_id without dumping the "
     "whole member list.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to search."),
         OpParam("query", ParamKind.STRING,
@@ -4349,10 +4209,8 @@ async def search_members(ctx: OpContext, guild, query: str, limit: int = 10):
 
 @registry.op(
     "set_nickname",
-    "Set or clear a member's nickname. Requires admin (Manage Nicknames "
-    "class action). Omit nick, or pass an empty string, to clear the "
-    "nickname back to the username. Fully reversible.",
-    PermissionLevel.ADMIN,
+    "Set or clear a member's nickname. Omit nick, or pass an empty string, to "
+    'clear the nickname back to the username. Fully reversible.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -4384,10 +4242,9 @@ async def set_nickname(ctx: OpContext, member, nick: Optional[str] = None,
 @registry.op(
     "timeout_member",
     "Timeout a member (Discord's native mute-everything) for a duration in "
-    "minutes, max 28 days. Requires admin. Auto-expires and reversible at "
-    "any moment via remove_timeout. Refuses members the bot cannot "
-    "moderate (role hierarchy) with a Forbidden error.",
-    PermissionLevel.ADMIN,
+    'minutes, max 28 days. Auto-expires and reversible at any moment via '
+    'remove_timeout. Refuses members the bot cannot moderate (role hierarchy) '
+    'with a Forbidden error.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -4423,9 +4280,8 @@ async def timeout_member(ctx: OpContext, member, duration_minutes: int,
 
 @registry.op(
     "remove_timeout",
-    "Remove a member's timeout early. Requires admin. The reversal half of "
-    "timeout_member; strictly permission-restoring.",
-    PermissionLevel.ADMIN,
+    "Remove a member's timeout early. The reversal half of timeout_member; "
+    'strictly permission-restoring.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -4453,7 +4309,6 @@ async def remove_timeout(ctx: OpContext, member,
     "Read the guild ban list (user id, name, reason) — the same list "
     "Server Settings → Bans shows an admin. Read-only; there is no "
     "ban/unban op. Pages by user id via after_user_id.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to read."),
         OpParam("limit", ParamKind.INTEGER,
@@ -4502,7 +4357,6 @@ def _audit_change_value(value: Any) -> Any:
     "reason, and per-attribute before/after changes. Read-only; the same "
     "view Server Settings → Audit Log shows an admin. Requires the bot to "
     "hold View Audit Log.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to read."),
         OpParam("limit", ParamKind.INTEGER,
@@ -4580,7 +4434,6 @@ async def fetch_audit_logs(ctx: OpContext, guild, limit: int = 50,
     "estimate_prune",
     "Estimate how many members a prune would remove (dry-run) — the number "
     "the client shows before a prune. Pure read; there is no prune op.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to estimate in."),
         OpParam("days", ParamKind.INTEGER,
@@ -4601,7 +4454,6 @@ async def estimate_prune(ctx: OpContext, guild, days: int = 30):
     "List a guild's integrations (connected bots, Twitch/YouTube subs) — "
     "the same list Server Settings → Integrations shows an admin. "
     "Read-only; there is no integration delete op.",
-    PermissionLevel.ADMIN,
     params=[OpParam("guild", ParamKind.GUILD,
                     "Discord guild id to enumerate.")],
     serialize=lambda rows: {"integrations": rows, "count": len(rows)},
@@ -4635,7 +4487,6 @@ async def list_integrations(ctx: OpContext, guild):
     "plus the vanity code when the guild has one) — the same list Server "
     "Settings → Invites shows an admin. Read-only; the entry point for "
     "revoke_invite. The bot needs Manage Guild or the call fails.",
-    PermissionLevel.ADMIN,
     params=[OpParam("guild", ParamKind.GUILD,
                     "Discord guild id to enumerate.")],
     serialize=lambda payload: payload,
@@ -4674,11 +4525,9 @@ INVITE_MAX_USES = 100
 
 @registry.op(
     "create_invite",
-    "Create an invite link for a channel. Requires admin. Defaults to a "
-    "24-hour expiry and unlimited uses (pass max_age_seconds=0 for a "
-    "never-expiring link — deliberate, never the default). Fully "
-    "reversible via revoke_invite.",
-    PermissionLevel.ADMIN,
+    'Create an invite link for a channel. Defaults to a 24-hour expiry and '
+    'unlimited uses (pass max_age_seconds=0 for a never-expiring link — '
+    'deliberate, never the default). Fully reversible via revoke_invite.',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id the invite lands in."),
@@ -4733,11 +4582,10 @@ async def create_invite(ctx: OpContext, channel, max_age_seconds: int = 86400,
 
 @registry.op(
     "revoke_invite",
-    "Revoke one of THIS guild's active invites by code. Requires admin. "
-    "Codes not found in the guild's own invite list are refused — a foreign "
-    "or expired code is never deleted blind. Low-stakes destructive: "
-    "create_invite mints a replacement in one call.",
-    PermissionLevel.ADMIN,
+    "Revoke one of THIS guild's active invites by code. Codes not found in "
+    "the guild's own invite list are refused — a foreign or expired code is "
+    'never deleted blind. Low-stakes destructive: create_invite mints a '
+    'replacement in one call.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the invite belongs to."),
@@ -4780,7 +4628,6 @@ async def revoke_invite(ctx: OpContext, guild, code: str):
     "Webhooks shows an admin. Read-only, and the webhook URL/token (a "
     "bearer credential that posts without any auth) is NEVER included. The "
     "bot needs Manage Webhooks or the call fails.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to enumerate."),
@@ -4877,7 +4724,6 @@ def _voice_flags(vs: Any) -> Dict[str, Any]:
     "in and their mute/deafen/streaming/video flags — the same info any "
     "member sees in the channel sidebar. Returns in_voice=false when the "
     "member is not connected (or their channel is not visible to you).",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -4916,7 +4762,6 @@ async def get_voice_state(ctx: OpContext, member, guild=None):
     "Guild-wide 'who is in voice': every voice/stage channel the invoking "
     "user can see, with connected members and their mute/deafen/streaming/"
     "video flags — exactly the voice sidebar. Read-only cache walk.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to enumerate. Optional when the invoking "
@@ -4972,10 +4817,9 @@ def _require_vocal_channel(channel: Any) -> None:
 
 @registry.op(
     "move_member",
-    "Move a member to another voice/stage channel (they must already be "
-    "connected to voice). Requires admin. Client-parity drag action — "
-    "instantly reversible by moving them back.",
-    PermissionLevel.ADMIN,
+    'Move a member to another voice/stage channel (they must already be '
+    'connected to voice). Client-parity drag action — instantly reversible by '
+    'moving them back.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -5000,11 +4844,9 @@ async def move_member(ctx: OpContext, member, channel, guild=None):
 
 @registry.op(
     "disconnect_member",
-    "Disconnect a member from voice. Requires admin. Client-parity "
-    "right-click action with no confirmation; the member can rejoin "
-    "immediately. Deliberately a separate op from move_member — explicit "
-    "intent beats a magic null channel.",
-    PermissionLevel.ADMIN,
+    'Disconnect a member from voice. Client-parity right-click action with no '
+    'confirmation; the member can rejoin immediately. Deliberately a separate '
+    'op from move_member — explicit intent beats a magic null channel.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -5025,10 +4867,9 @@ async def disconnect_member(ctx: OpContext, member, guild=None):
 
 @registry.op(
     "set_voice_mute",
-    "Server-mute or unmute a member in voice (one op, boolean — the client "
-    "checkbox). Requires admin. Symmetric and instantly reversible; errors "
-    "if the member is not connected to voice.",
-    PermissionLevel.ADMIN,
+    'Server-mute or unmute a member in voice (one op, boolean — the client '
+    'checkbox). Symmetric and instantly reversible; errors if the member is '
+    'not connected to voice.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -5052,10 +4893,9 @@ async def set_voice_mute(ctx: OpContext, member, muted: bool, guild=None):
 
 @registry.op(
     "set_voice_deafen",
-    "Server-deafen or undeafen a member in voice (one op, boolean — the "
-    "client checkbox). Requires admin. Symmetric and instantly reversible; "
-    "errors if the member is not connected to voice.",
-    PermissionLevel.ADMIN,
+    'Server-deafen or undeafen a member in voice (one op, boolean — the '
+    'client checkbox). Symmetric and instantly reversible; errors if the '
+    'member is not connected to voice.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -5080,11 +4920,9 @@ async def set_voice_deafen(ctx: OpContext, member, deafened: bool,
 
 @registry.op(
     "set_stage_suppress",
-    "Move a stage speaker to the audience (suppressed=true) or approve them "
-    "as a speaker (suppressed=false). Requires admin. Stage-moderator "
-    "client action, fully reversible; only valid while the member is in a "
-    "stage channel.",
-    PermissionLevel.ADMIN,
+    'Move a stage speaker to the audience (suppressed=true) or approve them '
+    'as a speaker (suppressed=false). Stage-moderator client action, fully '
+    'reversible; only valid while the member is in a stage channel.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -5117,7 +4955,6 @@ async def set_stage_suppress(ctx: OpContext, member, suppressed: bool,
     "Read the live stage instance of a stage channel (topic, privacy "
     "level), or live=false when nothing is live — the same view any member "
     "who can see the stage channel gets.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Stage channel id to read."),
@@ -5201,7 +5038,6 @@ def serialize_scheduled_event_full(e: Any) -> Dict[str, Any]:
     "list_scheduled_events",
     "List a guild's scheduled events with interest counts — the same events "
     "tab every member sees. Read-only.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to enumerate. Optional when the invoking "
@@ -5225,7 +5061,6 @@ async def list_scheduled_events(ctx: OpContext, guild=None):
     "get_scheduled_event",
     "Get one scheduled event by id, with its interest count, url, and cover "
     "image. Read-only.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the event belongs to. Optional when the "
@@ -5250,7 +5085,6 @@ async def get_scheduled_event(ctx: OpContext, event_id: int, guild=None):
     "list_scheduled_event_users",
     "List the users interested in a scheduled event (RSVPs) — the same "
     "interest list any member sees on the event card. Read-only.",
-    PermissionLevel.EVERYONE,
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the event belongs to. Optional when the "
@@ -5288,12 +5122,11 @@ _EVENT_ENTITY_TYPES = ("voice", "stage_instance", "external")
 
 @registry.op(
     "create_scheduled_event",
-    "Create a guild scheduled event (voice, stage_instance, or external). "
-    "Requires admin. voice/stage_instance events need a channel id; "
-    "external events need a location and an end_time. No notification "
-    "blast on create; reversible by deleting the event in the client "
-    "before it accrues RSVPs (there is deliberately no delete op).",
-    PermissionLevel.ADMIN,
+    'Create a guild scheduled event (voice, stage_instance, or external). '
+    'voice/stage_instance events need a channel id; external events need a '
+    'location and an end_time. No notification blast on create; reversible by '
+    'deleting the event in the client before it accrues RSVPs (there is '
+    'deliberately no delete op).',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to create the event in. Optional when "
@@ -5374,11 +5207,10 @@ async def create_scheduled_event(ctx: OpContext, name: str, start_time: str,
 
 @registry.op(
     "edit_scheduled_event",
-    "Edit a scheduled event: rename, retime, move, describe, or transition "
+    'Edit a scheduled event: rename, retime, move, describe, or transition '
     "its status ('active' to start it, 'completed' to end an active one — "
-    "forward-only per the API). Requires admin. All fields optional and "
-    "sparse; cancel/delete is delete_scheduled_event's job.",
-    PermissionLevel.ADMIN,
+    'forward-only per the API). All fields optional and sparse; cancel/delete '
+    "is delete_scheduled_event's job.",
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the event belongs to. Optional when the "
@@ -5504,11 +5336,9 @@ def _serialize_automod_rule(rule: Any) -> Dict[str, Any]:
 @registry.op(
     "list_automod_rules",
     "Read a guild's automod rules (triggers, keyword lists, actions, "
-    "exemptions) — the same view Server Settings → AutoMod shows an admin. "
-    "Requires admin, NOT everyone: keyword rules expose the guild's "
-    "filtered-word lists. Read-only; create_automod_rule / edit_automod_rule "
-    "/ delete_automod_rule own the writes.",
-    PermissionLevel.ADMIN,
+    'exemptions) — the same view Server Settings → AutoMod shows an admin. '
+    'Read-only; create_automod_rule / edit_automod_rule / delete_automod_rule '
+    'own the writes.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to read. Optional when the invoking "
@@ -5518,9 +5348,8 @@ def _serialize_automod_rule(rule: Any) -> Dict[str, Any]:
     ],
     serialize=lambda rs: {"rules": rs, "count": len(rs)},
     agent_guidance=(
-        "list_automod_rules is an admin-only read of moderation policy — "
-        "summarize what the rules do; never paste a guild's full "
-        "filtered-word list into a public channel."),
+        'list_automod_rules reads moderation policy — summarize what the rules '
+        "do; never paste a guild's full filtered-word list into a public channel."),
     scope=OpScope.GUILD,
     group="moderation",
 )
@@ -5533,20 +5362,10 @@ async def list_automod_rules(ctx: OpContext, guild=None):
 
 
 # ===========================================================================
-# NEEDS_OWNER-tier destructive / privileged ops (2026-08 owner-tier pass).
+# Destructive / privileged Discord actions.
 #
-# Everything below fills the deliberately-omitted DESTRUCTIVE or PRIVILEGED
-# half of a domain above — the actions the client itself fronts with a
-# confirmation dialog, or that mint credentials / expand the permission
-# model / broadcast irreversibly. They exist as ops because an owner opted
-# in, and they are gated accordingly:
-#
-#   - every one is at least PermissionLevel.ADMIN;
-#   - edit_guild_settings, bulk_ban and purge_messages are SUPERADMIN —
-#     server-wide blast radius (guild identity, 200-member ban, unbounded
-#     mass delete);
-#   - default_gate() is always off, so even a whitelisted destructive op
-#     stays hidden from a guild's agent until a guild admin opts it in.
+# These actions may destroy data, mint credentials or broadcast irreversibly.
+# Like other ops they default off and run only through configured frontends.
 #
 # Snowflake-input rule as everywhere: ids on the wire are strings, results
 # keep ids as ints. Bulk operations cap their batch (bulk_ban <=200 per the
@@ -5578,9 +5397,8 @@ def _serialize_channel_ref(ch: Any) -> Dict[str, Any]:
 
 @registry.op(
     "create_channel",
-    "Create a channel in a guild (text, voice, forum, stage, or category). "
-    "Requires admin. Server-structure-expanding — pair of delete_channel.",
-    PermissionLevel.ADMIN,
+    'Create a channel in a guild (text, voice, forum, stage, or category). '
+    'Server-structure-expanding — pair of delete_channel.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to create the channel in."),
@@ -5632,9 +5450,8 @@ async def create_channel(ctx: OpContext, guild, name: str,
 
 @registry.op(
     "delete_channel",
-    "Delete a channel and its entire history. Requires admin. The canonical "
-    "destructive channel action — irreversible.",
-    PermissionLevel.ADMIN,
+    'Delete a channel and its entire history. The canonical destructive '
+    'channel action — irreversible.',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Discord channel id to delete."),
     ],
@@ -5656,10 +5473,9 @@ async def delete_channel(ctx: OpContext, channel):
 
 @registry.op(
     "clone_channel",
-    "Clone a channel, copying its settings AND its permission overwrites into "
-    "a new channel. Requires admin. This is create_channel plus an "
-    "overwrite-write in one call.",
-    PermissionLevel.ADMIN,
+    'Clone a channel, copying its settings AND its permission overwrites into '
+    'a new channel. This is create_channel plus an overwrite-write in one '
+    'call.',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Discord channel id to clone."),
         OpParam("name", ParamKind.STRING,
@@ -5682,10 +5498,9 @@ async def clone_channel(ctx: OpContext, channel, name: Optional[str] = None):
 
 @registry.op(
     "move_channel",
-    "Move/reorder a channel: set its position and/or its category. Requires "
-    "admin. Positions shift globally around the moved channel (like role "
-    "positions, but more visible).",
-    PermissionLevel.ADMIN,
+    'Move/reorder a channel: set its position and/or its category. Positions '
+    'shift globally around the moved channel (like role positions, but more '
+    'visible).',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Discord channel id to move."),
         OpParam("position", ParamKind.INTEGER,
@@ -5759,11 +5574,9 @@ def _overwrite_target(guild, target_type: str, target_id: int):
 
 @registry.op(
     "set_channel_overwrite",
-    "Write a permission overwrite (channel ACL) for a role or member on a "
-    "channel. Requires admin — this rewrites who may do what in the channel. "
-    "allow/deny are lists of permission names (e.g. 'read_messages', "
+    'Write a permission overwrite (channel ACL) for a role or member on a '
+    "channel. allow/deny are lists of permission names (e.g. 'read_messages', "
     "'send_messages'); a permission in neither list is left at inherit.",
-    PermissionLevel.ADMIN,
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to set the overwrite on."),
@@ -5822,9 +5635,8 @@ async def set_channel_overwrite(ctx: OpContext, channel, target_type: str,
 
 @registry.op(
     "delete_channel_overwrite",
-    "Remove a role's or member's permission overwrite from a channel "
-    "entirely (back to inherit). Requires admin.",
-    PermissionLevel.ADMIN,
+    "Remove a role's or member's permission overwrite from a channel entirely "
+    '(back to inherit).',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to remove the overwrite from."),
@@ -5862,9 +5674,8 @@ async def delete_channel_overwrite(ctx: OpContext, channel, target_type: str,
 
 @registry.op(
     "delete_thread",
-    "Delete a thread and all its messages. Requires admin. Destructive — "
-    "edit_thread with archived=true is the reversible alternative.",
-    PermissionLevel.ADMIN,
+    'Delete a thread and all its messages. Destructive — edit_thread with '
+    'archived=true is the reversible alternative.',
     params=[OpParam("channel", ParamKind.CHANNEL,
                     "Discord thread id to delete.")],
     serialize=lambda info: info,
@@ -5883,9 +5694,8 @@ async def delete_thread(ctx: OpContext, channel):
 
 @registry.op(
     "add_thread_member",
-    "Add a user to a thread. Requires admin. Note this fires a notification "
-    "to the added user (it is the one add-class op that pings).",
-    PermissionLevel.ADMIN,
+    'Add a user to a thread. Note this fires a notification to the added user '
+    '(it is the one add-class op that pings).',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord thread id to add the user to."),
@@ -5904,9 +5714,8 @@ async def add_thread_member(ctx: OpContext, channel, member):
 
 @registry.op(
     "remove_thread_member",
-    "Remove a user from a thread (ejects them from the conversation). "
-    "Requires admin. Reversible via add_thread_member.",
-    PermissionLevel.ADMIN,
+    'Remove a user from a thread (ejects them from the conversation). '
+    'Reversible via add_thread_member.',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord thread id to remove the user from."),
@@ -5926,10 +5735,7 @@ async def remove_thread_member(ctx: OpContext, channel, member):
 @registry.op(
     "list_private_archived_threads",
     "List a channel's archived PRIVATE threads — invite-only conversations "
-    "the actor may never have been in. Requires admin (privacy-sensitive "
-    "beyond the channel-visibility gate: thread membership, not channel "
-    "readability, is the real boundary).",
-    PermissionLevel.ADMIN,
+    'the actor may never have been in.',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Parent channel id whose archived private threads to list."),
@@ -5962,9 +5768,8 @@ BAN_DELETE_MESSAGE_SECONDS_MAX = 604800  # 7 days
 
 @registry.op(
     "kick_member",
-    "Kick a member from the guild. Requires admin. Irreversible by the bot — "
-    "the member must be re-invited to return.",
-    PermissionLevel.ADMIN,
+    'Kick a member from the guild. Irreversible by the bot — the member must '
+    'be re-invited to return.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional in-guild; "
@@ -5994,10 +5799,9 @@ async def kick_member(ctx: OpContext, member, reason: Optional[str] = None,
 
 @registry.op(
     "ban_member",
-    "Ban a member (or any user id) from the guild, optionally deleting their "
-    "recent messages. Requires admin. Blocks rejoin until unbanned; can "
-    "bulk-delete up to 7 days of the target's messages.",
-    PermissionLevel.ADMIN,
+    'Ban a member (or any user id) from the guild, optionally deleting their '
+    'recent messages. Blocks rejoin until unbanned; can bulk-delete up to 7 '
+    "days of the target's messages.",
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to ban from. Optional in-guild; required "
@@ -6035,9 +5839,8 @@ async def ban_member(ctx: OpContext, member, reason: Optional[str] = None,
 
 @registry.op(
     "unban_member",
-    "Unban a user from the guild by id. Requires admin. The reversal half of "
-    "ban_member; strictly access-restoring.",
-    PermissionLevel.ADMIN,
+    'Unban a user from the guild by id. The reversal half of ban_member; '
+    'strictly access-restoring.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to unban from. Optional in-guild; required "
@@ -6063,10 +5866,8 @@ async def unban_member(ctx: OpContext, user, reason: Optional[str] = None,
 
 @registry.op(
     "bulk_ban",
-    "Ban up to 200 users at once by id, optionally deleting a day of their "
-    "messages. Requires SUPERADMIN — a mass-destructive raid tool; one bad "
-    "id list nukes 200 members.",
-    PermissionLevel.SUPERADMIN,
+    'Ban up to 200 users at once by id, optionally deleting a day of their '
+    'messages.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to ban from. Optional in-guild; required "
@@ -6084,9 +5885,9 @@ async def unban_member(ctx: OpContext, user, reason: Optional[str] = None,
     ],
     serialize=lambda payload: payload,
     agent_guidance=(
-        "bulk_ban is a superadmin-only mass action — never call it without "
-        "explicit, specific confirmation of the exact id list; a wrong list "
-        "bans up to 200 people irreversibly."),
+        'bulk_ban is a mass action — never call it without explicit, specific '
+        'confirmation of the exact id list; a wrong list bans up to 200 people '
+        'irreversibly.'),
     scope=OpScope.GUILD,
     group="members",
 )
@@ -6114,11 +5915,9 @@ async def bulk_ban(ctx: OpContext, user_ids: List[str],
 
 @registry.op(
     "prune_members",
-    "Prune inactive members (no role, no activity in the given number of "
-    "days). Requires admin. A mass kick with no undo — the client fronts it "
-    "with an explicit confirmation flow (estimate_prune is the safe read "
-    "half).",
-    PermissionLevel.ADMIN,
+    'Prune inactive members (no role, no activity in the given number of '
+    'days). A mass kick with no undo — the client fronts it with an explicit '
+    'confirmation flow (estimate_prune is the safe read half).',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id to prune. Optional in-guild; required over "
@@ -6150,10 +5949,8 @@ async def prune_members(ctx: OpContext, days: int,
 
 @registry.op(
     "edit_member_roles",
-    "Add and/or remove multiple roles on a member in one call. Requires "
-    "admin. Managed roles and @everyone are refused. Reversible by swapping "
-    "the add/remove lists.",
-    PermissionLevel.ADMIN,
+    'Add and/or remove multiple roles on a member in one call. Managed roles '
+    'and @everyone are refused. Reversible by swapping the add/remove lists.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional in-guild; "
@@ -6217,10 +6014,9 @@ BULK_DELETE_MAX = 100
 
 @registry.op(
     "bulk_delete_messages",
-    "Bulk-delete specific messages by id in one channel (max 100, and none "
-    "older than 14 days — Discord's bulk-delete limits). Requires admin. "
-    "Destructive and irreversible.",
-    PermissionLevel.ADMIN,
+    'Bulk-delete specific messages by id in one channel (max 100, and none '
+    "older than 14 days — Discord's bulk-delete limits). Destructive and "
+    'irreversible.',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id the messages are in."),
@@ -6256,10 +6052,8 @@ async def bulk_delete_messages(ctx: OpContext, channel,
 
 @registry.op(
     "purge_messages",
-    "Purge the most recent messages in a channel (up to a limit, optionally "
-    "only a given author's). Requires SUPERADMIN — unbounded mass delete, "
-    "the server-wide-blast-radius sibling of the !cleanup command.",
-    PermissionLevel.SUPERADMIN,
+    'Purge the most recent messages in a channel (up to a limit, optionally '
+    "only a given author's).",
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to purge."),
@@ -6272,8 +6066,8 @@ async def bulk_delete_messages(ctx: OpContext, channel,
     ],
     serialize=lambda payload: payload,
     agent_guidance=(
-        "purge_messages is superadmin-only and deletes in bulk — confirm the "
-        "channel, the count, and any author filter explicitly before calling."),
+        'purge_messages deletes in bulk — confirm the channel, the count, and any '
+        'author filter explicitly before calling.'),
     scope=OpScope.GUILD,
     group="message-mod",
 )
@@ -6294,10 +6088,9 @@ async def purge_messages(ctx: OpContext, channel, limit: int, author=None):
 
 @registry.op(
     "publish_message",
-    "Publish (crosspost) a message in an announcement channel to every "
-    "following server. Requires admin. Irreversible broadcast — there is no "
-    "un-publish — under a tight 10/hour rate limit.",
-    PermissionLevel.ADMIN,
+    'Publish (crosspost) a message in an announcement channel to every '
+    'following server. Irreversible broadcast — there is no un-publish — '
+    'under a tight 10/hour rate limit.',
     params=[OpParam("message", ParamKind.MESSAGE,
                     "Announcement-channel message id to publish.")],
     serialize=lambda m: {"message_id": m.id, "published": True},
@@ -6315,10 +6108,8 @@ async def publish_message(ctx: OpContext, message):
 
 @registry.op(
     "send_tts",
-    "Send a text-to-speech message to a channel — Discord reads it ALOUD to "
-    "everyone currently focused on the channel. Requires admin (audible "
-    "interruption of everyone in the channel).",
-    PermissionLevel.ADMIN,
+    'Send a text-to-speech message to a channel — Discord reads it ALOUD to '
+    'everyone currently focused on the channel.',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Channel to send into."),
         OpParam("content", ParamKind.STRING, "Text to speak (non-empty)."),
@@ -6341,10 +6132,8 @@ async def send_tts(ctx: OpContext, channel, content: str):
 
 @registry.op(
     "send_sticker",
-    "Send a message consisting of a guild sticker. Requires admin. The "
-    "sticker must belong to THIS guild (foreign ids are refused, preserving "
-    "guild confinement).",
-    PermissionLevel.ADMIN,
+    'Send a message consisting of a guild sticker. The sticker must belong to '
+    'THIS guild (foreign ids are refused, preserving guild confinement).',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Channel to send into."),
         OpParam("sticker_id", ParamKind.SNOWFLAKE,
@@ -6366,11 +6155,10 @@ async def send_sticker(ctx: OpContext, channel, sticker_id: int):
 
 @registry.op(
     "remove_reaction_other",
-    "Remove ANOTHER user's specific emoji reaction from a message. Requires "
-    "admin. This deliberately overrides the 'other users' reactions are "
-    "untouchable' rule of remove_reaction — a moderation action (it can also "
-    "strip reaction-role toggles, so use it carefully).",
-    PermissionLevel.ADMIN,
+    "Remove ANOTHER user's specific emoji reaction from a message. This "
+    "deliberately overrides the 'other users' reactions are untouchable' rule "
+    'of remove_reaction — a moderation action (it can also strip '
+    'reaction-role toggles, so use it carefully).',
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Message to remove the reaction from."),
@@ -6394,9 +6182,8 @@ async def remove_reaction_other(ctx: OpContext, message, member, emoji: str):
 
 @registry.op(
     "clear_reactions",
-    "Clear reactions from a message: one emoji, or ALL reactions. Requires "
-    "admin. Destructive (also strips reaction-role toggles); no undo.",
-    PermissionLevel.ADMIN,
+    'Clear reactions from a message: one emoji, or ALL reactions. Destructive '
+    '(also strips reaction-role toggles); no undo.',
     params=[
         OpParam("message", ParamKind.MESSAGE,
                 "Message whose reactions to clear."),
@@ -6447,11 +6234,9 @@ def _serialize_webhook_ref(w: Any) -> Dict[str, Any]:
 
 @registry.op(
     "create_webhook",
-    "Create a webhook on a channel. Requires admin. Mints a persistent "
-    "unauthenticated posting credential — anyone holding the URL can post as "
-    "it, outside every permission gate. The URL/token is NEVER returned by "
-    "this op.",
-    PermissionLevel.ADMIN,
+    'Create a webhook on a channel. Mints a persistent unauthenticated '
+    'posting credential — anyone holding the URL can post as it, outside '
+    'every permission gate. The URL/token is NEVER returned by this op.',
     params=[
         OpParam("channel", ParamKind.CHANNEL,
                 "Discord channel id to create the webhook on."),
@@ -6477,9 +6262,8 @@ async def create_webhook(ctx: OpContext, channel, name: str):
 
 @registry.op(
     "edit_webhook",
-    "Rename a webhook and/or move it to another channel. Requires admin. Can "
-    "silently redirect/rebrand webhooks owned by third-party integrations.",
-    PermissionLevel.ADMIN,
+    'Rename a webhook and/or move it to another channel. Can silently '
+    'redirect/rebrand webhooks owned by third-party integrations.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the webhook belongs to."),
@@ -6515,10 +6299,8 @@ async def edit_webhook(ctx: OpContext, guild, webhook_id: int,
 
 @registry.op(
     "delete_webhook",
-    "Delete a webhook. Requires admin. Destructive — irreversibly kills any "
-    "third-party integration depending on it; the same URL can never be "
-    "recreated.",
-    PermissionLevel.ADMIN,
+    'Delete a webhook. Destructive — irreversibly kills any third-party '
+    'integration depending on it; the same URL can never be recreated.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the webhook belongs to."),
@@ -6543,10 +6325,9 @@ async def delete_webhook(ctx: OpContext, guild, webhook_id: int):
 
 @registry.op(
     "execute_webhook",
-    "Post a message through a webhook, optionally under a custom display name "
-    "and avatar. Requires admin. Impersonation surface — it sends under an "
-    "arbitrary name/face, sidestepping the bot's own identity; never pings.",
-    PermissionLevel.ADMIN,
+    'Post a message through a webhook, optionally under a custom display name '
+    'and avatar. Impersonation surface — it sends under an arbitrary '
+    "name/face, sidestepping the bot's own identity; never pings.",
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the webhook belongs to."),
@@ -6591,11 +6372,9 @@ async def execute_webhook(ctx: OpContext, guild, webhook_id: int,
 
 @registry.op(
     "edit_guild_settings",
-    "Edit guild-identity settings: name, description, and verification "
-    "level. Requires SUPERADMIN — guild-identity and safety-posture changes "
-    "have server-wide blast radius. Deliberately narrow: dangerous sub-fields "
-    "(owner transfer, MFA level, icon) are not exposed.",
-    PermissionLevel.SUPERADMIN,
+    'Edit guild-identity settings: name, description, and verification level. '
+    'Deliberately narrow: dangerous sub-fields (owner transfer, MFA level, '
+    'icon) are not exposed.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to edit."),
         OpParam("name", ParamKind.STRING, "New guild name.", required=False),
@@ -6608,9 +6387,9 @@ async def execute_webhook(ctx: OpContext, guild, webhook_id: int,
     ],
     serialize=lambda payload: payload,
     agent_guidance=(
-        "edit_guild_settings is superadmin-only and changes the server's "
-        "public identity — confirm every field with the user before "
-        "applying; raising verification_level can lock out new members."),
+        "edit_guild_settings changes the server's public identity — confirm every "
+        'field with the user before applying; raising verification_level can lock '
+        'out new members.'),
     scope=OpScope.GUILD,
     group="guild-info",
 )
@@ -6688,11 +6467,10 @@ def _serialize_automod_ref(rule: Any) -> Dict[str, Any]:
 
 @registry.op(
     "create_automod_rule",
-    "Create an AutoMod rule (guild-wide enforcement policy that blocks "
-    "matching messages). Requires admin. v0 supports the common 'keyword' "
-    "trigger (keyword_filter/regex_patterns) and 'mention_spam' "
-    "(mention_limit); the block action is applied automatically.",
-    PermissionLevel.ADMIN,
+    'Create an AutoMod rule (guild-wide enforcement policy that blocks '
+    "matching messages). v0 supports the common 'keyword' trigger "
+    "(keyword_filter/regex_patterns) and 'mention_spam' (mention_limit); the "
+    'block action is applied automatically.',
     params=[
         OpParam("guild", ParamKind.GUILD, "Discord guild id to create in."),
         OpParam("name", ParamKind.STRING, "Rule name."),
@@ -6740,10 +6518,9 @@ async def create_automod_rule(ctx: OpContext, guild, name: str,
 
 @registry.op(
     "edit_automod_rule",
-    "Edit an AutoMod rule: rename, enable/disable, or replace its keyword/"
-    "regex filters. Requires admin. Disabling a rule silently drops the "
-    "protection it provided.",
-    PermissionLevel.ADMIN,
+    'Edit an AutoMod rule: rename, enable/disable, or replace its '
+    'keyword/regex filters. Disabling a rule silently drops the protection it '
+    'provided.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the rule belongs to."),
@@ -6800,9 +6577,8 @@ async def edit_automod_rule(ctx: OpContext, guild, rule_id: int,
 
 @registry.op(
     "delete_automod_rule",
-    "Delete an AutoMod rule. Requires admin. Destructive — removes the "
-    "protection with no undo.",
-    PermissionLevel.ADMIN,
+    'Delete an AutoMod rule. Destructive — removes the protection with no '
+    'undo.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the rule belongs to."),
@@ -6828,9 +6604,8 @@ async def delete_automod_rule(ctx: OpContext, guild, rule_id: int):
 
 @registry.op(
     "delete_scheduled_event",
-    "Delete/cancel a scheduled event. Requires admin. Destructive — destroys "
-    "the event and its accumulated RSVP/interest list irreversibly.",
-    PermissionLevel.ADMIN,
+    'Delete/cancel a scheduled event. Destructive — destroys the event and '
+    'its accumulated RSVP/interest list irreversibly.',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the event belongs to. Optional in-guild; "
@@ -6879,9 +6654,8 @@ def _serialize_stage_instance(inst: Any) -> Dict[str, Any]:
 
 @registry.op(
     "create_stage",
-    "Go live on a stage channel: create its stage instance with a topic. "
-    "Requires admin. Can push a start notification to the whole guild.",
-    PermissionLevel.ADMIN,
+    'Go live on a stage channel: create its stage instance with a topic. Can '
+    'push a start notification to the whole guild.',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Stage channel id to go live on."),
         OpParam("topic", ParamKind.STRING, "Stage topic (1-120 chars)."),
@@ -6908,9 +6682,7 @@ async def create_stage(ctx: OpContext, channel, topic: str,
 
 @registry.op(
     "edit_stage",
-    "Edit the live stage instance's topic on a stage channel. Requires admin. "
-    "Reversible.",
-    PermissionLevel.ADMIN,
+    "Edit the live stage instance's topic on a stage channel. Reversible.",
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Stage channel id to edit."),
         OpParam("topic", ParamKind.STRING, "New stage topic."),
@@ -6937,9 +6709,8 @@ async def edit_stage(ctx: OpContext, channel, topic: str):
 
 @registry.op(
     "end_stage",
-    "End the live stage instance on a stage channel (closes it, disconnecting "
-    "the audience). Requires admin. Destructive to the live session.",
-    PermissionLevel.ADMIN,
+    'End the live stage instance on a stage channel (closes it, disconnecting '
+    'the audience). Destructive to the live session.',
     params=[
         OpParam("channel", ParamKind.CHANNEL, "Stage channel id to close."),
     ],
@@ -6969,11 +6740,10 @@ async def end_stage(ctx: OpContext, channel):
 
 @registry.op(
     "delete_invite",
-    "Delete/revoke one of THIS guild's invites by code. Requires admin. "
-    "Codes not found in the guild's own invite list are refused — a foreign "
-    "code is never deleted blind. (Functionally the same as revoke_invite; "
-    "the delete_* name completes the destructive-op family.)",
-    PermissionLevel.ADMIN,
+    "Delete/revoke one of THIS guild's invites by code. Codes not found in "
+    "the guild's own invite list are refused — a foreign code is never "
+    'deleted blind. (Functionally the same as revoke_invite; the delete_* '
+    'name completes the destructive-op family.)',
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the invite belongs to."),
@@ -7021,7 +6791,7 @@ def _print_schemas() -> None:
         for op_ in ops:
             schema = op_.to_json_schema()
             wire = ", ".join(schema["properties"]) or "-"
-            print(f"  [{op_.permission.name:>10}] [{op_.scope.value:>6}] "
+            print(f"  [{op_.scope.value:>6}] "
                   f"{op_.name:<24} wire: {wire}")
 
 

@@ -2,8 +2,8 @@
 
 One ops layer (core/ops.py), two frontends: the in-bot agent loop
 (core/agent_loop.py) and this MCP server. Neither frontend re-implements
-Discord call plumbing, id resolution, result serialization, or permission
-checks — all of that lives in the registry. This module GENERATES its MCP
+Discord call plumbing, id resolution or result serialization — those live
+in the registry. Access policy belongs to the frontend. This module GENERATES its MCP
 tools mechanically from each op's typed param declarations
 (`Op.wire_params()`): the only hand-written pieces here are frontend
 policy (actor construction from `actor_id`, forced allowed_mentions=none
@@ -117,15 +117,11 @@ def exposed_ops() -> List[str]:
 
     The WHOLE ops registry, queried LIVE (never an import-time snapshot, so
     cog-registered ops are visible the moment their cog is loaded). Ops of
-    every scope except SELF are exposed: an MCP caller is a host-side operator, not a
-    guild member. ADMIN-tier ops (delete_message) are safe to expose because
-    registry.call_ids checks the permission gate BEFORE resolving any ids,
-    so permission failures never trigger target lookups.
-
-    Caveat: THIS frontend pre-resolves the context guild/channel (tool_fn
-    must build the actor Member from the target guild before the gate can
-    run), so guild/channel id EXISTENCE is observable to any token-holder —
-    accepted under the bearer-token trust model, same as caller-supplied
+    every scope except SELF are exposed: an MCP caller is an authenticated
+    host-side operator. Its enabled-tool list selects the available actions.
+    The actor still supplies context for visibility and ownership checks.
+    Guild/channel existence is observable to token-holders, accepted under
+    the bearer-token trust model, same as caller-supplied
     actor_id. The default bind is loopback; an explicit MCP_OPS_HOST does
     not add actor authentication.
 
@@ -170,13 +166,10 @@ def _require_bot(bot: Any) -> Any:
 
 
 def _build_context(bot: Any, actor_id: int, guild: Any) -> OpContext:
-    """Build an OpContext from ids supplied over MCP (no discord.py Context
-    exists on this frontend — that's the point of OpContext's duck-typed
-    shape). core.ops routes permission gates through core.permissions.is_admin /
-    is_superadmin, which read `ctx.bot.config`, `ctx.author.id`, and
-    `ctx.guild` — so prefer the real guild Member (correct roles/permissions)
-    and fall back to a bare id-holder, which those helpers treat as an
-    ordinary non-admin user unless the id is in the config admin lists.
+    """Prefer the real guild Member for visibility and target checks.
+
+    MCP authorization belongs to its authenticated operator surface and
+    enabled-tool list; the actor does not carry a fixed per-op ACL tier.
     """
     author: Any = None
     if guild is not None:
@@ -258,7 +251,7 @@ def _make_mcp_tool(bot: Any, op: Op):
 
     actor_annotation = Annotated[str, Field(
         description="Discord user id on whose behalf this call is made "
-                    "(used for permission checks). Decimal string."
+                    "(used for visibility checks and audit context). Decimal string."
     )]
     parameters.append(inspect.Parameter(
         "actor_id", inspect.Parameter.KEYWORD_ONLY, annotation=actor_annotation,
@@ -299,7 +292,7 @@ def build_server(bot: Any = None, *, name: Optional[str] = None,
 
     `bot` should be a live discord.py Bot/Client instance (with `.config`
     attached, as bot.py does) so the tools can resolve channel/message ids
-    and permission checks read the real config. If `bot` is None (schema-only
+    and visibility checks use the real member. If `bot` is None (schema-only
     smoke test), the tools raise BotUnavailableError when invoked.
 
     `host` is the bind serve() uses. DNS-rebinding protection stays on for
@@ -323,8 +316,8 @@ def build_server(bot: Any = None, *, name: Optional[str] = None,
             f"Ops-registry bridge for the Discord bot '{server_name}'. Exposes a "
             "subset of the bot's ops registry as MCP tools: "
             + ", ".join(op_names) + ". "
-            "Every call is permission-checked the same way an in-bot command "
-            "would be, via the shared ops registry. Tools are raw primitives: "
+            "Access is controlled by this authenticated MCP operator surface and "
+            "its enabled-tool list. Tools are raw primitives: "
             "every guild the bot is in is reachable."
         ),
     )

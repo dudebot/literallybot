@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace as NS
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import discord
 import pytest
@@ -14,7 +14,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from cogs.gpt import AiSettingsView, Gpt
-from core.agent_gate import agent_universe, call_requires_admin
+from core.agent_gate import agent_universe, resolve_agent_tools
 from core.agent_loop import build_agent_tools
 from core import mcp_server
 from core.ops import OpContext, registry
@@ -158,8 +158,7 @@ def test_agent_exposure_requires_both_gates_and_never_includes_dm_or_global():
     assert agent_universe(whitelist, None) == []
     assert agent_universe(whitelist, {'send_message': 'invalid'}) == []
     assert agent_universe(whitelist, gates) == ['send_message']
-    assert agent_universe(whitelist, None, is_superadmin_actor=True) == ['send_message']
-    assert agent_universe({}, gates, is_superadmin_actor=True) == []
+    assert agent_universe({}, gates) == []
 
 
 @pytest.mark.asyncio
@@ -169,13 +168,11 @@ async def test_agent_rechecks_live_gate_and_shares_budget_across_tools(config):
     channel = NS(id=10, guild=guild, send=AsyncMock(return_value=sent), typing=AsyncMock())
     ctx = OpContext(bot=NS(config=config, get_channel=lambda cid: channel), author=NS(id=1), guild=guild)
     whitelist = {'send_message': True, 'trigger_typing': True}
+    config.set_global('agent_ops_whitelist', whitelist)
     config.set(7, 'agent_ops_gate', {name: 'everyone' for name in whitelist})
 
-    def gate(name):
-        return call_requires_admin(registry.require(name), whitelist, config.get(7, 'agent_ops_gate'))
-
     tools = build_agent_tools(ctx, logging.getLogger('test.agent'), list(whitelist),
-                              tool_budget=2, gate_check=gate)
+                              tool_budget=2)
     assert (await tools[0].function(channel_id='10', content='hello'))['ok']
     config.set(7, 'agent_ops_gate', {'trigger_typing': 'admin'})
     assert not (await tools[1].function(channel_id='10'))['ok']
@@ -185,6 +182,95 @@ async def test_agent_rechecks_live_gate_and_shares_budget_across_tools(config):
     exhausted = await tools[1].function(channel_id='10')
     assert not exhausted['ok'] and 'budget' in exhausted['error'].lower()
     channel.typing.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('actor_tier', ['member', 'admin', 'superadmin'])
+@pytest.mark.parametrize('operation', ['set_nickname', 'purge_messages'])
+async def test_configured_access_controls_previously_privileged_ops_and_rechecks_revocation(
+        config, actor_tier, operation):
+    """Everyone really opens the op; Off/whitelist revocation binds all actors."""
+    target = NS(id=2, edit=AsyncMock())
+    guild = NS(id=7, owner=None, get_member=Mock(return_value=target))
+    target.guild = guild
+    channel = NS(id=10, guild=guild, purge=AsyncMock(return_value=[]))
+    bot = NS(config=config, user=NS(id=999), get_guild=lambda gid: guild,
+             get_channel=Mock(return_value=channel))
+    ctx = OpContext(bot=bot, author=NS(id=1), guild=guild)
+    config.set(7, 'admins', [1] if actor_tier == 'admin' else [])
+    config.set_global('superadmins', [1] if actor_tier == 'superadmin' else [])
+    config.set_global('agent_ops_whitelist', {operation: True})
+    config.set(7, 'agent_ops_gate', {operation: 'everyone'})
+    tool = build_agent_tools(ctx, logging.getLogger('test.access'),
+                             resolve_agent_tools(ctx))[0]
+    raw = ({'user_id': '2', 'nick': 'New name'} if operation == 'set_nickname'
+           else {'channel_id': '10', 'limit': 2})
+    action = target.edit if operation == 'set_nickname' else channel.purge
+    assert (await tool.function(**raw))['ok']
+    action.assert_awaited_once()
+
+    config.set(7, 'agent_ops_gate', {operation: 'admin'})
+    result = await tool.function(**raw)
+    assert result['ok'] is (actor_tier != 'member')
+    calls = action.await_count
+
+    for gates, whitelist in [({operation: 'off'}, {operation: True}),
+                             ({operation: 'everyone'}, {}),
+                             ({operation: 'invalid'}, {operation: True})]:
+        config.set(7, 'agent_ops_gate', gates)
+        config.set_global('agent_ops_whitelist', whitelist)
+        assert operation not in resolve_agent_tools(ctx)
+        guild.get_member.reset_mock()
+        bot.get_channel.reset_mock()
+        denied = await tool.function(**raw)
+        guild.get_member.assert_not_called()
+        bot.get_channel.assert_not_called()
+        assert not denied['ok'] and 'blocked locally' in denied['error']
+        assert action.await_count == calls
+
+
+@pytest.mark.asyncio
+async def test_nickname_request_uses_agent_tool_and_completes_for_nonadmin(config, gpt_run):
+    """Exercise the model/tool/result loop with deterministic model output."""
+    gpt, ctx, responses = gpt_run
+    target = NS(id=2, guild=ctx.guild, edit=AsyncMock())
+    ctx.guild.get_member = lambda uid: target
+    config.set_global('agent_ops_whitelist', {'set_nickname': True})
+    config.set(7, 'agent_ops_gate', {'set_nickname': 'everyone'})
+    requests = responses([
+        [ToolCallPart('set_nickname', {'user_id': '2', 'nick': 'New name'})],
+        [TextPart('Renamed.')],
+    ])
+    await gpt.process_askgpt(ctx, 'Rename this member')
+    assert len(requests) == 2
+    target.edit.assert_awaited_once()
+    assert target.edit.await_args.kwargs['nick'] == 'New name'
+    assert ctx.send.await_args.args[0] == 'Renamed.'
+
+
+@pytest.mark.asyncio
+async def test_cog_op_everyone_setting_and_revocation(config):
+    from cogs.points import Points
+    from core.points import get_points
+    guild = NS(id=7, owner=None)
+    member = NS(id=2, guild=guild)
+    guild.get_member = lambda uid: member
+    bot = NS(config=config, user=NS(id=999), get_guild=lambda gid: guild)
+    cog = Points(bot)
+    registry.register_cog_ops(cog)
+    try:
+        ctx = OpContext(bot=bot, author=NS(id=1), guild=guild)
+        config.set_global('agent_ops_whitelist', {'add_user_points': True})
+        config.set(7, 'agent_ops_gate', {'add_user_points': 'everyone'})
+        tool = build_agent_tools(ctx, logging.getLogger('test.cog_access'),
+                                 resolve_agent_tools(ctx))[0]
+        assert (await tool.function(user_id='2', amount=10))['ok']
+        assert get_points(bot, member) == 10
+        config.set(7, 'agent_ops_gate', {'add_user_points': 'admin'})
+        assert not (await tool.function(user_id='2', amount=10))['ok']
+        assert get_points(bot, member) == 10
+    finally:
+        registry.unregister_owner(cog)
 
 
 def panel(config):
@@ -201,14 +287,14 @@ def panel(config):
 async def test_full_settings_page_fits_discord_limits(config, page):
     # Build the actual view: helper-only checks missed the 40-component outage.
     # A cog op of each Extra kind renders the Guild and User rows too.
-    from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+    from core.ops import OpParam, OpScope, ParamKind, op
 
     class Extra:
-        @op('extra_guild_probe', 'Guild.', PermissionLevel.EVERYONE, group='extra-probe')
+        @op('extra_guild_probe', 'Guild.', group='extra-probe')
         async def guild(self, ctx):
             return None
 
-        @op('extra_user_probe', 'User.', PermissionLevel.EVERYONE, scope=OpScope.SELF,
+        @op('extra_user_probe', 'User.', scope=OpScope.SELF,
             group='extra-probe', params=[OpParam('user', ParamKind.SELF_USER, required=False)])
         async def user(self, ctx, user):
             return None
@@ -310,11 +396,11 @@ async def test_mcp_bearer_auth_refuses_missing_or_wrong_credentials():
 @pytest.fixture
 def self_surface(config, monkeypatch):
     from core import agent_gate, agent_loop
-    from core.ops import OpsRegistry, OpScope, PermissionLevel, OpParam, ParamKind
+    from core.ops import OpsRegistry, OpScope, OpParam, ParamKind
     reg = OpsRegistry()
     writes = []
 
-    @reg.op('save_value', 'Save own text.', PermissionLevel.EVERYONE,
+    @reg.op('save_value', 'Save own text.',
             agent_guidance='Use when asked to save.', scope=OpScope.SELF, sequential=True,
             params=[OpParam('text', ParamKind.STRING)], serialize=lambda value: value)
     async def save(ctx, text):
@@ -323,7 +409,7 @@ def self_surface(config, monkeypatch):
         writes.append((ctx.author.id, text))
         return {'text': text}
 
-    @reg.op('guild_probe', 'Probe guild.', PermissionLevel.EVERYONE)
+    @reg.op('guild_probe', 'Probe guild.')
     async def probe(ctx):
         writes.append(('guild', ctx.guild.id))
         return {}

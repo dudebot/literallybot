@@ -9,7 +9,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from core.ops import OpParam, OpScope, ParamKind, PermissionLevel, op
+from core.ops import OpParam, OpScope, ParamKind, op
 from core.permissions import is_admin
 from core.panels import panel_slash_pin
 from core.event_logging import registry as event_registry, report
@@ -232,8 +232,7 @@ class Honeypot(commands.Cog):
         "configure_honeypot",
         "Configure this guild's single honeypot using an existing text channel and role. "
         "Triggers assign the role, optionally remove other manageable roles, and delete the member's recent messages. "
-        "Does not create resources or restore roles. Disabling retains saved settings and assigned roles.",
-        PermissionLevel.ADMIN, scope=OpScope.GUILD, group="honeypot", group_label="Honeypot",
+        "Does not create resources or restore roles. Disabling retains saved settings and assigned roles.", scope=OpScope.GUILD, group="honeypot", group_label="Honeypot",
         params=[
             OpParam("channel", ParamKind.CHANNEL, "Existing trap text channel (explicit even when disabling)."),
             OpParam("role", ParamKind.ROLE, "Existing role; omit to reuse saved role.", required=False),
