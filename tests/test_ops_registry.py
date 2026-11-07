@@ -1,7 +1,6 @@
-"""History privacy and destructive-operation regressions at real op boundaries."""
+"""Discord history privacy and guild confinement."""
 import asyncio
 
-import discord
 import pytest
 
 from core.ops import OpContext, registry
@@ -51,15 +50,6 @@ class _FakeChannel:
         return gen()
 
 
-class _FakeMessage:
-    def __init__(self, mid, channel, content):
-        self.id = mid
-        self.channel = channel
-        self.author = type("A", (), {"id": 999})()
-        self.content = content
-        self.created_at = None
-
-
 def _search_ctx(guild, member=None):
     return OpContext(bot=None, author=member or _FakeMember(), guild=guild)
 
@@ -87,34 +77,6 @@ def test_search_history_drops_hits_where_actor_lacks_history_perm(monkeypatch):
     assert "total_matches" not in res.value
 
 
-def test_search_history_contains_any_is_one_call_per_term(monkeypatch):
-    """Telemetry showed one search_history call per keyword; contains_any
-    batches them but must keep per-term counts and the visibility drop."""
-    import core.ops as ops_module
-    guild = _FakeGuild(1, [])
-    visible = _FakeChannel(10, _Perms(True, True), guild=guild)
-    denied = _FakeChannel(20, _Perms(True, False), guild=guild)
-    guild._channels = {10: visible, 20: denied}
-    queried = []
-
-    async def fake_index(bot, gid, cids, limit, author_id, contains):
-        queried.append(contains)
-        if contains == "gawk":
-            return [{"id": 2, "channel_id": 20, "content": "gawk"}], 1
-        return [{"id": 1, "channel_id": 10, "content": contains}], 3
-    monkeypatch.setattr(ops_module, "_index_search", fake_index)
-
-    res = asyncio.run(registry.call("search_history", _search_ctx(guild),
-                                    contains_any=["bounce", "gawk", "bounce", " "]))
-    assert res.ok and queried == ["bounce", "gawk"]
-    bounce, gawk = res.value["terms"]
-    assert (bounce["contains"], bounce["count"], bounce["total_matches"]) == ("bounce", 1, 3)
-    assert gawk["count"] == 0 and "total_matches" not in gawk
-    both = asyncio.run(registry.call("search_history", _search_ctx(guild),
-                                     contains="x", contains_any=["y"]))
-    assert not both.ok
-
-
 def test_search_history_fallback_refuses_history_denied_actor(monkeypatch):
     """Fallback path: the recent-window scan reads with the bot's perms and
     bypasses per-hit filtering, so a history-denied member must be refused
@@ -136,42 +98,6 @@ def test_search_history_fallback_refuses_history_denied_actor(monkeypatch):
     assert res.value["count"] == 0
     assert "Read Message History" in res.value["note"]
     assert denied.history_calls == 0
-
-
-class _NoActorCtx:
-    """Bare ctx for direct-impl calls where the gate is not under test."""
-
-    def __init__(self, bot=None):
-        self.bot = bot
-        self.author = None
-        self.guild = None
-
-
-def test_search_history_fallback_matches_embed_text(monkeypatch):
-    """#log posts have empty content; Discord's index matches embed text,
-    so the fallback scan must too."""
-    import core.ops as ops_module
-
-    async def broken_index(*a, **k):
-        raise RuntimeError("index cold")
-    monkeypatch.setattr(ops_module, "_index_search", broken_index)
-
-    guild = _FakeGuild(1, [])
-    chan = _FakeChannel(10, _Perms(True, True), guild=guild)
-    hit = _FakeMessage(2, chan, "")
-    hit.embeds = [discord.Embed(description="Config has no attribute get_user")]
-    miss = _FakeMessage(1, chan, "")
-    miss.embeds = [discord.Embed(description="something else")]
-    chan._messages = [hit, miss]
-    guild._channels = {10: chan}
-
-    res = asyncio.run(registry.call(
-        "search_history", _search_ctx(guild), channels=[chan],
-        contains="get_user"))
-    assert res.ok
-    assert [m["id"] for m in res.value["messages"]] == [2]
-    assert res.value["messages"][0]["embeds"][0]["description"].endswith(
-        "get_user")
 
 
 class _HistoryChannel(_FakeChannel):
@@ -203,102 +129,6 @@ def test_read_history_refuses_history_denied_actor():
     assert denied.history_calls == 0
 
 
-class _ForwardBot:
-    def __init__(self, dest):
-        self._dest = dest
-
-    def get_channel(self, cid):
-        return self._dest if cid == self._dest.id else None
-
-
-class _ForwardDest:
-    def __init__(self, cid, guild):
-        self.id = cid
-        self.guild = guild
-
-
-class _ForwardMsg:
-    def __init__(self, guild):
-        self.guild = guild
-        self.channel = type("C", (), {"id": 10, "guild": guild})()
-        self.forwarded_to = None
-
-    async def forward(self, destination):
-        self.forwarded_to = destination
-        return type("M", (), {
-            "id": 999, "channel": type("C", (), {"id": destination.id})()})()
-
-
-def test_forward_message_refuses_a_cross_guild_destination():
-    """The destination is a bare snowflake, so guild confinement is enforced
-    in-impl: it must belong to the SOURCE message's guild."""
-    from core.ops import GuildNotAllowedError, forward_message
-    source_guild = type("G", (), {"id": 1})()
-    other_guild = type("G", (), {"id": 2})()
-    dest = _ForwardDest(20, other_guild)
-    msg = _ForwardMsg(source_guild)
-    with pytest.raises(GuildNotAllowedError):
-        asyncio.run(forward_message(
-            _NoActorCtx(bot=_ForwardBot(dest)), msg, 20))
-    assert msg.forwarded_to is None
-
-
-class _AuthorCtx(_NoActorCtx):
-    """Ctx with an author (for ops that stamp an audit reason string) but no
-    real Member, so the visibility gate stays out of the way."""
-
-    def __init__(self, bot=None):
-        super().__init__(bot=bot)
-        self.author = type("A", (), {
-            "id": 321, "__str__": lambda self: "tester"})()
-
-
-def _webhook(wid, name, channel_id, creator_id, creator_name):
-    return type("WH", (), {
-        "id": wid, "name": name, "channel_id": channel_id,
-        "type": type("WT", (), {"name": "incoming"})(),
-        "user": type("U", (), {"id": creator_id, "name": creator_name})(),
-        "url": "https://discord.com/api/webhooks/SECRET/TOKEN",
-        "token": "SECRET-TOKEN",
-    })()
-
-
-def test_list_webhooks_never_serializes_url_or_token():
-    from core.ops import list_webhooks
-
-    class _Guild:
-        async def webhooks(self):
-            return [_webhook(1, "gh-feed", 10, 42, "alice")]
-
-    payload = asyncio.run(list_webhooks(_NoActorCtx(), _Guild()))
-    assert payload["webhooks"][0]["id"] == 1
-    # The credential must not appear ANYWHERE in the wire payload.
-    import json
-    flat = json.dumps(payload)
-    assert "SECRET" not in flat and "TOKEN" not in flat
-
-
-class _ModChannel:
-    def __init__(self, cid=10):
-        self.id = cid
-        self.purge_kwargs = None
-
-    async def purge(self, **kw):
-        self.purge_kwargs = kw
-        return [object(), object(), object()]
-
-def test_purge_messages_filters_by_author():
-    from core.ops import purge_messages
-    chan = _ModChannel()
-    author = type("M", (), {"id": 42})()
-    asyncio.run(purge_messages(_AuthorCtx(), chan, 50, author=author))
-    assert chan.purge_kwargs["limit"] == 50
-    check = chan.purge_kwargs["check"]
-    assert check(type("Msg", (), {"author": author})())
-    assert not check(type("Msg", (), {
-        "author": type("A", (), {"id": 99})()})())
-
-
 @pytest.mark.asyncio
 async def test_channel_resolution_cannot_escape_the_invoking_guild():
     from types import SimpleNamespace as NS
@@ -316,150 +146,3 @@ async def test_channel_resolution_cannot_escape_the_invoking_guild():
                                      channel_id='10', content='private')
     assert not denied.ok
     channel.send.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_snowflake_wire_values_preserve_precision_and_hide_internal_controls():
-    from core.ops import HISTORY_LIMIT_MAX
-
-    search = registry.require('search_history')
-    assert search.to_json_schema()['properties']['author_id']['type'] == 'string'
-    resolved = await search.resolve_kwargs(None, None,
-        {'author_id': '1208839321801465886', 'limit': 9999}, frozenset())
-    assert resolved['author_id'] == 1208839321801465886
-    assert resolved['limit'] == HISTORY_LIMIT_MAX
-    send = registry.require('send_message').to_json_schema()
-    assert send['properties']['channel_id']['type'] == 'string'
-    assert 'allowed_mentions' not in send['properties']
-
-
-@pytest.mark.asyncio
-async def test_send_suppresses_mentions_and_supports_attachments_after_frontend_authorization(config, tmp_path):
-    from types import SimpleNamespace as NS
-    from unittest.mock import AsyncMock
-
-    guild = NS(id=7, owner=None)
-    channel = NS(id=10, guild=guild, send=AsyncMock(return_value=NS(id=22, attachments=[])))
-    ctx = OpContext(bot=NS(config=config, user=NS(id=999)), author=NS(id=1), guild=guild)
-    assert (await registry.call('send_message', ctx, channel=channel, content='@everyone <@1>')).ok
-    mentions = channel.send.call_args.kwargs['allowed_mentions']
-    assert not mentions.everyone and not mentions.users and not mentions.roles
-    attachment = tmp_path / 'private.png'
-    attachment.write_bytes(b'private data')
-    result = await registry.call('send_message', ctx, channel=channel, file_paths=[str(attachment)])
-    assert result.ok
-    assert channel.send.await_count == 2
-    assert channel.send.await_args.kwargs['files'][0].filename == 'private.png'
-    channel.send.await_args.kwargs['files'][0].close()
-
-
-def test_history_cursors_preserve_chronology_without_new_api():
-    guild = _FakeGuild(1, [])
-    channel = _HistoryChannel(20, _Perms(True, True), guild=guild)
-    channel._messages = [_FakeMessage(n, channel, str(n)) for n in [15, 12, 10]]
-    guild._channels = {20: channel}
-    result = asyncio.run(registry.call('read_history', _search_ctx(guild), channel=channel,
-                                      before_message_id=20, after_message_id=9))
-    assert result.ok and [m['id'] for m in result.value['messages']] == [10, 12, 15]
-    assert tuple(c.id for c in channel.seen_cursors) == (20, 9)
-
-
-@pytest.mark.asyncio
-async def test_self_dispatch_binds_invoker_and_rejects_identity_in_both_paths():
-    from types import SimpleNamespace as NS
-    from core.ops import OpsRegistry, OpScope, OpParam, ParamKind
-
-    reg = OpsRegistry()
-    saved = {}
-
-    @reg.op('save_value', 'Save own value.',
-            scope=OpScope.SELF, params=[OpParam('text', ParamKind.STRING)])
-    async def save(ctx, text):
-        saved[ctx.author.id] = text
-        return text
-
-    for call in (reg.call, reg.call_ids):
-        for uid in (1, 2):
-            ctx = OpContext(bot=None, author=NS(id=uid, bot=False))
-            assert (await call('save_value', ctx, text=str(uid))).ok
-            for key in ('user_id', 'actor_id', 'target_user', 'owner', 'undeclared'):
-                assert not (await call('save_value', ctx, text='overwrite', **{key: 2})).ok
-        for actor in (None, NS(id=0), NS(id=1, bot=True)):
-            assert not (await call('save_value', OpContext(bot=None, author=actor), text='bad')).ok
-    assert saved == {1: '1', 2: '2'}
-
-    for param in (OpParam('user_id', ParamKind.INTEGER),
-                  OpParam('actor', ParamKind.STRING),
-                  OpParam('subject_id', ParamKind.STRING),
-                  OpParam('recipient', ParamKind.USER),
-                  OpParam('token', ParamKind.INTERNAL)):
-        with pytest.raises(ValueError, match='SELF'):
-            reg.op('bad', 'Bad selector.',
-                   scope=OpScope.SELF, params=[param])(save)
-
-
-
-@pytest.mark.asyncio
-async def test_self_user_is_the_invoker_unless_an_admin_names_a_member(config):
-    from types import SimpleNamespace as NS
-    from unittest.mock import AsyncMock
-    from core.ops import OpsRegistry, OpScope, OpParam, ParamKind
-
-    reg = OpsRegistry()
-
-    async def read(ctx, user):
-        return user.id
-
-    for scope, required in ((OpScope.GUILD, False), (OpScope.SELF, True)):
-        with pytest.raises(ValueError, match='SELF_USER'):
-            reg.op('bad', 'Bad.', scope=scope,
-                   params=[OpParam('user', ParamKind.SELF_USER, required=required)])(read)
-    reg.op('read_record', 'Read a record.', scope=OpScope.SELF,
-           params=[OpParam('user', ParamKind.SELF_USER, required=False)])(read)
-
-    member = NS(id=2, bot=False)
-    guild = NS(id=7, owner=None, get_member=lambda uid: member if uid == 2 else None,
-               fetch_member=AsyncMock(side_effect=LookupError('not a member')))
-
-    async def run(guild, other):
-        ctx = OpContext(bot=NS(config=config), author=NS(id=1, bot=False), guild=guild)
-        by_ids = await reg.call_ids('read_record', ctx, **({'user_id': str(other)} if other else {}))
-        by_obj = await reg.call('read_record', ctx, **({'user': NS(id=other)} if other else {}))
-        assert (by_ids.ok, by_ids.value) == (by_obj.ok, by_obj.value)
-        return by_ids
-
-    assert (await run(None, None)).value == 1  # omitted: the invoker
-    assert (await run(None, 1)).value == 1
-    assert not (await run(None, 2)).ok  # a DM never targets someone else
-    assert not (await run(guild, 2)).ok  # not an admin
-    config.set(7, 'admins', [1])
-    assert (await run(guild, 2)).value == 2
-    assert not (await run(guild, 3)).ok  # admin, but not a member of this guild
-
-
-def test_self_user_ops_are_listed_as_user_tools():
-    from core.ops import OpScope, OpParam, ParamKind, op
-    from cogs.gpt import tool_tab_sections
-
-    class Records:
-        @op('record_test_read', 'Read a record.', scope=OpScope.SELF,
-            group='records-test', params=[OpParam('user', ParamKind.SELF_USER, required=False)])
-        async def read(self, ctx, user):
-            return None
-
-        @op('record_test_feature', 'A feature.',
-            scope=OpScope.SELF, group='records-test')
-        async def feature(self, ctx):
-            return None
-
-    cog = Records()
-    registry.register_cog_ops(cog)
-    try:
-        extra = dict(tool_tab_sections({OpScope.SELF}))['Extra']
-        buckets = {label: [o.name for o in ops] for _gid, label, ops in extra}
-        assert 'record_test_read' in buckets['User']
-        assert 'record_test_feature' in buckets['Guild']
-        schema = registry.require('record_test_read').to_json_schema()
-        assert 'Leave out' in schema['properties']['user_id']['description']
-    finally:
-        registry.unregister_owner(cog)

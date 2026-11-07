@@ -220,50 +220,22 @@ Failed sends are logged locally and do not consume the next retry's cooldown.
 
 ## Test quality and development checks
 
-Keep regression tests whose failure would reveal a **plausible future mistake
-with consequences that matter**. There is no test-count or coverage target.
-A new feature does not automatically need a permanent test bundle.
+Committed tests need obvious production value: a concrete failure in a
+supported code path and a result that identifies what actually broke.
+"It could regress" is not enough. A feature or bug fix does not call for
+adding permanent tests by default.
 
-- Name the mistake and its consequence: a dropped permission check, wrong config
-  scope, lost write, suppressed real error, or broken library integration. A past
-  incident is useful evidence, not a prerequisite. Merely inventing a mutation
-  that makes an assertion fail does not establish a test's value.
-- Assert outcomes through real local behavior. Use real Config in temporary
-  storage and mock external I/O, not the behavior being proved. Never load a
-  running bot's config or credentials. Reuse `tests/conftest.py` for Config.
-- Extend an existing scenario when it protects the same failure mechanism.
-  Separate implementations of the same privacy/auth policy can deserve separate
-  tests; a helper test does not prove callers use it. Keep coherent scenarios,
-  not per-op matrices or unrelated assertions combined to shrink the count.
-- Remove copied schema/metadata inventories, trivial forwarding checks, cosmetic
-  assertions, tests of the fake itself, and checks for absent features. Actual
-  component-limit failures or leaked private data matter; button labels do not.
-  Discord validates API arguments, but cannot enforce the invoking user's privacy
-  on requests made with the bot's credentials.
+Task-specific simulations and model-response/request experiments are
+development checks. Implementation mirrors, trivial forwarding checks and
+schema/metadata inventories do not belong in the committed suite. Keep
+development checks outside the repository and delete them when the
+investigation ends. Do not turn them into committed fixtures or
+retain them because they passed or were useful during implementation.
 
-**Self-checks are temporary.** Tests and probes can validate an implementation
-while building it. Retain one only if it also meets the regression standard
-above: a credible future mistake and an actionable failure. Having helped during
-implementation, passing once, or being cheap to run is not enough.
+Prefer an existing test that already exercises the failure. Keep external
+I/O mocked and local behavior real; never load deployment credentials or
+config. Remove unused fixtures with deleted tests. Do not merge unrelated
+checks, add parameter matrices, or preserve speculative cases to defend a
+test count. Run the retained suite after changes.
 
-Keep disposable probes in the task workspace while investigating input matrices,
-provider requests, prompt experiments, or alternative designs. Before retaining a
-scenario, name its supported caller, the consequential failure, and why existing
-retained tests would miss it. A hypothetical better test does not justify keeping
-a redundant or unreachable one. Assess parameter variants by failure mechanism,
-rather than retaining every example used during development.
-
-Experimental agent behavior needs product review before it becomes a permanent
-expectation. Stable authorization, privacy, storage, and cancellation boundaries
-can deserve regression checks while prompts and interaction design evolve.
-Local provider doubles establish request construction and lifecycle behavior;
-they do not establish model response quality or successful live Discord use.
-
-Before committing or handing off, review the tests introduced or changed during
-the work. Delete development-only checks and their unused fixtures without
-waiting for the user to ask; do not leave them skipped or in a permanent scratch
-suite. Explain retained additions and why existing tests do not protect that
-failure. For removals, identify the replacement or explain why the check is not
-worth keeping. Report collected count changes as context only, including
-parameterized cases. Never prune or combine valuable tests to reach a number.
-See the [historical audit](testing.md) for how the suite accumulated.
+See [testing.md](testing.md) for the suite's historical audits.

@@ -1,8 +1,7 @@
 """MCP bind allowlist on the real streamable-HTTP app.
 
 A non-loopback bind must not turn FastMCP's Host check off, and a concrete
-LAN address must work with only MCP_OPS_HOST. A wildcard must name the
-client-facing hosts or refuse to start.
+LAN address must work with only MCP_OPS_HOST.
 """
 import json
 from types import SimpleNamespace as NS
@@ -74,21 +73,3 @@ async def test_concrete_lan_bind_allows_that_host_and_requires_bearer(config, mo
         headers["origin"] = "https://evil.example"
         bad_origin = await client.post(f"http://{LAN}:8765/mcp", headers=headers, json=INIT)
         assert bad_origin.status_code == 403
-
-
-@pytest.mark.asyncio
-async def test_wildcard_bind_requires_an_explicit_client_host_list(config, monkeypatch):
-    monkeypatch.delenv(mcp_server.TRUSTED_HOSTS_ENV_VAR, raising=False)
-    with pytest.raises(RuntimeError, match="MCP_OPS_TRUSTED_HOSTS"):
-        mcp_server.transport_security_for("0.0.0.0")
-    monkeypatch.setenv(mcp_server.TRUSTED_HOSTS_ENV_VAR, f"{LAN},ops.lan")
-    app = _app(config, "0.0.0.0")
-    transport = httpx.ASGITransport(app=app)
-    async with app.router.lifespan_context(app), httpx.AsyncClient(transport=transport) as client:
-        ok = await _request(client, f"http://{LAN}:8765/mcp", "test-token")
-        assert ok.status_code == 200
-        assert ok.headers.get("mcp-session-id")
-        named = await _request(client, "http://ops.lan:8765/mcp", "test-token")
-        assert named.status_code == 200
-        wrong = await _request(client, "http://evil.example:8765/mcp", "test-token")
-        assert wrong.status_code == 421

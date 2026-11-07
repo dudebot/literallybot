@@ -55,7 +55,6 @@ patterns, and read the relevant guide before changing a subsystem.
 
 ## Tests
 
-Keep tests for plausible regressions whose failure would matter, not test slop.
 Development self-checks are fine; delete temporary checks and unused fixtures
 before committing or handing off, without waiting to be asked. No count target.
 See the [qualitative policy](docs/error-handling.md#test-quality-and-development-checks).
