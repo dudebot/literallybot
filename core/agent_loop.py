@@ -247,6 +247,15 @@ async def _run_agent_turn(llm, provider_config, api_messages, ctx, tool_names,
         f"model={provider_config.model} tools={available_names}"
     )
     command_turn = closing_request
+    if tools:
+        command_turn += (
+            "\n[TURN GUIDANCE] Handle the request above. If it asks for an "
+            "action an enabled tool performs, your next response must be a "
+            "native tool call with no text preamble. Inspect the result, then "
+            "write your reply about the outcome. Choose "
+            "any creative content the request delegates to you. Your final "
+            "reply ends the turn; it cannot start work or promise a later action."
+        )
     started = time.monotonic()
     outcome = "error"
     try:
@@ -360,15 +369,23 @@ def build_agentic_guidance(tool_names, guild_id=None, channel_id=None):
         "",
         "HOW TOOLS WORK:",
         "- Tools enabled for this turn: " + ", ".join([*tool_names, "stay_quiet"]) + ".",
-        "- Each tool's definition says what it does and when to use it. When a "
-        "request matches a tool's description, call that tool before you reply. "
-        "Most messages need only a conversational answer; don't reach for a "
-        "tool when none fits.",
-        "- The only way to act is a native function call. Text never executes "
-        "anything: a text response ends the turn and is posted as your reply.",
-        "- Say an action happened only after its tool returned success in this "
-        "turn. Earlier messages in the chat, including your own, are not proof "
-        "anything was done. If you couldn't do it, say so plainly.",
+        "- For an action request, work in this order: identify the target and "
+        "arguments from the conversation, call the matching tool, read its "
+        "result, then report the actual outcome. If asked to invent a name or "
+        "other content, choose it yourself and use it in the tool call.",
+        "- You have no progress/commentary channel. ANY assistant text ends "
+        "your turn immediately, including 'I am doing it' or 'loading'. There "
+        "is no following tool phase after that text. For action requests, "
+        "emit the native tool call first, with no text preamble. Write prose "
+        "only after receiving the tool result.",
+        "- Earlier assistant messages are a chat transcript, not tool-use "
+        "examples: their tool calls and results are not included. Use the "
+        "current tool definitions and this turn's results for capabilities "
+        "and outcomes. A request to try again means make a fresh tool call, "
+        "even if earlier messages describe failed attempts.",
+        "- If a tool fails, explain its returned error. If essential target "
+        "information is missing, ask for it. For ordinary conversation, "
+        "answer naturally without using an action tool.",
         "- Call stay_quiet with no arguments when no final reply is needed, "
         "after finishing and checking any requested actions. Messages already "
         "sent by tools remain. Never send empty text to mean silence.",

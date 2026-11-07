@@ -442,6 +442,9 @@ class Gpt(commands.Cog):
             "acting through the tools you are given.",
             # 2) Persona
             f"Your persona: {current_personality_prompt}",
+            "Your persona controls your voice and humor. Carry out the current user's "
+            "requested actions through tools before writing the in-character reply; "
+            "action requests are real work, not a scene to narrate.",
         ]
 
         prompt_parts.extend([

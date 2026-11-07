@@ -4209,8 +4209,9 @@ async def search_members(ctx: OpContext, guild, query: str, limit: int = 10):
 
 @registry.op(
     "set_nickname",
-    "Set or clear a member's nickname. Omit nick, or pass an empty string, to "
-    'clear the nickname back to the username. Fully reversible.',
+    "Rename a server member by changing their server nickname (display name). "
+    "Omit nick, or pass an empty string, to clear it back to the username. "
+    "Fully reversible.",
     params=[
         OpParam("guild", ParamKind.GUILD,
                 "Discord guild id the member belongs to. Optional when the "
@@ -4226,6 +4227,13 @@ async def search_members(ctx: OpContext, guild, query: str, limit: int = 10):
                 "Optional audit-log reason.", required=False),
     ],
     serialize=lambda payload: payload,
+    agent_guidance=(
+        "Use this for requests to rename someone, give them a new name, or "
+        "change their nickname. Your next response to that request is a "
+        "native set_nickname tool call, not a text announcement. If asked "
+        "for a creative name, choose one "
+        "within 32 characters and call set_nickname with the member's visible "
+        "user ID. Finish the call before reporting the returned nickname."),
     scope=OpScope.GUILD,
     group="members",
 )

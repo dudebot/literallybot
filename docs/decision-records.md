@@ -557,3 +557,22 @@ callers authorize their own entrypoints. Ordinary command/settings checks,
 SELF ownership, guild confinement, visibility and Discord API permissions
 remain separate contracts. Local denials identify configured access rather
 than suggesting a Discord permission failure.
+
+## Action guidance distinguishes execution from progress narration (2026-11-07)
+
+A rename request returned a progress announcement with zero tool calls,
+despite the tool being available. Real-provider replays reproduced this.
+The guidance about claiming completed actions did not explicitly cover
+preambles: the model announced its intended action instead of calling it.
+
+Guidance now states that any assistant text ends the turn, there is no
+progress channel, and an action request starts with the native tool call
+without a text preamble. The closing request repeats that execution order.
+Persona instructions apply to voice, while previous assistant text is chat
+history with tool traces omitted. The nickname tool explicitly identifies
+rename/display-name requests and tells the model to choose delegated names
+and execute the call before reporting the result.
+
+This is a guidance change. It adds no reply-text matching, output validator,
+classifier, terminal schema or automatic replay. Verification uses disposable
+real-model replays with Discord writes replaced, plus the existing suite.
