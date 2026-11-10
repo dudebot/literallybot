@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Summarize agent tool-usage telemetry (logs/agent_tools/*.jsonl).
 
-    venv/bin/python scripts/tool_usage.py [--days 7] [--guild ID] [--dir PATH]
+    venv/bin/python scripts/tool_usage.py [--days 7] [--guild ID] [--model NAME] [--dir PATH]
 
-Prints per-tool counts and failure rates, calls-per-run, an hour-of-day
+Prints per-model requests (model round trips), tokens and cost per run,
+per-tool counts and failure rates, calls-per-run, an hour-of-day
 histogram, call transitions (START/END included, i.e. a first-order Markov
 view) and same-tool repeats within one run. Repeated chains and hot
 transitions are the candidates for a bundled tool or a prompt fix.
@@ -32,12 +33,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument('--days', type=int, default=7, help='window ending today (0 = all)')
     parser.add_argument('--guild', type=int, help='only runs in this guild')
+    parser.add_argument('--model', help='only runs on this model')
     parser.add_argument('--dir', type=Path, default=TOOL_LOG_DIR)
     args = parser.parse_args()
 
     since = (date.today() - timedelta(days=args.days - 1)).isoformat() if args.days else None
     runs = [r for r in iter_runs(since, args.dir)
-            if args.guild is None or r.get('guild_id') == args.guild]
+            if (args.guild is None or r.get('guild_id') == args.guild)
+            and (args.model is None or r.get('model') == args.model)]
     if not runs:
         print(f"No runs in {args.dir}" + (f" since {since}" if since else ""))
         return
@@ -48,6 +51,24 @@ def main():
           + f"  ({runs[0]['ts']} .. {runs[-1]['ts']})")
     print("outcomes: " + ", ".join(f"{k}={v}" for k, v in
                                    Counter(r.get('outcome') for r in runs).most_common()))
+
+    # Rows written before these counters existed are left out of the medians.
+    print("\nper model                     runs  calls/run  requests/run  prompt_tok  cached%  completion_tok  cost_usd")
+    by_model = defaultdict(list)
+    for r in runs:
+        by_model[r.get('model')].append(r)
+    for model, rows in sorted(by_model.items(), key=lambda kv: -len(kv[1])):
+        counted = [r for r in rows if r.get('requests')]
+        med = lambda key: statistics.median(r[key] for r in counted) if counted else '-'
+        prompt = sum(r['prompt_tokens'] for r in counted)
+        cached = (f"{100 * sum(r['cached_prompt_tokens'] for r in counted) / prompt:.0f}"
+                  if prompt else '-')
+        costs = [r.get('est_cost_usd') for r in counted]
+        cost = f"{sum(costs):.4f}" if counted and None not in costs else '-'
+        print(f"  {str(model)[:28]:<28}{len(rows):>5}"
+              f"{statistics.mean(len(r.get('calls', [])) for r in rows):>11.2f}"
+              f"{med('requests'):>14}{med('prompt_tokens'):>12}{cached:>9}"
+              f"{med('completion_tokens'):>16}{cost:>10}")
 
     print("\nper tool                      calls   ok  err  refused  median_ms")
     by_tool = defaultdict(list)

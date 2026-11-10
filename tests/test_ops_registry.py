@@ -146,3 +146,51 @@ async def test_channel_resolution_cannot_escape_the_invoking_guild():
                                      channel_id='10', content='private')
     assert not denied.ok
     channel.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_guild_bound_frontend_need_not_name_the_guild_and_cannot_pass_internals(
+        discord_environment):
+    # The chat agent has one valid guild: its schema omits guild_id and the
+    # call resolves to the invoking guild. A model-supplied INTERNAL argument
+    # (send_message's allowed_mentions) must be rejected, not passed through.
+    from types import SimpleNamespace as NS
+    from unittest.mock import AsyncMock
+
+    bot, guild = discord_environment
+    op = registry.require('list_roles')
+    assert 'guild_id' in op.to_json_schema()['required']
+    assert 'guild_id' not in op.to_json_schema(in_guild=True)['properties']
+    ctx = OpContext(bot=bot, author=NS(id=1), guild=guild)
+    listed = await registry.call_ids('list_roles', ctx, allowed_guild_ids={42})
+    assert listed.ok and len(listed.value) == 5 and 'permissions' not in listed.value[0]
+
+    guild = NS(id=7)
+    channel = NS(id=10, guild=guild, send=AsyncMock())
+    ctx.bot = NS(get_channel=lambda cid: channel)
+    forged = await registry.call_ids(
+        'send_message', ctx, allowed_guild_ids={7}, channel_id='10', content='hi',
+        allowed_mentions={'parse': ['everyone']})
+    assert not forged.ok
+    channel.send.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_add_reaction_reports_each_emoji_and_fails_only_when_none_land():
+    from types import SimpleNamespace as NS
+
+    import discord
+
+    added = []
+
+    async def add_reaction(emoji):
+        if emoji == 'nope':
+            raise discord.HTTPException(NS(status=400, reason='Bad Request'), 'Unknown Emoji')
+        added.append(emoji)
+
+    message = NS(id=20, channel=None, add_reaction=add_reaction)
+    ctx = OpContext(bot=None, author=NS(id=1), guild=NS(id=7))
+    mixed = await registry.call('add_reaction', ctx, message=message, emoji=['👍', 'nope'])
+    assert mixed.ok and mixed.value['added'] == ['👍'] and mixed.value['failed'][0]['emoji'] == 'nope'
+    none = await registry.call('add_reaction', ctx, message=message, emoji=['nope'])
+    assert not none.ok and added == ['👍']

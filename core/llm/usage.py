@@ -94,28 +94,47 @@ class UsageRecord:
     tool_calls: int = 0
     cached_prompt_tokens: int = 0
     reasoning_tokens: int = 0
+    # Model round trips in an agent run (1 for plain chat).
+    requests: int = 1
 
 
-def estimate_cost(record: UsageRecord) -> Optional[float]:
-    """Best-effort USD cost estimate for a UsageRecord. None if the model
-    isn't in the pricing table (unknown, not zero)."""
-    prices = _match_prices(record.provider, record.model)
-    if prices is None:
+def _config_prices(model_info) -> Optional[tuple]:
+    """(prompt, cached, completion) $/Mtok from a model's ai_providers entry,
+    when the operator priced both directions. Cached input is the input
+    price times `cache_input_ratio` (default 0.10)."""
+    try:
+        prompt = float(model_info["cost_per_mtok_input"])
+        completion = float(model_info["cost_per_mtok_output"])
+        ratio = float(model_info.get("cache_input_ratio", 0.10))
+    except (KeyError, TypeError, ValueError):
         return None
+    return prompt, prompt * ratio, completion
 
-    prompt_price, completion_price = prices
-    cached_price = prompt_price
-    # Published global xAI rates; regional/priority premiums are not modeled.
-    if record.provider == "xai":
-        for prefix, price in (("grok-4.6", 0.50), ("grok-4.5", 0.30),
-                              ("grok-4.3", 0.20), ("grok-4.20", 0.20)):
-            if record.model.startswith(prefix):
-                cached_price = price
-                if record.prompt_tokens >= 200_000:
-                    prompt_price *= 2
-                    cached_price *= 2
-                    completion_price *= 2
-                break
+
+def estimate_cost(record: UsageRecord, model_info=None) -> Optional[float]:
+    """Best-effort USD cost estimate for a UsageRecord. Operator prices in
+    the model's config entry win over the built-in table; None if neither
+    knows the model (unknown, not zero)."""
+    configured = _config_prices(model_info or {})
+    if configured is not None:
+        prompt_price, cached_price, completion_price = configured
+    else:
+        prices = _match_prices(record.provider, record.model)
+        if prices is None:
+            return None
+        prompt_price, completion_price = prices
+        cached_price = prompt_price
+        # Published global xAI rates; regional/priority premiums are not modeled.
+        if record.provider == "xai":
+            for prefix, price in (("grok-4.6", 0.50), ("grok-4.5", 0.30),
+                                  ("grok-4.3", 0.20), ("grok-4.20", 0.20)):
+                if record.model.startswith(prefix):
+                    cached_price = price
+                    if record.prompt_tokens >= 200_000:
+                        prompt_price *= 2
+                        cached_price *= 2
+                        completion_price *= 2
+                    break
     cached = max(0, min(record.prompt_tokens, record.cached_prompt_tokens))
     cost = ((record.prompt_tokens - cached) * prompt_price
             + cached * cached_price

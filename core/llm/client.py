@@ -113,9 +113,9 @@ DEFAULT_PROVIDER = "xai"
 DEFAULT_MAX_TOKENS = 3000
 
 # Seed skeleton used when no ai_providers config exists yet, so a fresh
-# install can go straight to `!setapikey <provider> <key>` instead of
-# hand-editing JSON. Persisted to config the first time a mutating command
-# (setapikey/addmodel/addprovider) touches it; model lists then grow via
+# install can go straight to `/aisettings` → Models & Providers instead of
+# hand-editing JSON. Persisted to config the first time the panel changes a
+# key, model or provider; model lists then grow via
 # discovery. Model ids current as of 2026-07.
 DEFAULT_PROVIDERS: Dict[str, Any] = {
     # cost_per_mtok_output ($/1M output tokens) drives the per-message cooldown
@@ -459,16 +459,18 @@ class LLMClient:
         if any(message.get("images") for message in messages):
             settings["openai_store"] = False
 
-        response = await model_request(
-            pai_model,
-            _to_pai_messages(messages),
-            model_settings=settings,
-        )
+        async with pai_model:  # closes the provider's HTTP client
+            response = await model_request(
+                pai_model,
+                _to_pai_messages(messages),
+                model_settings=settings,
+            )
 
         text = "".join(
             part.content for part in response.parts if isinstance(part, TextPart)
         ).strip()
-        usage = _usage_from_pai(response.usage, provider=provider, model=model)
+        usage = _usage_from_pai(response.usage, provider=provider, model=model,
+                                model_info=_model_info(provider_info, model))
 
         self._log_usage(usage, metadata)
         return LLMResponse(text=text, provider=provider, model=model, usage=usage, raw=response)
@@ -499,9 +501,13 @@ class LLMClient:
         adds terminal output functions returning strings; their behavior
         belongs to the caller, not this provider-agnostic client.
 
-        The loop is bounded: at most `max_tool_calls` tool executions
-        (`AgentRunLimitExceeded` carries completed result text beyond that,
-        so callers can explain partial work without replaying actions).
+        The loop is bounded by model requests, not tool calls: at most
+        `max_tool_calls + 2` requests. pydantic-ai checks a tool-call limit
+        against a whole parallel batch before running any of it, so a
+        tool-call cap would drop large batches outright; callers bound what
+        executes inside their tools instead. `AgentRunLimitExceeded` carries
+        completed result text so callers can explain partial work without
+        replaying actions.
         Per-request usage is logged even when a later request fails.
         """
         provider = provider_config.provider
@@ -526,14 +532,12 @@ class LLMClient:
         costs = []
         with capture_run_messages() as transcript:
             try:
-                result = await agent.run(
-                    user_prompt,
-                    message_history=_to_pai_messages(messages),
-                    usage_limits=UsageLimits(
-                        tool_calls_limit=max_tool_calls,
-                        request_limit=max_tool_calls + 2,
-                    ),
-                )
+                async with pai_model:  # closes the provider's HTTP client
+                    result = await agent.run(
+                        user_prompt,
+                        message_history=_to_pai_messages(messages),
+                        usage_limits=UsageLimits(request_limit=max_tool_calls + 2),
+                    )
             except UsageLimitExceeded:
                 completed = [
                     {"tool": part.tool_name, "result": part.model_response_str()}
@@ -546,7 +550,8 @@ class LLMClient:
                 # belong to this run and must be accounted even on failure.
                 for message in transcript:
                     if isinstance(message, PaiModelResponse) and message.run_id is not None:
-                        request_usage = _usage_from_pai(message.usage, provider=provider, model=model)
+                        request_usage = _usage_from_pai(message.usage, provider=provider, model=model,
+                                                        model_info=_model_info(provider_info, model))
                         self._log_usage(request_usage, metadata)
                         if request_usage:
                             costs.append(request_usage.estimated_cost_usd)
@@ -554,7 +559,8 @@ class LLMClient:
         # RunUsage aggregates across every request in the loop; it is an
         # attribute in pydantic-ai 2.x (not the v1 `.usage()` method) and
         # duck-types RequestUsage's input/output token fields.
-        usage = _usage_from_pai(result.usage, provider=provider, model=model)
+        usage = _usage_from_pai(result.usage, provider=provider, model=model,
+                                model_info=_model_info(provider_info, model))
         if usage and costs:
             # Long-context tiers apply per request, never to an aggregate run.
             usage.estimated_cost_usd = (round(sum(costs), 6)
@@ -661,6 +667,10 @@ class _NullLogger:
     def error(self, *a, **k): pass
 
 
+def _model_info(provider_info: Dict[str, Any], model: str) -> Dict[str, Any]:
+    return (provider_info.get("models") or {}).get(model) or {}
+
+
 def _image_part(image):
     """A URL string becomes ImageUrl; {"data", "media_type"} becomes BinaryContent."""
     if isinstance(image, dict):
@@ -706,7 +716,8 @@ def _to_pai_messages(messages: List[Dict]) -> List[ModelMessage]:
     return pai_messages
 
 
-def _usage_from_pai(usage: Optional[RequestUsage], provider: str, model: str) -> Optional[UsageRecord]:
+def _usage_from_pai(usage: Optional[RequestUsage], provider: str, model: str,
+                    model_info: Optional[Dict] = None) -> Optional[UsageRecord]:
     if usage is None:
         return None
     prompt_tokens = usage.input_tokens or 0
@@ -722,6 +733,7 @@ def _usage_from_pai(usage: Optional[RequestUsage], provider: str, model: str) ->
         tool_calls=getattr(usage, "tool_calls", 0) or 0,
         cached_prompt_tokens=getattr(usage, "cache_read_tokens", 0) or 0,
         reasoning_tokens=(getattr(usage, "details", {}) or {}).get("reasoning_tokens", 0),
+        requests=getattr(usage, "requests", 1) or 1,
     )
-    record.estimated_cost_usd = estimate_cost(record)
+    record.estimated_cost_usd = estimate_cost(record, model_info)
     return record
