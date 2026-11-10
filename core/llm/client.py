@@ -234,9 +234,11 @@ class AgentRunLimitExceeded(UsageLimitExceeded):
     or logs. Keeping SDK messages here would couple callers to provider state.
     """
 
-    def __init__(self, completed_results):
+    def __init__(self, completed_results, usage=()):
         super().__init__("Agent run exceeded its usage limit.")
         self.completed_results = completed_results
+        # One UsageRecord per model request the capped run made.
+        self.usage = list(usage)
 
 
 class LLMClient:
@@ -544,7 +546,12 @@ class LLMClient:
                     for message in transcript if isinstance(message, PaiModelRequest)
                     for part in message.parts if isinstance(part, ToolReturnPart)
                 ]
-                raise AgentRunLimitExceeded(completed) from None
+                raise AgentRunLimitExceeded(completed, [
+                    _usage_from_pai(message.usage, provider=provider, model=model,
+                                    model_info=_model_info(provider_info, model))
+                    for message in transcript
+                    if isinstance(message, PaiModelResponse) and message.run_id is not None
+                ]) from None
             finally:
                 # Input history is synthesized without run IDs. SDK responses
                 # belong to this run and must be accounted even on failure.

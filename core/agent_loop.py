@@ -135,7 +135,10 @@ def _make_agent_tool(op: Op, ctx: Any, allowed: frozenset,
             return {"ok": False,
                     "error": f"'{op.name}' is no longer available in this "
                              "conversation. No Discord action was attempted."}
-        path_error = chat_host_path_error(op, raw, ctx.guild)
+        try:
+            path_error = chat_host_path_error(op, raw, ctx.guild)
+        except (ValueError, OSError):  # e.g. a NUL byte in the path
+            path_error = "Invalid file path."
         if path_error:
             logger.warning("agent-op %s actor=%s refused: host path outside media",
                            op.name, ctx.author.id)
@@ -256,7 +259,9 @@ async def _run_agent_turn(llm, provider_config, api_messages, ctx, tool_names,
 
     def count_usage(response):
         log_usage(response)
-        record = response.usage
+        add_usage(response.usage)
+
+    def add_usage(record):
         if record is None:
             return
         for key in ("requests", "prompt_tokens", "cached_prompt_tokens",
@@ -287,6 +292,8 @@ async def _run_agent_turn(llm, provider_config, api_messages, ctx, tool_names,
             # best-effort answer, never a canned failure string. The request
             # is repeated without the tool guidance: this run has no tools.
             logger.warning("agentic run hit hard request cap")
+            for record in error.usage:
+                add_usage(record)
             quiet = False
             fallback = await llm.run_agent(provider_config, api_messages + [
                 {"role": "user", "content": closing_request},

@@ -165,8 +165,8 @@ class Counter(commands.Cog):
         previous = None
         # before is essential: later burst messages must not move this
         # message's baseline. No saved number can survive a deletion. No
-        # number in the last 200 messages counts as a fresh start.
-        async for prior in message.channel.history(limit=200, before=message, oldest_first=False):
+        # number in the last 1000 messages counts as a fresh start.
+        async for prior in message.channel.history(limit=1000, before=message, oldest_first=False):
             if prior.author.bot or _marked_wrong(prior):
                 continue
             previous = _number(prior.content)

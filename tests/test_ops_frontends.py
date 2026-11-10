@@ -200,3 +200,26 @@ def test_cost_uses_operator_prices_for_a_model_the_table_does_not_know():
     assert estimate_cost(record) is None
     assert estimate_cost(record, {'cost_per_mtok_input': 2, 'cost_per_mtok_output': 10,
                                   'cache_input_ratio': 0.25}) == 11.25
+
+
+@pytest.mark.asyncio
+async def test_model_that_never_stops_calling_gets_a_final_answer_and_full_usage(
+        config, gpt_run, monkeypatch, tool_telemetry_dir):
+    # The fallback used to repeat "call a tool" guidance to a run with no tools.
+    import json
+    gpt, ctx = gpt_run
+    config.set(7, 'agent_ops_gate', {'send_message': 'everyone'})
+    config.set(7, 'ai_tool_budget', 4)
+
+    def respond(messages, info):
+        if not info.function_tools:
+            return ModelResponse(parts=[TextPart('here is what happened')])
+        return ModelResponse(parts=[ToolCallPart('send_message', {'channel_id': '10', 'content': 'x'})])
+
+    _use_model(gpt, config, monkeypatch, respond)
+    await gpt.process_askgpt(ctx, 'go')
+
+    assert ctx.channel.send.await_count == 4
+    assert ctx.send.await_args.args[0] == 'here is what happened'
+    row = json.loads(next(tool_telemetry_dir.glob('*.jsonl')).read_text())
+    assert row['outcome'] == 'hard_cap' and row['requests'] == 7
