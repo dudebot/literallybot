@@ -1,13 +1,11 @@
-"""Cost-aware history selection for Discord conversations.
+"""History window selection for Discord conversations.
 
-Cache lifetime and hit rate are assumptions, not provider guarantees. Compare
-complete serialized messages: editing an earlier message invalidates its suffix.
+Cache lifetime and hit rate are assumptions, not provider guarantees.
 History is fetched again on each invocation to reflect edits and deletions.
 """
 from collections import OrderedDict
 from dataclasses import dataclass
 import math
-import hashlib
 
 
 DEFAULT_HISTORY_MIN = 15
@@ -40,45 +38,11 @@ def cache_policy(model_info):
         return 0.10, 300.0
 
 
-def estimate_message_tokens(message):
-    """Cheap nonblocking cost proxy, not an invoice tokenizer (UTF-8 / 4)."""
-    return (4 + math.ceil(len(message.get("content", "").encode("utf-8")) / 4)
-            + 1792 * len(message.get("images", ())))
-
-
-def comparison_message(message):
-    """Detach comparison state from image bytes without changing equality."""
-    snapshot = dict(message)
-    if 'images' in snapshot:
-        snapshot['images'] = [
-            (hashlib.sha256(image['data']).hexdigest(), image['media_type'], len(image['data']))
-            if isinstance(image, dict) else image
-            for image in snapshot['images']]
-    return snapshot
-
-
-def prefix_tokens(previous, current):
-    total = 0
-    for old, new in zip(previous, current):
-        if comparison_message(old) != comparison_message(new):
-            break
-        total += estimate_message_tokens(new)
-    return total
-
-
-def input_units(messages, previous, ratio):
-    """Input cost in units of one full-price token."""
-    total = sum(map(estimate_message_tokens, messages))
-    cached = prefix_tokens(previous, messages)
-    return total - (1 - ratio) * cached
-
-
 @dataclass
 class HistoryState:
-    """Last successful request: anchor, comparison snapshot, and lifetime."""
+    """Last successful request: its first message and when it was sent."""
 
     anchor: int
-    messages: list
     sent_at: float
     expires_at: float
 
@@ -86,9 +50,10 @@ class HistoryState:
 class HistoryWindows:
     """Bounded map keyed by (guild, channel, provider, model, tool names).
 
-    Keep rendered text and image fingerprints to detect changed prefixes;
-    IDs alone cannot do that. OrderedDict provides expected O(1) lookup/update/oldest eviction.
-    Ordering follows successful commits, not reads or failed attempts.
+    Remembers where the last successful request's history started, so the
+    next one inside the cache lifetime can start at the same message and
+    repeat the same prefix. Ordering follows successful commits, not reads
+    or failed attempts.
     """
 
     def __init__(self, capacity=256):
@@ -102,26 +67,22 @@ class HistoryWindows:
         self.states.pop(key, None)
         return None
 
-    def choose(self, baseline, extended, previous, ratio):
-        """Keep the anchor only when its matching prefix outweighs extra input.
+    def choose(self, baseline, extended, previous):
+        """Keep the previous anchor while it is live and the caller could
+        still render it within the maximum; otherwise start a fresh window.
 
-        The caller bounds both candidates and provides the *current* rendering.
-        On equal costs prefer the shorter baseline. No output cost is assumed
-        to change as a result of retaining more conversation.
-        """
+        A cost model used to decide this. With max = 2x min it chose the
+        extension in nearly every case the caller offers one, so the rule is
+        stated directly."""
         if previous is None or extended is None:
             return baseline
-        old = previous.messages
-        if input_units(extended, old, ratio) < input_units(baseline, old, ratio):
-            return extended
-        return baseline
+        return extended
 
-    def commit(self, key, anchor, messages, sent_at, *, ttl=300):
-        # An extension retains the anchor, but always refreshes prompt/time.
+    def commit(self, key, anchor, sent_at, *, ttl=300):
+        # An extension retains the anchor, but always refreshes the time.
         for expired in [k for k, state in self.states.items() if state.expires_at <= sent_at]:
             del self.states[expired]
-        self.states[key] = HistoryState(
-            anchor, [comparison_message(message) for message in messages], sent_at, sent_at + ttl)
+        self.states[key] = HistoryState(anchor, sent_at, sent_at + ttl)
         self.states.move_to_end(key)
         while len(self.states) > self.capacity:
             self.states.popitem(last=False)

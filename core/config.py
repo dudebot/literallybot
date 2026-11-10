@@ -39,7 +39,6 @@ class Config:
         self._reload_delay = 2.0  # seconds - check for external changes
         self._lock = Lock()  # Thread safety for timer operations
         self._data_lock = Lock()  # Thread safety for config dict access
-        self._writing = False  # Flag to prevent read-during-write
         self._load_all()
         self._schedule_reload()  # Start monitoring for external changes
 
@@ -48,9 +47,12 @@ class Config:
             if not fname.endswith('.json'):
                 continue
             path = os.path.join(self.config_dir, fname)
-            with open(path, 'r') as f:
-                data = json.load(f)
-            
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except ValueError as e:
+                raise ValueError(f"Config file {path} is not valid UTF-8 JSON: {e}") from e
+
             config_id = fname[:-5]  # Remove .json extension
             self._configs[config_id] = data
             # Track initial modification time
@@ -87,13 +89,12 @@ class Config:
         fname = f'{config_id}.json'
         path = os.path.join(self.config_dir, fname)
         temp_path = path + '.tmp'
-        
-        self._writing = True  # Set flag to prevent reload during write
+
         try:
             # Atomic write, tmp+rename. These files carry plaintext secrets,
             # so the temp file is opened 0600 up front.
             fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, FILE_MODE)
-            with os.fdopen(fd, 'w') as f:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
                 # Tighten BEFORE writing any content. O_CREAT's mode is masked
                 # by umask, and is ignored outright when the temp file already
                 # exists (a leftover from a previous crash keeps its old, maybe
@@ -106,14 +107,7 @@ class Config:
                     pass  # best-effort: Windows has no fchmod
                 json.dump(self._configs.get(config_id, {}), f, indent=4)
 
-            # Cross-platform atomic rename
-            if os.name == 'nt':  # Windows
-                # On Windows, need to remove target first
-                if os.path.exists(path):
-                    os.remove(path)
-                os.rename(temp_path, path)
-            else:  # Unix/Linux - supports atomic replace
-                os.rename(temp_path, path)
+            os.replace(temp_path, path)
             _harden(path, FILE_MODE)
 
             # Update modification time after successful write
@@ -127,8 +121,6 @@ class Config:
                 except:
                     pass
             raise e
-        finally:
-            self._writing = False  # Clear flag
 
     def _schedule_save(self):
         """Schedule a delayed save to batch writes"""
@@ -283,9 +275,11 @@ class Config:
     
     def _timer_reload(self):
         """Timer callback to check for external changes"""
-        with self._lock:
-            self._check_external_changes()
-        self._schedule_reload()  # Reschedule next check outside lock
+        try:
+            with self._lock:
+                self._check_external_changes()
+        finally:
+            self._schedule_reload()  # Reschedule next check outside lock
     
     def _merge_configs(self, config_id, external_data):
         """Take the on-disk file wholesale; file wins over in-memory state."""
@@ -295,9 +289,6 @@ class Config:
     
     def _check_external_changes(self):
         """Check for external file modifications and reload if needed"""
-        if self._writing:
-            return  # Skip if we're currently writing
-        
         for fname in os.listdir(self.config_dir):
             if not fname.endswith('.json'):
                 continue
@@ -314,7 +305,7 @@ class Config:
                 
                 if is_new or is_modified:
                     # Load the external changes
-                    with open(path, 'r') as f:
+                    with open(path, 'r', encoding='utf-8') as f:
                         external_data = json.load(f)
                     
                     # Merge with current config
@@ -326,7 +317,7 @@ class Config:
                     action = "Loaded new" if is_new else "Reloaded"
                     print(f"[Config] {action} {config_id}.json due to external changes")
                     
-            except (OSError, json.JSONDecodeError) as e:
+            except (OSError, ValueError) as e:
                 print(f"[Config] Error reloading {config_id}.json: {e}")
     
     def shutdown(self):

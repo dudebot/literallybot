@@ -1,6 +1,139 @@
 # Cog Development Guide
 
-This guide covers creating custom cogs for LiterallyBot, from basic commands to advanced features with configuration management.
+How to write a custom cog: start from the template below, then read the
+sections it points to.
+
+## Quick start: a complete cog
+
+Save this as `cogs/greeter.py` and restart the bot. Its cog ID is `greeter`
+(the file name). It has one command for everyone, one bot-admin command with a
+slash twin, one superadmin command, per-server config, and one op that shares
+the command's service method.
+
+```python
+"""Greeter: posts a per-server greeting. A template for new cogs."""
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+from core.ops import OpParam, OpScope, ParamKind, op
+from core.panels import panel_slash_pin
+from core.permissions import is_admin, is_superadmin
+
+FALLBACK_GREETING = "Hello, {name}!"
+MAX_GREETING = 200
+
+
+class Greeter(commands.Cog):
+    """Greets members with a message each server can change."""
+
+    def __init__(self, bot):
+        self.bot = bot
+
+    # --- services: plain objects in, plain data out, no replies -----------
+
+    def _greeting_for(self, guild_id: int) -> str:
+        default = self.bot.config.get_global("greeter_default", FALLBACK_GREETING)
+        return self.bot.config.get(guild_id, "greeter_message", default)
+
+    def _set_greeting(self, guild_id: int, text: str) -> str:
+        text = (text or "").strip()
+        if not text or len(text) > MAX_GREETING:
+            raise ValueError(f"Greeting must be 1-{MAX_GREETING} characters.")
+        self.bot.config.set(guild_id, "greeter_message", text)
+        return text
+
+    async def _greet(self, channel, member) -> dict:
+        text = self._greeting_for(channel.guild.id).replace("{name}", member.display_name)
+        message = await channel.send(text)
+        return {"status": "sent", "message_id": str(message.id)}
+
+    # --- everyone ----------------------------------------------------------
+
+    @commands.command(name="greet")
+    @commands.guild_only()
+    async def greet(self, ctx):
+        """Greet yourself with this server's greeting."""
+        await self._greet(ctx.channel, ctx.author)
+
+    # --- bot admins: hidden prefix command + guild-only slash twin ---------
+
+    @commands.command(name="setgreeting", hidden=True)
+    @commands.guild_only()
+    @commands.check(is_admin)
+    async def setgreeting(self, ctx, *, text: str = None):
+        """Set this server's greeting. {name} becomes the member's name."""
+        try:
+            saved = self._set_greeting(ctx.guild.id, text)
+        except ValueError as error:
+            await ctx.send(f"{error} Usage: `{ctx.prefix}setgreeting <text>`")
+            return
+        await ctx.send(f"Greeting set: {saved}")
+
+    @app_commands.command(name="setgreeting", description="Set this server's greeting")
+    @app_commands.guild_only()
+    @panel_slash_pin()
+    @app_commands.check(is_admin)
+    @app_commands.describe(text="Greeting text; {name} becomes the member's name")
+    async def setgreeting_slash(self, interaction: discord.Interaction, text: str):
+        try:
+            saved = self._set_greeting(interaction.guild.id, text)
+        except ValueError as error:
+            await interaction.response.send_message(str(error), ephemeral=True)
+            return
+        await interaction.response.send_message(f"Greeting set: {saved}", ephemeral=True)
+
+    # --- superadmin (bot operator) -----------------------------------------
+
+    @commands.command(name="greeterdefault", hidden=True)
+    @commands.check(is_superadmin)
+    async def greeterdefault(self, ctx, *, text: str = None):
+        """Set the greeting used by servers that have not set their own."""
+        text = (text or "").strip()
+        if not text or len(text) > MAX_GREETING:
+            await ctx.send(f"Usage: `{ctx.prefix}greeterdefault <text>` (1-{MAX_GREETING} characters)")
+            return
+        self.bot.config.set_global("greeter_default", text)
+        await ctx.send(f"Default greeting set: {text}")
+
+    # --- op: the same service, callable by the chat agent and MCP ----------
+
+    @op("greet_member",
+        "Post this server's greeting for a member in a channel. "
+        "Returns the id of the message it sent.",
+        params=[OpParam("channel", ParamKind.CHANNEL, "Channel to post in."),
+                OpParam("member", ParamKind.MEMBER, "Member to greet.")],
+        scope=OpScope.GUILD, group="greeter", group_label="Greeter")
+    async def op_greet_member(self, ctx, channel, member) -> dict:
+        return await self._greet(channel, member)
+
+
+async def setup(bot):
+    await bot.add_cog(Greeter(bot))
+```
+
+What each part does:
+
+- **Access levels.** A command with no check is for everyone.
+  `@commands.check(is_admin)` (prefix) or `@app_commands.check(is_admin)`
+  (slash) limits it to bot admins; `is_superadmin` limits it to the bot's
+  operator. One decorator line is the whole gate. See
+  [Permission Management](#permission-management).
+- **Slash twin.** `@panel_slash_pin()` only hides the slash command from
+  members without Manage Messages. It is visibility, not authorization: the
+  `@app_commands.check` line is the gate.
+- **Config.** `self.bot.config.get(guild_id, key, default)` and
+  `.set(guild_id, key, value)` are per-server; `get_global` / `set_global` are
+  bot-wide. Add new keys to the [key registry](config-system.md#key-registry).
+- **Op.** `greet_member` and `!greet` call the same `_greet` service. The op
+  declares no permission level and is off until the superadmin whitelists it
+  and a server admin sets it to Admin or Everyone in `/aisettings`
+  ([enabling cog tools](config-system.md#enabling-cog-tools)).
+- **Errors.** Validate input in the command body and reply with usage; let
+  unexpected exceptions reach the [central error handler](error-handling.md).
+
+To turn the cog off without deleting it, add `greeter` to `disabled_cogs`
+(see [Disabling Cogs Per Deployment](#disabling-cogs-per-deployment)).
 
 ## Cog Architecture Overview
 
@@ -40,28 +173,6 @@ This does not ban Discord SDK imports in shared message or panel helpers, raw
 `registry.op` API primitives, or composition-root event wiring in `bot.py`. The
 checks cover static imports and declarations; runtime lookups and dynamically
 constructed imports still need code review.
-
-### Basic Cog Structure
-```python
-from discord.ext import commands
-
-class MyCog(commands.Cog):
-    """Description of what this cog does"""
-    
-    def __init__(self, bot):
-        self.bot = bot
-        self.logger = bot.logger  # Access central logging
-        # Initialize any cog-specific data here
-    
-    @commands.command()
-    async def my_command(self, ctx):
-        """Command description for help system"""
-        await ctx.send("Hello from MyCog!")
-
-async def setup(bot):
-    """Required function for cog loading"""
-    await bot.add_cog(MyCog(bot))
-```
 
 ## Command Development
 
@@ -111,43 +222,26 @@ an atomic transaction across concurrent writers.
 
 ## Permission Management
 
-THE DECORATOR DECIDES. The gate is `core.permissions.is_admin` / `is_superadmin` —
-the central predicates, not a separate Discord-only check. `is_admin` includes
-superadmins, configured guild admins, Discord administrators and the guild
-owner, with the bot-account exclusion described in [security.md](security.md).
-discord.py has two command systems, so the same function takes two wrappers. Do not invent a
-third.
+Commands have three access levels, decided by the bot:
 
-```python
-import discord
-from discord import app_commands
-from discord.ext import commands
-from core.permissions import is_admin, is_superadmin
-from core.panels import panel_slash_pin
+- **Everyone** — no check.
+- **Bot admin** — `core.permissions.is_admin`: listed in the guild's `admins`
+  config (`!claimadmin` / `!addadmin`), a Discord Administrator, the guild
+  owner, or a superadmin.
+- **Superadmin** — `core.permissions.is_superadmin`: listed in `superadmins` in
+  the global config. This is the bot's operator.
 
-@commands.command(hidden=True)
-@commands.guild_only()
-@commands.check(is_admin)          # prefix
-async def aisettings(self, ctx):
-    ...
-
-@app_commands.command(name="aisettings")
-@app_commands.guild_only()
-@panel_slash_pin()                 # picker pin, not authorization
-@app_commands.check(is_admin)      # slash — same predicate
-async def aisettings_slash(self, interaction: discord.Interaction):
-    ...
-```
+The decorator decides, in one line. discord.py has two command systems, so the
+same predicate takes two wrappers. Do not invent a third. The
+[template](#quick-start-a-complete-cog) shows all three levels.
 
 - Prefix: `@commands.check(is_admin)` or `@commands.check(is_superadmin)`.
 - Slash: `@app_commands.check(is_admin)` or `@app_commands.check(is_superadmin)`.
-- Gated slash also sets `guild_only` (never in DMs) and pins
-  `default_permissions(manage_messages=True)` so ordinary members do not
-  see the command in Discord's picker. Manage Messages is the typical
-  moderator bit — not Discord Administrator, which locked out bot admins
-  who are not server admins. Authorization is still the check. A bot
-  admin/superadmin without Manage Messages in that guild still has the
-  prefix twin. `/help` lists a command only if the invoker could run it.
+- Gated slash also sets `guild_only` (never in DMs) and `@panel_slash_pin()`,
+  which hides the command from members without Manage Messages in Discord's
+  picker. That is visibility, not authorization; the check is the gate. A bot
+  admin or superadmin without Manage Messages in that guild still has the
+  prefix twin.
 - `/help` lists a command only if the invoker could run it, by reading the
   decorator (`__gate__` on `is_admin` / `is_superadmin`). A body
   `if not is_admin(...)` is defense in depth, not the gate — `/help`
@@ -334,6 +428,14 @@ The op impl is a thin adapter: validate, coerce, delegate to the service.
 | **group** | Kebab-case id for the panel section. Core primitives use an `OP_GROUPS` key in `core/ops.py`. Cog ops pass any id plus optional `group_label`; the live registry learns the group when the op registers. Do not add cog groups to `OP_GROUPS`. Each group must stay under Discord's 25-option select cap. |
 | **agent_guidance** | Optional. When and how the in-chat agent should use the tool, and non-obvious result semantics ("status 'exists' means nothing was written"). Appended to `description` in the agent's tool definition; a short worked example belongs here when the arguments are not obvious. MCP clients get `description` only. |
 | **serialize** | Callable adapting a return value to a JSON-safe dict. Without one, dict results pass through unchanged; other results become `{}`. Use it when objects or IDs need conversion. |
+| **sequential** | `True` makes the provider loop run this tool's calls one at a time (two writes in one turn do not race). Not a storage transaction. |
+| **group_label** | `@op` only. Display label for a new cog group. |
+| **confirm_everyone** | `True` makes the `/aisettings` Server tab ask the admin to type YES before this op is first set to Everyone. Use it for ops that let a member spend the bot's permissions to gain access or do lasting damage. It is a settings-panel prompt only: never checked at call time, never sent to the model, and not a security boundary. |
+
+There is no permission field. An op's access is configuration only: the
+superadmin's `agent_ops_whitelist`, then the guild's Off / Admin / Everyone
+choice in `/aisettings`. Do not describe access tiers in `description` or
+`agent_guidance`.
 
 There is deliberately **no `origin` parameter**. Origin is stamped by the
 registration *path* (`'core'` for `core/ops.py`'s inline registrations,
@@ -379,14 +481,26 @@ decimal *strings* (they exceed 2**53 and would round as JSON numbers).
 | `STRING`, `INTEGER`, `BOOLEAN` | same name | the scalar |
 | `SNOWFLAKE` | same name (string) | an id you handle yourself — *not* resolved |
 | `INTERNAL` | never on the wire | only object-based callers pass it |
-| `SELF_USER` | `user_id`, optional | the invoker when omitted; another `Member` only when an admin names someone in this guild. In a DM, always the invoker. Checked on both dispatch paths. SELF ops only; such an op is a **User** tool in /aisettings (Extra → User). |
+| `SELF_USER` | `user_id`, optional | the invoker when omitted; another `Member` only when an admin names someone in this guild. Checked on both dispatch paths. SELF ops only; such an op is a **User** tool in /aisettings (Extra → User). |
+
+In the chat agent, `guild_id` is left out of every tool schema
+(`Op.to_json_schema(in_guild=True)`). A required `GUILD` param then resolves
+to the invoking guild; an optional one arrives as `None`, so fall back to
+`ctx.guild` in the impl. MCP schemas keep `guild_id`. `INTERNAL` params are never on the wire,
+and an id-based call that supplies one is rejected.
+
+`OpParam(..., host_path=True)` marks a string that is a path on the bot's
+host. In chat, such a path must be inside the guild's media library
+(`media/<guild_id>/`) or the emoji download folder (`media/tmp/`); anything
+else is refused before the op runs (`core.ops.chat_host_path_error`, called
+from `core/agent_loop.py`). MCP calls are not confined. Mark every parameter
+that names a host file.
 
 #### Example: a SELF user tool
 
-A pair of note tools on a cog, the shape a downstream copy uses to let the
-agent remember things about the person it talks to. Both are SELF ops with one
-optional `SELF_USER` parameter, so each acts on the invoker unless an admin
-names another member of the same guild. In a DM it is always the invoker.
+A pair of note tools that let the agent remember things about the person it
+talks to. Both are SELF ops with one optional `SELF_USER` parameter, so each
+acts on the invoker unless an admin names another member of the same guild.
 
 ```python
 from datetime import datetime, timezone
@@ -425,8 +539,8 @@ class Notes(commands.Cog):
   `user_id` out for the person talking to it.
 - `sequential=True` keeps two writes in one turn from racing.
 - The tools stay off until a super-admin whitelists them, `ai_self_tools_enabled`
-  is on, and a guild admin opens them in /aisettings (DMs skip the guild gate).
-  They then show under Extra → User.
+  is on, and a guild admin opens them in /aisettings. They then show under
+  Extra → User.
 
 ### Lifecycle
 
@@ -497,10 +611,7 @@ The media cog already supplies two behavioral primitives:
 an item. A successful result contains `status`, the matched `name`, and
 `message_id`; the attachment has already been sent. Use `stay_quiet` when
 the in-chat request needs only the clip and no final reply. Paths are never
-returned. Addition and deletion remain admin-panel actions (`/media`).
-If exposed later, both should share panel services and use configured tool access;
-deletion should take an exact filename, and download failures must produce
-tool errors rather than successful human-readable error strings.
+returned. Addition and deletion are admin-panel actions (`/media`).
 
 Media additions allow one download per guild and two across the bot. Direct
 HTTP transfers use finite connect/read timeouts; streamed downloads and yt-dlp
@@ -515,67 +626,9 @@ files and release admission slots.
 Activation uses the [global and guild gates](config-system.md#enabling-cog-tools).
 The stable `@op` description, followed by its `agent_guidance`, becomes the
 Pydantic tool description (`core/agent_loop.py`, `Tool.from_schema`), so it
-reaches the model only for enabled tools. Neither field currently has a runtime config editor or catalog callback.
-There is no lazy schema discovery in the in-chat loop: enabled schemas are
-sent with the run; `list_media` discovers library data on demand.
-
-#### Dynamic catalog proposal (not implemented)
-
-Keep static schemas plus `list_media` as the default. For a future experiment,
-build a sorted, bounded catalog snapshot from the invoking guild only, once
-per run, and append it to the changing request context after reusable history.
-Include it only when media tools are enabled. Encode filenames as untrusted
-data, cap entries and bytes, and identify truncation with a `list_media`
-fallback. Resolve the actual file again at execution: a snapshot can become
-stale. Never mutate registry descriptions shared across guilds or put a
-guild catalog in the server-wide MCP schema.
-
-This saves a discovery call for vague requests but adds input tokens to every
-media-enabled run. Catalog changes in a tool description can invalidate cache
-reuse at or after that changed prefix; they do not inherently destroy every
-cached token. A stable sorted catalog need not change on every request, but
-the current history cost estimator does not model changing tool definitions.
-Keeping optional catalog data late in request context preserves more stable
-prefix material. Compare actual cached-input usage, total cost, latency and
-correct clip selection before adopting automatic injection. For the current
-small library, explicit listing keeps freshness and behavior simpler.
-
-### GPT history and image inputs
-
-`!gpt` always uses `LLMClient.run_agent`, including tool-less guilds and DM
-command contexts. DMs expose zero bot tools; automatic mention/reply handling
-remains guild-only. `stay_quiet` is a terminal output tool on every run.
-The hard-budget fallback is another agent run with zero bot tools and the
-budget note. Existing tool authorization and guild confinement still apply.
-
-History turns always carry message IDs. Attachment images and embed images /
-thumbnails belong to their source turn, including referenced messages and bot
-posts; the closing request context has no pixels. Pydantic-ai response parts
-cannot contain input `BinaryContent`, so the adapter places bot-posted pixels
-in a labeled user part immediately after the corresponding assistant text.
-
-Each render sends at most eight images. Trigger images have first priority,
-then reply-target images, each in attachment/embed order. Remaining slots keep
-retained pins; only new required trigger/reply images can evict the oldest pins
-(by message ID and position). Vacancies fill from the newest other images.
-A bounded per-conversation memo preserves these selections while they remain
-in the window, so text-only follow-ups keep shared prefixes stable. Overflow
-images get `[image: filename]` placeholders, including excess explicit inputs.
-Failed downloads and images excluded by `vision: false` also get placeholders.
-Image availability never changes the system prompt. The history cost estimate
-includes a conservative 1,792 input tokens per image.
-
-`core/ai_images.py` holds an LRU of normalized JPEG/PNG bytes keyed by attachment
-ID (or URL without query/fragment), bounded at 64 entries and 64 MiB. Failed
-loads are cached for 30 seconds. Up to four downloads/processes run concurrently;
-Pillow processing runs off the event loop. Inputs retain the Discord host
-allowlist, 8 MiB body cap, and 2048-pixel normalization; redirects are refused.
-A signed CDN 403/404 refreshes the source message once per preparation, then
-retries the same image identity. Eviction or failure expiry can cause a reload;
-deterministic normalization keeps successful image bytes stable. Failed loads
-log a WARNING with the URL query and fragment removed. History comparison
-snapshots retain image fingerprints rather than pixels; expired snapshots are
-pruned on successful commits.
+reaches the model only when the tool is offered. The schemas of every tool
+the invoker may call are sent with the run; `list_media` discovers library
+data on demand.
 
 ## Registering event reports
 
@@ -621,14 +674,14 @@ when needed for edits and timeout cleanup. Components V2 panels set
 
 ## Testing & Restarting Tips
 
-Follow [the qualitative test policy](error-handling.md#test-quality-and-development-checks). A new cog or op does not
-require its own schema, metadata, forwarding, and payload test bundle.
+Follow the [test policy](testing.md). A new cog or op does not need its own
+schema, metadata, forwarding, and payload test bundle.
 
 - **The cog set is fixed at boot (#86)** — there is no hot-reload. To pick up a
   code change, restart the bot: `!restart` in Discord (or the `!cogs` panel's
   Restart button — same exit path), or restart the service from the shell,
   which is also where deployment `git pull`s happen.
-- Run `pytest tests/` before restarting; a cog that fails to import is reported
+- Run `venv/bin/python -m pytest tests/` before restarting; a cog that fails to import is reported
   to Discord at startup but simply won't be there.
 - Let unexpected failures reach the central error handler. Catch only when
   recovering or adding context; explicitly report handled failures through
@@ -674,15 +727,24 @@ cannot supply a password. `Restart=always` relaunches a killed process.
 ### Shared agent execution
 
 `core.agent_loop.run_agent_turn` owns tool construction, terminal quiet,
-usage logging and hard-limit fallback. GPT delegates to it;
+usage logging, telemetry and the hard-limit fallback. GPT delegates to it;
 other trusted callers supply their assembled messages, context, resolved tool
 names, closing request, metadata and optional dispatch-validity hook. Persona,
 history scraping, lifecycle checks and delivery remain with the caller.
 Use `resolve_agent_tools(ctx, scopes)` before assembling history/guidance, and
-include that same policy in the cache key. Descriptions and per-tool guidance
-reach the model through the tool definitions. `build_agentic_guidance(names)`
-names the enabled tools from that resolved list and states the loop contract;
-it supports ID-free guidance, and guild callers add guild/channel IDs.
+include that same list in the cache key. It returns only the tools this invoker
+may call, so the model is never offered a tool it would be refused.
+Descriptions and per-tool guidance reach the model through the tool
+definitions. `build_agentic_guidance(tool_names, guild_id, channel_id)` does
+not list tool names; it adds the guild/channel IDs and the loop contract (a
+response without a tool call ends the turn and is posted).
+
+The action budget (`ai_tool_budget`, default 8) is enforced in
+`core/agent_loop.py`, not by a pydantic-ai tool-call limit: calls past the
+budget get an in-band refusal telling the model to answer now, and the last
+three results carry `tool_calls_remaining`. The only hard stop is a
+model-request limit of budget + 2; hitting it runs one tool-less fallback that
+explains the results so far.
 
 Set `sequential=True` on an op whose writes must execute sequentially in the
 provider loop; this metadata is carried by both registration paths into Tool.

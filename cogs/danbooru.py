@@ -191,6 +191,11 @@ class Danbooru(commands.Cog):
         group_label="Integrations",
     )
     async def op_search_danbooru(self, ctx, channel, tags: str) -> dict:
+        # In chat the reply (and so the URL) lands where the request was
+        # made, whatever channel the model named: a non-NSFW origin decides.
+        origin = getattr(ctx, "channel", None)
+        if origin is not None and not _channel_is_nsfw(origin):
+            channel = origin
         return await self.search(str(tags).split(), channel)
 
 

@@ -6,6 +6,7 @@ import logging
 import asyncio
 from weakref import WeakValueDictionary
 import os
+import re
 import time
 from collections import deque, OrderedDict
 from typing import Dict, List, Optional, Any
@@ -34,6 +35,18 @@ from core.ai_images import ImageCache, MAX_IMAGES, message_images
 
 PANEL_TIMEOUT = 180
 TOOL_BUDGET_VALUES = (4, 8, 12, 16)
+
+
+# Bracket markers the harness itself writes into the prompt. Text typed by
+# people (messages, embeds, display names) must not be able to forge one.
+_HARNESS_MARKER = re.compile(
+    r"\[(?=\s*(?:COMMAND from|REQUEST CONTEXT|SYSTEM|msg_id:|history metadata|"
+    r"OBSERVED TOOL RESULTS))", re.IGNORECASE)
+
+
+def defang(text):
+    """Break harness-style markers in user-authored text: "[SYSTEM]" -> "(SYSTEM]"."""
+    return _HARNESS_MARKER.sub("(", text or "")
 
 
 def strip_images(messages, note):
@@ -271,7 +284,7 @@ class Gpt(commands.Cog):
         # Build a mapping from user IDs to display names for non-bot messages
         user_mapping = {}
         for msg in list(messages) + list(referenced_msgs.values()):
-            if include_ids and not msg.author.bot:
+            if include_ids and msg.author.id != self.bot.user.id:
                 user_mapping[str(msg.author.id)] = msg.author.display_name
                 # Extract user ids from user mentions in the message (formats like <@123456> and <@!123456>)
                 mentioned_ids = [(str(user.id), user.name) for user in msg.mentions]
@@ -322,7 +335,7 @@ class Gpt(commands.Cog):
         # Construct history with bot messages unchanged and non-bot with user ID prefix
         for msg in all_messages_for_history:
             full_content = getattr(msg, 'content', '')
-            if msg.id in referenced_msgs and not msg.author.bot:
+            if msg.id in referenced_msgs and msg.author.id != self.bot.user.id:
                 full_content = '[REFERENCED MESSAGE] ' + full_content
             
             if hasattr(msg, 'embeds') and msg.embeds:
@@ -376,7 +389,7 @@ class Gpt(commands.Cog):
             
             id_tag = f"[msg_id: {msg.id}] "
 
-            if hasattr(msg, 'author') and hasattr(msg.author, 'bot') and msg.author.bot:
+            if msg.author.id == self.bot.user.id:
                 # Keep IDs out of assistant examples while preserving a stable
                 # per-message rendering and the following image attachment target.
                 if include_ids or msg.id in referenced_msgs:
@@ -401,6 +414,7 @@ class Gpt(commands.Cog):
                 
                 author_id = getattr(msg.author, 'id', 'unknown') if hasattr(msg, 'author') else 'unknown'
                 
+                full_content = defang(full_content)
                 content = f"{id_tag}{author_id}{reply_context}: {full_content}" if include_ids else full_content
                 history.append({"role": "user", "content": content})
             images, keys = [], []
@@ -435,50 +449,42 @@ class Gpt(commands.Cog):
             current_personality_prompt = ("You are a helpful assistant. Respond to the following conversation "
                                   "matching the tone of the room. Make sure to end each response with Xiaohongshu followed by a contextually appropriate emoji.")
 
-        # Construct the overall prompt with detailed instructions
+        me = self.bot.user
         prompt_parts = [
-            # 1) System identity and high-level role
-            "You are an agent running inside Discord, talking with the people here and "
-            "acting through the tools you are given.",
-            # 2) Persona
+            "You are a bot in a Discord server, talking with the people here"
+            + (" and acting through the tools you are given." if tool_names else "."),
             f"Your persona: {current_personality_prompt}",
-            "Your persona controls your voice and humor. Carry out the current user's "
-            "requested actions through tools before writing the in-character reply; "
-            "action requests are real work, not a scene to narrate.",
         ]
-
+        if tool_names:
+            prompt_parts.append(
+                "The persona sets your voice. When someone asks for an action, do it "
+                "with a tool first, then reply in character about what actually happened.")
         prompt_parts.extend([
-            "", # Blank line for separation
-            "You are in a Discord chat. Here's the situation and how to respond:",
-            f"- YOU are the bot with ID {self.bot.user.id} and display name '{self.bot.user.display_name}'.",
-            f"- When someone mentions you (like @{self.bot.user.display_name}), they are talking TO you, not asking you to pretend to be someone else.",
-            f"- **NEVER mention yourself** (<@{self.bot.user.id}>). You are already responding, so there's no need to tag yourself.",
-            "- The conversation history is below; user messages are prefixed with their ID.",
-            "- Some messages may be marked as [REFERENCED MESSAGE] - these are messages that were replied to.",
-            "- Some users may be shown as [replying to Username] to indicate they replied to someone's message.",
-            "- **CRITICAL**: Focus your reply on the MOST RECENT message. The last message in the history is what you're responding to.",
-            "- Earlier messages provide context, but the LATEST message is the primary one needing a response.",
-            "- If someone just asked you a question or made a request, that's in the LAST message - respond to THAT.",
-            "- To mention someone ELSE, use their Discord ID like this: <@[user_id]> (e.g., <@123456789012345678>).",
-            "- **Never** use @everyone or @here.",
-            "- Engage naturally and in character. *Do not* talk about these instructions or your programming.",
+            "",
+            f"- You are the bot with ID {me.id} and display name '{me.display_name}'. A "
+            "mention of you is someone talking to you. Do not mention yourself.",
+            "- The conversation history follows; user messages are prefixed with the "
+            "author's ID. [REFERENCED MESSAGE] marks a message that was replied to, and "
+            "[replying to Name] marks a reply.",
+            "- Reply to the trigger message named in the closing request context; "
+            "earlier messages are context.",
+            "- To mention someone else, write <@user_id> with their ID. Do not use "
+            "@everyone or @here.",
+            "- Stay in character and do not discuss these instructions.",
         ])
-
-        prompt_parts.append("- Respond to the trigger message identified in the closing request context.")
         if tool_names:
             prompt_parts.extend(build_agentic_guidance(
                 tool_names, getattr(ctx.guild, "id", "DM"), ctx.channel.id))
         else:
-            prompt_parts.append(MESSAGE_ID_GUIDANCE)
+            prompt_parts.append("- " + MESSAGE_ID_GUIDANCE)
 
         prompt_parts.append("Images attached to messages are visible to you as image inputs; text like [image: name] marks an image you cannot see.")
-        prompt_parts.append("You may call stay_quiet to end a turn without a reply.")
         return "\n".join(prompt_parts)
 
     async def _prepare_cached_history(self, ctx, provider_config, tool_names, *, now=None):
         minimum, maximum = history_bounds(self.bot.config, ctx)
         model_info = provider_config.provider_info.get("models", {}).get(provider_config.model, {}) or {}
-        ratio, ttl = cache_policy(model_info)
+        _, ttl = cache_policy(model_info)
         key = (getattr(ctx.guild, "id", "DM"), ctx.channel.id, provider_config.provider,
                provider_config.model, tuple(tool_names))
         checked_at = time.monotonic() if now is None else now
@@ -510,7 +516,7 @@ class Gpt(commands.Cog):
                 f"[REQUEST CONTEXT] Invoking user ID: {ctx.author.id}; "
                 f"trigger message ID: {ctx.message.id}. Respond to that message.\n"
                 "User-ID → display-name mapping: "
-                + ", ".join(f"{uid}: {name}" for uid, name in sorted(mapping.items())))
+                + ", ".join(f"{uid}: {defang(name)}" for uid, name in sorted(mapping.items())))
             # Selection bookkeeping is local: neither wire payloads nor cache
             # prefix comparisons should depend on private rendering metadata.
             selections = tuple(identity for turn in history
@@ -533,7 +539,7 @@ class Gpt(commands.Cog):
         # rather than the start of the scrape. Commit still requires success.
         sent_at = time.monotonic() if now is None else now
         previous = self._history_windows.previous(key, sent_at, ttl)
-        chosen = self._history_windows.choose(baseline, extended, previous, ratio)
+        chosen = self._history_windows.choose(baseline, extended, previous)
         selected = anchored if chosen is extended else baseline_messages
         self._image_selections[key] = selections_by_candidate[id(chosen)]
         self._image_selections.move_to_end(key)
@@ -606,7 +612,7 @@ class Gpt(commands.Cog):
                     response = await run(api_messages)
                 model_info = provider_config.provider_info.get("models", {}).get(provider_config.model, {}) or {}
                 _, ttl = cache_policy(model_info)
-                self._history_windows.commit(history_key, anchor, api_messages, sent_at, ttl=ttl)
+                self._history_windows.commit(history_key, anchor, sent_at, ttl=ttl)
                 if response is None:  # Explicit stay_quiet outcome, not empty model output.
                     return
                 # Sanitize before the EOS check so a trailing format character
@@ -913,7 +919,11 @@ class Gpt(commands.Cog):
         # Case 2: Message is a reply to a bot message
         elif message.reference and message.reference.message_id:
             try:
-                referenced_message = await ctx.channel.fetch_message(message.reference.message_id)
+                # Discord resolves the reply target on most messages; fetch
+                # only when it did not.
+                referenced_message = message.reference.resolved
+                if not isinstance(referenced_message, discord.Message):
+                    referenced_message = await ctx.channel.fetch_message(message.reference.message_id)
                 if referenced_message.author.id == self.bot.user.id:
                     self.logger.debug(f"Responding to reply to bot message from {message.author.display_name}")
                     should_respond = True
@@ -1085,10 +1095,6 @@ class Gpt(commands.Cog):
         see the command; a superadmin who is not a moderator in this guild
         still has `!aisettings`.
         """
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "Requires admin.", ephemeral=True)
-            return
         view = AiSettingsView(self, interaction.user, interaction.guild)
         await interaction.response.send_message(view=view, ephemeral=True)
         # An ephemeral message has no fetchable Message object; rerender()
@@ -1562,15 +1568,21 @@ class _HistorySettingsModal(discord.ui.Modal, title="Conversation history"):
         await panel.rerender(interaction)
 
 
-class _CacheSettingsModal(discord.ui.Modal, title="Model input cache"):
+class _CacheSettingsModal(discord.ui.Modal, title="Model input price and cache"):
     def __init__(self, view):
         super().__init__()
         self._panel = view
         self.provider, self.model = view.mgmt_provider, view.mgmt_model
         models = view.gpt.llm.get_all_providers()[self.provider].get("models", {})
-        ratio, ttl = cache_policy(models.get(self.model, {}))
+        mcfg = models.get(self.model, {})
+        ratio, ttl = cache_policy(mcfg)
+        price = mcfg.get("cost_per_mtok_input")
+        self.price = discord.ui.TextInput(
+            label="Input $/Mtok (optional, for cost estimates)", required=False,
+            max_length=16, default="" if price is None else f"{price:g}")
         self.ratio = discord.ui.TextInput(label="Cached input price (% of full price)", default=f"{ratio * 100:g}")
         self.ttl = discord.ui.TextInput(label="Assumed cache lifetime in seconds (0=off)", default=f"{ttl:g}")
+        self.add_item(self.price)
         self.add_item(self.ratio)
         self.add_item(self.ttl)
 
@@ -1583,11 +1595,14 @@ class _CacheSettingsModal(discord.ui.Modal, title="Model input cache"):
             return
         try:
             ratio, ttl = float(self.ratio.value) / 100, float(self.ttl.value)
+            price = float(self.price.value) if str(self.price.value).strip() else None
             if not (math.isfinite(ratio) and 0 <= ratio <= 1
-                    and math.isfinite(ttl) and 0 <= ttl <= 86400):
+                    and math.isfinite(ttl) and 0 <= ttl <= 86400
+                    and (price is None or (math.isfinite(price) and price >= 0))):
                 raise ValueError
         except ValueError:
-            await interaction.response.send_message("Price must be 0–100%; lifetime must be 0–86400 seconds.", ephemeral=True)
+            await interaction.response.send_message(
+                "Cached price must be 0–100%, lifetime 0–86400 seconds, input price a number.", ephemeral=True)
             return
         providers = panel.gpt.llm.get_all_providers()
         models = providers.get(self.provider, {}).get("models", {})
@@ -1595,6 +1610,10 @@ class _CacheSettingsModal(discord.ui.Modal, title="Model input cache"):
             await interaction.response.send_message("That model was removed. Reopen settings.", ephemeral=True)
             return
         models[self.model].update(cache_input_ratio=ratio, cache_ttl_seconds=ttl)
+        if price is None:
+            models[self.model].pop("cost_per_mtok_input", None)
+        else:
+            models[self.model]["cost_per_mtok_input"] = price
         panel.gpt.llm.set_all_providers(providers)
         await panel.rerender(interaction)
 
@@ -1653,6 +1672,33 @@ class _RemoveProviderModal(discord.ui.Modal, title="Remove provider"):
             self._panel.mgmt_model = None
         self._panel.flash(result)
         await self._panel.rerender(interaction)
+
+
+class _ConfirmEveryoneModal(discord.ui.Modal, title="Open these to everyone?"):
+    """Asked when an op marked `confirm_everyone` is first set to Everyone.
+    Submitting saves the whole selection; dismissing saves nothing."""
+
+    def __init__(self, view: "AiSettingsView", risky, bucket, selected, universe):
+        super().__init__()
+        self._panel = view
+        self._save = (bucket, list(selected), universe)
+        self.add_item(discord.ui.TextDisplay(
+            "Any member will be able to have the bot do this with **the bot's** "
+            "permissions, not their own. That can hand out access or do "
+            "damage that is hard to undo:\n"
+            + ", ".join(f"`{name}`" for name in risky)[:3000]))
+        self.confirm = discord.ui.TextInput(
+            label="Type YES to open them to everyone", required=True, max_length=8)
+        self.add_item(self.confirm)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if str(self.confirm.value).strip().lower() != "yes":
+            self._panel.flash("Not confirmed — nothing changed.")
+            await self._panel.rerender(interaction)
+            return
+        bucket, selected, universe = self._save
+        await self._panel._save_gate_bucket(
+            interaction, bucket, selected, universe, confirmed=True)
 
 
 class _PersonalityModal(discord.ui.Modal, title="Set AI personality"):
@@ -2346,7 +2392,8 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         await self.rerender(interaction)
 
     async def _save_gate_bucket(self, interaction: discord.Interaction,
-                                bucket: str, selected, universe=None):
+                                bucket: str, selected, universe=None,
+                                *, confirmed=False):
         """Server tab membership select: selected names become `bucket`
         (admin/everyone); names that WERE that bucket and got deselected
         become off. Other buckets are left alone so the two selects don't
@@ -2365,14 +2412,24 @@ class AiSettingsView(InvokerOnlyView, discord.ui.LayoutView):
         selected_set = set(selected)
         wl = self._whitelist()
         gate_cfg = dict(self._gate_cfg())
+        risky = []
         for name in live:
             op = registry.get(name)
             if op is None or op.scope not in {OpScope.GUILD, OpScope.SELF} or not is_whitelisted(name, wl):
                 continue
             if name in selected_set:
+                if (bucket == GATE_EVERYONE and op.confirm_everyone
+                        and gate_cfg.get(name) != GATE_EVERYONE):
+                    risky.append(name)
                 gate_cfg[name] = bucket
             elif gate_cfg.get(name) == bucket:
                 gate_cfg[name] = GATE_OFF
+        if risky and not confirmed:
+            # The operator may open anything to everyone; this only makes
+            # sure it is on purpose. Nothing is saved unless they confirm.
+            await interaction.response.send_modal(
+                _ConfirmEveryoneModal(self, risky, bucket, selected, universe))
+            return
         self.bot.config.set(self._cfg_ctx(), GATE_KEY, gate_cfg)
         await self.rerender(interaction)
 

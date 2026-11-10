@@ -1,9 +1,38 @@
 # AI history caching
 
-The bot normally sends the latest **15 Discord messages**. Recent invocations
-can retain the same starting message and grow the window to **30 messages**,
-but only when reusing the unchanged prefix is estimated to cost less than a
-fresh minimum-sized window. These bounds count messages, not tokens.
+Each chat turn sends recent channel messages as history. The window is chosen
+so that consecutive turns can repeat the same prefix and hit the provider's
+input cache. Bounds count messages, not tokens; defaults are **15** (min) and
+**30** (max).
+
+## The rule
+
+The bot remembers where the last successful request's history started (its
+first message, the *anchor*).
+
+- If the last successful send in this conversation was within
+  `cache_ttl_seconds`, and the anchor is still within the newest **max**
+  messages, the new window starts at the same anchor and runs through the
+  trigger message. The prefix repeats; the window grows.
+- Otherwise (or when that window would be no longer than min) the window is
+  the newest **min** messages, and its first message becomes the new anchor.
+
+There is no cost comparison and no token estimate. A conversation is keyed by
+`(guild, channel, provider, model, tool names)`, so changing the model or the
+offered tools starts fresh. State lives in memory (`core/ai_history.py`), is
+capped at 256 entries, and resets on restart. Only a successful model call
+commits it: an extension keeps the anchor and refreshes the send time. Turns
+in one channel run one at a time.
+
+History is fetched again every turn, through the trigger message, so edits and
+deletions show and later messages are excluded. Messages a turn replies to
+(referenced messages) are added if missing and placed at their chronological
+position. Only this bot's own messages become assistant turns; other bots'
+messages are user turns like anyone else's.
+
+The system prompt comes first, then history, then the changing request context
+(invoking user, trigger id, user-name mapping). xAI requests carry a stable
+`x-grok-conv-id` per guild/channel/model.
 
 ## Operator settings
 
@@ -11,75 +40,60 @@ fresh minimum-sized window. These bounds count messages, not tokens.
 dropdowns. **Custom min / max…** accepts any bounds from 1 to 1000 messages.
 Raising Min above Max raises Max with it; Max cannot be below Min.
 
-- **Min:** normal context size, or all available messages in a shorter channel.
-- **Max:** ceiling for retaining older history when estimated caching savings
-  justify it. Reply references can add supplemental messages beyond this cap.
-- Start with **Max = 2× Min** (the default 15/30). Larger caps permit longer
-  reuse chains, but do not guarantee savings or more context. To consistently
-  provide more context, raise Min. Equal bounds give a fixed-size window.
+- **Min** is the normal context size. To always send more context, raise Min.
+- **Max** caps how far a kept anchor may fall behind. Equal bounds give a
+  fixed-size window. Referenced messages can add messages beyond Max.
 
-`/aisettings` → **Models & Providers** → **Input cache** lets superadmins set
-the cached/full input price ratio and assumed cache lifetime (defaults
-**10% / 300 seconds**). Use the model's actual price ratio: Grok 4.5 is **15%**
-and Grok 4.6 is **25%** ([pricing](https://docs.x.ai/developers/pricing)). This
-percentage is a price, not a hit rate. A zero lifetime disables extension.
-These settings neither force cache retention nor change provider billing.
+`/aisettings` → **Models & Providers** → **Input cache** (superadmin) sets two
+per-model values:
 
-## Selection and lifecycle
+- **Assumed cache lifetime in seconds** (`cache_ttl_seconds`, default 300;
+  0 always starts fresh). This is the only setting the window rule reads.
+- **Cached input price** (`cache_input_ratio`, default 10%). Used only for cost
+  estimates, and only when the model also has `cost_per_mtok_input` and
+  `cost_per_mtok_output` set. It does not affect history.
 
-Each invocation fetches current history through its trigger message, honoring
-edits/deletions and excluding later arrivals. It compares a fresh Min-sized
-window with the previous anchor's window, if that anchor is still present
-within Max and the previous send is within the assumed lifetime:
+Neither setting changes provider billing or forces cache retention. See the
+[config registry](config-system.md#model-cache-policy).
 
-```
-estimated input cost = uncached tokens + cached tokens × cached/full price ratio
-```
+## Image inputs
 
-Token estimates use UTF-8 bytes / 4 plus message overhead. Cached tokens are
-estimated from the identical whole-message prefix of the previous prompt.
-This is a planning estimate, not a tokenizer or a guarantee of a provider hit.
-Ties choose the fresh window. Frequent invocations with few intervening
-messages favor extension; lots of chat between invocations can defeat it.
+Image input is on unless the model entry sets `vision: false`. Attachment
+images and embed images/thumbnails belong to their source turn, including
+referenced messages and bot posts. Pydantic-ai response parts cannot carry
+input images, so bot-posted pixels go in a labeled user part right after the
+bot's text.
 
-Stable system instructions precede chronological history. Supplemental reply
-references and changing request details follow it. Each reference is resolved
-at most once per invocation, shared by both candidates, and fetched afresh on
-the next invocation. The lifetime is rechecked after these reads. xAI requests
-use a stable `x-grok-conv-id` per guild/channel/model for routing.
+Each request sends at most eight images. Trigger images come first, then the
+reply target's, each in attachment/embed order. Remaining slots keep earlier
+selections for this conversation while they stay in the window, so text-only
+follow-ups keep the prefix stable; only new trigger/reply images evict the
+oldest. Free slots fill from the newest other images. Images over the limit,
+failed downloads and images on `vision: false` models become
+`[image: filename]` placeholders.
 
-Only a successful model call commits state. An extension **keeps the same
-anchor ID and refreshes the prompt and last-send timestamp**; it can extend
-repeatedly, not just once. Failed calls do not refresh state. Calls in a channel
-serialize. State resets on restart and is capped at 256 entries, evicting the
-least recently committed entry. Expired entries are removed on access.
+`core/ai_images.py` keeps an LRU of normalized JPEG/PNG bytes (64 entries,
+64 MiB), keyed by attachment ID or by URL without query/fragment. Failed loads
+are cached for 30 seconds. At most four downloads run at once, and Pillow work
+runs off the event loop. Only Discord CDN hosts are fetched, bodies are capped
+at 8 MiB, images are scaled to at most 2048 pixels, and redirects are refused.
+A signed-URL 403/404 refreshes the source message once, then retries.
 
-## Data structure and complexity
+## Usage and cost logs
 
-The key is `(guild, channel, provider, model, tool names)`; the value contains
-the anchor ID, last-send monotonic timestamp, and previous rendered prompt.
-An ID/timestamp pair alone cannot detect edits or measure a matching prefix.
+Each model request logs an `llm_usage` line with prompt, cached prompt,
+completion and reasoning tokens and an estimated cost. Token counts are read
+from the provider response; reasoning tokens are reported separately and not
+added to completion tokens again.
 
-For K stored entries (at most 256), with fixed-size routing keys:
+Each chat turn also appends one row to `logs/agent_tools/YYYY-MM-DD.jsonl`
+(`core/tool_telemetry.py`): the ordered tool calls with status and timing,
+plus `requests`, `prompt_tokens`, `cached_prompt_tokens`,
+`completion_tokens`, `reasoning_tokens` and `est_cost_usd`. Rows never hold
+arguments or results. `venv/bin/python scripts/tool_usage.py [--days N]
+[--guild ID] [--model NAME]` summarizes them, with a per-model table.
 
-| Structure | Lookup / update | Oldest-entry eviction | Assessment |
-|---|---|---|---|
-| Current flat `OrderedDict` | Expected O(1) | O(1) | Direct lookup and one global cap |
-| Nested guild/channel dictionaries | Expected O(1) | O(K) without a separate ordering index | More bookkeeping, no lookup advantage |
-| List of tuples | O(K) search | O(K) search/removal | Simpler records, slower access |
-
-Prompt storage dominates memory: O(K + total retained prompt bytes), rather
-than just O(K) IDs. Rendering H history/reference messages with B text bytes
-takes O(H log H + B), plus mention processing and Discord I/O; ID lookups use
-dictionaries. Candidate cost comparison is O(B + H). No persistent message
-cache, token index, or background cleanup is needed for this bounded store.
-
-The `llm_usage` log records actual input, cached input, output, and available
-reasoning tokens per request. See the [config registry](config-system.md#model-cache-policy)
-for stored settings. Settings apply immediately; code changes require restart.
-
-OpenAI-compatible Chat Completions usage is read directly from the response
-by the LLM adapter. This avoids pricing-data extractor changes silently
-zeroing counters in pydantic-ai 2.5. Completion tokens remain the provider
-reported total; reasoning tokens are retained separately without adding them
-to that total again.
+Cost uses the model's `cost_per_mtok_input` and `cost_per_mtok_output` from
+`ai_providers` (cached input priced by `cache_input_ratio`) when both are set;
+otherwise the built-in table in `core/llm/usage.py`. An unknown model's cost
+is `null`, not zero.

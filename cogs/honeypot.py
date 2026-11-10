@@ -232,7 +232,7 @@ class Honeypot(commands.Cog):
         "configure_honeypot",
         "Configure this guild's single honeypot using an existing text channel and role. "
         "Triggers assign the role, optionally remove other manageable roles, and delete the member's recent messages. "
-        "Does not create resources or restore roles. Disabling retains saved settings and assigned roles.", scope=OpScope.GUILD, group="honeypot", group_label="Honeypot",
+        "Does not create resources or restore roles. Disabling retains saved settings and assigned roles.", confirm_everyone=True, scope=OpScope.GUILD, group="honeypot", group_label="Honeypot",
         params=[
             OpParam("channel", ParamKind.CHANNEL, "Existing trap text channel (explicit even when disabling)."),
             OpParam("role", ParamKind.ROLE, "Existing role; omit to reuse saved role.", required=False),

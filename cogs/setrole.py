@@ -527,7 +527,7 @@ class SetRole(commands.Cog):
             "Check the returned status: 'exists' means a different role is "
             "already bound and NOTHING was written — report the conflict to "
             "the user rather than silently retrying with replace_existing."),
-        scope=OpScope.GUILD,
+        confirm_everyone=True, scope=OpScope.GUILD,
         group="role-automation",
         group_label="Role automation",
     )

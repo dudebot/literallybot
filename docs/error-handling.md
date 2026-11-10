@@ -98,37 +98,40 @@ listener does not consume the message; the command dispatcher can still report
 `CommandNotFound`. Recognize the same input in both places; do not track message
 IDs or rely on listener execution order.
 
-For regex-based shortcuts, decorate the **cog class**:
+Register a hook in the cog's `__init__` and unregister it in `cog_unload`. A
+hook takes `(ctx, error)` and returns `True` to suppress the report. Hooks run
+only for prefix `CommandNotFound`; invocation failures, event exceptions,
+permission denials and stale slash registrations are never suppressed. A hook
+that raises is reported as an unexpected error and does not suppress anything.
+The dice example from `cogs/rng.py`:
 
 ```python
 import re
-from core.error_handler import suppress_command_not_found
+from discord.ext import commands
+from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
 
 DICE_PATTERN = re.compile(r"(?P<rolls>\d+)?d(?P<sides>\d+)", re.IGNORECASE)
 
-@suppress_command_not_found(DICE_PATTERN)
+
 class RNG(commands.Cog):
-    ...  # The listener uses DICE_PATTERN.fullmatch(text), too.
+    def __init__(self, bot):
+        self.bot = bot
+        register_error_whitelist_hook(self._is_dice_command)
+
+    def cog_unload(self):
+        unregister_error_whitelist_hook(self._is_dice_command)
+
+    def _is_dice_command(self, ctx, error):
+        """`!2d20` is handled by on_message, not a missing command."""
+        prefix = ctx.prefix
+        return (bool(prefix) and not ctx.message.author.bot
+                and DICE_PATTERN.fullmatch(ctx.message.content[len(prefix):].strip()) is not None)
 ```
 
-The decorator accepts one or more regex strings or compiled patterns. They are
-compiled once and full-match the whole message after removing `ctx.prefix` and
-trimming surrounding whitespace. Only loaded cogs participate. Matching is
-restricted to human-authored prefix `CommandNotFound` errors; invocation failures,
-event exceptions, permission denials, and stale slash-command registrations are
-never suppressed. Regexes are code declarations, not user-configurable patterns.
-
-Match recognized syntax even when the cog returns a validation message:
-`!999d67` is handled by RNG's "too many dice" reply. `!2d20 extra` is not handled
-and stays an unknown command. Keep prefix handling, case, and whitespace rules
-identical between the listener and its suppression rule.
-
-For dynamic lookups such as media filenames, the existing callback API remains:
-register `register_error_whitelist_hook(self._is_media_command)` in `__init__`,
-unregister it in `cog_unload`, and return a boolean from `(ctx, error)`. The media
-hook and listener both check the entire filename. Hooks run only for prefix
-`CommandNotFound`. A hook exception is reported as an unexpected error and cannot
-silently suppress the original activity.
+Match exactly what the listener handles, with the same prefix, case and
+whitespace rules. `!999d67` is recognized (RNG replies "too many dice");
+`!2d20 extra` is not, and stays an unknown command. `cogs/media.py` uses the
+same hook for `!<filename>` shortcuts, checking the whole filename.
 
 ## Logging Errors Manually
 
@@ -220,22 +223,4 @@ Failed sends are logged locally and do not consume the next retry's cooldown.
 
 ## Test quality and development checks
 
-Committed tests need obvious production value: a concrete failure in a
-supported code path and a result that identifies what actually broke.
-"It could regress" is not enough. A feature or bug fix does not call for
-adding permanent tests by default.
-
-Task-specific simulations and model-response/request experiments are
-development checks. Implementation mirrors, trivial forwarding checks and
-schema/metadata inventories do not belong in the committed suite. Keep
-development checks outside the repository and delete them when the
-investigation ends. Do not turn them into committed fixtures or
-retain them because they passed or were useful during implementation.
-
-Prefer an existing test that already exercises the failure. Keep external
-I/O mocked and local behavior real; never load deployment credentials or
-config. Remove unused fixtures with deleted tests. Do not merge unrelated
-checks, add parameter matrices, or preserve speculative cases to defend a
-test count. Run the retained suite after changes.
-
-See [testing.md](testing.md) for the suite's historical audits.
+Moved to [testing.md](testing.md).

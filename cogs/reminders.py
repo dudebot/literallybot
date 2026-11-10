@@ -23,6 +23,8 @@ SNOOZE_MAX_SECONDS = 30 * 86400
 SNOOZE_STATIC_FLOOR = 600  # 10m — always offered
 SNOOZE_MULTIPLIERS = (1.0, 2.0)
 SNOOZE_STATIC_FALLBACK = (600, 3600, 86400)  # 10m / 1h / 1d
+REMINDER_PREFIX = "Reminder: "
+MAX_REMINDER_TEXT = 2000 - len(REMINDER_PREFIX)
 
 
 def format_duration(seconds: int) -> str:
@@ -89,8 +91,8 @@ class SnoozeButton(discord.ui.DynamicItem[discord.ui.Button],
 
     async def callback(self, interaction: discord.Interaction):
         text = interaction.message.content
-        if text.startswith("Reminder: "):
-            text = text[len("Reminder: "):]
+        if text.startswith(REMINDER_PREFIX):
+            text = text[len(REMINDER_PREFIX):]
         remind_time = int(time.time()) + self.secs
         row = {
             "user_id": interaction.user.id,
@@ -200,6 +202,10 @@ class Reminders(commands.Cog):
             return
 
         delay, text = parsed
+        if len(text) > MAX_REMINDER_TEXT:
+            await ctx.send(f"That reminder is {len(text)} characters; the limit "
+                           f"is {MAX_REMINDER_TEXT}. Shorten it and try again.")
+            return
         current_time = int(time.time())
         remind_time = current_time + delay
         config = self.bot.config
@@ -218,20 +224,23 @@ class Reminders(commands.Cog):
         reminders = config.get(None, "reminders", [])
         updated_reminders = []
         for reminder in reminders:
-            if reminder["timestamp"] <= current_time:
-                user = self.bot.get_user(reminder["user_id"])
-                if not user:
-                    try:
-                        user = await self.bot.fetch_user(reminder["user_id"])
-                    except Exception as e:
-                        self.logger.warning(f"Failed to fetch user {reminder['user_id']}: {e}")
-                        continue
-                try:
-                    await user.send(f"Reminder: {reminder['text']}",
-                                    view=snooze_view(reminder.get("delay")))
-                except Exception as e:
-                    self.logger.warning(f"Failed to send DM to {reminder['user_id']}: {e}")
-            else:
+            try:
+                due = reminder["timestamp"] <= current_time
+                user_id, text = reminder["user_id"], reminder["text"]
+            except (KeyError, TypeError) as e:
+                self.logger.error(f"Dropping malformed reminder {reminder!r}: {e!r}")
+                continue
+            if not due:
+                updated_reminders.append(reminder)
+                continue
+            try:
+                user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+                await user.send(f"{REMINDER_PREFIX}{text}",
+                                view=snooze_view(reminder.get("delay")))
+            except (discord.Forbidden, discord.NotFound) as e:
+                self.logger.warning(f"Dropping reminder for {user_id}: {e}")
+            except Exception as e:
+                self.logger.warning(f"Reminder for {user_id} not delivered, retrying next tick: {e}")
                 updated_reminders.append(reminder)
         if len(updated_reminders) != len(reminders):
             config.set(None, "reminders", updated_reminders)

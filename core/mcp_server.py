@@ -18,7 +18,7 @@ client into the same bot account and could not see cog-registered ops at
 all; it was deleted in the ops-registry refactor rather than fixed.)
 
 RESTART-BOUND SURFACE: the tool list is built once, when the server starts,
-from a live registry query. FastMCP on mcp 1.x cannot reliably broadcast
+from a live registry query. The MCP SDK cannot reliably broadcast
 `notifications/tools/list_changed` to already-connected streamable-HTTP
 sessions, so growing/shrinking the surface mid-flight would leave clients
 holding a stale tool list with no way to learn better. Ops registered later
@@ -45,9 +45,9 @@ Guardrails (per the Codex review of the original spike, issue #58):
 - send_message always sends with allowed_mentions=none — no pings, ever.
 - search_history clamps `limit` to core.ops.HISTORY_LIMIT_MAX (200),
   declared on the op itself.
-- ACCEPTED RISK: `actor_id` is caller-supplied and not credential-bound, so a
-  client that already holds the bearer token can act as any user id for
-  permission purposes. The bearer is the HTTP credential; the session id is
+- `actor_id` is caller-supplied and is NOT authorization: it only selects
+  whose channel visibility applies when it resolves to a guild member.
+  The bearer is the HTTP credential and full operator access; the session id is
   not a second user identity. Acceptable when the bearer is treated as
   owner-equivalent. An explicit non-loopback bind does not add actor
   authentication. Do not publish the port.
@@ -613,7 +613,13 @@ async def serve(bot: Any, *, port: int, token: str,
             "publish this port.",
             bind, port,
         )
-    await server.serve()
+    try:
+        await server.serve()
+    except SystemExit as exc:
+        # uvicorn exits the process when it cannot bind; keep the bot alive.
+        raise RuntimeError(
+            f"MCP ops server failed to start on {bind}:{port} "
+            f"(see the uvicorn error above; is the port already in use?)") from exc
 
 
 def maybe_start_in_bot(bot: Any) -> Optional[asyncio.Task]:

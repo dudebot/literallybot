@@ -232,7 +232,7 @@ async def build_help_embed(bot, invoker_is_admin, ctx=None,
 
 
 class Help(commands.Cog):
-    """Interactive help: /help (the prefix !help is deliberately gone)."""
+    """Interactive help: /help (ephemeral) and !help (public), one embed."""
 
     def __init__(self, bot):
         self.bot = bot

@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 
 
-
 def disk(config, name='global'):
     return json.loads((Path(config.config_dir) / f'{name}.json').read_text())
 
@@ -24,7 +23,6 @@ def test_mutating_a_loaded_list_then_setting_it_persists(config, config_factory)
     assert disk(reopened, '7') == {'admins': [1, 2]}
 
 
-@pytest.mark.skipif(os.name == 'nt', reason='POSIX atomic replacement path')
 def test_failed_replace_preserves_disk_and_pending_write(config, monkeypatch):
     config.set_global('value', 'old')
     config.flush()
@@ -32,7 +30,7 @@ def test_failed_replace_preserves_disk_and_pending_write(config, monkeypatch):
     with monkeypatch.context() as patch:
         def fail(*args):
             raise OSError('disk failure')
-        patch.setattr('core.config.os.rename', fail)
+        patch.setattr('core.config.os.replace', fail)
         with pytest.raises(OSError, match='disk failure'):
             config.flush()
     assert disk(config) == {'value': 'old'}
@@ -64,3 +62,17 @@ def test_secret_modes_are_tightened_before_writing_even_a_stale_temp_file(
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700
     assert stat.S_IMODE((directory / 'global.json').stat().st_mode) == 0o600
     assert not stale.exists()
+
+
+def test_live_reload_survives_undecodable_file_and_picks_up_later_edit(config):
+    # A UnicodeDecodeError used to escape the reload callback and stop the timer for good.
+    path = Path(config.config_dir) / '7.json'
+    path.write_bytes(b'\xff\xfe not utf-8')
+    timer = config._reload_timer
+    timer.function()
+    assert config._reload_timer is not timer
+    assert config.get(7, 'admins') is None
+    path.write_text(json.dumps({'admins': [1]}), encoding='utf-8')
+    os.utime(path, (path.stat().st_mtime + 5,) * 2)
+    config._reload_timer.function()
+    assert config.get(7, 'admins') == [1]

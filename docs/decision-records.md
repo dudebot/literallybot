@@ -52,6 +52,8 @@ API). Since then:
 
 ### Amendment: AI-surface rework (2026-07-10)
 
+*(Superseded by Owner-tier pass + two-tier agent permission model: 89 → 125 ops (2026-08-20) for tool exposure and by the cooldown correction below.)*
+
 `70ad081` reworked the surfaces the sweep above described; where they
 conflict, this entry wins:
 
@@ -77,6 +79,8 @@ conflict, this entry wins:
   cost visibility is the INFO-level `est_cost_usd` log line on agentic runs.
 
 ### Amendment: narrated-call backstop returns, redesigned (2026-07-21)
+
+*(Superseded by Tool guidance rides in the tool definitions; narrated-call nudge removed (2026-10-31).)*
 
 Supersedes the 2026-07-10 sentence "the narration-guard regex + retry nudge
 was removed" — a narrated-call backstop exists again, but it is NOT the
@@ -234,7 +238,7 @@ panel on the next rerender without a restart.
   disambiguation and costs a second list to keep consistent. `origin` is a
   *rendering* concern; the panel groups by it visually while storing one flat
   list of names.
-- **`_save_bot_tools` gate relaxed from superadmin to `is_admin`.** Guild admins
+- *(Superseded by Tool access follows settings, without declaration ACL floors (2026-11-06).)* **`_save_bot_tools` gate relaxed from superadmin to `is_admin`.** Guild admins
   configure their own guild's agent surface. Anti-escalation holds structurally:
   that universe is guild-scoped ops only, and every op re-checks its own
   `PermissionLevel` against the invoking user at call time — enabling an op
@@ -257,6 +261,8 @@ panel on the next rerender without a restart.
   default (empty allowlist ⇒ plain chat) and gets configured via the panel.
 
 ### Exposure vs authorization (the doctrine both frontends encode)
+
+*(Superseded by Tool access follows settings, without declaration ACL floors (2026-11-06): there is no per-call `PermissionLevel` gate.)*
 
 Worth stating once, because it is the reason the defaults look permissive:
 `mcp_tools_enabled` absent ⇒ the full registry is served, and `bot_tools_enabled`
@@ -365,7 +371,7 @@ read, and the check is wrapped: a detached/closed stdin raises from `isatty`
 rather than returning False, and that must fail fast, not propagate an
 unrelated `ValueError` out of startup.
 
-**Verify before persisting.** A typo'd token written to `global.json` converts
+**Verify before persisting.** *(The re-prompt below is superseded by Only callable tools, no call-time tiers, confined host paths (2026-11-10).)* A typo'd token written to `global.json` converts
 a one-line fix into a "why does it fail *with a token configured*" debugging
 session. The verification boundary is discord.py's own login: `bot.run()`
 raises `LoginFailure` before the gateway connects, and reaches `setup_hook`
@@ -465,6 +471,8 @@ those ops shipped — the 89-op / 78-9-2 arithmetic above is also superseded.)*
 
 ## Owner-tier pass + two-tier agent permission model: 89 → 125 ops (2026-08-20)
 
+*(The `PermissionLevel` floors below are superseded by Tool access follows settings, without declaration ACL floors (2026-11-06).)*
+
 Commit `810e05a` (merge `7698948`). The owner ruled on every withheld
 candidate from the cross-reference campaign above: **36 destructive or
 privileged primitives shipped** in a NEEDS_OWNER tier (channel CRUD +
@@ -483,6 +491,8 @@ The later `eab7105` deleted the redundant `agent_default` field.
 to a guild's members until a guild admin picks Admin or Everyone.
 
 ## 2026-09-17: risk-based test suite
+
+*(Superseded by Only callable tools, no call-time tiers, confined host paths (2026-11-10): [testing.md](testing.md) now holds the qualitative policy only.)*
 
 The [test audit](testing.md) supersedes the earlier instructions to retain
 mid-run cog-replacement tests and the skipped chat_stream test. Those runtime
@@ -515,11 +525,13 @@ The fixed-at-boot decision (#86) remains in force. Global `disabled_cogs` edits
 withdraw the feature's commands, listeners, tasks, views and behavioral tools
 on the next boot; they preserve state and existing Discord effects. Registration
 makes an op eligible, configured exposure chooses a frontend's tools, and
-per-call permissions authorize execution. MCP's unset allowlist still selects
+per-call permissions authorize execution *(superseded by Tool access follows settings, without declaration ACL floors (2026-11-06))*. MCP's unset allowlist still selects
 the full registered universe. No new exposure default or hot-unload contract
 is introduced by this refactor.
 
 ## Tool guidance rides in the tool definitions; narrated-call nudge removed (2026-10-31)
+
+*(The tool-name list in the prompt is superseded by Only callable tools, no call-time tiers, confined host paths (2026-11-10).)*
 
 Supersedes the 2026-07-21 narrated-call backstop. Its detector looked for an
 enabled tool's name in a zero-call reply, so it missed the failure seen live:
@@ -542,6 +554,8 @@ GPT's identity line now says it is an agent running inside Discord.
 
 ## Tool access follows settings, without declaration ACL floors (2026-11-06)
 
+*(The attachment rule is narrowed by Only callable tools, no call-time tiers, confined host paths (2026-11-10).)*
+
 Supersedes earlier decisions requiring fixed PermissionLevel floors on ops.
 `@op` and `@registry.op` now declare behavior and typed parameters without a
 permission argument. Tool descriptions and guidance do not assert admin tiers.
@@ -560,6 +574,8 @@ than suggesting a Discord permission failure.
 
 ## Action guidance distinguishes execution from progress narration (2026-11-07)
 
+*(Superseded by Only callable tools, no call-time tiers, confined host paths (2026-11-10).)*
+
 A rename request returned a progress announcement with zero tool calls,
 despite the tool being available. Real-provider replays reproduced this.
 The guidance about claiming completed actions did not explicitly cover
@@ -576,3 +592,49 @@ and execute the call before reporting the result.
 This is a guidance change. It adds no reply-text matching, output validator,
 classifier, terminal schema or automatic replay. Verification uses disposable
 real-model replays with Discord writes replaced, plus the existing suite.
+
+## Only callable tools, no call-time tiers, confined host paths (2026-11-10)
+
+**Only callable tools are offered.** `core.agent_gate.resolve_agent_tools`
+filters by the invoking user, so the model sees exactly the tools that user may
+call. A refused call is reachable only if settings change mid-run. Nothing
+about access is put in a tool description or sent to the model; Discord's own
+error comes back if Discord refuses.
+
+**No tool-call limit in pydantic-ai.** Its limiter checks a whole parallel
+batch before running any of it. The budget lives in `core/agent_loop.py`:
+calls past it are refused in-band, and the hard stop is a model-request limit
+of budget + 2.
+
+**`confirm_everyone` instead of any call-time tier.** An op may declare
+`confirm_everyone=True`. The `/aisettings` Server tab then asks the admin to
+type YES before the op is first set to Everyone. It is never checked at call
+time and never sent to the model. Operators may still open anything to
+everyone.
+
+**Chat host paths are confined.** Parameters declared `host_path=True` must,
+in chat, resolve inside the guild's media library or the emoji download
+folder (`core.ops.chat_host_path_error`). This narrows the 2026-11-06 rule
+that files follow the op's configured access: access says who may run an op,
+not which host files it may read. MCP is not confined.
+
+**History window rule.** The cost model is removed. Keep the previous window's
+first message while the last successful send is within `cache_ttl_seconds`
+and the anchor is still within the max window; otherwise use a fresh min
+window. With max = 2 × min the cost model chose the extension in nearly every
+case it was offered one. `cache_input_ratio` is now used only for cost
+estimates. Referenced messages sit at their chronological position, and other
+bots' messages are user turns.
+
+**Prompt slimming.** The `[TURN GUIDANCE]` text is gone and
+`build_agentic_guidance` no longer lists tool names. Live replays (grok-4.7,
+24 action requests per variant) showed the long and short prompts both
+narrated instead of calling in roughly 30% of action requests, so wording was
+not the lever. A forced `reply` output tool was tried and rejected: the
+provider returned plain text anyway and runs errored.
+
+**Startup.** A prompted token that Discord rejects exits 1 without saving and
+without re-prompting; a closed client cannot be run again.
+
+**Tests.** [testing.md](testing.md) holds the qualitative test policy and the
+run command; the suite-size history is removed.

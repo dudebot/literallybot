@@ -55,7 +55,7 @@ def effective_gate(op: Any, whitelist: Optional[Dict[str, bool]],
 
 def agent_universe(whitelist: Optional[Dict[str, bool]],
                    gate_cfg: Optional[Dict[str, str]]) -> List[str]:
-    """Offer configured guild ops; enforce Admin/Everyone at dispatch."""
+    """Guild ops switched on here for anyone (Admin or Everyone)."""
     return [op.name for op in registry.ops(scope=OpScope.GUILD)
             if effective_gate(op, whitelist, gate_cfg) != GATE_OFF]
 
@@ -69,21 +69,30 @@ def self_tools_enabled(ctx) -> bool:
     return bool(ctx.bot.config.get_global(SELF_TOOLS_KEY, True))
 
 
+def _gate_allows(ctx, gate: str) -> bool:
+    from core.permissions import is_admin
+    return gate == GATE_EVERYONE or (gate == GATE_ADMIN and is_admin(ctx))
+
+
 def resolve_agent_tools(ctx, scopes=None) -> List[str]:
-    """Resolve one trusted surface's tool policy, also used as its cache key."""
+    """The tools this invoker may call here, also used as the cache key.
+
+    Only callable tools are offered: a tool the invoker's gate would refuse
+    costs prompt tokens every request and a wasted call when tried."""
     guild = getattr(ctx, "guild", None)
     scopes = set(scopes if scopes is not None else
                  ({OpScope.GUILD, OpScope.SELF} if guild else {OpScope.SELF}))
     config = ctx.bot.config
     wl = config.get_global(WHITELIST_KEY)
     gates = config.get(guild.id, GATE_KEY) if guild else None
-    names = (agent_universe(wl, gates)
+    names = ([name for name in agent_universe(wl, gates)
+              if not guild_call_denied(ctx, name)]
              if guild and OpScope.GUILD in scopes else [])
     if OpScope.SELF in scopes and self_tools_enabled(ctx):
         for op in registry.ops(scope=OpScope.SELF):
             if op.self_call_error(ctx, {}) or not is_whitelisted(op.name, wl):
                 continue
-            if guild and guild_gate(op, gates) == GATE_OFF:
+            if guild and not _gate_allows(ctx, guild_gate(op, gates)):
                 continue
             names.append(op.name)
     return names
@@ -91,22 +100,14 @@ def resolve_agent_tools(ctx, scopes=None) -> List[str]:
 
 def self_call_allowed(ctx, op) -> bool:
     """No privileged bypass: SELF policy is always re-read at dispatch."""
-    from core.permissions import is_admin
-    if op.name not in resolve_agent_tools(ctx, {OpScope.SELF}):
-        return False
-    if getattr(ctx, "guild", None):
-        gate = guild_gate(op, ctx.bot.config.get(ctx.guild.id, GATE_KEY))
-        return gate == GATE_EVERYONE or (gate == GATE_ADMIN and is_admin(ctx))
-    return True
+    return op.name in resolve_agent_tools(ctx, {OpScope.SELF})
 
 
 def guild_call_denied(ctx, name) -> bool:
     """Re-read whitelist and guild access before resolving any Discord IDs."""
-    from core.permissions import is_admin
     op = registry.get(name)
     if op is None or op.scope != OpScope.GUILD or not getattr(ctx, "guild", None):
         return True
     config = ctx.bot.config
-    gate = effective_gate(op, config.get_global(WHITELIST_KEY),
-                          config.get(ctx.guild.id, GATE_KEY))
-    return not (gate == GATE_EVERYONE or (gate == GATE_ADMIN and is_admin(ctx)))
+    return not _gate_allows(ctx, effective_gate(
+        op, config.get_global(WHITELIST_KEY), config.get(ctx.guild.id, GATE_KEY)))

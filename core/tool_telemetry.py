@@ -6,8 +6,12 @@ transition (bigram/Markov) and repeated-call analysis can be done offline
 (scripts/tool_usage.py): a model repeatedly chaining the same calls is the
 signal for a prompt problem or a missing bundled tool.
 
-Rows carry tool names, statuses and timings only — never arguments or
-results, so SELF exchanges stay out of the file. Writing is best-effort: a
+Each row also carries the run's model requests (round trips), token counts
+and estimated cost, so a prompt or tool change can be compared before and
+after on the same kind of request.
+
+Rows carry tool names, statuses, timings and counters only — never arguments
+or results, so SELF exchanges stay out of the file. Writing is best-effort: a
 telemetry failure must never break the turn it describes.
 """
 import json

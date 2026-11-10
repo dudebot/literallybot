@@ -1,7 +1,7 @@
 from discord.ext import commands
 import random
 import re
-from core.error_handler import suppress_command_not_found
+from core.error_handler import register_error_whitelist_hook, unregister_error_whitelist_hook
 
 
 DICE_PATTERN = re.compile(r"(?P<rolls>\d+)?d(?P<sides>\d+)", re.IGNORECASE)
@@ -18,11 +18,20 @@ def smart_split(options):
     return [value for value in values if value != ""]
 
 
-@suppress_command_not_found(DICE_PATTERN)
 class RNG(commands.Cog):
     """Dice rolls and random picks."""
     def __init__(self, bot):
         self.bot = bot
+        register_error_whitelist_hook(self._is_dice_command)
+
+    def cog_unload(self):
+        unregister_error_whitelist_hook(self._is_dice_command)
+
+    def _is_dice_command(self, ctx, error):
+        """`!2d20` is handled by on_message, not a missing command."""
+        prefix = ctx.prefix
+        return (bool(prefix) and not ctx.message.author.bot
+                and DICE_PATTERN.fullmatch(ctx.message.content[len(prefix):].strip()) is not None)
 
     @commands.command(name='random')
     async def random(self, ctx, *, options: str):
