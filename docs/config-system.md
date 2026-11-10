@@ -93,8 +93,9 @@ tool is unnecessary.
    writes `agent_ops_whitelist` in **global** scope.
 3. Under Server config for the target guild, select Everyone or Admin for
    each tool. This writes `agent_ops_gate` in **guild** scope. A global tick
-   alone leaves ordinary guild users with the default Off gate. Superadmin
-   invocations bypass the guild gate, so they alone cannot prove member access.
+   alone leaves everyone, superadmins included, with the default Off gate.
+   An op marked `confirm_everyone` asks the admin to type YES before it is
+   first set to Everyone.
 4. For external MCP callers, separately enable the names under the MCP ops tab
    if `mcp_tools_enabled` is an explicit list. MCP uses neither agent gate.
 
@@ -137,8 +138,8 @@ Guild scope, `configs/<guild_id>.json`:
 
 Agent settings apply on the next invocation (external changes reload within
 about two seconds). MCP exposure and cog/code changes require a bot restart.
-The saved guild gate authorizes calls. Validate both effective
-gates for a regular member; then ask the bot to call `list_media` and
+The saved guild gate authorizes calls, and the model is offered only the
+tools the invoking user may call. Test as a regular member; then ask the bot to call `list_media` and
 `post_media` with a returned filename and the current channel ID.
 
 ## Key Registry
@@ -154,14 +155,15 @@ illustration; they are not real.)
 |-----|-------|-----------|-------|
 | `discord_token` | `str` | `core.bootstrap` first-run prompt only (no command surface; never a panel field) | The bot's own Discord token. Resolution order is **`DISCORD_TOKEN` env var → this key → interactive prompt → exit with instructions**; the env var is **NEVER persisted here** (a panel-supplied secret belongs only where the operator set it). Written only *after* discord.py confirms the login, so a typo'd token never lands on disk. Plaintext, protected by the store's 0600/0700 modes — see the hardening note below |
 | `superadmins` | `list[int]` user ids | `!addsuperadmin` / `!removesuperadmin`, plus the first-run bootstrap in `core.bootstrap` (any key also editable via the `!config` panel, superadmin) | Read through `core.permissions.get_superadmins`, which normalizes a bare int to a list and re-persists — the one "read that writes". On a first successful login with this list **empty or absent**, the Discord application owner (the team owner for team-owned apps) is added automatically and logged, retiring `!claimsuper` for new installs. Empty-list gate ONLY: an existing deployment is never touched |
-| `ai_providers` | `{provider_id: {name, base_url, default_model, requires_api_key?, models: {model_id: {cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?, cache_input_ratio?, cache_ttl_seconds?}}}}` | `!aisettings` → Models & Providers (superadmin) | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed |
+| `ai_providers` | `{provider_id: {name, base_url, default_model, api_type?, requires_api_key?, models: {model_id: {cost_per_mtok_input?, cost_per_mtok_output?, max_completion_tokens?, reasoning_effort?, vision?, cache_input_ratio?, cache_ttl_seconds?}}}}` | `!aisettings` → Models & Providers (superadmin) | Absent ⇒ readers substitute the built-in `DEFAULT_PROVIDERS` seed. `api_type`: `"openai"` (default, OpenAI-compatible) or `"anthropic"`. `vision: false` marks a text-only model. `cost_per_mtok_output` sets the cooldown tier; with `cost_per_mtok_input` also set, both prices (and `cache_input_ratio`) drive cost estimates instead of the built-in table. See [model cache policy](#model-cache-policy) |
 | `<PROVIDER>_API_KEY` | `str` (e.g. `XAI_API_KEY`) | `!aisettings` → Models & Providers key modal | Env var of the same name is the fallback; removed with its provider. Keys are entered ONLY via the panel modal (no slash parameter) |
 | `DANBOORU_API_KEY`, `DANBOORU_LOGIN` | `str` | *no command surface* | Hand-edit or env only |
-| `cooldown_tier_bases` | `{tier: seconds}` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS`; the model modal's tier dropdown covers the common case |
-| `cooldown_windows` | `list[[count, period_mult]]` | *no command surface (2026-08 UX pass)* — hand-edit | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
+| `cooldown_tier_bases` | `{tier: seconds}` | *no command surface* — hand-edit | Absent/malformed ⇒ per-tier defaults from `COOLDOWN_TIERS`; the model modal's tier dropdown covers the common case |
+| `cooldown_windows` | `list[[count, period_mult]]` | *no command surface* — hand-edit | Absent/malformed ⇒ `DEFAULT_COOLDOWN_WINDOWS`; validated on both write and read |
 | `agent_ops_whitelist` | `{op_name: bool}` | `!aisettings` → 🛠 Agent Ops (superadmin) | The GLOBAL ceiling for the in-chat AGENT tier (`core/agent_gate`). Only ops set `true` here can EVER reach the agent — in any guild or DM — and only whitelisted GUILD/SELF ops render on a server's ⚙ tab. Absent/empty ⇒ nothing enabled (fail closed, the owner opts ops in). A whitelisted name whose op is currently unregistered (cog unloaded) is KEPT and just dropped from the effective set (same live-registry doctrine as `mcp_tools_enabled`). Governs the agent path ONLY; MCP uses its authenticated operator surface; direct registry callers authorize their own entrypoints |
+| `ai_self_tools_enabled` | `bool` | *no command surface* — hand-edit | Master switch for SELF tools (`core.agent_gate.self_tools_enabled`). Absent ⇒ true. Each SELF tool still needs its whitelist entry and guild gate. See [SELF tool policy](#self-tool-policy-contracts) |
 | `mcp_tools_enabled` | `list[str]` op names | `!aisettings` → MCP (superadmin) | Read at MCP server build ⇒ restart-bound; absent ⇒ all exposed ops |
-| `mcp_ops_enabled` | `bool` | `!aisettings` → MCP (🔌 toggle, superadmin) | The MCP server's on/off switch (was the `MCP_OPS_ENABLED` env var until 2026-08). Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
+| `mcp_ops_enabled` | `bool` | `!aisettings` → MCP (🔌 toggle, superadmin) | The MCP server's on/off switch. Read at bot startup ⇒ restart-bound; absent ⇒ off (fail closed) |
 | `mcp_ops_token` | `str` | *no command surface* — hand-edit, or auto-generated | Bearer token for the MCP server. Config-first with an `MCP_OPS_TOKEN` env fallback; if the server is enabled with neither set, the bot generates one (`secrets.token_urlsafe(32)`) and writes it here. Never logged — read it out of `global.json` to connect a client |
 | `mcp_ops_port` | `int` | *no command surface* — hand-edit | Port for the MCP server (loopback by default; `MCP_OPS_HOST` selects the bind). Config-first, then `MCP_OPS_PORT`, then `8765`. Read at bot startup ⇒ restart-bound |
 | `error_logging` | `{default_channel?: int, category_channels?: {category: channel_id}, severity_channels?: {severity: channel_id}, log_unknown_commands?: bool, rate_limit_minutes?: int}` | `/logsettings` → Global (superadmin) | Global and guild destinations are independent; both receive errors/denials. Unknown prefix commands opt-in (default false). Global duplicate interval is 1–60 minutes (default 5). Category routes take priority; existing `command_error` is a fallback for new `command_denied` / `command_not_found` categories. See [error-handling.md](error-handling.md) |
@@ -177,11 +179,11 @@ illustration; they are not real.)
 | `current_ai_provider` | `str` provider id | `!aisettings` → Server config | Absent ⇒ `DEFAULT_PROVIDER` — deleting a provider must account for guilds relying on that implicit default (`_do_removeprovider` does) |
 | `current_ai_model` | `str` or absent | `!aisettings` → Server config | Absent ⇒ provider's `default_model` |
 | `ai_history_min_messages` | `int`, default 15 | `/aisettings` → Server config → History Min / Max | Fresh/sliding context size; 1–1000 messages |
-| `ai_history_max_messages` | `int`, default 30 | `/aisettings` → Server config → History Min / Max | Cache-reuse ceiling, at least the minimum and at most 1000. Equal bounds give fixed history; references may add supplemental messages. Previous anchor retained only inside the assumed TTL when estimated input cost decreases |
+| `ai_history_max_messages` | `int`, default 30 | `/aisettings` → Server config → History Min / Max | Cache-reuse ceiling, at least the minimum and at most 1000. Equal bounds give fixed history; referenced messages may add more. The previous window's first message is kept while the last successful send is within `cache_ttl_seconds` and the window still fits in this maximum. See [AI history caching](ai-caching.md) |
+| `ai_tool_budget` | `int`, default 8 | `/aisettings` → Server config (4/8/12/16) | Action tool calls per chat turn, clamped to 1–16 on read. See [guild tool effort](#guild-tool-effort) |
 | `gpt_personality_data` | `{prompt: str}` | `!aisettings` → Personality modal | Guild persona for `!gpt` |
 | `ai_enabled` | `bool` | `!aisettings` → Server config (💬 toggle) | Per-guild AI kill switch. Absent ⇒ ON. Gates the mention/reply chat path only — the panel stays reachable to turn it back on. Chat is guild-only: DMs never answer |
-| `agent_ops_gate` | `{op_name: "off"\|"admin"\|"everyone"}` | `!aisettings` → ⚙ Server config, per-op tri-state select (**guild admin**) | The per-guild agent gate (`core/agent_gate`), the second tier under the global `agent_ops_whitelist` ceiling. For each WHITELISTED GUILD/SELF op a server admin picks Off / Admin only / Everyone; a missing entry falls back to the op's `default_gate()` (always `"off"`). `off` hides the op from that guild's agent, `admin` limits agent invocation to bot admins, `everyone` opens it to any member. There is no fixed op permission floor. Off and whitelist revocation bind every actor, including superadmins, and are rechecked at dispatch. The surface is eligible GUILD/SELF ops only, capped by the super-admin whitelist. Superseded `bot_tools_enabled` (the old single on/off allowlist) when the two-tier model landed |
-| `whitelist_roles` | `list[str]` role NAMES | nothing (legacy) | Orphaned by the removal of the command/panel role-claiming path (`!setrole`, `/roles claim`, `/roles settings`) — reaction roles are the sole assignment path now. Data left in guild jsons; no live reader or writer |
+| `agent_ops_gate` | `{op_name: "off"\|"admin"\|"everyone"}` | `!aisettings` → ⚙ Server config, per-op select (**bot admin**) | The per-guild agent gate (`core/agent_gate`) under the global `agent_ops_whitelist`. For each whitelisted GUILD/SELF op a bot admin picks Off / Admin / Everyone; a missing or invalid entry is `"off"`. `off` withholds the op from everyone in that guild, `admin` offers it to bot admins only, `everyone` to any member. Ops declare no permission level. Off and whitelist revocation bind every actor, including superadmins, and are re-read at dispatch. Setting a `confirm_everyone` op to Everyone for the first time asks for a typed YES; the call path never checks that flag |
 | `emoji_role_toggles` | `list[{channel_id, message_id, emoji, role_id}]` | `/role add\|delete\|sync` (setrole.py) | emoji is canonical str form (unicode char or `<:name:id>`); channel_id None = legacy-migrated entry pending `/role sync`; legacy nested-dict shape auto-migrates on first read |
 | `error_logging` | as global, except `rate_limit_minutes` is global-only | `/logsettings` → Server (admin) | Independent destination/routes and `log_unknown_commands` toggle; cannot disable global reporting |
 | `honeypot` | `{enabled: bool, channel_id: int, role_id: int, minutes: int, strip_all_other_roles: bool}` | `/honeypot`, `!honeypot`, `configure_honeypot` (admin) | Absent ⇒ disabled. One trap per guild; existing role/channel only. Minutes 0–10080 (default 10), stripping defaults false on each enable. Disable preserves saved settings and assigned roles. See [honeypot](honeypot.md) |
@@ -362,27 +364,26 @@ against another process overwriting the file later.
 
 ### Model cache policy
 
-`ai_providers[provider].models[model].cache_input_ratio` (global, default `0.10`)
-is the cached input price divided by uncached input price, not the cache hit
-rate. `cache_ttl_seconds` (default `300`, range 0–86400; 0 disables extension)
-is an assumed useful cache lifetime, not a provider retention guarantee.
-Superadmins edit these under `/aisettings` → Models & Providers → Input cache.
-The ratio is entered as a percentage. Known Grok 4.6 pricing implies **25%**,
-and Grok 4.5 **15%**; the generic default is 10%.
-Neither setting changes provider billing or forces cache retention.
-The selector uses a UTF-8 byte/4 token estimate and exact whole-message prefix
-matching. State is in memory, separated by guild/channel/provider/model/tools,
-bounded to 256 entries, and committed only after a successful model call.
-Reusing a window keeps its anchor ID and refreshes its last-send timestamp.
-Requests in one channel serialize. Stable system instructions precede history;
-changing user mappings and invoking IDs follow it. xAI requests use a stable
-`x-grok-conv-id`. Usage logs retain actual cached token counts per API request.
+Two per-model keys in `ai_providers[provider].models[model]`, edited by
+superadmins under `/aisettings` → Models & Providers → **Input cache**:
+
+- `cache_ttl_seconds` (default `300`, range 0–86400) is the assumed provider
+  cache lifetime. It decides how long the history window keeps its first
+  message (see [AI history caching](ai-caching.md)); 0 always starts a fresh
+  window. It does not force provider retention.
+- `cache_input_ratio` (default `0.10`, entered as a percentage) is the cached
+  input price divided by the full input price, not a hit rate. It is used
+  only for cost estimates, and only when the model also has both
+  `cost_per_mtok_input` and `cost_per_mtok_output`; otherwise the built-in
+  price table in `core/llm/usage.py` applies. It has no effect on history.
+
+xAI requests carry a stable `x-grok-conv-id` per guild/channel/model.
 
 ### Guild tool effort
 
 `ai_tool_budget`: guild-scoped integer, default 8, read clamped to 1–16.
-Server config offers 4/8/12/16. The hard runaway cap is twice the selected budget.
-No op may change this setting.
+Server config offers 4/8/12/16. Calls past the budget are refused in-band; the
+hard stop is a model-request limit of budget + 2 (`core/agent_loop.py`).
 
 ### Image input capability
 
@@ -393,16 +394,8 @@ referenced messages and bot posts. Trigger images have first priority, then the
 reply target; remaining slots retain earlier selections and fill from recent
 history. Images stay attached to their source turn. Images beyond the limit,
 failed loads and images disabled by `vision: false` remain text placeholders.
-Normalized image bytes and retained selections use bounded in-memory caches;
-provider usage accounts for the resulting input tokens. Verify image capability
-for the exact configured provider/model and explicitly opt text-only models out.
-An actual image-content answer is required before declaring a model verified.
-
-Verified vision seed: `ollama/qwen3.5:4b` supports image input per
-https://ollama.com/library/qwen3.5:4b . A bounded local inference with installed
-`qwen3.5:4b-gpu` and a synthetic image answered “Blue square” correctly through
-LLMClient on 2026-10-03. Verify other entries against the exact configured
-provider/model and set `vision: false` for text-only models.
+Details are in [AI history caching](ai-caching.md#image-inputs). Verify image
+capability for the exact configured provider/model and opt text-only models out.
 
 ### Atomic user-document updates
 
@@ -418,18 +411,16 @@ MCP binding is configured at startup with `MCP_OPS_HOST` (default `127.0.0.1`). 
 
 ### SELF tool policy contracts
 
-`ai_self_tools_enabled` is a global master switch for SELF tools, including
-DMs (absent means `true`), read by `core.agent_gate.self_tools_enabled` /
+`ai_self_tools_enabled` is a global master switch for SELF tools (absent
+means `true`), read by `core.agent_gate.self_tools_enabled` /
 `resolve_agent_tools`. There is no per-guild copy.
 
 The global `agent_ops_whitelist` still requires each tool name to be explicitly
 true. Guild SELF also requires a non-off `agent_ops_gate` entry, which defaults
-off, so a new guild starts with no tools; Admin/Everyone
-still apply. No superadmin bypass applies to configured Off states. DM callers request SELF only and never substitute another
-guild's context. Readers do not persist defaults or automatically grant tools.
-Visible switches are deferred to the downstream R3 settings work.
+off, so a new guild starts with no tools; Admin/Everyone still apply. Off
+binds superadmins too. Readers do
+not persist defaults or automatically grant tools. There is no panel switch
+for `ai_self_tools_enabled`; hand-edit it.
 
-Public guild `ai_tool_budget` keeps its default 8 and existing 1–16 clamp.
-DM turns use 8. All GUILD/SELF action tools share one counter per turn.
-Terminal `stay_quiet` remains outside the
-action counter, matching existing public behavior.
+All GUILD/SELF action tools share one `ai_tool_budget` counter per turn.
+Terminal `stay_quiet` is outside that counter.

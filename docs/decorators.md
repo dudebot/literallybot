@@ -5,9 +5,7 @@ custom helpers and command checks; the remaining tables cover command creation,
 events, tasks, UI, Python utilities, and tests.
 
 **Inventory scope:** every custom decorator API defined by this repository and
-every decorator form used in its Python source, including disabled optional cogs
-and tests. Audited against the working tree on 2026-09-17 (discord.py 2.6.4).
-Repeated uses and differently named instances of the same API share a row. The
+every decorator form used in its Python source, including tests. Repeated uses and differently named instances of the same API share a row. The
 underlying libraries offer additional decorators; their full API references are
 linked below. This is the repository's inventory, not an inventory of every
 installed dependency.
@@ -16,21 +14,28 @@ installed dependency.
 
 | Decorator | Import / owner | Apply to | Purpose and limits | Deep dive |
 |---|---|---|---|---|
-| `@op(name, description, ...)` | `from core.ops import op` | Async method on the owning cog | Declares a behavioral op. Cog loading registers instance methods; shared services remain plain functions in `core/`. Declaration alone does not register or grant access. Configured frontend policy authorizes calls. | [Declaring an op](cog-development.md#declaring-the-op), [execution and permissions](security.md#agentic--ops-execution-model) |
+| `@op(name, description, ...)` | `from core.ops import op` | Async method on the owning cog | Declares a behavioral op. Cog loading registers instance methods; shared services remain plain functions in `core/`. Declares no permission level; declaration alone does not register or grant access. Configured frontend policy authorizes calls. | [Declaring an op](cog-development.md#declaring-the-op), [execution and permissions](security.md#agentic--ops-execution-model) |
 | `@registry.op(name, description, ...)` | `from core.ops import registry` | Async function in `core/ops.py` | Immediately registers a raw Discord API primitive. Registration stamps `origin='core'`; the behavioral registration paths stamp `origin='cog'`. Neither decorator takes an `origin` argument. | [Ops architecture](cog-development.md#registering-ops-from-a-cog) |
 | `@panel_slash_pin()` | `from core.panels import panel_slash_pin` | Slash command | Sets the Manage Messages default permission for picker visibility. Does **not** enforce bot-admin authorization; pair with a check and `guild_only`. Wraps `app_commands.default_permissions(manage_messages=True)`. | [Permission recipe](cog-development.md#permission-management), [command gates](security.md#command-gates-prefix-and-slash) |
-| `@suppress_command_not_found(*patterns)` | `from core.error_handler import suppress_command_not_found` | Cog **class** | Accepts regex strings or compiled patterns. Full-matches prefix-stripped, trimmed text only for human-authored prefix `CommandNotFound`. Only loaded cogs participate; command/event exceptions and denials remain visible. | [Regex suppression](error-handling.md#suppressing-commandnotfound) |
 
-`@op` supports `params`, `serialize`, `agent_guidance`, `scope`, `group`, and
-`group_label`; `@registry.op` supports the same fields except `group_label`.
-See the [field chart](cog-development.md#the-fields) and
+`@op` supports `params`, `serialize`, `agent_guidance`, `scope`, `group`,
+`group_label`, `sequential` and `confirm_everyone`; `@registry.op` supports the
+same fields except `group_label`. `confirm_everyone=True` only makes the
+`/aisettings` Server tab ask for a typed YES before the op is first set to
+Everyone; it is never checked at call time. See the
+[field chart](cog-development.md#the-fields) and
 [scope rules](cog-development.md#choosing-scope). Current examples are
-[reaction-role ops](../cogs/setrole.py), [points ops](../cogs/points.py),
-and [RNG suppression](../cogs/rng.py).
+[reaction-role ops](../cogs/setrole.py) and [points ops](../cogs/points.py).
 For a SELF op with a `SELF_USER` parameter, see the
 [note tools example](cog-development.md#example-a-self-user-tool).
 
 ## Authorization and server context
+
+Commands have three access levels: everyone (no check), bot admin (`is_admin`:
+the guild's `admins` list, Discord Administrator, guild owner, or superadmin)
+and superadmin (`is_superadmin`: the global `superadmins` list, the bot's
+operator). Gating a command is one decorator line, `@commands.check(is_admin)`
+on prefix or `@app_commands.check(is_admin)` on slash.
 
 `is_admin` and `is_superadmin` are **predicates**, not decorators. Import them
 from `core.permissions` and pass them to the wrapper for the correct command system.
@@ -79,7 +84,7 @@ Import task decorators with `from discord.ext import tasks`. Names such as
 
 | Decorator | Apply to / current spellings | What it does | Deep dive |
 |---|---|---|---|
-| `@commands.Cog.listener()` | Async cog event method, usually `on_message`, `on_ready`, etc. | Adds a listener alongside other handlers. Handling a message here does not consume it for command dispatch. An explicit event name can be passed. | [Events and tasks](cog-development.md#advanced-features), [dynamic shortcut suppression](error-handling.md#suppressing-commandnotfound) |
+| `@commands.Cog.listener()` | Async cog event method, usually `on_message`, `on_ready`, etc. | Adds a listener alongside other handlers. Handling a message here does not consume it for command dispatch. An explicit event name can be passed. | [Events and tasks](cog-development.md#advanced-features), [shortcut suppression](error-handling.md#suppressing-commandnotfound) |
 | `@bot.event` | Async function in `bot.py` | Registers the bot-level handler by function name. The bot's `on_message` preserves prefix dispatch with `process_commands`. | [Error flow](error-handling.md#error-flow-overview), [entrypoint](../bot.py) |
 | `@bot.tree.error` | Async function in `bot.py` | Registers the central slash-command error handler. | [Error flow](error-handling.md#error-flow-overview) |
 | `@tasks.loop(...)` | Async cog method | Creates a scheduled task loop. Current users: reminder polling, status rotation, reaction-role startup sync. The decorator does not start the loop; lifecycle code does. | [Events and tasks](cog-development.md#advanced-features) |
@@ -102,6 +107,7 @@ These are Python features, not additional bot command or permission systems.
 | `@staticmethod` | Built-in | A class-associated helper that receives neither `self` nor `cls`, e.g. media's `_validate_name`. | [Service functions](cog-development.md#the-service-function-pattern-required), [Python staticmethod](https://docs.python.org/3.12/library/functions.html#staticmethod) |
 | `@classmethod` | Built-in | Receives `cls`; used by the reminder snooze view's factory. | [Reminder source](../cogs/reminders.py), [Python classmethod](https://docs.python.org/3.12/library/functions.html#classmethod) |
 | `@contextlib.contextmanager` | `import contextlib` | Builds a context manager from a generator. The embedded MCP server uses it to leave signal handling with the bot. | [MCP server](security.md#mcp-ops-server), [Python contextmanager](https://docs.python.org/3.12/library/contextlib.html#contextlib.contextmanager) |
+| `@lru_cache(maxsize=...)` | `from functools import lru_cache` | Memoizes a pure function; auto-response caches compiled regex triggers. | [Auto-response source](../cogs/auto_response.py), [Python lru_cache](https://docs.python.org/3.12/library/functools.html#functools.lru_cache) |
 
 ## Test decorators
 
@@ -111,12 +117,14 @@ support comes from the `pytest-asyncio` development dependency.
 | Decorator | Purpose | Reference |
 |---|---|---|
 | `@pytest.fixture` / `@pytest.fixture(...)` | Supplies reusable setup and teardown, such as an isolated real `Config` store. | [Testing](cog-development.md#testing--restarting-tips), [pytest fixtures](https://docs.pytest.org/en/stable/how-to/fixtures.html) |
+| `@pytest_asyncio.fixture` | An async fixture under pytest-asyncio. | [Honeypot tests](../tests/test_honeypot.py) |
+| `@asynccontextmanager` | `from contextlib import asynccontextmanager`; an async context manager built inside a test helper. | [Frontend tests](../tests/test_ops_frontends.py) |
 | `@pytest.mark.parametrize(...)` | Runs the same test over multiple argument sets. | [Testing](cog-development.md#testing--restarting-tips), [pytest parametrization](https://docs.pytest.org/en/stable/how-to/parametrize.html) |
 | `@pytest.mark.asyncio` | Runs an async test under pytest-asyncio. | [Logging tests](../tests/test_error_logging.py), [pytest-asyncio marker](https://pytest-asyncio.readthedocs.io/en/stable/reference/markers/index.html) |
 | `@pytest.mark.skipif(condition, reason=...)` | Skips tests when a stated prerequisite is absent. | [Testing](cog-development.md#testing--restarting-tips), [pytest skipping](https://docs.pytest.org/en/stable/how-to/skipping.html) |
 
 Tests also use the runtime `@op(...)` decorator above; it is not a separate
-test API. Follow the [test retention policy](testing.md) when adding cases.
+test API. Follow the [test policy](testing.md) when adding cases.
 
 ## Standard recipes
 
@@ -149,19 +157,9 @@ These decorators guard initial invocation. Recheck authorization when a user
 clicks a control or submits a modal, since their permissions can change while
 it is open. See the [panel pattern](cog-development.md#panel-components).
 
-Regex suppression uses a **class** decorator, outside the command/listener stack:
-
-```python
-import re
-from discord.ext import commands
-from core.error_handler import suppress_command_not_found
-
-DICE_PATTERN = re.compile(r"(?P<rolls>\d+)?d(?P<sides>\d+)", re.IGNORECASE)
-
-@suppress_command_not_found(DICE_PATTERN)
-class RNG(commands.Cog):
-    ...  # Reuse DICE_PATTERN.fullmatch(text) in the listener.
-```
+A listener-handled shortcut (such as `!2d20`) silences its `CommandNotFound`
+report with a registered hook, not a decorator; see
+[Suppressing CommandNotFound](error-handling.md#suppressing-commandnotfound).
 
 Python applies stacked decorators from the bottom upward. Follow the existing
 command/check order above. An op adapter is a separate async method calling the

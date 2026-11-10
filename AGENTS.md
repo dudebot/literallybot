@@ -1,66 +1,72 @@
 # Agent notes
 
-Discord bot, Python 3.12+ / discord.py. Keep changes focused, reuse existing
-patterns, and read the relevant guide before changing a subsystem.
+Discord bot, Python 3.11+ / discord.py. Meant to stay small and hackable: keep
+changes focused, copy an existing pattern, and read the linked guide before
+changing a subsystem.
 
 ## Where to look
 
-- **Commands (`!`, `/`), `@` decorators, and panels:**
-  [cog development](docs/cog-development.md) and [decorators](docs/decorators.md).
-  Templates: [RNG](cogs/rng.py) for a small cog,
-  [log settings](cogs/error_handler.py) for admin panels,
-  [reaction roles](cogs/setrole.py) for shared command/op behavior.
-- **Config:** [API and key registry](docs/config-system.md). Use the central
-  Config store, choose the correct scope, and document new keys there.
-- **Auth, ops, MCP:** [security](docs/security.md) and
-  [op authoring](docs/cog-development.md#registering-ops-from-a-cog).
-  Reuse `core.permissions.is_admin` / `is_superadmin`; register Discord actions as
-  ops and share headless logic with commands. No parallel permission system.
-  For existing media tools and activation, see the
-  [media tool guide](docs/cog-development.md#media-tools-and-discovery) and
-  [two-tier config example](docs/config-system.md#enabling-cog-tools).
-- **Logging and test quality:** [error handling](docs/error-handling.md) and
-  [test guidance](docs/error-handling.md#test-quality-and-development-checks).
-  Use `self.bot.logger`; permission denials still log at WARNING.
-- **Other systems and decisions:** [README](README.md#documentation) and
-  [decision records](docs/decision-records.md).
+- **Writing a cog, commands, panels, ops:** [cog development](docs/cog-development.md)
+  (has a full template) and [decorators](docs/decorators.md). Live examples:
+  [RNG](cogs/rng.py) for a small cog, [log settings](cogs/error_handler.py)
+  for an admin panel, [reaction roles](cogs/setrole.py) for a command and an
+  op sharing one implementation.
+- **Config:** [API and key registry](docs/config-system.md). Document new keys there.
+- **Who may do what, the AI agent path, MCP:** [architecture](docs/architecture.md)
+  and [security](docs/security.md).
+- **Logging and tests:** [error handling](docs/error-handling.md) and the
+  [test policy](docs/error-handling.md#test-quality-and-development-checks).
+- **Why something is the way it is:** [decision records](docs/decision-records.md).
+  The newest entry wins; older ones may be marked superseded.
+
+## Access levels
+
+"Admin" always means the bot's own notion, from `core.permissions`:
+
+- **Superadmin** (`is_superadmin`): the bot's operator, listed in `superadmins`
+  in `configs/global.json`.
+- **Bot admin** (`is_admin`): in the server's `admins` list (`!claimadmin`,
+  `!addadmin`), or a Discord Administrator, or the server owner, or a superadmin.
+- **Everyone**: no check.
+
+**Commands** declare their level with one decorator:
+`@commands.check(is_admin)` on a prefix command, `@app_commands.check(is_admin)`
+on a slash command (same for `is_superadmin`). An admin panel is a hidden
+`!name` plus a `guild_only` `/name` with `@panel_slash_pin()`, which only hides
+it from members without Manage Messages. Copy [log settings](cogs/error_handler.py).
+
+**Ops** (AI and MCP tools) declare no level. Operators choose Off / Admin /
+Everyone per server in `/aisettings`. So:
+
+- Never write who may use a tool, or what it will refuse, into an op's
+  description or guidance. The model is given only tools the user may call;
+  if Discord refuses, it gets Discord's error.
+- Never write `agent_ops_whitelist`, `agent_ops_gate` or `mcp_tools_enabled`
+  from code. Registering an op enables nothing.
+- `confirm_everyone=True` marks an op that can grant access or do lasting
+  damage. It only makes the settings panel ask before opening it to Everyone.
 
 ## Working rules
 
-- All feature cogs live in `cogs/`, one per purpose. Cogs own prefix/slash
-  commands, listeners, tasks, views, and behavioral `@op` adapters. Shared
-  headless implementations and state live in `core/`; private helpers may stay
-  with their cog. Never import or call another cog to reuse its behavior.
-- `core/cog_discovery.py` owns discovery and protection. Only `control` and
-  `admin` are protected, with reasons in `PROTECTED_COGS`. Filter disabled
-  modules before import; never import them to discover metadata or infer
-  protection from folders. Keep stable bare cog IDs.
-- Behavioral ops belong to their owning cog even when services live in `core/`.
-  Disabling withdraws feature entrypoints at next boot while preserving shared
-  implementations, saved settings and existing effects. Independent raw Discord
-  API primitives retain their own exposure and permission policy.
-- Cogs are fixed at boot; disable via `disabled_cogs`, never delete or hot-reload.
-  Follow the [restart instructions](docs/cog-development.md#testing--restarting-tips).
-- Admin commands use the central checks, hidden prefix commands, and guild-only
-  slash twins with `panel_slash_pin()`. Guard guild-only prefix commands too.
-- Cogs declare capabilities; authorized operators configure their exposure.
-  Never auto-enable a cog's own tools or grant access from registration or execution.
-- Use `core.permissions` for authorization, `core.panels` for panel lifecycle
-  and slash visibility, and `core.messages` for outbound text helpers.
-- Reuse `core.messages.recursive_split` for Discord message splitting.
-  Keep async handlers nonblocking and runtime data/credentials out of git.
-- Downstream copies merge upstream as-is. Fix shared backbone here first;
-  keep copy-only additions separate. No merge helpers or `merge=ours`.
-  Never cherry-pick private-copy commits into a public repo; re-author here.
+- Features live in `cogs/`, one file per purpose, and own their commands,
+  listeners, tasks, views and `@op` methods. Shared logic and state live in
+  `core/`. A cog never imports another cog; `core/` never imports a cog.
+- If the AI or an MCP client should be able to do something a command does,
+  add an `@op` method on the same cog that calls the same function.
+- No hot reload: cogs load at boot. To stop one in a deployment, `!disable`
+  it (stored in `disabled_cogs`) and restart. Don't rename a cog file: its
+  name is the stored ID. Only `control` and `admin` cannot be disabled.
+- Use `self.bot.config` for settings, `self.bot.logger` for logging,
+  `core.messages.recursive_split` to split long messages, `core.panels` for
+  panel views.
+- No blocking calls in async handlers (`asyncio.to_thread` for file, network
+  and subprocess work). No runtime data or credentials in git.
+- This repo is upstream of other deployments: fix shared code here and keep
+  it deployment-neutral.
 
 ## Tests
 
-Development self-checks are fine; delete temporary checks and unused fixtures
-before committing or handing off, without waiting to be asked. No count target.
-See the [qualitative policy](docs/error-handling.md#test-quality-and-development-checks).
-Architecture ownership is enforced by `tests/test_architecture.py`: no core-to-cog
-or cog-to-cog imports; Cog classes and Discord feature declarations live in
-`cogs/`; behavioral `@op` declarations belong on owning Cog methods. Shared
-Discord SDK helpers in `core/` and raw API `registry.op` operations remain valid.
-These are static import/declaration checks, not a runtime dependency sandbox.
-Use real Config with temporary storage; run `venv/bin/python -m pytest tests/`.
+`venv/bin/python -m pytest tests/`. Each test should name the specific failure
+it catches; there is no count target. Use real `Config` with temporary storage
+(see `tests/conftest.py`). Delete throwaway checks before handing off.
+`tests/test_architecture.py` enforces the import and ownership rules above.

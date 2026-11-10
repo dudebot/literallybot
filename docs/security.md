@@ -6,19 +6,24 @@ MCP ops server, and secret handling. Read alongside `docs/config-system.md`
 
 ## Permission Model
 
-Three tiers, checked by `core/permissions.py`. Both prefix commands (`commands.Context`)
-and slash commands (`discord.Interaction`) route through the same `is_admin` /
-`is_superadmin` helpers — there is one auth gate, not two.
+Commands have three access levels, decided by the bot (not by Discord roles
+alone) in `core/permissions.py`. Prefix commands (`commands.Context`) and slash
+commands (`discord.Interaction`) use the same `is_admin` / `is_superadmin`
+predicates.
 
 | Tier | Granted by | Stored in | Checked by |
 |------|-----------|-----------|-----------|
 | **Superadmin** | `!claimsuper` (first-come, once) or `!addsuperadmin` (by an existing superadmin) | `global.json` → `superadmins` (list of int user ids) | `is_superadmin(ctx)` |
-| **Guild admin** | `!claimadmin` (needs Discord Administrator / guild owner, only if no admins exist yet) or `!addadmin` (by a superadmin or existing admin) | `<GUILD_ID>.json` → `admins` (list of int user ids) | `is_admin(ctx)` |
+| **Bot admin** | `!claimadmin` (needs Discord Administrator / guild owner, only if no admins exist yet) or `!addadmin` (by a superadmin or existing admin) | `<GUILD_ID>.json` → `admins` (list of int user ids) | `is_admin(ctx)` |
 | **Everyone** | default | — | no check |
 
 `is_admin` returns true for: superadmins, ids in the guild's `admins` list, a
 member with the Discord **Administrator** permission, or the guild owner.
-`is_superadmin` is global and id-only.
+`is_superadmin` is global and id-only: the bot's operator.
+
+A cog gates a command with one decorator line: `@commands.check(is_admin)` /
+`@commands.check(is_superadmin)` on prefix, `@app_commands.check(...)` on slash.
+Ops are different: they declare no access level (see below).
 
 ### Command gates (prefix and slash)
 
@@ -27,14 +32,11 @@ prefix, `@app_commands.check(is_admin)` on slash. Same function; discord.py
 has two command systems and they do not accept each other's decorator. Do
 not invent a third wrapper.
 
-Gated slash commands set `guild_only` (never in DMs) and pin
-`default_permissions(manage_messages=True)` so ordinary members do not
-see them in Discord's picker. Manage Messages is the typical moderator
-bit; Discord Administrator was too high a bar and locked out bot admins
-who are not server admins. Authorization is still `is_admin` /
-`is_superadmin`. A bot admin/superadmin without Manage Messages in that
-guild still has the prefix twin. `/help` hides anything the invoker
-could not run.
+Gated slash commands set `guild_only` (never in DMs) and `@panel_slash_pin()`
+(`core/panels.py`), which hides them from members without Manage Messages in
+Discord's picker. That is visibility, not authorization: the check is the
+gate. A bot admin or superadmin without Manage Messages in that guild still
+has the prefix twin.
 
 `/help` lists a command only if the invoker could run it, by reading the
 decorator. A body `if not is_admin` is defense in depth, not the gate.
@@ -62,8 +64,8 @@ Management.
 ## Agentic / Ops Execution Model
 
 The registry (`core/ops.py`) describes atomic actions, typed parameters,
-scopes and results. Neither `@op` nor `@registry.op` declares an ACL tier.
-Descriptions and agent guidance explain behavior, not assumed authorization.
+scopes and results. Neither `@op` nor `@registry.op` declares a permission
+level. Nothing about access is put in a tool description or sent to the model.
 
 ### Configured authorization
 
@@ -75,18 +77,29 @@ Descriptions and agent guidance explain behavior, not assumed authorization.
 | Guild `agent_ops_gate` | Off disables the tool; Admin authorizes bot admins; Everyone authorizes members | Off |
 | Global `ai_self_tools_enabled` | Master switch for SELF tools | On |
 
-Tool selection and dispatch use `core.agent_gate`. Dispatch re-reads the
-whitelist and guild choice before resolving Discord IDs or spending action
-budget. Off and whitelist revocation apply to all actors, including
-superadmins. Everyone has no additional per-op admin floor. Existing stored
-choices are retained; registration never grants access or persists defaults.
-Settings editors and ordinary prefix/slash commands keep their central
+Tool selection and dispatch use `core.agent_gate`.
+`resolve_agent_tools` offers the model only the tools the invoking user may
+call; the model calls them and gets Discord's own error if Discord refuses.
+Dispatch re-reads the whitelist and guild choice before resolving Discord IDs
+or spending action budget. Off and whitelist revocation apply to every actor,
+including superadmins; there is no bypass. Registration never grants access or
+writes defaults. Settings editors and ordinary prefix/slash commands keep their
 `is_admin` / `is_superadmin` checks.
 
 MCP is a separate authenticated operator surface, controlled by
 `mcp_tools_enabled` and its bearer/host/origin checks. It has no additional
 per-op actor tier. Direct registry callers are trusted application code and
 must authorize their entrypoint before dispatch.
+
+### `confirm_everyone` is a prompt, not a boundary
+
+An op declared with `confirm_everyone=True` (role and channel-permission
+writes, bans and kicks, webhooks, bulk deletes, `configure_honeypot`, and
+others) makes the `/aisettings` Server tab ask the admin to type YES in a modal
+before the op is first set to Everyone
+(`_ConfirmEveryoneModal` in `cogs/gpt.py`). Dismissing the modal saves nothing.
+The flag is never checked at call time and never sent to the model. Operators
+may still open any op to everyone; the prompt only makes sure it is on purpose.
 
 ### Execution boundaries
 
@@ -98,11 +111,19 @@ must authorize their entrypoint before dispatch.
   tools below. SELF tools are unavailable through MCP.
 - Discord itself enforces the bot's permissions, hierarchy and API limits.
   A configured-access refusal is local and does not mean Discord rejected it.
-- Sends suppress mentions. Host attachment access follows the selected op's
-  configured access, with file type, size and path validation retained.
-- The action budget defaults to 8, configurable from 1–16 per guild. The
-  final three results carry a countdown; calls after exhaustion are refused.
-  A hard cap at twice the budget falls back to a model-authored final answer.
+- Sends suppress mentions. Bot-wide, `allowed_mentions` blocks @everyone and
+  role pings unless a call says otherwise (`bot.py`).
+- Host paths. A parameter declared `OpParam(..., host_path=True)` (attachment
+  and emoji file paths) must, in chat, resolve inside the guild's media library
+  (`media/<guild_id>/`) or the emoji download folder (`media/tmp/`)
+  (`core.ops.chat_host_path_error`, enforced in `core/agent_loop.py`). Anything
+  else is refused with one fixed message before the file is touched. File type,
+  size and existence checks still apply. Configured access says who may run an
+  op, not which host files it may read. MCP is not confined.
+- The action budget defaults to 8 (Server config offers 4/8/12/16; stored
+  values are clamped to 1–16). The final three results carry a countdown;
+  calls after exhaustion are refused in-band. The hard stop is a model-request
+  limit of budget + 2, which falls back to one tool-less model answer.
 - `stay_quiet()` is local terminal output, outside the action budget and
   registry. It ends the run without an automatic final reply; prior actions
   remain. Empty model output is an error.
@@ -113,14 +134,13 @@ must authorize their entrypoint before dispatch.
 ## MCP Ops Server
 
 `core/mcp_server.py` exposes a subset of the ops registry over HTTP, in-process
-with the bot (the standalone runner was deleted in 2026-08 — it opened a second
-Discord session on the same account and could not see cog-registered ops). The
-server stays off unless enabled. Every request still has to pass bearer auth
+with the bot, so it sees cog-registered ops. The server stays off unless
+enabled. Every request still has to pass bearer auth
 and the Host/Origin allowlist for the bind.
 
 - **Off by default.** Refuses to start unless the `mcp_ops_enabled` global
-  config boolean is true (toggled from `!aisettings` → MCP tab; moved out of
-  `.env` 2026-08 so it's operable without shell access; binds on restart).
+  config boolean is true (toggled from `!aisettings` → MCP tab; binds on
+  restart).
 - **Bind.** Default `127.0.0.1`. `MCP_OPS_HOST`, when set, is an explicit
   opt-in: an IP address, `localhost`, or a wildcard (`0.0.0.0` or `::`).
   Unset or empty stays on loopback. Anything else refuses startup. A
@@ -149,8 +169,7 @@ and the Host/Origin allowlist for the bind.
   shared secret, not a per-user credential. Anyone who can reach the port
   and present it is a full operator of the exposed tools.
 - **Mentions suppressed** on `send_message`, same as the agent loop.
-- **Full guild reach by design** (owner decision 2026-08; the former
-  `MCP_OPS_GUILD_ALLOWLIST` gate was removed). MCP tools act as raw
+- **Full guild reach by design.** MCP tools act as raw
   primitives: every guild the bot account is in is addressable, and access
   control belongs upstream in the MCP caller. DM channels are still refused
   on id-based calls — DMs flow only through the user-keyed DM ops (keyed by
@@ -162,23 +181,22 @@ and the Host/Origin allowlist for the bind.
   guild-confined surface in the system is the in-bot `!gpt` agent loop,
   which passes exactly `{ctx.guild.id}` to the registry.
 
-### Accepted risk: caller-supplied `actor_id`
+### The bearer is the credential; `actor_id` is not authorization
 
-The MCP frontend takes `actor_id` as a plain tool parameter — it is **not**
-credential-bound and it is **not** derived from the HTTP client. A client that
-already holds the bearer token can present any user id (including a
-superadmin's) for permission purposes. The ops gate then evaluates that id.
-When the id matches a guild Member in the bot's cache, that Member is the
-actor; otherwise a bare id-holder is used, which the permission helpers treat
-as an ordinary non-admin unless the id is in a config admin or superadmin list.
+The bearer token is full operator access to every tool `mcp_tools_enabled`
+exposed at startup. There is one shared secret, not a per-user credential.
+
+Every MCP tool also takes an `actor_id`. It is caller-supplied and not
+credential-bound, and it grants nothing. When it resolves to a member of the
+target guild, that member's channel visibility and private-thread access
+apply to the call. Otherwise a bare id is used and those checks are skipped.
+A caller can therefore pick any id, or an unknown one, to change which
+visibility applies; the bearer already allows everything the exposed tools do.
 
 The streamable-HTTP session id is a per-connection capability minted by the
 MCP library. An unknown session id is rejected. This server does not use MCP
 OAuth, so the library does not bind the session to a distinct user: any
-request that already passed the shared bearer can use a live session. Two
-different bearers are not two actors; there is one shared secret. Holding it
-is owner-equivalent for whatever `actor_id` the caller supplies and for
-whatever tools `mcp_tools_enabled` exposed at startup.
+request that already passed the shared bearer can use a live session.
 
 That is acceptable when the operator treats the bearer as a host credential.
 It is the same risk on loopback and on an explicit LAN or wildcard bind.
@@ -198,10 +216,11 @@ does not change it. Do not publish the port or front it with a public proxy.
     rotate elsewhere.
   - **A prompted token is written only after discord.py confirms the login.**
     The verification boundary is `setup_hook`, which is reached only after the
-    REST login succeeded; a `LoginFailure` re-prompts (3 attempts) and writes
-    nothing, so a typo'd token never reaches disk. A rejected *env* or *stored*
-    token exits instead of looping — re-prompting there would paper over a
-    broken panel variable rather than surfacing it.
+    REST login succeeded. A `LoginFailure` writes nothing and exits 1 with a
+    message naming the token's source; it never re-prompts. A typo'd token
+    never reaches disk. (The prompt itself allows 3 tries for an *empty*
+    entry.) `PrivilegedIntentsRequired` exits 1 with instructions for enabling
+    the intents in the Developer Portal.
 
   Stored tokens live in `configs/global.json` as plaintext, protected by the
   store's 0600/0700 modes (below). **`.env` is deprecated** — still loaded when
@@ -239,9 +258,7 @@ does not change it. Do not publish the port or front it with a public proxy.
   name are honored as a fallback. The store's 0700/0600 modes (above) are what
   protects them at rest.
 - **The MCP bearer token** follows the same config-first-with-env-fallback
-  pattern: the `mcp_ops_token` global config key, else `MCP_OPS_TOKEN`. It moved
-  out of env-only into config in 2026-08 so the server is operable without shell
-  access. If an operator enables the server with neither set, the bot
+  pattern: the `mcp_ops_token` global config key, else `MCP_OPS_TOKEN`. If an operator enables the server with neither set, the bot
   **generates** one (`secrets.token_urlsafe(32)`) and persists it to
   `global.json`. Generating rather than refusing keeps the server fail-closed
   (it is never unauthenticated) without stranding an operator who has no UI for
@@ -261,8 +278,8 @@ does not change it. Do not publish the port or front it with a public proxy.
 
 ## Prompt-Injection and Data Surfaces (`!gpt`)
 
-- **Channel history is sent to a third-party LLM.** `!gpt` scrapes the last ~15
-  channel messages (plus referenced messages and their embeds/attachment URLs) and
+- **Channel history is sent to a third-party LLM.** `!gpt` sends the last 15–30
+  channel messages by default (the guild's history min/max) (plus referenced messages and their embeds/attachment URLs) and
   sends them to the configured provider. This is a data-egress surface: whatever is
   visible in the channel can leave to the provider. Choose providers accordingly;
   a local provider (`requires_api_key: false`, e.g. a self-hosted model) keeps data
@@ -279,9 +296,9 @@ does not change it. Do not publish the port or front it with a public proxy.
 
 ## Known Accepted Risks (documented, not defects)
 
-1. **MCP `actor_id` is caller-supplied** — any bearer holder can act as any
-   actor. The HTTP boundary is the shared bearer plus the Host/Origin
-   allowlist, not the actor id (see above).
+1. **The MCP bearer is full operator access** — `actor_id` is caller-supplied
+   and only selects whose channel visibility applies. The HTTP boundary is the
+   shared bearer plus the Host/Origin allowlist (see above).
 2. **Superadmin tier is owner-level RCE-adjacent** — the global config editor,
    the `disabled_cogs` editor, restart, and bulk delete are intentionally
    available to superadmins. (Arbitrary cog load/reload and `git pull` were
@@ -303,10 +320,10 @@ does not change it. Do not publish the port or front it with a public proxy.
   every config file lands 0600; the atomic-save temp file is created 0600 and
   `fchmod`'d before content is written (#83). Best-effort on non-POSIX
   filesystems.
-- [ ] **Default the MCP server to loopback.** `MCP_OPS_HOST` is an explicit
+- [x] **Default the MCP server to loopback.** `MCP_OPS_HOST` is an explicit
   address or wildcard opt-in. DNS-rebinding Host/Origin checks stay on for
-  that bind. Bearer auth stays mandatory, and any bearer holder can still
-  supply `actor_id`. Do not publish the port or front it with a public proxy.
+  that bind. Bearer auth stays mandatory. Do not publish the port or front it
+  with a public proxy.
 - [x] **Constrain media filenames** — add, lookup, post and delete validate
   literal basenames; glob/template syntax and path separators are rejected.
   Library enumeration excludes directories and symbolic links, and file actions
@@ -314,42 +331,23 @@ does not change it. Do not publish the port or front it with a public proxy.
   finished file is moved into the guild library. Symlinked media roots and guild
   directories are rejected. These checks assume the host's library directories
   are not concurrently rewritten by an untrusted local process.
-- [ ] **Audit `addmedia` targets** — it fetches arbitrary user-supplied URLs
-  server-side (admin-gated); an admin could point it at internal/loopback or cloud
-  metadata endpoints (SSRF). Consider an allowlist / private-IP block if the admin
-  set is broad.
-- [x] **The console REPL cog was removed** (2026-07-05) — it read host stdin
-  and could send messages as the bot to any channel with no auth, and was dead
-  under systemd anyway (blocking `input()` on a non-tty).
-- [x] **Unauthenticated config-disclosure reads are gone.** The former `/ai
-  status` and `!listmedia` — which showed any member which providers had keys
-  configured, the model catalog, and the media inventory — no longer exist. That
-  configuration state now lives inside the admin-gated `!aisettings` / `!media`
+- [ ] **Audit media panel Add targets** — the `/media` panel's Add fetches an
+  arbitrary URL server-side (bot-admin-gated); an admin could point it at
+  internal/loopback or cloud metadata endpoints (SSRF). Consider an allowlist /
+  private-IP block if the admin set is broad.
+- [x] **No unauthenticated config-disclosure reads.** Provider, model and
+  media configuration live inside the admin-gated `!aisettings` / `!media`
   panels, which answer ephemerally in their slash form. The public media
-  inventory is also available through the cog's `list_media` op when exposed;
-  `post_media` mirrors the public `!<name>` shortcut. Both follow the agent's global/guild access settings or the
-  separate MCP allowlist. They never return host filesystem paths.
-
-Fixed in the 2026-07-05 consistency sweep (see git history for details):
-`!echo` is admin-gated (was open bot-impersonation), `!sethuebridgeip` was
-superadmin-gated (was an ungated global-config write; the whole Hue/signal cog
-was later removed, 2026-08-11), `!addmedia` and the
-`!errorlog` group (now the `/logsettings` panel) route through the shared `is_admin` gate (each previously
-used a divergent hand-rolled check), and the global-mutating provider commands
-(`setapikey`/`addmodel`/`removemodel`/`addprovider`) were made superadmin-only
-because they alter configuration shared by every guild — their prefix variants
-have since been removed entirely in favor of the `!aisettings` panel (and its
-ephemeral `/aisettings` slash twin), which keeps the superadmin gate on the
-Models & Providers tab.
-`delete_message` follows configured tool access, like every other op. The
-agent checks that access before resolving any Discord targets.
+  inventory is available through the `list_media` op when exposed;
+  `post_media` mirrors the public `!<name>` shortcut. Neither returns host
+  filesystem paths.
 
 ### Invoker-only tools
 
 `OpScope.SELF` binds ownership to the trusted invocation's `ctx.author`. A SELF op
 may declare one optional `SELF_USER` parameter (wire `user_id`): omitted, it is the
 invoker; naming someone else requires an admin invoker and a member of the current
-guild; in a DM it is always the invoker. `Op.__call__` enforces this on both dispatch
+guild. `Op.__call__` enforces this on both dispatch
 paths before the op runs, so a model-chosen id cannot widen it.
 Registration rejects identity/target selectors, Discord entity and snowflake
 parameters, INTERNAL parameters and undeclared implementation arguments.
@@ -364,9 +362,9 @@ identity remains deferred; other scopes retain their existing MCP policy.
 
 The shared agent policy requires a global whitelist entry and global
 `ai_self_tools_enabled` (absent means true). Public guild SELF additionally
-requires a non-off per-op gate (absent means off). All SELF switches, whitelist entries and applicable gates are
-rechecked on each dispatch for every actor, including superadmins. Existing
-GUILD admin bypass behavior is preserved.
+requires a non-off per-op gate (absent means off). All SELF switches, whitelist
+entries and applicable gates are rechecked on each dispatch for every actor,
+including superadmins.
 
 SELF logs omit arguments, result bodies and error strings. They retain safe
 operation, actor, surface, status and budget metadata. Provider exceptions from

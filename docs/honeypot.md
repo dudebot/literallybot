@@ -24,11 +24,13 @@ that Discord permission can use the hidden, guild-only prefix fallback:
 !honeypot disable
 ```
 
-The ADMIN, GUILD-scoped `configure_honeypot` op calls the same configuration
+The GUILD-scoped `configure_honeypot` op calls the same configuration
 service. It requires an explicit `channel_id`, even when disabling, and accepts
 optional `role_id`, `enabled`, `minutes`, and `strip_all_other_roles`. Its IDs are
 returned as decimal strings. Registration does not enable the op for agents;
-normal [tool exposure settings](config-system.md#enabling-cog-tools) apply.
+normal [tool exposure settings](config-system.md#enabling-cog-tools) apply. It
+is marked `confirm_everyone`, so `/aisettings` asks for a typed YES before it is
+first set to Everyone.
 
 ## Permissions and setup
 
