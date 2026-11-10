@@ -173,10 +173,6 @@ class Control(commands.Cog):
         Authorization is `@app_commands.check(is_superadmin)`. The picker
         pin is Manage Messages so ordinary members do not see the command;
         a superadmin who is not a moderator in this guild still has `!cogs`."""
-        if not is_superadmin(interaction):
-            await interaction.response.send_message(
-                "Requires superadmin.", ephemeral=True)
-            return
         view = CogsView(self, interaction.user)
         await interaction.response.send_message(
             embed=view.render_embed(), view=view, ephemeral=True)
@@ -195,10 +191,6 @@ class Control(commands.Cog):
         pin is Manage Messages so ordinary members do not see the command;
         a superadmin who is not a moderator in this guild still has
         `!config`."""
-        if not is_superadmin(interaction):
-            await interaction.response.send_message(
-                "Requires superadmin.", ephemeral=True)
-            return
         view = ConfigView(self, interaction.user)
         await interaction.response.send_message(
             embed=view.render_embed(), view=view, ephemeral=True)

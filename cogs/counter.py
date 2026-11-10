@@ -164,8 +164,9 @@ class Counter(commands.Cog):
             return  # Non-strict channels allow chatter.
         previous = None
         # before is essential: later burst messages must not move this
-        # message's baseline. No saved number can survive a deletion.
-        async for prior in message.channel.history(limit=None, before=message, oldest_first=False):
+        # message's baseline. No saved number can survive a deletion. No
+        # number in the last 200 messages counts as a fresh start.
+        async for prior in message.channel.history(limit=200, before=message, oldest_first=False):
             if prior.author.bot or _marked_wrong(prior):
                 continue
             previous = _number(prior.content)

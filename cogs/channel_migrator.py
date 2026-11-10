@@ -110,7 +110,7 @@ class ChannelMigrator(commands.Cog):
             await ctx.send("Can only migrate into text channels or threads.")
             return
 
-        total_entries = self._count_bundle_messages(bundle_path)
+        total_entries = await asyncio.to_thread(self._count_bundle_messages, bundle_path)
         await ctx.send(
             f"Replaying {total_entries} entries from `{safe_name}` into {target_channel.mention}. "
             "Attachments will be re-uploaded when possible (fallback to links if too large or unavailable)."
@@ -151,7 +151,7 @@ class ChannelMigrator(commands.Cog):
         asset_dir = self.storage_dir / f"{safe_name}_assets"
         asset_dir.mkdir(parents=True, exist_ok=True)
 
-        urls = self._collect_bundle_media_urls(bundle_path)
+        urls = await asyncio.to_thread(self._collect_bundle_media_urls, bundle_path)
         if not urls:
             await ctx.send(f"No embed images or attachments found in `{safe_name}`.")
             return

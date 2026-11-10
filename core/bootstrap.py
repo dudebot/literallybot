@@ -49,10 +49,22 @@ No Discord bot token found.
 Get one in about a minute:
   1. Open https://discord.com/developers/applications and click New Application
   2. Open the Bot tab, then Reset Token, then Copy
-  3. Paste it below (it will not be echoed)
+  3. On the same Bot tab, enable the Presence, Server Members and Message
+     Content privileged intents, then Save Changes
+  4. Paste the token below (it will not be echoed)
 
 The token is saved to configs/global.json (mode 0600) once it logs in
 successfully, so you only do this once.
+""".strip()
+
+PRIVILEGED_INTENTS_INSTRUCTIONS = """
+Discord refused the connection: this bot needs privileged gateway intents
+that are not enabled for the application.
+
+  1. Open https://discord.com/developers/applications and pick the bot
+  2. Bot tab -> Privileged Gateway Intents: enable Presence Intent,
+     Server Members Intent and Message Content Intent
+  3. Save Changes and start the bot again
 """.strip()
 
 NO_TTY_INSTRUCTIONS = """
@@ -73,7 +85,8 @@ Or run the bot once from an interactive terminal and paste the token at the
 prompt — it is then stored in configs/global.json and no env var is needed.
 
 Get a token at https://discord.com/developers/applications (New Application
--> Bot -> Reset Token).
+-> Bot -> Reset Token), and on that Bot tab enable the Presence, Server
+Members and Message Content privileged intents.
 """.strip()
 
 
@@ -153,57 +166,52 @@ def persist_token(config, token):
                 "Future starts need no token entry.", TOKEN_CONFIG_KEY)
 
 
-def run_bot(bot, run=None, login_failure=None, **resolve_kwargs):
-    """Resolve a token, run the bot, and re-prompt if a typed token is bad.
+def run_bot(bot, run=None, **resolve_kwargs):
+    """Resolve a token and run the bot; exit nonzero if Discord rejects it.
 
     The verification boundary is discord.py's own login: `bot.run(token)`
     raises `LoginFailure` before the gateway connects when the token is
     rejected, and reaches `setup_hook` only after the REST login succeeded.
     So the rule "never write an unverified token" is implemented as: stash the
     candidate on the bot, let `setup_hook` persist it once login is confirmed,
-    and on `LoginFailure` write nothing and ask again.
+    and on `LoginFailure` write nothing and exit. There is no retry: a closed
+    discord.Client cannot be run again.
 
     Only a `SOURCE_PROMPT` token is ever a persistence candidate — an env token
     stays out of the config store by design, and a config token is already
-    there. Retry is likewise prompt-only: re-prompting after a bad *env* token
-    would silently paper over the operator's broken panel variable.
+    there.
 
     ``resolve_kwargs`` are forwarded to `resolve_token` (``env``, ``prompt``,
-    ``stdin_is_tty``) so a test can drive the whole loop without a terminal.
+    ``stdin_is_tty``) so a test can drive it without a terminal.
     """
-    if run is None:
-        run = bot.run
-    if login_failure is None:
-        import discord
-        login_failure = discord.LoginFailure
+    import discord
 
-    for attempt in range(1, MAX_PROMPT_ATTEMPTS + 1):
-        token, source = resolve_token(bot.config, **resolve_kwargs)
-        # Read by LiterallyBot.setup_hook; cleared once written so a
-        # reconnect-triggered hook never re-persists.
-        bot._pending_token = token if source == SOURCE_PROMPT else None
-        try:
-            run(token)
-            return
-        except login_failure:
-            bot._pending_token = None
-            if source != SOURCE_PROMPT:
-                where = (f"the {TOKEN_ENV_VAR} environment variable"
-                         if source == SOURCE_ENV
-                         else f"the stored `{TOKEN_CONFIG_KEY}` global config value")
-                print(f"\nDiscord rejected the token from {where}.\n"
-                      f"It is wrong, revoked, or truncated — reset it in the "
-                      f"Developer Portal and set it again.", file=sys.stderr)
-                raise SystemExit(1)
-            remaining = MAX_PROMPT_ATTEMPTS - attempt
-            print("\nDiscord rejected that token — nothing was saved.",
-                  file=sys.stderr)
-            if not remaining:
-                print("Out of attempts. Reset the token in the Developer "
-                      "Portal and run again.", file=sys.stderr)
-                raise SystemExit(1)
-            print(f"Check for a truncated copy/paste and try again "
-                  f"({remaining} attempt(s) left).", file=sys.stderr)
+    if run is None:
+        def run(token):
+            bot.run(token, log_handler=None)
+
+    token, source = resolve_token(bot.config, **resolve_kwargs)
+    # Read by LiterallyBot.setup_hook; cleared once written so a
+    # reconnect-triggered hook never re-persists.
+    bot._pending_token = token if source == SOURCE_PROMPT else None
+    try:
+        run(token)
+    except discord.PrivilegedIntentsRequired:
+        print(PRIVILEGED_INTENTS_INSTRUCTIONS, file=sys.stderr)
+        raise SystemExit(1)
+    except discord.LoginFailure:
+        bot._pending_token = None
+        if source == SOURCE_PROMPT:
+            print("\nDiscord rejected that token — nothing was saved. Check "
+                  "for a truncated copy/paste and run again.", file=sys.stderr)
+        else:
+            where = (f"the {TOKEN_ENV_VAR} environment variable"
+                     if source == SOURCE_ENV
+                     else f"the stored `{TOKEN_CONFIG_KEY}` global config value")
+            print(f"\nDiscord rejected the token from {where}.\n"
+                  f"It is wrong, revoked, or truncated — reset it in the "
+                  f"Developer Portal and set it again.", file=sys.stderr)
+        raise SystemExit(1)
 
 
 async def bootstrap_superadmin(bot):

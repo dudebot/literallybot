@@ -1,14 +1,14 @@
 [Unit]
 Description=LiterallyBot Discord Bot
 Wants=network-online.target
-After=network.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=YOUR_USERNAME
 Group=YOUR_USERNAME
 WorkingDirectory=/path/to/literallybot
-ExecStart=/usr/bin/python3 /path/to/literallybot/bot.py
+ExecStart=/path/to/literallybot/start.sh
 Restart=always
 RestartSec=3
 

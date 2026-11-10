@@ -24,15 +24,6 @@ SERVICE_NAME="${1:-$DEFAULT_NAME}"
 DESCRIPTION="${DEFAULT_NAME} Discord Bot"
 CURRENT_USER="${SUDO_USER:-$USER}"
 
-# Check if venv exists, use it if available
-if [ -f "$CURRENT_DIR/venv/bin/python3" ]; then
-    PYTHON_BIN="$CURRENT_DIR/venv/bin/python3"
-    echo -e "${YELLOW}Note: Using virtual environment at $CURRENT_DIR/venv${NC}"
-else
-    PYTHON_BIN="$(which python3)"
-    echo -e "${YELLOW}Note: No venv found, using system python3${NC}"
-fi
-
 # Verify bot.py exists
 if [ ! -f "$CURRENT_DIR/bot.py" ]; then
     echo -e "${RED}Error: bot.py not found in $CURRENT_DIR${NC}"
@@ -47,7 +38,7 @@ echo -e "${GREEN}=== Service Installation Configuration ===${NC}"
 echo "Service name:    $SERVICE_NAME"
 echo "Description:     $DESCRIPTION"
 echo "Working dir:     $CURRENT_DIR"
-echo "Python binary:   $PYTHON_BIN"
+echo "Start command:   $CURRENT_DIR/start.sh"
 echo "Run as user:     $CURRENT_USER"
 echo ""
 
@@ -68,14 +59,14 @@ cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=$DESCRIPTION
 Wants=network-online.target
-After=network.target
+After=network-online.target
 
 [Service]
 Type=simple
 User=$CURRENT_USER
 Group=$CURRENT_USER
 WorkingDirectory=$CURRENT_DIR
-ExecStart=$PYTHON_BIN $CURRENT_DIR/bot.py
+ExecStart=$CURRENT_DIR/start.sh
 Restart=always
 RestartSec=3
 

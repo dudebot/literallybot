@@ -115,7 +115,10 @@ class LiterallyBot(commands.Bot):
                                 f"{', '.join(removed)}")
 
 
-bot = LiterallyBot(command_prefix='!', intents=discord.Intents.all())
+# Nothing the bot sends may ping @everyone or a role unless a call says so:
+# replies quote user text and provider errors verbatim.
+bot = LiterallyBot(command_prefix='!', intents=discord.Intents.all(),
+                   allowed_mentions=discord.AllowedMentions(everyone=False, roles=False))
 # Attach central logger to bot for use in cogs
 bot.logger = logger
 bot.config = Config()
@@ -128,9 +131,6 @@ async def load_cogs():
     failed_cogs = []
     for cog_name in list_cog_modules(bot.config):
         try:
-            if cog_name in bot.extensions:
-                logger.debug(f"{cog_name} already loaded, skipping")
-                continue
             await bot.load_extension(cog_name)
             logger.info(f"Successfully loaded {cog_name}")
         except Exception as exc:
@@ -138,7 +138,7 @@ async def load_cogs():
             failed_cogs.append({
                 'name': cog_name, 'error': str(exc), 'type': type(exc).__name__,
             })
-    bot.failed_cogs = failed_cogs if failed_cogs else []
+    bot.failed_cogs = failed_cogs
 
 @bot.event
 async def on_ready():
@@ -167,11 +167,15 @@ async def on_ready():
     # Global first (what DMs see), then copy onto each guild so a deleted
     # or re-permissioned command doesn't linger as a stale guild copy.
     if not getattr(bot, "_synced", False):
-        await bot.tree.sync()
-        for guild in bot.guilds:
-            bot.tree.copy_global_to(guild=guild)
-            await bot.tree.sync(guild=guild)
-        bot._synced = True
+        try:
+            await bot.tree.sync()
+            for guild in bot.guilds:
+                bot.tree.copy_global_to(guild=guild)
+                await bot.tree.sync(guild=guild)
+            bot._synced = True
+        except Exception:
+            logger.error("Slash command sync failed; run !sync to retry.",
+                         exc_info=True)
 
     # MCP ops server — OFF unless the `mcp_ops_enabled` global config bool is
     # set. Default bind is 127.0.0.1. MCP_OPS_HOST may set a LAN address, or

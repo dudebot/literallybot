@@ -285,10 +285,6 @@ class AutoResponse(commands.Cog):
         Manage Messages so ordinary members do not see the command; a bot
         admin who is not a moderator in this guild still has
         `!autoresponse`."""
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "Requires admin.", ephemeral=True)
-            return
         view = AutoResponseView(self, interaction.user, interaction.guild)
         await interaction.response.send_message(
             embed=view.render_embed(), view=view, ephemeral=True)

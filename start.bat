@@ -17,11 +17,22 @@ if errorlevel 1 (
   echo Python to PATH" during setup^) and try again.
   exit /b 1
 )
+%PYTHON% -c "import sys; sys.exit(sys.version_info < (3, 11))"
+if errorlevel 1 (
+  echo Python 3.11 or newer is required. Install it from https://python.org and try again.
+  exit /b 1
+)
 
-if not exist venv (
+venv\Scripts\python.exe -c "" >nul 2>&1
+if errorlevel 1 (
   echo Creating virtual environment...
+  if exist venv rmdir /s /q venv
   %PYTHON% -m venv venv
-  if errorlevel 1 exit /b 1
+  if errorlevel 1 (
+    if exist venv rmdir /s /q venv
+    echo Could not create the virtual environment.
+    exit /b 1
+  )
 )
 
 REM Reinstall only when requirements.txt is newer than the last successful

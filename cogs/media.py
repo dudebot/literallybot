@@ -169,20 +169,6 @@ class Media(commands.Cog):
             await self._post_file(message.guild, message.channel,
                                   message.content[1:])
 
-    def _cleanup_media_files(self, media_dir, file_name):
-        """Remove only literal basename matches inside a safe library directory."""
-        self._validate_name(file_name)
-        directory = safe_media_directory(media_dir)
-        for name in os.listdir(directory):
-            if not name.startswith((f'{file_name}.', f'{file_name}_tmp.')):
-                continue
-            try:
-                path = self._media_path(directory, name)
-                if os.path.isfile(path):
-                    os.remove(path)
-            except (OSError, ValueError):
-                pass
-
     def _trim_media(self, file_path, start_ms, end_ms):
         """Trim media file in place using ffmpeg. Returns True on success.
 
@@ -200,8 +186,7 @@ class Media(commands.Cog):
         if start_ms > 0:
             cmd.extend(['-ss', str(start_ms / 1000)])
 
-        cmd.extend(['-i', file_path, '-t', str(duration_ms / 1000),
-                    '-c:v', 'libx264', '-c:a', 'aac', temp_path])
+        cmd.extend(['-i', file_path, '-t', str(duration_ms / 1000), temp_path])
 
         result = subprocess.run(cmd, capture_output=True, timeout=60)
         if result.returncode != 0:
@@ -346,7 +331,6 @@ class Media(commands.Cog):
                     start_ms = 0
 
                 if not self._trim_media(file_path, start_ms, end_ms):
-                    self._cleanup_media_files(download_dir, file_name)
                     return 'Failed to trim media file.'
 
             final_name = os.path.basename(file_path)
@@ -356,16 +340,12 @@ class Media(commands.Cog):
             return f'Media file {final_name} has been added — post it with `!{file_name}`.'
 
         except requests.RequestException as e:
-            self._cleanup_media_files(download_dir, file_name)
             return f'Failed to download the file: {e}'
         except yt_dlp.utils.DownloadError as e:
-            self._cleanup_media_files(download_dir, file_name)
             return f'Failed to download the video: {e}'
         except ValueError as e:
-            self._cleanup_media_files(download_dir, file_name)
             return str(e)
         except Exception as e:
-            self._cleanup_media_files(download_dir, file_name)
             return f'Unexpected error: {e}'
         finally:
             staging.cleanup()
@@ -381,10 +361,6 @@ class Media(commands.Cog):
         """Ephemeral twin of `!media` (#76). Authorization is
         `@app_commands.check(is_admin)`. The picker pin is Manage Messages
         so ordinary members do not see the command."""
-        if not is_admin(interaction):
-            await interaction.response.send_message(
-                "Requires admin.", ephemeral=True)
-            return
         view = MediaView(self, interaction.user, interaction.guild)
         await interaction.response.send_message(
             embed=view.render_embed(), view=view, ephemeral=True)

@@ -6,7 +6,6 @@ docs/error-handling.md for suppression, routing, and the settings panel.
 """
 import asyncio
 import logging
-import re
 import sys
 import traceback
 from collections.abc import Callable
@@ -65,34 +64,9 @@ def unregister_error_whitelist_hook(hook: Callable):
         _command_error_whitelist_hooks.remove(hook)
 
 
-def suppress_command_not_found(*patterns: str | re.Pattern):
-    """Cog-class decorator: full-match prefix-stripped, trimmed message text.
-
-    Patterns compile at definition time. Only loaded cogs participate; this
-    never suppresses invocation/event errors, even on matching messages.
-    Pass the SAME compiled pattern used by the listener to avoid drift.
-    """
-    compiled = tuple(re.compile(pattern) for pattern in patterns)
-
-    def decorate(cog_class):
-        cog_class.__command_not_found_patterns__ = (
-            getattr(cog_class, "__command_not_found_patterns__", ()) + compiled
-        )
-        return cog_class
-    return decorate
-
-
 def _suppresses_command_not_found(bot, ctx, error) -> bool:
     if not isinstance(error, commands.CommandNotFound):
         return False
-    prefix = getattr(ctx, "prefix", None)
-    content = ctx.message.content
-    if prefix and content.startswith(prefix) and not ctx.message.author.bot:
-        text = content[len(prefix):].strip()
-        for cog in getattr(bot, "cogs", {}).values():
-            for pattern in getattr(cog, "__command_not_found_patterns__", ()):
-                if pattern.fullmatch(text):
-                    return True
     for hook in tuple(_command_error_whitelist_hooks):
         try:
             if hook(ctx, error):
